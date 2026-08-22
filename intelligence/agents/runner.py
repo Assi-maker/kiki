@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from typing import TypeVar
 
-from anthropic import Anthropic
+from anthropic import Anthropic, APIError
 
 from intelligence.agents.loader import AgentDefinition
 from intelligence.schemas.assessments import AssessmentBase
@@ -67,7 +67,7 @@ class RealClaudeRunner(AgentRunner):
                 data.setdefault("status", "ok")
                 data.setdefault("created_at", datetime.now(UTC).isoformat())
                 return output_schema.model_validate(data)
-            except (json.JSONDecodeError, ValueError, TypeError):
+            except (json.JSONDecodeError, ValueError, TypeError, APIError):
                 continue
 
         return self._failed_assessment(agent_def, output_schema, context.get("run_id", "unknown"))

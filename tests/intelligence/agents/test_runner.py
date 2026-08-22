@@ -1,7 +1,9 @@
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
+from anthropic import APIConnectionError
 
 from intelligence.agents.loader import AgentDefinition
 from intelligence.agents.runner import MockAgentRunner, RealClaudeRunner
@@ -56,6 +58,20 @@ def test_real_runner_returns_failed_status_on_invalid_json(mock_anthropic_cls):
     mock_message = MagicMock()
     mock_message.content = [MagicMock(type="text", text="detta är inte json")]
     mock_client.messages.create.return_value = mock_message
+
+    runner = RealClaudeRunner(
+        api_key="fake-key", model="claude-sonnet-5", timeout_seconds=5, max_retries=1
+    )
+    result = runner.run(_agent_def(), context={"question": "test"}, output_schema=QAAssessment)
+    assert result.status == "failed"
+
+
+@patch("intelligence.agents.runner.Anthropic")
+def test_real_runner_returns_failed_status_on_api_error(mock_anthropic_cls):
+    mock_client = MagicMock()
+    mock_anthropic_cls.return_value = mock_client
+    request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+    mock_client.messages.create.side_effect = APIConnectionError(request=request)
 
     runner = RealClaudeRunner(
         api_key="fake-key", model="claude-sonnet-5", timeout_seconds=5, max_retries=1
