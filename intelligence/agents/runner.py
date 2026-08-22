@@ -63,6 +63,8 @@ class RealClaudeRunner(AgentRunner):
                 )
                 text = "".join(block.text for block in message.content if block.type == "text")
                 data = json.loads(text)
+                if not isinstance(data, dict):
+                    raise ValueError("model response was not a JSON object")
                 data.setdefault("agent_name", agent_def.name)
                 data.setdefault("status", "ok")
                 data.setdefault("created_at", datetime.now(UTC).isoformat())
