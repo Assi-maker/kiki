@@ -65,6 +65,32 @@ def test_real_runner_disables_sdk_level_retries(mock_anthropic_cls):
 
 
 @patch("intelligence.agents.runner.Anthropic")
+def test_real_runner_applies_per_agent_timeout_override(mock_anthropic_cls):
+    # opportunity-hunter's real-run latency sat right at the default timeout
+    # (2026-08-23 verification run) — it gets a raised per-agent timeout via
+    # timeout_overrides, while every other agent keeps timeout_seconds.
+    mock_client = MagicMock()
+    mock_anthropic_cls.return_value = mock_client
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(type="text", text='{"passed": true, "violations": []}')]
+    mock_client.messages.create.return_value = mock_message
+
+    runner = RealClaudeRunner(
+        api_key="fake-key",
+        model="claude-sonnet-5",
+        timeout_seconds=30,
+        max_retries=1,
+        timeout_overrides={"opportunity-hunter": 45},
+    )
+
+    runner.run(_agent_def(name="opportunity-hunter"), context={}, output_schema=QAAssessment)
+    assert mock_client.messages.create.call_args.kwargs["timeout"] == 45
+
+    runner.run(_agent_def(name="qa-agent"), context={}, output_schema=QAAssessment)
+    assert mock_client.messages.create.call_args.kwargs["timeout"] == 30
+
+
+@patch("intelligence.agents.runner.Anthropic")
 def test_real_runner_returns_failed_status_on_invalid_json(mock_anthropic_cls):
     mock_client = MagicMock()
     mock_anthropic_cls.return_value = mock_client

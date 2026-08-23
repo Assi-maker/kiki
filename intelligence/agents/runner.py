@@ -41,7 +41,14 @@ class MockAgentRunner(AgentRunner):
 
 
 class RealClaudeRunner(AgentRunner):
-    def __init__(self, api_key: str, model: str, timeout_seconds: float, max_retries: int):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        timeout_seconds: float,
+        max_retries: int,
+        timeout_overrides: dict[str, float] | None = None,
+    ):
         # SDK-level retries default to 2 (i.e. 3 attempts) and retry timeouts by
         # design, nesting inside our own retry loop below (self._max_retries) and
         # multiplying worst-case wall time to attempts x SDK_attempts x timeout_seconds.
@@ -50,6 +57,9 @@ class RealClaudeRunner(AgentRunner):
         self._model = model
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
+        # Per-agent-name override of timeout_seconds, e.g. for an agent whose
+        # real-world latency runs closer to the default than others.
+        self._timeout_overrides = timeout_overrides or {}
 
     def run(self, agent_def: AgentDefinition, context: dict, output_schema: type[T]) -> T:
         schema = output_schema.model_json_schema()
@@ -66,6 +76,7 @@ class RealClaudeRunner(AgentRunner):
             f"Svara ENDAST med giltig JSON som matchar detta schema:\n{json.dumps(schema)}"
         )
         run_id = context.get("run_id", "unknown")
+        timeout_seconds = self._timeout_overrides.get(agent_def.name, self._timeout_seconds)
         for attempt in range(self._max_retries):
             try:
                 message = self._client.messages.create(
@@ -73,7 +84,7 @@ class RealClaudeRunner(AgentRunner):
                     max_tokens=16000,
                     system=agent_def.system_prompt,
                     messages=[{"role": "user", "content": user_message}],
-                    timeout=self._timeout_seconds,
+                    timeout=timeout_seconds,
                 )
                 text = "".join(block.text for block in message.content if block.type == "text")
                 data = json.loads(text)

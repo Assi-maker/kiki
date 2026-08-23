@@ -28,6 +28,11 @@ from intelligence.storage.repository import SQLiteRepository
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# opportunity-hunter's real-run latency (2026-08-23 verification) sat right at
+# the default agent_timeout_seconds (~30s attempts, 91.4s across 3 retries) —
+# a modest bump for this agent only, not a blanket timeout increase.
+_AGENT_TIMEOUT_OVERRIDES: dict[str, float] = {"opportunity-hunter": 45.0}
+
 
 def _default_mock_fixtures() -> dict[str, AssessmentBase]:
     """Happy-path fixtures for --mock's demo run against real HN data.
@@ -101,6 +106,7 @@ def build_orchestrator(use_mock: bool, mock_fixtures: dict | None = None) -> Orc
             model="claude-sonnet-5",
             timeout_seconds=settings.agent_timeout_seconds,
             max_retries=3,
+            timeout_overrides=_AGENT_TIMEOUT_OVERRIDES,
         )
 
     return Orchestrator(

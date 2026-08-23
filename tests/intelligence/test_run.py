@@ -3,7 +3,7 @@ import sys
 from datetime import UTC, datetime
 
 from intelligence.agents.runner import MockAgentRunner
-from intelligence.run import build_orchestrator
+from intelligence.run import _AGENT_TIMEOUT_OVERRIDES, build_orchestrator
 from intelligence.schemas.event import Event
 
 
@@ -11,6 +11,32 @@ def test_build_orchestrator_uses_mock_runner_when_requested(tmp_path, monkeypatc
     monkeypatch.setenv("DB_PATH_OVERRIDE", str(tmp_path / "t.db"))
     orch = build_orchestrator(use_mock=True, mock_fixtures={})
     assert isinstance(orch._runner, MockAgentRunner)
+
+
+def test_build_orchestrator_passes_opportunity_hunter_timeout_override_to_real_runner(
+    tmp_path, monkeypatch
+):
+    # opportunity-hunter gets a raised per-agent timeout (2026-08-23 real-run
+    # verification showed it sitting right at the default) — verify build_orchestrator
+    # actually wires _AGENT_TIMEOUT_OVERRIDES into the real runner, not just that the
+    # constant exists.
+    monkeypatch.setenv("DB_PATH_OVERRIDE", str(tmp_path / "t.db"))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+
+    import intelligence.run as run_module
+
+    captured = {}
+
+    class _FakeRealClaudeRunner:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(run_module, "RealClaudeRunner", _FakeRealClaudeRunner)
+
+    build_orchestrator(use_mock=False)
+
+    assert captured["timeout_overrides"] == _AGENT_TIMEOUT_OVERRIDES
+    assert captured["timeout_overrides"]["opportunity-hunter"] > 30
 
 
 def test_build_orchestrator_default_mock_fixtures_reach_reported_status(tmp_path, monkeypatch):
