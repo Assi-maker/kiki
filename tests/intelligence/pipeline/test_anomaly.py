@@ -6,7 +6,9 @@ from intelligence.schemas.source import Source
 
 
 def _source():
-    return Source(source_id="hn", name="HN", type="forum", reliability_score=0.6, url="https://x.com")
+    return Source(
+        source_id="hn", name="HN", type="forum", reliability_score=0.6, url="https://x.com"
+    )
 
 
 def test_large_deviation_creates_event():

@@ -6,7 +6,13 @@ from intelligence.schemas.source import Source
 
 
 def _connector():
-    source = Source(source_id="hn", name="Hacker News", type="forum", reliability_score=0.6, url="https://news.ycombinator.com")
+    source = Source(
+        source_id="hn",
+        name="Hacker News",
+        type="forum",
+        reliability_score=0.6,
+        url="https://news.ycombinator.com",
+    )
     return HackerNewsConnector(source, timeout_seconds=5, max_retries=2, min_interval_seconds=0)
 
 
@@ -51,7 +57,9 @@ def test_fetch_returns_raw_records_for_top_stories():
 def test_fetch_raises_connector_unavailable_after_retries():
     from intelligence.connectors.exceptions import ConnectorUnavailableError
 
-    respx.get("https://hacker-news.firebaseio.com/v0/topstories.json").mock(return_value=Response(500))
+    respx.get("https://hacker-news.firebaseio.com/v0/topstories.json").mock(
+        return_value=Response(500)
+    )
     connector = _connector()
     try:
         connector.fetch()

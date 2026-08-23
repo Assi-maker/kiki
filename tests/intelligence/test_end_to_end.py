@@ -37,13 +37,19 @@ class _FixtureConnector(BaseConnector):
 
 def test_full_pipeline_from_data_to_markdown_report(tmp_path):
     repo = SQLiteRepository(tmp_path / "e2e.db")
-    source = Source(source_id="hn", name="Hacker News", type="forum", reliability_score=0.6, url="https://x.com")
+    source = Source(
+        source_id="hn", name="Hacker News", type="forum", reliability_score=0.6, url="https://x.com"
+    )
     repo.save_source(source)
 
     connector = _FixtureConnector(source, timeout_seconds=5, max_retries=1, min_interval_seconds=0)
     events = run_event_pipeline(
-        connectors=[connector], source_types={"hn": "forum"}, baselines={"hn": 50.0},
-        repo=repo, max_events=10, run_id="e2e-run",
+        connectors=[connector],
+        source_types={"hn": "forum"},
+        baselines={"hn": 50.0},
+        repo=repo,
+        max_events=10,
+        run_id="e2e-run",
     )
     assert len(events) == 1
 

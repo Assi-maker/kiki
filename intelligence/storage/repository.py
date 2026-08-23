@@ -37,9 +37,7 @@ class Repository(Protocol):
     def has_seen_content_hash(self, source_id: str, content_hash: str) -> bool: ...
     def save_opportunity(self, opportunity: Opportunity) -> None: ...
     def get_opportunity(self, opportunity_id: str) -> Opportunity | None: ...
-    def update_opportunity_status(
-        self, opportunity_id: str, status: OpportunityStatus
-    ) -> None: ...
+    def update_opportunity_status(self, opportunity_id: str, status: OpportunityStatus) -> None: ...
     def save_assessment(
         self, opportunity_id: str, field_name: str, assessment: AssessmentBase
     ) -> None: ...
@@ -61,8 +59,15 @@ class SQLiteRepository:
         self._conn.execute(
             "INSERT OR REPLACE INTO events VALUES (?,?,?,?,?,?,?,?,?)",
             (
-                event.event_id, event.source_id, event.observed_at.isoformat(), event.category,
-                event.metric, event.baseline, event.deviation, event.description, event.raw_ref,
+                event.event_id,
+                event.source_id,
+                event.observed_at.isoformat(),
+                event.category,
+                event.metric,
+                event.baseline,
+                event.deviation,
+                event.description,
+                event.raw_ref,
             ),
         )
         self._conn.commit()

@@ -35,9 +35,7 @@ def _full_opportunity() -> Opportunity:
         opportunity=OpportunityAssessment(
             **_A, observed_data="d", hypothesis="h", interpretation="i"
         ),
-        market=MarketAssessment(
-            **_A, market_data={"volatility": 0.4}, interpretation="i"
-        ),
+        market=MarketAssessment(**_A, market_data={"volatility": 0.4}, interpretation="i"),
         forecast=ForecastAssessment(
             **_A,
             scenarios=[{"description": "up", "probability": 0.6}],

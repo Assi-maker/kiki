@@ -22,36 +22,61 @@ _A = dict(run_id="r1", created_at=datetime.now(UTC), status="ok")
 
 def _event():
     return Event(
-        event_id="evt-1", source_id="hn", observed_at=datetime.now(UTC), category="forum",
-        metric="score", baseline=50.0, deviation=400.0, description="d", raw_ref="hash-1",
+        event_id="evt-1",
+        source_id="hn",
+        observed_at=datetime.now(UTC),
+        category="forum",
+        metric="score",
+        baseline=50.0,
+        deviation=400.0,
+        description="d",
+        raw_ref="hash-1",
     )
 
 
 def _happy_fixtures():
     return {
         "research-agent": ResearchAssessment(
-            **_A, agent_name="research-agent",
-            verified_facts=["f"], source_references=["s"], assumptions=[],
+            **_A,
+            agent_name="research-agent",
+            verified_facts=["f"],
+            source_references=["s"],
+            assumptions=[],
         ),
         "opportunity-hunter": OpportunityAssessment(
-            **_A, agent_name="opportunity-hunter",
-            observed_data="d", hypothesis="h", interpretation="i",
+            **_A,
+            agent_name="opportunity-hunter",
+            observed_data="d",
+            hypothesis="h",
+            interpretation="i",
         ),
         "trading-research": MarketAssessment(
-            **_A, agent_name="trading-research", market_data={}, interpretation="i",
+            **_A,
+            agent_name="trading-research",
+            market_data={},
+            interpretation="i",
         ),
         "forecasting-agent": ForecastAssessment(
-            **_A, agent_name="forecasting-agent",
+            **_A,
+            agent_name="forecasting-agent",
             scenarios=[{"description": "up", "probability": 0.6}],
-            confidence=0.6, uncertainty="u",
+            confidence=0.6,
+            uncertainty="u",
         ),
         "risk-agent": RiskAssessment(
-            **_A, agent_name="risk-agent",
-            downside="d", liquidity_risk="l", model_risk="m", timing_risk="t",
+            **_A,
+            agent_name="risk-agent",
+            downside="d",
+            liquidity_risk="l",
+            model_risk="m",
+            timing_risk="t",
         ),
         "fact-checker-bear": BearAssessment(
-            **_A, agent_name="fact-checker-bear",
-            counterarguments=[], alternative_explanations=[], falsification_conditions="f",
+            **_A,
+            agent_name="fact-checker-bear",
+            counterarguments=[],
+            alternative_explanations=[],
+            falsification_conditions="f",
         ),
         "qa-agent": QAAssessment(**_A, agent_name="qa-agent", passed=True, violations=[]),
     }
@@ -65,7 +90,10 @@ def _orchestrator(tmp_path, fixtures=None, fail_agents=None, dest_dir=None):
     weights = load_weights(get_settings().scoring_weights_path)
     settings = get_settings()
     return Orchestrator(
-        repo=repo, runner=runner, weights=weights, settings=settings,
+        repo=repo,
+        runner=runner,
+        weights=weights,
+        settings=settings,
         report_dest_dir=dest_dir or tmp_path,
     )
 

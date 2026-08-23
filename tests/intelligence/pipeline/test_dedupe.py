@@ -17,8 +17,18 @@ def test_is_duplicate_false_then_true_after_seen(tmp_path):
     assert is_duplicate(repo, record) is False
 
     from intelligence.schemas.event import Event
-    repo.save_event(Event(
-        event_id="evt-1", source_id="hn", observed_at=datetime.now(UTC), category="trend",
-        metric="score", baseline=1.0, deviation=1.0, description="d", raw_ref="dup-hash",
-    ))
+
+    repo.save_event(
+        Event(
+            event_id="evt-1",
+            source_id="hn",
+            observed_at=datetime.now(UTC),
+            category="trend",
+            metric="score",
+            baseline=1.0,
+            deviation=1.0,
+            description="d",
+            raw_ref="dup-hash",
+        )
+    )
     assert is_duplicate(repo, record) is True

@@ -26,9 +26,7 @@ def get_settings() -> Settings:
     load_dotenv(_PROJECT_ROOT / ".env", override=False)
     db_path_override = os.environ.get("DB_PATH_OVERRIDE")
     db_path = (
-        Path(db_path_override)
-        if db_path_override
-        else _PROJECT_ROOT / "data" / "intelligence.db"
+        Path(db_path_override) if db_path_override else _PROJECT_ROOT / "data" / "intelligence.db"
     )
     return Settings(
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,

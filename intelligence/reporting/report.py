@@ -6,23 +6,15 @@ from intelligence.schemas.opportunity import Opportunity
 
 
 def render_report(opportunity: Opportunity) -> str:
-    forecast_scenarios = (
-        opportunity.forecast.scenarios if opportunity.forecast else []
-    )
+    forecast_scenarios = opportunity.forecast.scenarios if opportunity.forecast else []
     scenarios_lines = "\n".join(
         f"- {s['description']}: {s['probability']:.0%}" for s in forecast_scenarios
     )
-    bear_counterargs = (
-        opportunity.bear.counterarguments if opportunity.bear else []
-    )
+    bear_counterargs = opportunity.bear.counterarguments if opportunity.bear else []
     counterarguments = "\n".join(f"- {c}" for c in bear_counterargs)
-    bear_alts = (
-        opportunity.bear.alternative_explanations if opportunity.bear else []
-    )
+    bear_alts = opportunity.bear.alternative_explanations if opportunity.bear else []
     alternatives = "\n".join(f"- {a}" for a in bear_alts)
-    research_sources = (
-        opportunity.research.source_references if opportunity.research else []
-    )
+    research_sources = opportunity.research.source_references if opportunity.research else []
     sources = "\n".join(f"- {s}" for s in research_sources)
 
     return f"""# OPPORTUNITY #{opportunity.opportunity_id}
@@ -61,11 +53,13 @@ Timingrisk: {opportunity.risk.timing_risk if opportunity.risk else "Ej tillgäng
 Ej tillgängligt i Fas 1 — Historical/Backtest Agent byggs i Fas 3.
 
 ## Data quality:
-{(
-    opportunity.score_breakdown.get("data_quality")
-    if opportunity.score_breakdown
-    else "Ej tillgängligt"
-)}
+{
+        (
+            opportunity.score_breakdown.get("data_quality")
+            if opportunity.score_breakdown
+            else "Ej tillgängligt"
+        )
+    }
 
 ## Confidence:
 {opportunity.forecast.confidence if opportunity.forecast else "Ej tillgängligt"}
