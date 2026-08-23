@@ -2,6 +2,12 @@ from intelligence.config import get_settings
 
 
 def test_defaults_without_env(monkeypatch):
+    # get_settings() calls load_dotenv(..., override=False), which re-reads the
+    # real .env file and fills in anything monkeypatch.delenv just removed —
+    # override=False only means "don't clobber an already-set var", not "don't
+    # read the file". Neutralize load_dotenv so this test stays hermetic
+    # against whatever is actually in .env (e.g. a real ANTHROPIC_API_KEY).
+    monkeypatch.setattr("intelligence.config.load_dotenv", lambda *args, **kwargs: None)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ALPHAVANTAGE_API_KEY", raising=False)
     settings = get_settings()
