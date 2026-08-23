@@ -1,0 +1,8 @@
+# Alla vikter ska summera till 1.0. Komponenterna beräknas i intelligence/scoring/model.py.
+signal_strength: 0.20
+data_quality: 0.15
+source_reliability: 0.15
+potential: 0.20
+risk: 0.15
+confidence: 0.10
+novelty: 0.05

@@ -15,6 +15,10 @@ build/
 # Claude Code local state (project-level)
 .claude/settings.local.json
 
+# Intelligence-systemet
+data/*.db
+data/*.db-journal
+
 # OS
 Thumbs.db
 .DS_Store
