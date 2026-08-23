@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, datetime
 from pathlib import Path
 
 from intelligence.agents.runner import AgentRunner, MockAgentRunner, RealClaudeRunner
@@ -11,11 +12,78 @@ from intelligence.connectors.hackernews import HackerNewsConnector
 from intelligence.logging import log_event, new_run_id
 from intelligence.orchestrator import Orchestrator
 from intelligence.pipeline.event_pipeline import run_event_pipeline
+from intelligence.schemas.assessments import (
+    AssessmentBase,
+    BearAssessment,
+    ForecastAssessment,
+    MarketAssessment,
+    OpportunityAssessment,
+    QAAssessment,
+    ResearchAssessment,
+    RiskAssessment,
+)
 from intelligence.schemas.source import Source
 from intelligence.scoring.model import load_weights
 from intelligence.storage.repository import SQLiteRepository
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _default_mock_fixtures() -> dict[str, AssessmentBase]:
+    """Happy-path fixtures for --mock's demo run against real HN data.
+
+    One passing (status="ok") assessment per agent role, matching the shape
+    proven by ``_happy_fixtures()`` in tests/intelligence/test_orchestrator.py
+    and tests/intelligence/test_end_to_end.py — enough to satisfy the state
+    machine's REQUIRED_FOR_REPORTED gate so the demo run reaches a terminal
+    status instead of crashing on a missing fixture.
+    """
+    common = dict(run_id="mock", created_at=datetime.now(UTC), status="ok")
+    return {
+        "research-agent": ResearchAssessment(
+            **common,
+            agent_name="research-agent",
+            verified_facts=["f"],
+            source_references=["s"],
+            assumptions=[],
+        ),
+        "opportunity-hunter": OpportunityAssessment(
+            **common,
+            agent_name="opportunity-hunter",
+            observed_data="d",
+            hypothesis="h",
+            interpretation="i",
+        ),
+        "trading-research": MarketAssessment(
+            **common,
+            agent_name="trading-research",
+            market_data={},
+            interpretation="i",
+        ),
+        "forecasting-agent": ForecastAssessment(
+            **common,
+            agent_name="forecasting-agent",
+            scenarios=[{"description": "up", "probability": 0.6}],
+            confidence=0.6,
+            uncertainty="u",
+        ),
+        "risk-agent": RiskAssessment(
+            **common,
+            agent_name="risk-agent",
+            downside="d",
+            liquidity_risk="l",
+            model_risk="m",
+            timing_risk="t",
+        ),
+        "fact-checker-bear": BearAssessment(
+            **common,
+            agent_name="fact-checker-bear",
+            counterarguments=[],
+            alternative_explanations=[],
+            falsification_conditions="f",
+        ),
+        "qa-agent": QAAssessment(**common, agent_name="qa-agent", passed=True, violations=[]),
+    }
 
 
 def build_orchestrator(use_mock: bool, mock_fixtures: dict | None = None) -> Orchestrator:
@@ -25,7 +93,8 @@ def build_orchestrator(use_mock: bool, mock_fixtures: dict | None = None) -> Orc
 
     runner: AgentRunner
     if use_mock or not settings.anthropic_api_key:
-        runner = MockAgentRunner(fixtures=mock_fixtures or {})
+        fixtures = mock_fixtures if mock_fixtures is not None else _default_mock_fixtures()
+        runner = MockAgentRunner(fixtures=fixtures)
     else:
         runner = RealClaudeRunner(
             api_key=settings.anthropic_api_key,
