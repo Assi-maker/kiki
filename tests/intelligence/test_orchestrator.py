@@ -99,3 +99,18 @@ def test_qa_rejection_sets_status_rejected(tmp_path):
     assert opp.status == "rejected"
     report_files = list(tmp_path.glob("*opportunity-*.md"))
     assert len(report_files) == 0
+
+
+def test_qa_agent_infra_failure_sets_status_under_review_not_rejected(tmp_path):
+    # A pure infrastructure failure of the qa-agent (status="failed") must never be
+    # mislabeled as the terminal "rejected" status, even though a real runner's
+    # blank-fill would leave passed=False on such a failure. Only a qa-agent that
+    # actually ran (status="ok") and explicitly failed (passed=False) is "rejected".
+    fixtures = _happy_fixtures()
+    qa_kwargs = {**_A, "agent_name": "qa-agent", "status": "failed"}
+    fixtures["qa-agent"] = QAAssessment(**qa_kwargs, passed=False, violations=[])
+    orch = _orchestrator(tmp_path, fixtures=fixtures)
+    opp = orch.process_event(_event(), run_id="r1")
+    assert opp.status == "under_review"
+    report_files = list(tmp_path.glob("*opportunity-*.md"))
+    assert len(report_files) == 0

@@ -89,7 +89,11 @@ class Orchestrator:
             )
         else:
             qa = opportunity.qa
-            target_status = "rejected" if qa is not None and qa.passed is False else "under_review"
+            target_status = (
+                "rejected"
+                if qa is not None and qa.status == "ok" and qa.passed is False
+                else "under_review"
+            )
             opportunity.status = target_status
             self._repo.update_opportunity_status(opportunity.opportunity_id, target_status)
             log_event(
