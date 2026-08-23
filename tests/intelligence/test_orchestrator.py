@@ -1,4 +1,5 @@
 # tests/intelligence/test_orchestrator.py
+import logging
 from datetime import UTC, datetime
 
 from intelligence.agents.runner import MockAgentRunner
@@ -125,6 +126,95 @@ def test_qa_rejection_sets_status_rejected(tmp_path):
     orch = _orchestrator(tmp_path, fixtures=fixtures)
     opp = orch.process_event(_event(), run_id="r1")
     assert opp.status == "rejected"
+    report_files = list(tmp_path.glob("*opportunity-*.md"))
+    assert len(report_files) == 0
+
+
+def test_max_agent_calls_per_run_persists_across_events_not_reset_per_event(tmp_path, caplog):
+    # Finding #3: agent_calls must be scoped per RUN, not reset for every event.
+    # 7 roles/event; limit=10 -> event 1 consumes 7, event 2 (same run_id) should
+    # be cut off after 3 more roles (at 10 total), not get a fresh budget of 7.
+    caplog.set_level(logging.INFO)
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    settings = get_settings()
+    weights = load_weights(settings.scoring_weights_path)
+    low_limit_settings = settings.model_copy(update={"max_agent_calls_per_run": 10})
+    orch = Orchestrator(
+        repo=repo,
+        runner=runner,
+        weights=weights,
+        settings=low_limit_settings,
+        report_dest_dir=tmp_path,
+    )
+
+    opp1 = orch.process_event(_event(), run_id="r1")
+    assert opp1.status == "reported"
+
+    opp2 = orch.process_event(_event(), run_id="r1")
+    assert opp2.status != "reported"
+    assert opp2.qa is None  # cut off before reaching the qa role
+    assert "max_agent_calls_reached" in "\n".join(caplog.messages)
+
+
+def test_max_agent_calls_per_run_resets_on_new_run_id(tmp_path):
+    # A fresh run_id must get a fresh budget, not inherit exhaustion from a
+    # previous run processed by the same long-lived Orchestrator instance.
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    settings = get_settings()
+    weights = load_weights(settings.scoring_weights_path)
+    low_limit_settings = settings.model_copy(update={"max_agent_calls_per_run": 7})
+    orch = Orchestrator(
+        repo=repo,
+        runner=runner,
+        weights=weights,
+        settings=low_limit_settings,
+        report_dest_dir=tmp_path,
+    )
+
+    opp1 = orch.process_event(_event(), run_id="run-a")
+    assert opp1.status == "reported"
+
+    opp2 = orch.process_event(_event(), run_id="run-b")
+    assert opp2.status == "reported"
+
+
+def test_process_event_writes_log_run_event_rows_per_role(tmp_path):
+    # Finding #4: Repository.log_run_event (SPEC §10 observability — started_at/
+    # completed_at/latency_ms/errors) is fully implemented but previously had
+    # zero production call sites. It must actually be called once per agent
+    # role during a real process_event run.
+    orch = _orchestrator(tmp_path)
+    orch.process_event(_event(), run_id="r1")
+
+    rows = orch._repo._conn.execute("SELECT * FROM runs WHERE run_id = 'r1'").fetchall()
+    assert len(rows) == 7  # one per role in _ROLE_ORDER
+    for row in rows:
+        assert row["agent_name"]
+        assert row["status"] == "ok"
+        assert row["started_at"] is not None
+        assert row["completed_at"] is not None
+        assert row["latency_ms"] is not None and row["latency_ms"] >= 0
+
+
+def test_report_write_failure_does_not_crash_process_event(tmp_path, monkeypatch):
+    # Finding #2: a report-generation failure (e.g. a differently-shaped
+    # scenario dict slipping past pydantic validation and crashing
+    # render_report) must not abort the whole run. The opportunity's
+    # "reported" status was already committed to the DB before write_report
+    # runs, and must stay that way.
+    import intelligence.orchestrator as orchestrator_module
+
+    def _boom(*args, **kwargs):
+        raise KeyError("simulated render failure")
+
+    monkeypatch.setattr(orchestrator_module, "write_report", _boom)
+
+    orch = _orchestrator(tmp_path)
+    opp = orch.process_event(_event(), run_id="r1")
+
+    assert opp.status == "reported"
     report_files = list(tmp_path.glob("*opportunity-*.md"))
     assert len(report_files) == 0
 

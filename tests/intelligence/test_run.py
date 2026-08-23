@@ -1,3 +1,5 @@
+import logging
+import sys
 from datetime import UTC, datetime
 
 from intelligence.agents.runner import MockAgentRunner
@@ -35,3 +37,35 @@ def test_build_orchestrator_default_mock_fixtures_reach_reported_status(tmp_path
     opportunity = orch.process_event(event, run_id="run-1")
 
     assert opportunity.status == "reported"
+
+
+def test_main_logs_when_events_truncated_by_max_opportunities(tmp_path, monkeypatch, caplog):
+    # Finding #3 (item 2): unlike the other run.py limits, event-count
+    # truncation by max_opportunities_per_run previously logged nothing.
+    caplog.set_level(logging.INFO)
+    monkeypatch.setenv("DB_PATH_OVERRIDE", str(tmp_path / "t.db"))
+    monkeypatch.setenv("MAX_OPPORTUNITIES_PER_RUN", "1")
+    monkeypatch.setattr(sys, "argv", ["run.py", "--mock"])
+
+    import intelligence.run as run_module
+
+    events = [
+        Event(
+            event_id=f"evt-{i}",
+            source_id="hn",
+            observed_at=datetime.now(UTC),
+            category="forum",
+            metric="score",
+            baseline=50.0,
+            deviation=400.0,
+            description="d",
+            raw_ref=f"hash-{i}",
+        )
+        for i in range(3)
+    ]
+    monkeypatch.setattr(run_module, "run_event_pipeline", lambda **kwargs: events)
+
+    run_module.main()
+
+    combined = "\n".join(r.getMessage() for r in caplog.records if r.name == "intelligence")
+    assert "max_opportunities_truncated" in combined

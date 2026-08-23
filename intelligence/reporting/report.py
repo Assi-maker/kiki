@@ -7,8 +7,13 @@ from intelligence.schemas.opportunity import Opportunity
 
 def render_report(opportunity: Opportunity) -> str:
     forecast_scenarios = opportunity.forecast.scenarios if opportunity.forecast else []
+    # `scenarios` is an untyped list[dict] on ForecastAssessment — a schema-valid
+    # LLM response can use different keys (e.g. {"scenario": ..., "prob": ...}).
+    # Never strict-index it; fall back defensively, matching the convention
+    # scoring/model.py already uses (s.get("probability", 0.0)).
     scenarios_lines = "\n".join(
-        f"- {s['description']}: {s['probability']:.0%}" for s in forecast_scenarios
+        f"- {s.get('description', '?')}: {s.get('probability', 0.0):.0%}"
+        for s in forecast_scenarios
     )
     bear_counterargs = opportunity.bear.counterarguments if opportunity.bear else []
     counterarguments = "\n".join(f"- {c}" for c in bear_counterargs)
@@ -16,6 +21,10 @@ def render_report(opportunity: Opportunity) -> str:
     alternatives = "\n".join(f"- {a}" for a in bear_alts)
     research_sources = opportunity.research.source_references if opportunity.research else []
     sources = "\n".join(f"- {s}" for s in research_sources)
+    # Finding #6: MarketAssessment (the `market` role) previously fed neither
+    # scoring/model.py nor reporting/report.py at all — render it here.
+    market_data = opportunity.market.market_data if opportunity.market else {}
+    market_data_lines = "\n".join(f"- {k}: {v}" for k, v in market_data.items())
 
     return f"""# OPPORTUNITY #{opportunity.opportunity_id}
 
@@ -27,6 +36,10 @@ def render_report(opportunity: Opportunity) -> str:
 
 ## Vilka bevis finns?
 {sources or "Inga källor registrerade"}
+
+## Marknadsdata
+{market_data_lines or "Ingen marknadsdata registrerad"}
+{opportunity.market.interpretation if opportunity.market else "Ej tillgängligt"}
 
 ## Vad talar FÖR?
 {opportunity.opportunity.hypothesis if opportunity.opportunity else "Ej tillgängligt"}

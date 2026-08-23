@@ -171,6 +171,14 @@ def main() -> None:
         run_id=run_id,
     )
 
+    if len(events) > settings.max_opportunities_per_run:
+        log_event(
+            run_id,
+            event="max_opportunities_truncated",
+            total_events=len(events),
+            limit=settings.max_opportunities_per_run,
+        )
+
     orchestrator = build_orchestrator(use_mock=args.mock)
     reported = 0
     for event in events[: settings.max_opportunities_per_run]:

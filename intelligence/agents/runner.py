@@ -8,6 +8,7 @@ from typing import TypeVar
 from anthropic import Anthropic, APIError
 
 from intelligence.agents.loader import AgentDefinition
+from intelligence.logging import log_event
 from intelligence.schemas.assessments import AssessmentBase
 
 T = TypeVar("T", bound=AssessmentBase)
@@ -52,7 +53,8 @@ class RealClaudeRunner(AgentRunner):
             f"Context (JSON): {json.dumps(context, default=str)}\n\n"
             f"Svara ENDAST med giltig JSON som matchar detta schema:\n{json.dumps(schema)}"
         )
-        for _attempt in range(self._max_retries):
+        run_id = context.get("run_id", "unknown")
+        for attempt in range(self._max_retries):
             try:
                 message = self._client.messages.create(
                     model=self._model,
@@ -69,10 +71,24 @@ class RealClaudeRunner(AgentRunner):
                 data.setdefault("status", "ok")
                 data.setdefault("created_at", datetime.now(UTC).isoformat())
                 return output_schema.model_validate(data)
-            except (json.JSONDecodeError, ValueError, TypeError, APIError):
+            except (json.JSONDecodeError, ValueError, TypeError, APIError) as exc:
+                # SPEC §10: every retry failure must leave a diagnostic trace —
+                # never a silent `continue`. Never interpolate the raw exception
+                # or any raw request/response object here (Finding #1's class of
+                # bug); log_event's redact() still scrubs defensively, but only
+                # type name + str(exc) are passed in, never `exc.request`/`.response`.
+                log_event(
+                    run_id,
+                    event="agent_retry_failed",
+                    agent_name=agent_def.name,
+                    attempt=attempt + 1,
+                    max_retries=self._max_retries,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
                 continue
 
-        return self._failed_assessment(agent_def, output_schema, context.get("run_id", "unknown"))
+        return self._failed_assessment(agent_def, output_schema, run_id)
 
     def _failed_assessment(
         self, agent_def: AgentDefinition, output_schema: type[T], run_id: str

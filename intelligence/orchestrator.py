@@ -1,6 +1,7 @@
 # intelligence/orchestrator.py
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,8 +35,20 @@ class Orchestrator:
         self._weights = weights
         self._settings = settings
         self._report_dest_dir = report_dest_dir
+        # Finding #3: agent_calls must be scoped per RUN (across every event in
+        # the run), not per event — otherwise, with 7 roles/event and a default
+        # limit of 50, the cutoff can never fire in normal operation. We detect
+        # a new run by comparing against the last-seen run_id and reset then;
+        # this keeps Orchestrator's constructor-injection style (repo/runner/
+        # settings passed in once) without requiring run.py to thread a counter
+        # through every process_event call.
+        self._agent_calls = 0
+        self._current_run_id: str | None = None
 
     def process_event(self, event: Event, run_id: str) -> Opportunity:
+        if run_id != self._current_run_id:
+            self._current_run_id = run_id
+            self._agent_calls = 0
         opportunity = Opportunity(
             opportunity_id=str(uuid.uuid4()),
             event_id=event.event_id,
@@ -48,9 +61,8 @@ class Orchestrator:
         )
         self._repo.save_opportunity(opportunity)
 
-        agent_calls = 0
         for role in _ROLE_ORDER:
-            if agent_calls >= self._settings.max_agent_calls_per_run:
+            if self._agent_calls >= self._settings.max_agent_calls_per_run:
                 log_event(run_id, event="max_agent_calls_reached", role=role)
                 break
             spec = ROLE_MAP[role]
@@ -60,10 +72,44 @@ class Orchestrator:
                 "opportunity": opportunity.model_dump(mode="json"),
                 "run_id": run_id,
             }
-            assessment = self._runner.run(agent_def, context, spec.assessment_type)
-            agent_calls += 1
+            started_at = datetime.now(UTC)
+            start_monotonic = time.monotonic()
+            try:
+                assessment = self._runner.run(agent_def, context, spec.assessment_type)
+            except Exception as exc:
+                # AgentRunner.run() (Task 17's contract) should never raise — but
+                # be defensive rather than assume, so a contract violation still
+                # leaves a diagnostic trace (SPEC §10) instead of vanishing.
+                completed_at = datetime.now(UTC)
+                latency_ms = (time.monotonic() - start_monotonic) * 1000
+                self._repo.log_run_event(
+                    run_id,
+                    event_id=event.event_id,
+                    opportunity_id=opportunity.opportunity_id,
+                    agent_name=agent_def.name,
+                    status="error",
+                    started_at=started_at.isoformat(),
+                    completed_at=completed_at.isoformat(),
+                    errors=f"{type(exc).__name__}: {exc}",
+                    latency_ms=latency_ms,
+                )
+                raise
+            completed_at = datetime.now(UTC)
+            latency_ms = (time.monotonic() - start_monotonic) * 1000
+            self._agent_calls += 1
             setattr(opportunity, role, assessment)
             self._repo.save_assessment(opportunity.opportunity_id, role, assessment)
+            self._repo.log_run_event(
+                run_id,
+                event_id=event.event_id,
+                opportunity_id=opportunity.opportunity_id,
+                agent_name=agent_def.name,
+                status=assessment.status,
+                started_at=started_at.isoformat(),
+                completed_at=completed_at.isoformat(),
+                errors=None,
+                latency_ms=latency_ms,
+            )
             log_event(
                 run_id,
                 event="assessment_completed",
@@ -80,7 +126,16 @@ class Orchestrator:
             opportunity.status = "reported"
             self._repo.save_opportunity(opportunity)
             self._repo.update_opportunity_status(opportunity.opportunity_id, "reported")
-            write_report(opportunity, self._report_dest_dir)
+            try:
+                write_report(opportunity, self._report_dest_dir)
+            except Exception as exc:  # report generation must never crash the run (Finding #2)
+                log_event(
+                    run_id,
+                    event="report_write_failed",
+                    opportunity_id=opportunity.opportunity_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
             log_event(
                 run_id,
                 event="opportunity_reported",

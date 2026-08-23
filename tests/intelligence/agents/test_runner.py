@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
@@ -79,6 +80,29 @@ def test_real_runner_returns_failed_status_on_non_object_json(mock_anthropic_cls
     )
     result = runner.run(_agent_def(), context={"question": "test"}, output_schema=QAAssessment)
     assert result.status == "failed"
+
+
+@patch("intelligence.agents.runner.Anthropic")
+def test_real_runner_logs_each_retry_failure_instead_of_swallowing_it(mock_anthropic_cls, caplog):
+    # Finding #4: the retry loop's except/continue previously swallowed every
+    # retry failure with zero logging, leaving no diagnostic trace of *why* a
+    # fully-failed agent failed.
+    caplog.set_level(logging.INFO)
+    mock_client = MagicMock()
+    mock_anthropic_cls.return_value = mock_client
+    mock_message = MagicMock()
+    mock_message.content = [MagicMock(type="text", text="detta är inte json")]
+    mock_client.messages.create.return_value = mock_message
+
+    runner = RealClaudeRunner(
+        api_key="fake-key", model="claude-sonnet-5", timeout_seconds=5, max_retries=2
+    )
+    result = runner.run(_agent_def(), context={"run_id": "r1"}, output_schema=QAAssessment)
+
+    assert result.status == "failed"
+    combined = "\n".join(r.getMessage() for r in caplog.records if r.name == "intelligence")
+    assert combined.count("agent_retry_failed") == 2
+    assert "JSONDecodeError" in combined
 
 
 @patch("intelligence.agents.runner.Anthropic")

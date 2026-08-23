@@ -33,7 +33,12 @@ class AlphaVantageConnector(BaseConnector):
         try:
             return self._fetch_with_retry()
         except httpx.HTTPError as exc:
-            raise ConnectorUnavailableError(f"Alpha Vantage otillgänglig: {exc}") from exc
+            # OBS: interpolera aldrig `exc` (eller dess request-URL) rakt av här —
+            # httpx:s felmeddelanden innehåller hela request-URL:en inklusive
+            # ?apikey=... i klartext. Använd bara typnamn + ev. statuskod.
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status_code}" if status_code is not None else type(exc).__name__
+            raise ConnectorUnavailableError(f"Alpha Vantage otillgänglig: {detail}") from exc
 
     def _fetch_with_retry(self) -> list[RawRecord]:
         @retry(

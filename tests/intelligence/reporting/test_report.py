@@ -83,6 +83,7 @@ def test_render_report_contains_required_sections():
         "Vad hände?",
         "Varför är detta intressant?",
         "Vilka bevis finns?",
+        "Marknadsdata",
         "Vad talar FÖR?",
         "Vad talar EMOT?",
         "Vilka alternativa förklaringar finns?",
@@ -98,6 +99,39 @@ def test_render_report_contains_required_sections():
         "Ej finansiell rådgivning",
     ]:
         assert heading in md, f"saknar rubrik/text: {heading}"
+
+
+def test_render_report_includes_market_data_and_interpretation():
+    # Finding #6: MarketAssessment.market_data / .interpretation previously fed
+    # neither scoring nor reporting at all.
+    md = render_report(_full_opportunity())
+    assert "volume_change_pct: 300.0" in md
+    assert "ovanlig rörelse" in md
+
+
+def test_render_report_handles_missing_market_assessment():
+    opp = _full_opportunity()
+    opp.market = None
+    md = render_report(opp)
+    assert "Marknadsdata" in md
+    assert "Ej tillgängligt" in md
+
+
+def test_render_report_does_not_raise_on_differently_shaped_scenario_dict():
+    # Finding #2: ForecastAssessment.scenarios is an untyped list[dict] — a
+    # schema-valid LLM response can use different keys than "description"/
+    # "probability" and still pass pydantic validation. render_report must
+    # degrade gracefully (fallback values), never raise KeyError.
+    opp = _full_opportunity()
+    opp.forecast = ForecastAssessment(
+        **_A,
+        scenarios=[{"scenario": "up", "prob": 0.6}],
+        confidence=0.7,
+        uncertainty="litet underlag",
+    )
+    md = render_report(opp)
+    assert "?" in md
+    assert "0%" in md
 
 
 def test_write_report_creates_file(tmp_path):
