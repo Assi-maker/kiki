@@ -42,7 +42,11 @@ class MockAgentRunner(AgentRunner):
 
 class RealClaudeRunner(AgentRunner):
     def __init__(self, api_key: str, model: str, timeout_seconds: float, max_retries: int):
-        self._client = Anthropic(api_key=api_key)
+        # SDK-level retries default to 2 (i.e. 3 attempts) and retry timeouts by
+        # design, nesting inside our own retry loop below (self._max_retries) and
+        # multiplying worst-case wall time to attempts x SDK_attempts x timeout_seconds.
+        # We already own retry/backoff here, so disable the SDK's own layer.
+        self._client = Anthropic(api_key=api_key, max_retries=0)
         self._model = model
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
@@ -50,6 +54,14 @@ class RealClaudeRunner(AgentRunner):
     def run(self, agent_def: AgentDefinition, context: dict, output_schema: type[T]) -> T:
         schema = output_schema.model_json_schema()
         user_message = (
+            "OBS: Det här API-anropet har inga verktyg tillgängliga — varken "
+            "webbsökning eller filskrivning. Basera ditt svar på kontexten nedan "
+            "och ditt eget resonemang. Hitta aldrig på specifika fakta, källor "
+            "eller marknadsdata som varken finns i kontexten eller är allmänt "
+            "känd kunskap. Fyll i schemats fält efter bästa förmåga utifrån det "
+            "du faktiskt har — sätt status=ok så länge du kan göra det på ett "
+            "rimligt sätt. Sätt status=failed bara om kontexten konkret saknar "
+            "det du behöver för att fullgöra just din del av uppdraget.\n\n"
             f"Context (JSON): {json.dumps(context, default=str)}\n\n"
             f"Svara ENDAST med giltig JSON som matchar detta schema:\n{json.dumps(schema)}"
         )
@@ -58,7 +70,7 @@ class RealClaudeRunner(AgentRunner):
             try:
                 message = self._client.messages.create(
                     model=self._model,
-                    max_tokens=2048,
+                    max_tokens=16000,
                     system=agent_def.system_prompt,
                     messages=[{"role": "user", "content": user_message}],
                     timeout=self._timeout_seconds,

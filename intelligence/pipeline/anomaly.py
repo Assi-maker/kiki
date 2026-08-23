@@ -29,6 +29,10 @@ def detect_events(
                         f"från baseline {baseline}"
                     ),
                     raw_ref=record.raw_ref,
+                    title=record.title,
+                    url=record.url,
+                    author=record.author,
+                    content_excerpt=record.content_excerpt,
                 )
             )
     return events

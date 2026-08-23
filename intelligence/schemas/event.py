@@ -18,6 +18,13 @@ class NormalizedRecord(BaseModel):
     metric: str
     value: float
     raw_ref: str
+    # Optional source content (e.g. HN title/url/by/text) so downstream agents
+    # get more than a bare numeric deviation to work with. None for sources
+    # (e.g. market data) that have no equivalent content.
+    title: str | None = None
+    url: str | None = None
+    author: str | None = None
+    content_excerpt: str | None = None
 
 
 class Event(BaseModel):
@@ -30,3 +37,7 @@ class Event(BaseModel):
     deviation: float
     description: str
     raw_ref: str
+    title: str | None = None
+    url: str | None = None
+    author: str | None = None
+    content_excerpt: str | None = None

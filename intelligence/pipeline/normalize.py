@@ -2,14 +2,21 @@ from __future__ import annotations
 
 from intelligence.schemas.event import NormalizedRecord, RawRecord
 
+_CONTENT_EXCERPT_MAX_CHARS = 500
+
 
 def _normalize_hackernews(record: RawRecord) -> NormalizedRecord:
+    text = record.payload.get("text")
     return NormalizedRecord(
         source_id=record.source_id,
         observed_at=record.fetched_at,
         metric="score",
         value=float(record.payload.get("score", 0)),
         raw_ref=record.content_hash,
+        title=record.payload.get("title"),
+        url=record.payload.get("url"),
+        author=record.payload.get("by"),
+        content_excerpt=text[:_CONTENT_EXCERPT_MAX_CHARS] if text else None,
     )
 
 

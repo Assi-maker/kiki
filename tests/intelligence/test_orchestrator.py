@@ -2,7 +2,7 @@
 import logging
 from datetime import UTC, datetime
 
-from intelligence.agents.runner import MockAgentRunner
+from intelligence.agents.runner import AgentRunner, MockAgentRunner
 from intelligence.config import get_settings
 from intelligence.orchestrator import Orchestrator
 from intelligence.schemas.assessments import (
@@ -32,6 +32,24 @@ def _event():
         deviation=400.0,
         description="d",
         raw_ref="hash-1",
+    )
+
+
+def _event_with_content():
+    return Event(
+        event_id="evt-1",
+        source_id="hn",
+        observed_at=datetime.now(UTC),
+        category="forum",
+        metric="score",
+        baseline=50.0,
+        deviation=400.0,
+        description="d",
+        raw_ref="hash-1",
+        title="Show HN: I built a thing",
+        url="https://example.com/thing",
+        author="someuser",
+        content_excerpt="A self-text body",
     )
 
 
@@ -83,6 +101,20 @@ def _happy_fixtures():
     }
 
 
+class _ContextCapturingRunner(AgentRunner):
+    """Delegates to a MockAgentRunner but records every context dict it is
+    called with, keyed by agent name, so a test can inspect exactly what an
+    agent would have received."""
+
+    def __init__(self, fixtures):
+        self._delegate = MockAgentRunner(fixtures=fixtures)
+        self.contexts_by_agent: dict[str, dict] = {}
+
+    def run(self, agent_def, context, output_schema):
+        self.contexts_by_agent[agent_def.name] = context
+        return self._delegate.run(agent_def, context, output_schema)
+
+
 def _orchestrator(tmp_path, fixtures=None, fail_agents=None, dest_dir=None):
     repo = SQLiteRepository(tmp_path / "t.db")
     runner = MockAgentRunner(
@@ -106,6 +138,32 @@ def test_happy_path_reaches_reported_status(tmp_path):
     assert opp.score is not None
     report_files = list(tmp_path.glob("*opportunity-*.md"))
     assert len(report_files) == 1
+
+
+def test_agent_context_includes_event_content_metadata(tmp_path):
+    # Fas 2: opportunity-hunter/trading-research previously only ever saw a bare
+    # numeric score deviation (no title/url/author/content_excerpt) in their
+    # context, which they correctly reported as insufficient underlag. Verify
+    # the full pipeline (Event -> orchestrator context) actually carries it
+    # through to what the agent receives, for every role, not just the DB row.
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = _ContextCapturingRunner(fixtures=_happy_fixtures())
+    weights = load_weights(get_settings().scoring_weights_path)
+    settings = get_settings()
+    orch = Orchestrator(
+        repo=repo, runner=runner, weights=weights, settings=settings, report_dest_dir=tmp_path
+    )
+
+    orch.process_event(_event_with_content(), run_id="r1")
+
+    opportunity_context = runner.contexts_by_agent["opportunity-hunter"]
+    assert opportunity_context["event"]["title"] == "Show HN: I built a thing"
+    assert opportunity_context["event"]["url"] == "https://example.com/thing"
+    assert opportunity_context["event"]["author"] == "someuser"
+    assert opportunity_context["event"]["content_excerpt"] == "A self-text body"
+
+    market_context = runner.contexts_by_agent["trading-research"]
+    assert market_context["event"]["title"] == "Show HN: I built a thing"
 
 
 def test_failed_risk_agent_blocks_reported(tmp_path):

@@ -53,6 +53,18 @@ def test_mock_runner_missing_fixture_raises_key_error():
 
 
 @patch("intelligence.agents.runner.Anthropic")
+def test_real_runner_disables_sdk_level_retries(mock_anthropic_cls):
+    # RealClaudeRunner.run() already implements its own retry loop
+    # (self._max_retries). The SDK's own default max_retries=2 retries
+    # timeouts internally too, nesting under our loop and multiplying
+    # worst-case wall time (attempts x SDK_attempts x timeout_seconds) — so
+    # the client must be constructed with max_retries=0 to keep a single
+    # source of retry truth.
+    RealClaudeRunner(api_key="fake-key", model="claude-sonnet-5", timeout_seconds=5, max_retries=3)
+    mock_anthropic_cls.assert_called_once_with(api_key="fake-key", max_retries=0)
+
+
+@patch("intelligence.agents.runner.Anthropic")
 def test_real_runner_returns_failed_status_on_invalid_json(mock_anthropic_cls):
     mock_client = MagicMock()
     mock_anthropic_cls.return_value = mock_client
