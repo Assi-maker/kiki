@@ -16,9 +16,10 @@ def test_build_orchestrator_uses_mock_runner_when_requested(tmp_path, monkeypatc
 def test_build_orchestrator_passes_opportunity_hunter_timeout_override_to_real_runner(
     tmp_path, monkeypatch
 ):
-    # opportunity-hunter gets a raised per-agent timeout (2026-08-23 real-run
-    # verification showed it sitting right at the default) — verify build_orchestrator
-    # actually wires _AGENT_TIMEOUT_OVERRIDES into the real runner, not just that the
+    # opportunity-hunter and fact-checker-bear each get a raised per-agent
+    # timeout (2026-08-23 and later real-run verifications showed both sitting
+    # right at the default) — verify build_orchestrator actually wires
+    # _AGENT_TIMEOUT_OVERRIDES into the real runner, not just that the
     # constant exists.
     monkeypatch.setenv("DB_PATH_OVERRIDE", str(tmp_path / "t.db"))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
@@ -37,6 +38,7 @@ def test_build_orchestrator_passes_opportunity_hunter_timeout_override_to_real_r
 
     assert captured["timeout_overrides"] == _AGENT_TIMEOUT_OVERRIDES
     assert captured["timeout_overrides"]["opportunity-hunter"] > 30
+    assert captured["timeout_overrides"]["fact-checker-bear"] == 50.0
 
 
 def test_build_orchestrator_default_mock_fixtures_reach_reported_status(tmp_path, monkeypatch):

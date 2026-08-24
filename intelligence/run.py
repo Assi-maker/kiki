@@ -31,7 +31,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # opportunity-hunter's real-run latency (2026-08-23 verification) sat right at
 # the default agent_timeout_seconds (~30s attempts, 91.4s across 3 retries) —
 # a modest bump for this agent only, not a blanket timeout increase.
-_AGENT_TIMEOUT_OVERRIDES: dict[str, float] = {"opportunity-hunter": 45.0}
+# fact-checker-bear showed the same symptom in a later verification run —
+# raised to 50s for that agent only; other agents keep agent_timeout_seconds.
+_AGENT_TIMEOUT_OVERRIDES: dict[str, float] = {
+    "opportunity-hunter": 45.0,
+    "fact-checker-bear": 50.0,
+}
 
 
 def _default_mock_fixtures() -> dict[str, AssessmentBase]:

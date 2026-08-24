@@ -18,6 +18,13 @@ def can_transition(opportunity: Opportunity, target: OpportunityStatus) -> tuple
             assessment = getattr(opportunity, field)
             if assessment is None:
                 return False, f"saknar obligatorisk assessment: {field}"
+            # market (trading-research) bedömer ett handlat instrument. Utanför
+            # market_data-kategorin finns strukturellt aldrig någon tillgång att
+            # bedöma (ingen market_data-connector inblandad i händelsen), så dess
+            # status gatear inte reported/approved där — assessment krävs
+            # fortfarande närvarande ovan, bara inte status="ok".
+            if field == "market" and opportunity.category != "market_data":
+                continue
             if assessment.status != "ok":
                 return False, f"assessment {field} har status={assessment.status}, kräver 'ok'"
         qa = opportunity.qa

@@ -107,3 +107,43 @@ def test_failed_assessment_blocks_reported():
     ok, reason = can_transition(opp, "reported")
     assert ok is False
     assert "failed" in reason.lower() or "bear" in reason.lower()
+
+
+def test_failed_market_assessment_does_not_block_reported_for_non_market_category():
+    # trading-research (role "market") analyserar ett handlat instrument. För
+    # forum-härledda opportunities (t.ex. Hacker News, ingen market_data-
+    # connector inblandad) finns strukturellt aldrig någon tillgång att
+    # bedöma, och agenten svarar korrekt status="failed" i det läget — det
+    # ska inte gatea reported/approved utanför market_data-kategorin.
+    from intelligence.schemas.assessments import MarketAssessment
+
+    failed_market = MarketAssessment(
+        **{**_A, "status": "failed"}, market_data={}, interpretation="i"
+    )
+    opp = _fully_assessed(category="forum", market=failed_market)
+    ok, reason = can_transition(opp, "reported")
+    assert ok is True, reason
+
+
+def test_failed_market_assessment_still_blocks_reported_for_market_data_category():
+    # För en opportunity som faktiskt härstammar från en market_data-händelse
+    # ska ett misslyckat market-assessment fortsatt gatea — det speglar en
+    # verklig brist, inte en strukturell icke-tillämplighet.
+    from intelligence.schemas.assessments import MarketAssessment
+
+    failed_market = MarketAssessment(
+        **{**_A, "status": "failed"}, market_data={}, interpretation="i"
+    )
+    opp = _fully_assessed(category="market_data", market=failed_market)
+    ok, reason = can_transition(opp, "reported")
+    assert ok is False
+    assert "market" in reason.lower()
+
+
+def test_missing_market_assessment_still_blocks_reported_regardless_of_category():
+    # Assessment-närvaron är fortfarande obligatorisk oavsett kategori — bara
+    # kravet på status="ok" är kategorivillkorat.
+    opp = _fully_assessed(category="forum", market=None)
+    ok, reason = can_transition(opp, "reported")
+    assert ok is False
+    assert "market" in reason.lower()
