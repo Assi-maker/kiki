@@ -46,16 +46,26 @@ Om separata tabeller för någon av dessa ändå önskas innan respektive fas b�
 - Create: `crypto_trading/schemas/__init__.py`
 - Create: `crypto_trading/config/__init__.py`
 - Create: `crypto_trading/storage/__init__.py`
+- Create: `tests/__init__.py`
+- Create: `tests/crypto_trading/__init__.py`
+- Create: `tests/crypto_trading/schemas/__init__.py`
+- Create: `tests/crypto_trading/config/__init__.py`
+- Create: `tests/crypto_trading/storage/__init__.py`
 - Modify: `.gitignore`
 
-**Rättad under exekvering:** planen angav ursprungligen även `tests/crypto_trading/__init__.py` + undermappars `__init__.py`. Det skapar en pytest-rootpath-kollision — testmoduler namnges då `crypto_trading.schemas.test_x`, vilket binder `sys.modules['crypto_trading']` till den tomma test-paketversionen istället för det riktiga paketet, och gör alla efterföljande imports av riktig kod från testfiler omöjliga (`ModuleNotFoundError`). Åtgärdat genom att INTE skapa `__init__.py` under `tests/crypto_trading/` alls — matchar `tests/intelligence/`s etablerade mönster (inga paketnivå-`__init__.py` i testträdet). Se separat commit "crypto_trading Phase 0: ta bort tests/crypto_trading/__init__.py-hierarkin".
+**Rättad under exekvering (två omgångar — läs båda, den andra är slutgiltig):**
+
+1. Planen angav ursprungligen `tests/crypto_trading/__init__.py` + undermappars `__init__.py`. Det skapade en pytest-rootpath-kollision: testmoduler namngavs `crypto_trading.schemas.test_x`, vilket band `sys.modules['crypto_trading']` till den tomma test-paketversionen istället för det riktiga paketet — alla efterföljande imports av riktig kod från testfiler blev omöjliga (`ModuleNotFoundError`). Första försöket till fix: ta bort `__init__.py` under `tests/crypto_trading/` helt (commit "ta bort tests/crypto_trading/__init__.py-hierarkin").
+2. Den fixen exponerade i sin tur ett ANNAT, allvarligare problem vid Task 17:s fulla repo-testsvit: `tests/crypto_trading/test_state_machine.py`, `test_assessments.py`, `test_event.py` och `test_logging.py` har samma bassnamn som filer i `tests/intelligence/`. Utan någon `__init__.py`-hierarki alls importeras BÅDA som samma bara modulnamn (t.ex. `test_state_machine`) — pytest kraschar hela körningen med "import file mismatch".
+
+**Slutgiltig fix** (commit "crypto_trading Phase 0: återinför tests/__init__.py-hierarkin, denna gång med tests/__init__.py"): `tests/crypto_trading/**` får tillbaka sin `__init__.py`-hierarki, PLUS en ny `tests/__init__.py` läggs till (fanns aldrig innan). Det gör att pytests rootpath-vandring går ända upp till `tests/` OCH vidare förbi den (eftersom `tests/` nu också har `__init__.py`) till repo-roten — testmodulerna får det fullt kvalificerade dotted-namnet `tests.crypto_trading.schemas.test_x`, vilket varken kolliderar med det riktiga `crypto_trading`-paketet (skiljs åt av `tests.`-prefixet) eller med `tests/intelligence/`s bara modulnamn (skiljs åt av hela sökvägen). `tests/intelligence/**` och `tests/test_setup.py` påverkas inte funktionellt av den nya `tests/__init__.py` — verifierat: alla 103 intelligence-tester + `test_setup.py` fortsatt gröna, identiskt antal som på `master` innan Phase 0-arbetet (bekräftat med `git stash`-jämförelse).
 
 **Interfaces:**
 - Produces: paketet `crypto_trading` är importerbart (`import crypto_trading`).
 
 - [ ] **Step 1: Skapa paketskelettet**
 
-Bara filerna under `crypto_trading/` skapas som tomma (`__init__.py` helt utan innehåll — inga re-exports än, inget att exportera). Skapa INGA `__init__.py` under `tests/crypto_trading/` (se rättningen ovan) — pytest hittar och samlar in testfiler utan dem.
+Filerna under `crypto_trading/` skapas som tomma (`__init__.py` helt utan innehåll — inga re-exports än, inget att exportera). `tests/__init__.py` och hela `tests/crypto_trading/`-hierarkins `__init__.py`-filer skapas likaså tomma (se rättningen ovan för varför de krävs).
 
 - [ ] **Step 2: Lägg till crypto_trading-databasen i `.gitignore`**
 
