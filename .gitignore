@@ -24,6 +24,12 @@ memory/
 data/*.db
 data/*.db-journal
 
+# Crypto trading-systemet
+data/crypto_trading.db
+data/crypto_trading.db-journal
+data/crypto_trading.db-wal
+data/crypto_trading.db-shm
+
 # OS
 Thumbs.db
 .DS_Store
