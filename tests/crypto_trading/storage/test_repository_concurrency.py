@@ -153,7 +153,8 @@ def test_busy_timeout_is_respected_write_fails_after_timeout_elapses(tmp_path):
         f"B misslyckades för snabbt ({elapsed:.3f}s) - busy_timeout verkar ignorerat"
     )
     assert elapsed < hold_seconds, (
-        f"B väntade lika länge som A höll låset ({elapsed:.3f}s) - busy_timeout verkar inte styra väntetiden"
+        f"B väntade lika länge som A höll låset ({elapsed:.3f}s) - "
+        "busy_timeout verkar inte styra väntetiden"
     )
 
     # Ingen korruption: B:s misslyckade skrivning lämnade ingen rad (rollback

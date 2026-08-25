@@ -44,9 +44,7 @@ def can_transition(current_status: str, target_status: str) -> tuple[bool, str]:
     return True, "ok"
 
 
-def sweep_interrupted_analyses(
-    repo: "Repository", swept_at: datetime, run_id: str
-) -> list[str]:
+def sweep_interrupted_analyses(repo: Repository, swept_at: datetime, run_id: str) -> list[str]:
     """Vid start av discovery-processen: varje candidate som redan ligger i
     UNDER_AI_ANALYSIS är per definition föräldralös (denna process skrev den
     inte - den startar precis nu). Sveper dem till ANALYSIS_INTERRUPTED,

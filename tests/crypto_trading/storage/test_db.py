@@ -28,7 +28,8 @@ def test_init_schema_is_idempotent(tmp_path):
         ("c1", "k1", "BTCUSDT", "run-1", "hash-1", "CANDIDATE", "{}", "2026-01-01", "2026-01-01"),
     )
     conn.commit()
-    # anropa init_schema igen (som en ny get_connection skulle göra) - ska inte kasta eller ta bort data
+    # anropa init_schema igen (som en ny get_connection skulle göra)
+    # - ska inte kasta eller ta bort data
     from crypto_trading.storage.db import init_schema
 
     init_schema(conn)

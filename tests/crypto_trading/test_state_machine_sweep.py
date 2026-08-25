@@ -133,7 +133,8 @@ def test_sweep_continues_past_corrupt_candidate_and_still_interrupts_valid_ones(
     # korrumpera evidence_record, INTE status - så att raden fortfarande
     # matchar UNDER_AI_ANALYSIS-frågan men inte kan deserialiseras fullt ut.
     repo._conn.execute(
-        "UPDATE candidates SET evidence_record = 'not valid json' WHERE candidate_id = 'stuck-corrupt'"
+        "UPDATE candidates SET evidence_record = 'not valid json' "
+        "WHERE candidate_id = 'stuck-corrupt'"
     )
     repo._conn.commit()
 

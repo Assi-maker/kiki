@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 import pytest
+from pydantic import ValidationError
 
 from crypto_trading.config.exceptions import ConfigError
 from crypto_trading.config.loader import (
@@ -21,7 +22,7 @@ def test_get_settings_loads_real_yaml_files_successfully():
 
 
 def test_pipeline_config_rejects_zero_top_n():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         PipelineConfig(
             discovery_interval_minutes=15,
             monitoring_interval_seconds=30,
@@ -35,7 +36,7 @@ def test_pipeline_config_rejects_zero_top_n():
 
 
 def test_risk_limits_config_rejects_risk_pct_over_one():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         RiskLimitsConfig(
             starting_capital_usdt=Decimal("10000"),
             risk_per_trade_pct=Decimal("1.5"),
@@ -48,7 +49,7 @@ def test_risk_limits_config_rejects_risk_pct_over_one():
 
 
 def test_budget_limits_config_rejects_zero_calls():
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         BudgetLimitsConfig(
             max_candidates_per_discovery_run=10,
             max_ai_calls_per_discovery_run=0,

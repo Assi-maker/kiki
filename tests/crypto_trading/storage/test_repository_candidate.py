@@ -41,7 +41,9 @@ def _make_evidence() -> CandidateEvidenceRecord:
     )
 
 
-def _make_candidate(candidate_id="cand-1", idempotency_key="key-1", status="CANDIDATE") -> Candidate:
+def _make_candidate(
+    candidate_id="cand-1", idempotency_key="key-1", status="CANDIDATE"
+) -> Candidate:
     now = datetime.now(UTC)
     return Candidate(
         candidate_id=candidate_id,
@@ -80,7 +82,9 @@ def test_create_candidate_with_event_persists_both(tmp_path):
     reloaded = repo.get_candidate("cand-1")
     assert reloaded is not None
     assert reloaded.status == "CANDIDATE"
-    row = repo._conn.execute("SELECT event_type FROM events WHERE event_id = ?", (event.event_id,)).fetchone()
+    row = repo._conn.execute(
+        "SELECT event_type FROM events WHERE event_id = ?", (event.event_id,)
+    ).fetchone()
     assert row is not None
     assert row["event_type"] == "CANDIDATE_CREATED"
 
@@ -113,9 +117,7 @@ def test_get_candidate_raises_corrupt_state_error_on_unrecognized_status(tmp_pat
     repo.create_candidate_with_event(candidate, event)
 
     # simulera datakorruption: skriv ett ogiltigt status-värde direkt
-    repo._conn.execute(
-        "UPDATE candidates SET status = 'GARBAGE' WHERE candidate_id = 'cand-1'"
-    )
+    repo._conn.execute("UPDATE candidates SET status = 'GARBAGE' WHERE candidate_id = 'cand-1'")
     repo._conn.commit()
 
     with pytest.raises(CorruptCandidateStateError) as exc_info:
@@ -193,9 +195,11 @@ def test_find_candidates_by_status_skips_corrupt_rows_and_keeps_valid_ones(tmp_p
 
     corrupt = _make_candidate(candidate_id="cand-corrupt", idempotency_key="key-corrupt")
     repo.create_candidate_with_event(corrupt, _make_event(corrupt, "CANDIDATE_CREATED"))
-    # korrumpera evidence_record, INTE status - annars matchar WHERE status=... inte längre raden
+    # korrumpera evidence_record, INTE status - annars matchar WHERE status=...
+    # inte längre raden
     repo._conn.execute(
-        "UPDATE candidates SET evidence_record = 'not valid json' WHERE candidate_id = 'cand-corrupt'"
+        "UPDATE candidates SET evidence_record = 'not valid json' "
+        "WHERE candidate_id = 'cand-corrupt'"
     )
     repo._conn.commit()
 

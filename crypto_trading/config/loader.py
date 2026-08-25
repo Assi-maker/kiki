@@ -64,9 +64,7 @@ def get_settings() -> Settings:
     load_dotenv(_PROJECT_ROOT / ".env", override=False)
     db_path_override = os.environ.get("CRYPTO_TRADING_DB_PATH_OVERRIDE")
     db_path = (
-        Path(db_path_override)
-        if db_path_override
-        else _PROJECT_ROOT / "data" / "crypto_trading.db"
+        Path(db_path_override) if db_path_override else _PROJECT_ROOT / "data" / "crypto_trading.db"
     )
     return Settings(
         db_path=db_path,

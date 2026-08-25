@@ -81,7 +81,13 @@ def test_bear_adversarial_requires_falsification_conditions():
 
 
 def test_technical_and_bull_thesis_construct():
-    TechnicalAssessment(**_BASE_KWARGS, status="ok", market_data={"price": 50000}, interpretation="uptrend")
+    TechnicalAssessment(
+        **_BASE_KWARGS, status="ok", market_data={"price": 50000}, interpretation="uptrend"
+    )
     BullThesisAssessment(
-        **_BASE_KWARGS, status="ok", hypothesis="breakout", catalyst="ETF news", setup="range breakout"
+        **_BASE_KWARGS,
+        status="ok",
+        hypothesis="breakout",
+        catalyst="ETF news",
+        setup="range breakout",
     )
