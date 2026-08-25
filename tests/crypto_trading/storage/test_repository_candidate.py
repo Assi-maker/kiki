@@ -214,3 +214,55 @@ def test_find_candidates_by_status_skips_corrupt_rows_and_keeps_valid_ones(tmp_p
 def test_repository_protocol_exposes_no_update_or_delete_event_method():
     assert not hasattr(SQLiteRepository, "update_event")
     assert not hasattr(SQLiteRepository, "delete_event")
+
+
+class _FailingConnection:
+    """Wrapper runt en riktig sqlite3.Connection som injicerar ett fel på ett
+    specifikt execute()-anrop. sqlite3.Connection är en C-typ vars execute-
+    attribut är skrivskyddat per instans - kan inte monkeypatchas direkt,
+    därför den här tunna wrappern istället (byts in på repo._conn, som är ett
+    vanligt Python-attribut)."""
+
+    def __init__(self, real_conn, fail_on_call_number: int):
+        self._real_conn = real_conn
+        self._fail_on_call_number = fail_on_call_number
+        self._call_count = 0
+
+    def execute(self, sql, *args, **kwargs):
+        self._call_count += 1
+        if self._call_count == self._fail_on_call_number:
+            raise sqlite3.OperationalError(
+                "simulated failure between state-update and event-insert"
+            )
+        return self._real_conn.execute(sql, *args, **kwargs)
+
+    def commit(self):
+        return self._real_conn.commit()
+
+    def rollback(self):
+        return self._real_conn.rollback()
+
+
+def test_transition_candidate_with_event_rolls_back_atomically_on_failure(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate()
+    creation_event = _make_event(candidate, "CANDIDATE_CREATED")
+    repo.create_candidate_with_event(candidate, creation_event)
+
+    real_conn = repo._conn
+    # anrop 1 = UPDATE candidates, anrop 2 = event-INSERT - fel injiceras exakt där
+    repo._conn = _FailingConnection(real_conn, fail_on_call_number=2)
+    transition_event = _make_event(candidate, "CANDIDATE_TO_UNDER_ANALYSIS")
+
+    with pytest.raises(sqlite3.OperationalError):
+        repo.transition_candidate_with_event(
+            "cand-1", "UNDER_AI_ANALYSIS", datetime.now(UTC), transition_event
+        )
+
+    repo._conn = real_conn
+    reloaded = repo.get_candidate("cand-1")
+    assert reloaded.status == "CANDIDATE"  # oförändrat - rollback fungerade
+    event_row = repo._conn.execute(
+        "SELECT 1 FROM events WHERE event_id = ?", (transition_event.event_id,)
+    ).fetchone()
+    assert event_row is None  # eventet skrevs aldrig heller
