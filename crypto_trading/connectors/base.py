@@ -55,7 +55,11 @@ class BaseMarketDataConnector:
         self._cache[key] = (time.monotonic(), value)
 
     def _get(self, path: str, params: dict) -> object:
-        cache_key = f"{path}?{sorted(params.items())}"
+        # "timestamp" är BingX-signeringsbrus (ändras varje anrop) och hör
+        # INTE till förfrågans semantiska identitet - exkluderas ur cache-
+        # nyckeln, annars missar cachen alltid (upptäckt vid exekvering).
+        cache_params = {k: v for k, v in params.items() if k != "timestamp"}
+        cache_key = f"{path}?{sorted(cache_params.items())}"
         cached = self._cache_get(cache_key)
         if cached is not None:
             return cached
