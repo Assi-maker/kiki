@@ -21,18 +21,65 @@ def test_get_settings_loads_real_yaml_files_successfully():
     assert settings.budget_limits.max_ai_calls_per_day > 0
 
 
+_VALID_MAX_DATA_AGE_SECONDS = {
+    "ticker": 30, "kline": 120, "funding_rate": 3600, "open_interest": 300, "contracts": 86400,
+}
+_VALID_REQUIRED_FIELDS = {
+    "ticker": ["lastPrice"], "kline": ["open"], "funding_rate": ["fundingRate"],
+    "open_interest": ["openInterest"], "contracts": ["symbol"],
+}
+
+
+def _valid_pipeline_kwargs(**overrides) -> dict:
+    defaults = dict(
+        discovery_interval_minutes=15,
+        monitoring_interval_seconds=30,
+        top_n=30,
+        cooldown_minutes=60,
+        max_data_age_seconds=_VALID_MAX_DATA_AGE_SECONDS,
+        min_sample_size_for_calibration=30,
+        calibration_preliminary_sample_size=10,
+        sqlite_busy_timeout_ms=5000,
+        required_fields=_VALID_REQUIRED_FIELDS,
+        screener_timeframes=["1h"],
+        bingx_base_url="https://open-api.bingx.com",
+        bingx_requests_per_second=10,
+        bingx_cache_ttl_seconds=5,
+        bingx_max_retries=3,
+        kline_consistency_tolerance_pct=Decimal("0.5"),
+    )
+    defaults.update(overrides)
+    return defaults
+
+
 def test_pipeline_config_rejects_zero_top_n():
     with pytest.raises(ValidationError):
-        PipelineConfig(
-            discovery_interval_minutes=15,
-            monitoring_interval_seconds=30,
-            top_n=0,
-            cooldown_minutes=60,
-            max_data_age_seconds={"ticker": 30},
-            min_sample_size_for_calibration=30,
-            calibration_preliminary_sample_size=10,
-            sqlite_busy_timeout_ms=5000,
-        )
+        PipelineConfig(**_valid_pipeline_kwargs(top_n=0))
+
+
+def test_get_settings_loads_phase1_fields():
+    settings = get_settings()
+    assert settings.pipeline.screener_timeframes == ["1h", "4h"]
+    assert settings.pipeline.bingx_base_url == "https://open-api.bingx.com"
+    assert settings.pipeline.bingx_requests_per_second > 0
+    assert set(settings.pipeline.required_fields.keys()) >= {
+        "ticker", "kline", "funding_rate", "open_interest", "contracts"
+    }
+    assert set(settings.pipeline.max_data_age_seconds.keys()) >= {
+        "ticker", "kline", "funding_rate", "open_interest", "contracts"
+    }
+
+
+def test_pipeline_config_rejects_missing_max_data_age_seconds_key():
+    incomplete = {"ticker": 30, "kline": 120, "funding_rate": 3600}
+    with pytest.raises(ValidationError):
+        PipelineConfig(**_valid_pipeline_kwargs(max_data_age_seconds=incomplete))
+
+
+def test_pipeline_config_rejects_missing_required_fields_key():
+    incomplete = {"ticker": ["lastPrice"]}
+    with pytest.raises(ValidationError):
+        PipelineConfig(**_valid_pipeline_kwargs(required_fields=incomplete))
 
 
 def test_risk_limits_config_rejects_risk_pct_over_one():

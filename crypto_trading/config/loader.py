@@ -6,12 +6,14 @@ from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from crypto_trading.config.exceptions import ConfigError
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "crypto_trading" / "config"
+
+_REQUIRED_DATA_TYPES = {"ticker", "kline", "funding_rate", "open_interest", "contracts"}
 
 
 class PipelineConfig(BaseModel):
@@ -23,6 +25,31 @@ class PipelineConfig(BaseModel):
     min_sample_size_for_calibration: int = Field(gt=0)
     calibration_preliminary_sample_size: int = Field(gt=0)
     sqlite_busy_timeout_ms: int = Field(gt=0)
+    required_fields: dict[str, list[str]]
+    screener_timeframes: list[str]
+    bingx_base_url: str
+    bingx_requests_per_second: float = Field(gt=0)
+    bingx_cache_ttl_seconds: float = Field(ge=0)
+    bingx_max_retries: int = Field(gt=0)
+    kline_consistency_tolerance_pct: Decimal = Field(gt=0, le=1)
+
+    @field_validator("max_data_age_seconds")
+    @classmethod
+    def max_data_age_seconds_covers_all_data_types(cls, v: dict[str, int]) -> dict[str, int]:
+        missing = _REQUIRED_DATA_TYPES - v.keys()
+        if missing:
+            raise ValueError(f"max_data_age_seconds missing required keys: {missing}")
+        return v
+
+    @field_validator("required_fields")
+    @classmethod
+    def required_fields_covers_all_data_types(
+        cls, v: dict[str, list[str]]
+    ) -> dict[str, list[str]]:
+        missing = _REQUIRED_DATA_TYPES - v.keys()
+        if missing:
+            raise ValueError(f"required_fields missing required keys: {missing}")
+        return v
 
 
 class RiskLimitsConfig(BaseModel):

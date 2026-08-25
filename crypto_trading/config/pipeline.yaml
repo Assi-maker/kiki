@@ -7,6 +7,19 @@ max_data_age_seconds:
   kline: 120
   funding_rate: 3600
   open_interest: 300
+  contracts: 86400
 min_sample_size_for_calibration: 30
 calibration_preliminary_sample_size: 10
 sqlite_busy_timeout_ms: 5000
+required_fields:
+  ticker: [lastPrice, askPrice, bidPrice, quoteVolume, closeTime]
+  kline: [open, high, low, close, volume, time]
+  funding_rate: [fundingRate, fundingTime, markPrice]
+  open_interest: [openInterest, time]
+  contracts: [symbol, status]
+screener_timeframes: ["1h", "4h"]
+bingx_base_url: "https://open-api.bingx.com"
+bingx_requests_per_second: 10
+bingx_cache_ttl_seconds: 5
+bingx_max_retries: 3
+kline_consistency_tolerance_pct: "0.5"
