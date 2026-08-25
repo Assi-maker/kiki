@@ -46,18 +46,16 @@ Om separata tabeller för någon av dessa ändå önskas innan respektive fas b�
 - Create: `crypto_trading/schemas/__init__.py`
 - Create: `crypto_trading/config/__init__.py`
 - Create: `crypto_trading/storage/__init__.py`
-- Create: `tests/crypto_trading/__init__.py`
-- Create: `tests/crypto_trading/schemas/__init__.py`
-- Create: `tests/crypto_trading/config/__init__.py`
-- Create: `tests/crypto_trading/storage/__init__.py`
 - Modify: `.gitignore`
+
+**Rättad under exekvering:** planen angav ursprungligen även `tests/crypto_trading/__init__.py` + undermappars `__init__.py`. Det skapar en pytest-rootpath-kollision — testmoduler namnges då `crypto_trading.schemas.test_x`, vilket binder `sys.modules['crypto_trading']` till den tomma test-paketversionen istället för det riktiga paketet, och gör alla efterföljande imports av riktig kod från testfiler omöjliga (`ModuleNotFoundError`). Åtgärdat genom att INTE skapa `__init__.py` under `tests/crypto_trading/` alls — matchar `tests/intelligence/`s etablerade mönster (inga paketnivå-`__init__.py` i testträdet). Se separat commit "crypto_trading Phase 0: ta bort tests/crypto_trading/__init__.py-hierarkin".
 
 **Interfaces:**
 - Produces: paketet `crypto_trading` är importerbart (`import crypto_trading`).
 
 - [ ] **Step 1: Skapa paketskelettet**
 
-Alla filer ovan skapas som tomma (`__init__.py` helt utan innehåll — inga re-exports än, inget att exportera).
+Bara filerna under `crypto_trading/` skapas som tomma (`__init__.py` helt utan innehåll — inga re-exports än, inget att exportera). Skapa INGA `__init__.py` under `tests/crypto_trading/` (se rättningen ovan) — pytest hittar och samlar in testfiler utan dem.
 
 - [ ] **Step 2: Lägg till crypto_trading-databasen i `.gitignore`**
 
@@ -79,7 +77,7 @@ Expected: inget fel, ingen output.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crypto_trading/__init__.py crypto_trading/schemas/__init__.py crypto_trading/config/__init__.py crypto_trading/storage/__init__.py tests/crypto_trading/__init__.py tests/crypto_trading/schemas/__init__.py tests/crypto_trading/config/__init__.py tests/crypto_trading/storage/__init__.py .gitignore
+git add crypto_trading/__init__.py crypto_trading/schemas/__init__.py crypto_trading/config/__init__.py crypto_trading/storage/__init__.py .gitignore
 git commit -m "crypto_trading Phase 0 steg 1: paketskelett"
 ```
 
