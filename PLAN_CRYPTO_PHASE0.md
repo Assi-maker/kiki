@@ -438,7 +438,7 @@ def compute_candidate_idempotency_key(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/schemas/test_evidence.py -v`
-Expected: PASS (6 tests)
+Expected: PASS (5 tests — rättat räknefel upptäckt vid exekvering, testfilen har alltid haft 5 def test_-funktioner)
 
 - [ ] **Step 5: Commit**
 
