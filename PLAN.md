@@ -1,5 +1,7 @@
 # Market Opportunity Intelligence System — Fas 1 Implementation Plan
 
+> **Status: FAS 1 AVSLUTAD (2026-08-25).** Alla 23 tasks nedan är implementerade, testade och verifierade mot verklig data. Se `PHASE_1_COMPLETION.md` för sammanfattning (testresultat, verkliga körningar, kända begränsningar). Fas 1 är en stabil, testad baslinje — inga ändringar görs i denna plan retroaktivt.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Bygga en testbar, feltolerant end-to-end-pipeline (data → event → 7-agent-analys → gated state machine → transparent scoring → sqlite → markdown-rapport) för Fas 1, körbar helt med `MockAgentRunner` utan Claude API.
@@ -62,7 +64,7 @@ Varje task lämnar `pytest` grönt och `ruff check` rent innan nästa task påb�
 **Interfaces:**
 - Produces: paketet `intelligence` är importerbart; `config/scoring_weights.yaml` finns på disk med nycklarna `signal_strength, data_quality, source_reliability, potential, risk, confidence, novelty` (används av Task 18).
 
-- [ ] **Step 1: Lägg till dependencies i `pyproject.toml`**
+- [x] **Step 1: Lägg till dependencies i `pyproject.toml`**
 
 ```toml
 [project]
@@ -100,16 +102,16 @@ markers = [
 ]
 ```
 
-- [ ] **Step 2: Installera dependencies**
+- [x] **Step 2: Installera dependencies**
 
 Run: `uv sync`
 Expected: lyckas, `uv.lock` uppdateras.
 
-- [ ] **Step 3: Skapa paketskelett**
+- [x] **Step 3: Skapa paketskelett**
 
 Skapa tomma `__init__.py` i: `intelligence/`, `intelligence/connectors/`, `intelligence/pipeline/`, `intelligence/schemas/`, `intelligence/agents/`, `intelligence/storage/`, `intelligence/scoring/`, `intelligence/reporting/`. Varje fil är tom (0 bytes) — de markerar paketen som importerbara.
 
-- [ ] **Step 4: Skapa `config/scoring_weights.yaml`**
+- [x] **Step 4: Skapa `config/scoring_weights.yaml`**
 
 ```yaml
 # Alla vikter ska summera till 1.0. Komponenterna beräknas i intelligence/scoring/model.py.
@@ -122,7 +124,7 @@ confidence: 0.10
 novelty: 0.05
 ```
 
-- [ ] **Step 5: Skapa `data/.gitkeep` och uppdatera `.gitignore`**
+- [x] **Step 5: Skapa `data/.gitkeep` och uppdatera `.gitignore`**
 
 Lägg till i `.gitignore` under en ny sektion:
 
@@ -134,7 +136,7 @@ data/*.db-journal
 
 Skapa tom fil `data/.gitkeep` så mappen finns i git även när `.db`-filen är ignorerad.
 
-- [ ] **Step 6: Uppdatera `.env.example`**
+- [x] **Step 6: Uppdatera `.env.example`**
 
 Lägg till under Steg 6-sektionen:
 
@@ -143,7 +145,7 @@ Lägg till under Steg 6-sektionen:
 # ANTHROPIC_API_KEY=
 ```
 
-- [ ] **Step 7: Verifiera**
+- [x] **Step 7: Verifiera**
 
 Run: `uv run python -c "import intelligence"`
 Expected: inga fel.
@@ -151,7 +153,7 @@ Expected: inga fel.
 Run: `uv run pytest`
 Expected: befintliga testet `tests/test_setup.py` passerar fortfarande (1 passed).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add pyproject.toml uv.lock .env.example .gitignore config/scoring_weights.yaml data/.gitkeep intelligence/
@@ -170,7 +172,7 @@ git commit -m "Fas 1 steg 1: paketskelett, dependencies, scoring-config"
 - Consumes: `config/scoring_weights.yaml` (Task 1).
 - Produces: `Settings` (pydantic `BaseModel`), `get_settings() -> Settings`, med fälten: `anthropic_api_key: str | None`, `alphavantage_api_key: str | None`, `db_path: Path`, `scoring_weights_path: Path`, `max_events_per_run: int`, `max_opportunities_per_run: int`, `max_agent_calls_per_run: int`, `agent_timeout_seconds: float`, `connector_timeout_seconds: float`, `connector_max_retries: int`. Används av alla senare tasks som behöver gränser/sökvägar/nycklar.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/test_config.py
@@ -205,12 +207,12 @@ def test_scoring_weights_file_exists():
     assert settings.scoring_weights_path.exists()
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/test_config.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'intelligence.config'`
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/config.py
@@ -254,17 +256,17 @@ def get_settings() -> Settings:
     )
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/test_config.py -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Ruff**
+- [x] **Step 5: Ruff**
 
 Run: `uv run ruff check intelligence/config.py tests/intelligence/test_config.py`
 Expected: inga fel.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add intelligence/config.py tests/intelligence/test_config.py
@@ -282,7 +284,7 @@ git commit -m "Fas 1 steg 2: Settings-modul med env-läsning och run-limits"
 **Interfaces:**
 - Produces: `new_run_id() -> str`, `redact(data: dict) -> dict`, `log_event(run_id: str, **fields) -> None` (skriver en JSON-rad till stdout via stdlib `logging`). Används av `connectors/base.py`, `orchestrator.py`, `run.py`.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/test_logging.py
@@ -314,12 +316,12 @@ def test_log_event_never_contains_secret_value(caplog):
     assert payload["api_key"] == "***REDACTED***"
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/test_logging.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/logging.py
@@ -358,12 +360,12 @@ def log_event(run_id: str, **fields) -> None:
     _logger.info(json.dumps(payload, default=str))
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/test_logging.py -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 Run: `uv run ruff check intelligence/logging.py tests/intelligence/test_logging.py`
 
@@ -385,7 +387,7 @@ git commit -m "Fas 1 steg 3: strukturerad loggning med run_id och secret-redacti
 **Interfaces:**
 - Produces: `Source(source_id, name, type, reliability_score, url)`, `RawRecord(source_id, fetched_at, payload, content_hash)`, `NormalizedRecord(source_id, observed_at, metric, value, raw_ref)`, `Event(event_id, source_id, observed_at, category, metric, baseline, deviation, description, raw_ref)`. Rena Pydantic-modeller, inga beroenden på andra `intelligence`-moduler.
 
-- [ ] **Step 1: Skriv testerna**
+- [x] **Step 1: Skriv testerna**
 
 ```python
 # tests/intelligence/schemas/test_source.py
@@ -437,12 +439,12 @@ def test_event_roundtrip():
     assert e.deviation == 32.0
 ```
 
-- [ ] **Step 2: Kör testerna för att bekräfta att de failar**
+- [x] **Step 2: Kör testerna för att bekräfta att de failar**
 
 Run: `uv run pytest tests/intelligence/schemas -v`
 Expected: FAIL — moduler saknas.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/schemas/source.py
@@ -495,12 +497,12 @@ class Event(BaseModel):
     raw_ref: str
 ```
 
-- [ ] **Step 4: Kör testerna igen**
+- [x] **Step 4: Kör testerna igen**
 
 Run: `uv run pytest tests/intelligence/schemas -v`
 Expected: PASS (5 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/schemas/source.py intelligence/schemas/event.py tests/intelligence/schemas/
@@ -519,7 +521,7 @@ git commit -m "Fas 1 steg 4: Source/RawRecord/NormalizedRecord/Event-scheman"
 - Consumes: inget (rent schema-lager).
 - Produces: `AssessmentStatus = Literal["ok", "failed", "timeout"]`, `AssessmentBase(agent_name, run_id, created_at, status)`, samt `ResearchAssessment`, `OpportunityAssessment`, `MarketAssessment`, `ForecastAssessment`, `RiskAssessment`, `BearAssessment`, `QAAssessment` — alla ärver `AssessmentBase`. Fältnamnen nedan är exakta och används av `agents/roles.py` (Task 16), `orchestrator.py` (Task 20) och `scoring/model.py` (Task 18) — ändra dem inte i senare tasks.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/schemas/test_assessments.py
@@ -593,12 +595,12 @@ def test_invalid_status_rejected():
         QAAssessment(agent_name="x", run_id="r1", created_at=datetime.now(UTC), status="maybe", passed=True, violations=[])
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/schemas/test_assessments.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/schemas/assessments.py
@@ -660,12 +662,12 @@ class QAAssessment(AssessmentBase):
     violations: list[str]
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/schemas/test_assessments.py -v`
 Expected: PASS (8 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/schemas/assessments.py tests/intelligence/schemas/test_assessments.py
@@ -684,7 +686,7 @@ git commit -m "Fas 1 steg 5: sju assessment-scheman med evidence/interpretation-
 - Consumes: `assessments.py` (Task 5), `event.py` (Task 4).
 - Produces: `OpportunityStatus = Literal["candidate", "under_review", "approved", "rejected", "reported", "evaluated"]`, `Opportunity(opportunity_id, event_id, created_at, category, title, summary, time_horizon, liquidity, status, research, opportunity, market, forecast, risk, bear, qa, score, score_breakdown)` — de sju assessment-fälten är `X | None = None`, `score`/`score_breakdown` sätts av Task 18.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/schemas/test_opportunity.py
@@ -731,12 +733,12 @@ def test_status_rejects_invalid_value():
         Opportunity(**_base(), status="finished")
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/schemas/test_opportunity.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/schemas/opportunity.py
@@ -783,12 +785,12 @@ class Opportunity(BaseModel):
     score_breakdown: dict | None = None
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/schemas/test_opportunity.py -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/schemas/opportunity.py tests/intelligence/schemas/test_opportunity.py
@@ -809,7 +811,7 @@ git commit -m "Fas 1 steg 6: Opportunity-aggregat med OpportunityStatus"
 
 Detta täcker SPEC §13 gate-test 1–4 direkt.
 
-- [ ] **Step 1: Skriv testerna**
+- [x] **Step 1: Skriv testerna**
 
 ```python
 # tests/intelligence/test_state_machine.py
@@ -904,12 +906,12 @@ def test_failed_assessment_blocks_reported():
     assert "failed" in reason.lower() or "bear" in reason.lower()
 ```
 
-- [ ] **Step 2: Kör testerna för att bekräfta att de failar**
+- [x] **Step 2: Kör testerna för att bekräfta att de failar**
 
 Run: `uv run pytest tests/intelligence/test_state_machine.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/state_machine.py
@@ -942,12 +944,12 @@ def can_transition(opportunity: Opportunity, target: OpportunityStatus) -> tuple
     return True, "ok"
 ```
 
-- [ ] **Step 4: Kör testerna igen**
+- [x] **Step 4: Kör testerna igen**
 
 Run: `uv run pytest tests/intelligence/test_state_machine.py -v`
 Expected: PASS (7 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/state_machine.py tests/intelligence/test_state_machine.py
@@ -967,7 +969,7 @@ git commit -m "Fas 1 steg 7: obligatorisk state-machine-gate (kod, inte prompt)"
 - Consumes: `Source`, `Event` (Task 4), `Opportunity` + alla assessment-typer (Task 5–6).
 - Produces: `init_schema(conn: sqlite3.Connection) -> None`, `get_connection(path: Path) -> sqlite3.Connection`, `Repository` (`typing.Protocol` med metoderna nedan), `SQLiteRepository(Repository)`. Metoder: `save_source(source)`, `save_event(event)`, `has_seen_content_hash(source_id: str, content_hash: str) -> bool`, `save_opportunity(opportunity)`, `get_opportunity(opportunity_id) -> Opportunity | None`, `update_opportunity_status(opportunity_id, status)`, `save_assessment(opportunity_id, field_name, assessment)`, `log_run_event(run_id, **fields)`. Används av `pipeline/dedupe.py` (Task 12), `orchestrator.py` (Task 20).
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/storage/test_repository.py
@@ -1040,12 +1042,12 @@ def test_log_run_event_does_not_raise(repo):
     repo.log_run_event(run_id="r1", event_id="evt-1", opportunity_id=None, agent_name="orchestrator", status="started")
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/storage -v`
 Expected: FAIL — modulerna finns inte.
 
-- [ ] **Step 3: Implementera `db.py`**
+- [x] **Step 3: Implementera `db.py`**
 
 ```python
 # intelligence/storage/db.py
@@ -1123,7 +1125,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 ```
 
-- [ ] **Step 4: Implementera `repository.py`**
+- [x] **Step 4: Implementera `repository.py`**
 
 ```python
 # intelligence/storage/repository.py
@@ -1259,12 +1261,12 @@ class SQLiteRepository:
         self._conn.commit()
 ```
 
-- [ ] **Step 5: Kör testet igen**
+- [x] **Step 5: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/storage -v`
 Expected: PASS (5 passed)
 
-- [ ] **Step 6: Ruff + commit**
+- [x] **Step 6: Ruff + commit**
 
 ```bash
 git add intelligence/storage/ tests/intelligence/storage/
@@ -1284,7 +1286,7 @@ git commit -m "Fas 1 steg 8: SQLite-schema + Repository-interface"
 - Consumes: `RawRecord`, `Source` (Task 4), `Settings` (Task 2), `log_event` (Task 3).
 - Produces: `ConnectorError`, `ConnectorConfigError(ConnectorError)`, `ConnectorUnavailableError(ConnectorError)`; `BaseConnector` (ABC) med `fetch() -> list[RawRecord]` (abstrakt), `validate(records) -> list[RawRecord]`, samt hjälpmetoder `_content_hash(payload: dict) -> str`, `_cached_fetch(key: str, loader: Callable) -> object` (TTL-cache), `_rate_limit() -> None` (min-intervall mellan anrop), body-implementation för retry/timeout görs av konkreta connectors via `tenacity`-dekoratorn (visas i Task 10/11) men basklassen exponerar `self.timeout_seconds` och `self.max_retries` från `Settings`.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/connectors/test_base.py
@@ -1338,12 +1340,12 @@ def test_validate_passes_through_well_formed_records():
     assert validated[0].payload == {"id": 1}
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/connectors/test_base.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera `exceptions.py`**
+- [x] **Step 3: Implementera `exceptions.py`**
 
 ```python
 # intelligence/connectors/exceptions.py
@@ -1359,7 +1361,7 @@ class ConnectorUnavailableError(ConnectorError):
     """Källan svarade inte inom timeout/retry-policy."""
 ```
 
-- [ ] **Step 4: Implementera `base.py`**
+- [x] **Step 4: Implementera `base.py`**
 
 ```python
 # intelligence/connectors/base.py
@@ -1421,12 +1423,12 @@ class BaseConnector(ABC):
         return datetime.now(UTC)
 ```
 
-- [ ] **Step 5: Kör testet igen**
+- [x] **Step 5: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/connectors/test_base.py -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 6: Ruff + commit**
+- [x] **Step 6: Ruff + commit**
 
 ```bash
 git add intelligence/connectors/exceptions.py intelligence/connectors/base.py tests/intelligence/connectors/test_base.py
@@ -1445,7 +1447,7 @@ git commit -m "Fas 1 steg 9: BaseConnector med rate limiting, cache och content-
 - Consumes: `BaseConnector` (Task 9), `httpx`, `tenacity`.
 - Produces: `HackerNewsConnector(BaseConnector)` med `fetch() -> list[RawRecord]` som hämtar topplistan + item-detaljer från `https://hacker-news.firebaseio.com/v0/`. Inget API-nyckel krävs.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/connectors/test_hackernews.py
@@ -1493,12 +1495,12 @@ def test_fetch_raises_connector_unavailable_after_retries():
         pass
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/connectors/test_hackernews.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/connectors/hackernews.py
@@ -1553,12 +1555,12 @@ class HackerNewsConnector(BaseConnector):
         return _do()
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/connectors/test_hackernews.py -v`
 Expected: PASS (2 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/connectors/hackernews.py tests/intelligence/connectors/test_hackernews.py
@@ -1577,7 +1579,7 @@ git commit -m "Fas 1 steg 10: HackerNewsConnector (ingen API-nyckel krävs)"
 - Consumes: `BaseConnector` (Task 9), `ConnectorConfigError` (Task 9), `Settings.alphavantage_api_key` (Task 2).
 - Produces: `AlphaVantageConnector(BaseConnector)` med extra konstruktorargument `api_key: str | None`, `symbols: list[str]`. `fetch()` kastar `ConnectorConfigError` omedelbart om `api_key is None` — testas UTAN riktig nyckel. Med mockad nyckel + mockad HTTP testas lyckad fetch.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/connectors/test_alpha_vantage.py
@@ -1621,12 +1623,12 @@ def test_fetch_with_mocked_key_and_http_returns_raw_records():
     assert records[0].payload["Global Quote"]["01. symbol"] == "IBM"
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/connectors/test_alpha_vantage.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/connectors/alpha_vantage.py
@@ -1698,12 +1700,12 @@ class AlphaVantageConnector(BaseConnector):
         return _do()
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/connectors/test_alpha_vantage.py -v`
 Expected: PASS (2 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/connectors/alpha_vantage.py tests/intelligence/connectors/test_alpha_vantage.py
@@ -1728,7 +1730,7 @@ git commit -m "Fas 1 steg 11: AlphaVantageConnector, config-gated, testbar utan 
 
 Detta täcker SPEC §13 gate-test 7 (dedup) tillsammans med Task 13.
 
-- [ ] **Step 1: Skriv testerna**
+- [x] **Step 1: Skriv testerna**
 
 ```python
 # tests/intelligence/pipeline/test_normalize.py
@@ -1809,12 +1811,12 @@ def test_small_deviation_creates_no_event():
     assert events == []
 ```
 
-- [ ] **Step 2: Kör testerna för att bekräfta att de failar**
+- [x] **Step 2: Kör testerna för att bekräfta att de failar**
 
 Run: `uv run pytest tests/intelligence/pipeline -v`
 Expected: FAIL — modulerna finns inte.
 
-- [ ] **Step 3: Implementera `normalize.py`**
+- [x] **Step 3: Implementera `normalize.py`**
 
 ```python
 # intelligence/pipeline/normalize.py
@@ -1858,7 +1860,7 @@ def normalize_record(record: RawRecord, source_type: str) -> NormalizedRecord:
     return normalizer(record)
 ```
 
-- [ ] **Step 4: Implementera `dedupe.py`**
+- [x] **Step 4: Implementera `dedupe.py`**
 
 ```python
 # intelligence/pipeline/dedupe.py
@@ -1872,7 +1874,7 @@ def is_duplicate(repo: Repository, record: RawRecord) -> bool:
     return repo.has_seen_content_hash(record.source_id, record.content_hash)
 ```
 
-- [ ] **Step 5: Implementera `anomaly.py`**
+- [x] **Step 5: Implementera `anomaly.py`**
 
 ```python
 # intelligence/pipeline/anomaly.py
@@ -1912,12 +1914,12 @@ def detect_events(
     return events
 ```
 
-- [ ] **Step 6: Kör testerna igen**
+- [x] **Step 6: Kör testerna igen**
 
 Run: `uv run pytest tests/intelligence/pipeline -v`
 Expected: PASS (5 passed)
 
-- [ ] **Step 7: Ruff + commit**
+- [x] **Step 7: Ruff + commit**
 
 ```bash
 git add intelligence/pipeline/normalize.py intelligence/pipeline/dedupe.py intelligence/pipeline/anomaly.py tests/intelligence/pipeline/
@@ -1936,7 +1938,7 @@ git commit -m "Fas 1 steg 12: deterministisk normalize/dedupe/anomaly-pipeline"
 - Consumes: `BaseConnector` (Task 9), `normalize_record`, `is_duplicate`, `detect_events` (Task 12), `Repository` (Task 8), `Settings.max_events_per_run` (Task 2), `log_event`/`new_run_id` (Task 3).
 - Produces: `run_event_pipeline(connectors: list[BaseConnector], source_types: dict[str, str], baselines: dict[str, float], repo: Repository, max_events: int, run_id: str) -> list[Event]`. `source_types` mappar `source_id → source_type` (för normalize-dispatch), `baselines` mappar `source_id → baseline`. Fångar `ConnectorError` per connector — loggar, fortsätter med övriga.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/pipeline/test_event_pipeline.py
@@ -1996,12 +1998,12 @@ def test_pipeline_respects_max_events(tmp_path):
     assert events == []
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/pipeline/test_event_pipeline.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/pipeline/event_pipeline.py
@@ -2049,12 +2051,12 @@ def run_event_pipeline(
     return all_events
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/pipeline/test_event_pipeline.py -v`
 Expected: PASS (2 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/pipeline/event_pipeline.py tests/intelligence/pipeline/test_event_pipeline.py
@@ -2073,7 +2075,7 @@ git commit -m "Fas 1 steg 13: event_pipeline, feltolerant per källa, respektera
 **Interfaces:**
 - Produces: tre markdown-filer med samma frontmatter-format som de fyra befintliga (`name`, `description`, `tools`). Laddas av `agents/loader.py` (Task 15) och mappas i `agents/roles.py` (Task 16).
 
-- [ ] **Step 1: Skapa `forecasting-agent.md`**
+- [x] **Step 1: Skapa `forecasting-agent.md`**
 
 ```markdown
 ---
@@ -2099,7 +2101,7 @@ Strukturerad output enligt `ForecastAssessment`: `scenarios` (lista av `{descrip
 - Om underlaget är för tunt för att särskilja scenarier — säg det explicit i `uncertainty`, sänk `confidence`, gissa inte för att fylla i.
 ```
 
-- [ ] **Step 2: Skapa `risk-agent.md`**
+- [x] **Step 2: Skapa `risk-agent.md`**
 
 ```markdown
 ---
@@ -2125,7 +2127,7 @@ Strukturerad output enligt `RiskAssessment`: `downside`, `liquidity_risk`, `mode
 - Om du inte kan bedöma en riskdimension utifrån given data, skriv det explicit ("otillräckligt underlag för likviditetsbedömning") istället för att gissa.
 ```
 
-- [ ] **Step 3: Skapa `qa-agent.md`**
+- [x] **Step 3: Skapa `qa-agent.md`**
 
 ```markdown
 ---
@@ -2150,12 +2152,12 @@ Strukturerad output enligt `QAAssessment`: `passed` (bool), `violations` (lista,
 - Var strikt: hellre underkänna en gränsfallsrapport än släppa igenom en med en tyst motsägelse.
 ```
 
-- [ ] **Step 4: Verifiera format**
+- [x] **Step 4: Verifiera format**
 
 Run: `uv run python -c "import yaml, pathlib; [print(f, yaml.safe_load(pathlib.Path(f).read_text(encoding='utf-8').split('---')[1])) for f in ['.claude/agents/forecasting-agent.md', '.claude/agents/risk-agent.md', '.claude/agents/qa-agent.md']]"`
 Expected: skriver ut frontmatter-dict för alla tre utan fel.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add .claude/agents/forecasting-agent.md .claude/agents/risk-agent.md .claude/agents/qa-agent.md
@@ -2174,7 +2176,7 @@ git commit -m "Fas 1 steg 14: tre nya agentdefinitioner (Forecasting, Risk, QA)"
 - Consumes: `.claude/agents/*.md` (Task 14 + befintliga fyra).
 - Produces: `AgentDefinition(name: str, description: str, tools: list[str], system_prompt: str)` (pydantic `BaseModel`), `load_agent_definition(filename: str, agents_dir: Path | None = None) -> AgentDefinition`. `agents_dir` default `.claude/agents/` relativt projektroten — samma källa oavsett interaktiv eller programmatisk körning (SPEC §7).
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/agents/test_loader.py
@@ -2202,12 +2204,12 @@ def test_missing_file_raises_file_not_found():
         load_agent_definition("does-not-exist.md")
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/agents/test_loader.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/agents/loader.py
@@ -2249,12 +2251,12 @@ def load_agent_definition(filename: str, agents_dir: Path | None = None) -> Agen
     )
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/agents/test_loader.py -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/agents/loader.py tests/intelligence/agents/test_loader.py
@@ -2273,7 +2275,7 @@ git commit -m "Fas 1 steg 15: agent-loader — läser .claude/agents/*.md som sy
 - Consumes: `AssessmentBase`-subtyperna (Task 5), `load_agent_definition` (Task 15).
 - Produces: `RoleSpec(agent_file: str, assessment_type: type[AssessmentBase])`, `ROLE_MAP: dict[str, RoleSpec]` med nycklarna `"research", "opportunity", "market", "forecast", "risk", "bear", "qa"` i EXAKT samma ordning som `Opportunity`-fälten (Task 6) och `REQUIRED_FOR_REPORTED` (Task 7). Används av `orchestrator.py` (Task 20).
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/agents/test_roles.py
@@ -2315,12 +2317,12 @@ def test_all_agent_files_exist_and_load():
         assert definition.name
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/agents/test_roles.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/agents/roles.py
@@ -2357,12 +2359,12 @@ ROLE_MAP: dict[str, RoleSpec] = {
 }
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/agents/test_roles.py -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/agents/roles.py tests/intelligence/agents/test_roles.py
@@ -2383,7 +2385,7 @@ git commit -m "Fas 1 steg 16: roll-till-agentfil-mappning, återanvänder fyra b
 
 Detta täcker SPEC §13 gate-test 5 och 6.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/agents/test_runner.py
@@ -2442,12 +2444,12 @@ def test_real_runner_returns_failed_status_on_invalid_json(mock_anthropic_cls):
     assert result.status == "failed"
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/agents/test_runner.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/agents/runner.py
@@ -2555,12 +2557,12 @@ class RealClaudeRunner(AgentRunner):
         return ""
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/agents/test_runner.py -v`
 Expected: PASS (5 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/agents/runner.py tests/intelligence/agents/test_runner.py
@@ -2579,7 +2581,7 @@ git commit -m "Fas 1 steg 17: AgentRunner (Real/Mock) — ogiltig output blir st
 - Consumes: `Opportunity` (Task 6), `config/scoring_weights.yaml` (Task 1), `Settings.scoring_weights_path` (Task 2).
 - Produces: `load_weights(path: Path) -> dict[str, float]`, `score_opportunity(opportunity: Opportunity, weights: dict[str, float]) -> tuple[float, dict[str, float]]` — returnerar `(total_score, breakdown)`. Kräver att alla sju assessments finns (anropas efter QA-steget i orchestratorn, aldrig innan).
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/scoring/test_model.py
@@ -2636,12 +2638,12 @@ def test_score_reflects_weighted_sum():
     assert abs(total - expected) < 1e-9
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/scoring -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/scoring/model.py
@@ -2721,12 +2723,12 @@ def _novelty(opp: Opportunity) -> float:
     return 0.5 if opp.opportunity is not None else 0.0
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/scoring -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/scoring/model.py tests/intelligence/scoring/
@@ -2745,7 +2747,7 @@ git commit -m "Fas 1 steg 18: transparent komponent-scoring, vikter från YAML"
 - Consumes: `Opportunity` (Task 6, fullt ifylld).
 - Produces: `render_report(opportunity: Opportunity) -> str` (markdown enligt SPEC:ens template), `write_report(opportunity: Opportunity, dest_dir: Path) -> Path` (skriver till `research/YYYY-MM-DD-opportunity-<id>.md`, skapar mappen om den saknas).
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/reporting/test_report.py
@@ -2802,12 +2804,12 @@ def test_write_report_creates_file(tmp_path):
     assert "OPPORTUNITY #opp-42" in path.read_text(encoding="utf-8")
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/reporting -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/reporting/report.py
@@ -2892,12 +2894,12 @@ def write_report(opportunity: Opportunity, dest_dir: Path) -> Path:
     return path
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/reporting -v`
 Expected: PASS (2 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/reporting/report.py tests/intelligence/reporting/
@@ -2918,7 +2920,7 @@ git commit -m "Fas 1 steg 19: markdown-rapportgenerering enligt Opportunity-temp
 
 Detta är integrationstestet för SPEC §13 gate-test 5 (missing/failed agent → blockerad rapport) och 7 (dedup, tillsammans med Task 13) end-to-end genom hela orchestratorn, inte bara i isolerade enheter.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/test_orchestrator.py
@@ -2999,12 +3001,12 @@ def test_qa_rejection_sets_status_rejected(tmp_path):
     assert len(report_files) == 0
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/test_orchestrator.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/orchestrator.py
@@ -3091,12 +3093,12 @@ class Orchestrator:
         return opportunity
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/test_orchestrator.py -v`
 Expected: PASS (3 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/orchestrator.py tests/intelligence/test_orchestrator.py
@@ -3115,7 +3117,7 @@ git commit -m "Fas 1 steg 20: Lead Orchestrator — kör 7-agent-pipeline, gated
 - Consumes: allt från Task 2–20.
 - Produces: `build_orchestrator(use_mock: bool, mock_fixtures: dict | None = None) -> Orchestrator`, `main() -> None` (CLI-entrypoint: kör `event_pipeline` mot konfigurerade connectors, sedan `orchestrator.process_event` per event, skriver ut en sammanfattning). Använder `MockAgentRunner` om `ANTHROPIC_API_KEY` saknas ELLER om `--mock`-flaggan ges; annars `RealClaudeRunner`.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/test_run.py
@@ -3129,12 +3131,12 @@ def test_build_orchestrator_uses_mock_runner_when_requested(tmp_path, monkeypatc
     assert isinstance(orch._runner, MockAgentRunner)
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/test_run.py -v`
 Expected: FAIL — modulen finns inte.
 
-- [ ] **Step 3: Implementera**
+- [x] **Step 3: Implementera**
 
 ```python
 # intelligence/run.py
@@ -3226,12 +3228,12 @@ if __name__ == "__main__":
     main()
 ```
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/test_run.py -v`
 Expected: PASS (1 passed)
 
-- [ ] **Step 5: Ruff + commit**
+- [x] **Step 5: Ruff + commit**
 
 ```bash
 git add intelligence/run.py tests/intelligence/test_run.py
@@ -3248,7 +3250,7 @@ git commit -m "Fas 1 steg 21: run.py entrypoint, väljer Real/Mock runner automa
 **Interfaces:**
 - Consumes: hela paketet (Task 1–21). Inga produktionsfiler skapas i denna task — bara det test SPEC §16 explicit kräver.
 
-- [ ] **Step 1: Skriv testet**
+- [x] **Step 1: Skriv testet**
 
 ```python
 # tests/intelligence/test_end_to_end.py
@@ -3323,21 +3325,21 @@ def test_full_pipeline_from_data_to_markdown_report(tmp_path):
     assert "Status:" in content
 ```
 
-- [ ] **Step 2: Kör testet för att bekräfta att det failar**
+- [x] **Step 2: Kör testet för att bekräfta att det failar**
 
 Run: `uv run pytest tests/intelligence/test_end_to_end.py -v`
 Expected: FAIL vid första körningen om någon integration missats — annars PASS direkt eftersom alla beroenden redan är implementerade från Task 1–21.
 
-- [ ] **Step 3: Kör testet och åtgärda ev. integrationsavvikelser**
+- [x] **Step 3: Kör testet och åtgärda ev. integrationsavvikelser**
 
 Om testet failar: felsök mot den specifika modulen det pekar på, fixa där (inte i testet — testet uttrycker SPEC:ens krav).
 
-- [ ] **Step 4: Kör testet igen**
+- [x] **Step 4: Kör testet igen**
 
 Run: `uv run pytest tests/intelligence/test_end_to_end.py -v`
 Expected: PASS (1 passed)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/intelligence/test_end_to_end.py
@@ -3350,12 +3352,12 @@ git commit -m "Fas 1 steg 22: end-to-end-test — data till markdown-rapport, he
 
 **Files:** inga nya — verifierar hela Fas 1.
 
-- [ ] **Step 1: Full testsvit**
+- [x] **Step 1: Full testsvit**
 
 Run: `uv run pytest -v`
 Expected: alla tester passerar (inklusive `tests/test_setup.py`), noll `@pytest.mark.live`-tester körda (de finns inte i Fas 1 — se `Fas 1 ska inte överbyggas`).
 
-- [ ] **Step 2: Ruff check + format**
+- [x] **Step 2: Ruff check + format**
 
 Run: `uv run ruff check .`
 Expected: inga fel.
@@ -3363,17 +3365,17 @@ Expected: inga fel.
 Run: `uv run ruff format --check .`
 Expected: inga diff.
 
-- [ ] **Step 3: Verifiera att default-testkörning inte kräver nätverk**
+- [x] **Step 3: Verifiera att default-testkörning inte kräver nätverk**
 
 Run: `uv run pytest -v -p no:cacheprovider --disable-socket 2>/dev/null || uv run pytest -v` (om `pytest-socket` inte är installerat, kör bara vanlig `pytest` — alla externa anrop är redan `respx`-mockade eller `MockAgentRunner`, så detta ska passera ändå).
 Expected: alla tester passerar utan nätverksåtkomst.
 
-- [ ] **Step 4: Kör demo mot verklig Hacker News (manuellt, engångscheck — inte en del av CI)**
+- [x] **Step 4: Kör demo mot verklig Hacker News (manuellt, engångscheck — inte en del av CI)**
 
 Run: `uv run python -m intelligence.run --mock`
 Expected: skriver ut `Körning <run_id>: N events, M opportunities rapporterade.` och en fil dyker upp i `research/`. Detta kör mot RIKTIG Hacker News-data men med `MockAgentRunner` — bekräftar att connector+pipeline+orchestrator hänger ihop utan att kosta ett enda LLM-anrop.
 
-- [ ] **Step 5: Uppdatera `git log` för Fas 1**
+- [x] **Step 5: Uppdatera `git log` för Fas 1**
 
 Run: `git log --oneline -25`
 Expected: 22 commits synliga från Task 1–22, alla med prefixet `Fas 1 steg`.

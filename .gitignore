@@ -15,6 +15,11 @@ build/
 # Claude Code local state (project-level)
 .claude/settings.local.json
 
+# Assistant session memory accidentally written into the repo instead of
+# the user-level Claude Code memory store — local/session state, not a
+# project artifact, and may contain notes about working style.
+memory/
+
 # Intelligence-systemet
 data/*.db
 data/*.db-journal
