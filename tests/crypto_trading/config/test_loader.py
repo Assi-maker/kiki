@@ -22,11 +22,18 @@ def test_get_settings_loads_real_yaml_files_successfully():
 
 
 _VALID_MAX_DATA_AGE_SECONDS = {
-    "ticker": 30, "kline": 120, "funding_rate": 3600, "open_interest": 300, "contracts": 86400,
+    "ticker": 30,
+    "kline": 120,
+    "funding_rate": 3600,
+    "open_interest": 300,
+    "contracts": 86400,
 }
 _VALID_REQUIRED_FIELDS = {
-    "ticker": ["lastPrice"], "kline": ["open"], "funding_rate": ["fundingRate"],
-    "open_interest": ["openInterest"], "contracts": ["symbol"],
+    "ticker": ["lastPrice"],
+    "kline": ["open"],
+    "funding_rate": ["fundingRate"],
+    "open_interest": ["openInterest"],
+    "contracts": ["symbol"],
 }
 
 
@@ -63,10 +70,18 @@ def test_get_settings_loads_phase1_fields():
     assert settings.pipeline.bingx_base_url == "https://open-api.bingx.com"
     assert settings.pipeline.bingx_requests_per_second > 0
     assert set(settings.pipeline.required_fields.keys()) >= {
-        "ticker", "kline", "funding_rate", "open_interest", "contracts"
+        "ticker",
+        "kline",
+        "funding_rate",
+        "open_interest",
+        "contracts",
     }
     assert set(settings.pipeline.max_data_age_seconds.keys()) >= {
-        "ticker", "kline", "funding_rate", "open_interest", "contracts"
+        "ticker",
+        "kline",
+        "funding_rate",
+        "open_interest",
+        "contracts",
     }
 
 

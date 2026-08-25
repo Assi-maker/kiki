@@ -12,9 +12,13 @@ from crypto_trading.schemas.market import Kline
 
 def _kline(close: str, high: str = "100", low: str = "1", volume: str = "10") -> Kline:
     return Kline(
-        instrument="BTC-USDT", interval="1h",
-        open=Decimal(close), high=Decimal(high), low=Decimal(low),
-        close=Decimal(close), volume=Decimal(volume),
+        instrument="BTC-USDT",
+        interval="1h",
+        open=Decimal(close),
+        high=Decimal(high),
+        low=Decimal(low),
+        close=Decimal(close),
+        volume=Decimal(volume),
         observed_at=datetime.now(UTC),
     )
 

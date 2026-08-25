@@ -42,9 +42,7 @@ class BingXMarketDataConnector(BaseMarketDataConnector):
         )
 
     def get_open_interest(self, symbol: str) -> dict:
-        return self._get(
-            _OPEN_INTEREST_PATH, {"symbol": symbol, "timestamp": self._timestamp_ms()}
-        )
+        return self._get(_OPEN_INTEREST_PATH, {"symbol": symbol, "timestamp": self._timestamp_ms()})
 
     @staticmethod
     def _timestamp_ms() -> int:

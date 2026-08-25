@@ -2,6 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+## Status: KLAR (2026-08-25)
+
+Alla 9 tasks genomförda på branch `crypto-trading/phase-1`. 129 tester i `tests/crypto_trading/` (90 från Phase 0 + 39 nya, exklusive 1 `@pytest.mark.live`-test som är avsiktligt exkluderad från default-körning). Full repo-svit (`intelligence/` + `crypto_trading/` + `test_setup`): 233 passed, 1 deselected. `ruff check` och `ruff format --check`: rena. `git diff master -- intelligence/`: tom. `test_no_intelligence_coupling.py`: 3/3 PASS. Live-verifiering mot riktig BingX-data (AC5): PASS.
+
+**Två verkliga avvikelser/buggar hittade och åtgärdade under exekvering** (utöver planens ordalydelse):
+
+1. **Cache-nyckel-bugg (Task 5):** `test_cache_avoids_duplicate_http_call_within_ttl` avslöjade att cache-nyckeln i `base.py`s `_get()` inkluderade den ständigt föränderliga `timestamp`-parametern (BingX-signeringsbrus), så cachen missade alltid. Åtgärdat genom att exkludera `timestamp` ur cache-nyckelberäkningen. Dokumenterat inline i Task 5 och i commit `51508dd`.
+2. **Saknad `live`-marker-infrastruktur (Task 8):** Ingen `@pytest.mark.live`-exkludering fanns någonstans i repot trots att Fas 1:s SPEC beskrev mönstret — det hade aldrig faktiskt implementerats. La till både `markers` och `addopts = "-m 'not live'"` i `pyproject.toml` (en nödvändig men från planens bokstav utökad ändring). Commit `d42f024`.
+
+Dessutom verifierades under Phase 1-brainstormingen att en extern BingX-skill-doc (`swap-market/SKILL.md`) felaktigt påstod att alla swap-endpoints kräver HMAC-signering — motbevisat live via `curl` mot samtliga fem endpoints, vilket bekräftade SPEC_CRYPTO.md §14:s antagande om publik/nyckellös åtkomst men endast efter verklig verifiering, inte tillit till dokumentationen.
+
+Väntar på användarens granskning innan merge till `master`. Phase 2 är inte påbörjad.
+
+---
+
 **Goal:** Bygga en BingX-connector för publik, nyckellös swap-marknadsdata (kontrakt, ticker, klines, funding rate, open interest) plus ett data-quality-lager som implementerar SPEC §8.1 exakt — helt testbart utan nätverk i default `pytest`, med en explicit, en gång manuellt körd verifiering mot riktig BingX-data.
 
 **Architecture:** `schemas/market.py` (beroendefritt) ← `connectors/exceptions.py` ← `connectors/base.py` ← `connectors/bingx_market_data.py` + `connectors/data_quality.py`. Connectorn hämtar och returnerar **rådata** (dict) — mappning till typade scheman (`from_raw`) och data-quality-klassificering är separata steg, samma separation-of-concerns-princip som Fas 1:s `BaseConnector` (`fetch()` ⊥ `pipeline/normalize.py`).
@@ -33,7 +48,7 @@
 **Interfaces:**
 - Produces: `PipelineConfig` får sju nya fält: `required_fields`, `screener_timeframes`, `bingx_base_url`, `bingx_requests_per_second`, `bingx_cache_ttl_seconds`, `bingx_max_retries`, `kline_consistency_tolerance_pct`. `max_data_age_seconds` och `required_fields` valideras (fail-fast) att innehålla nycklarna `{ticker, kline, funding_rate, open_interest, contracts}`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Lägg till i `tests/crypto_trading/config/test_loader.py` (efter befintliga tester):
 
@@ -101,12 +116,12 @@ def test_pipeline_config_rejects_missing_required_fields_key():
 
 Lägg till `PipelineConfig` i importen från `crypto_trading.config.loader` (redan importerad i filen sedan Phase 0).
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/config/test_loader.py -v`
 Expected: `test_get_settings_loads_phase1_fields` FAIL med `AttributeError` (fälten finns inte än). De två övriga FAIL eftersom `PipelineConfig(...)` inte accepterar de nya nyckelordsargumenten (`TypeError`).
 
-- [ ] **Step 3: Modify `pipeline.yaml`**
+- [x] **Step 3: Modify `pipeline.yaml`**
 
 I `crypto_trading/config/pipeline.yaml`, ändra `max_data_age_seconds`-blocket och lägg till nya nycklar på slutet:
 
@@ -138,7 +153,7 @@ bingx_max_retries: 3
 kline_consistency_tolerance_pct: "0.5"
 ```
 
-- [ ] **Step 4: Modify `loader.py`**
+- [x] **Step 4: Modify `loader.py`**
 
 Lägg till `field_validator`-import (redan importerad `Field, BaseModel` — lägg till `field_validator` i samma rad) och utöka `PipelineConfig`:
 
@@ -188,17 +203,17 @@ class PipelineConfig(BaseModel):
 
 (`Decimal` är redan importerad i `loader.py` sedan Phase 0.)
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/config/test_loader.py -v`
 Expected: PASS (8 tester: 5 från Phase 0 + 3 nya).
 
-- [ ] **Step 6: Run full crypto_trading suite to verify Phase 0 is unaffected**
+- [x] **Step 6: Run full crypto_trading suite to verify Phase 0 is unaffected**
 
 Run: `pytest tests/crypto_trading/ -v`
 Expected: alla tester gröna (Phase 0:s 90 + de 3 nya = 93).
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crypto_trading/config/loader.py crypto_trading/config/pipeline.yaml tests/crypto_trading/config/test_loader.py
@@ -216,7 +231,7 @@ git commit -m "crypto_trading Phase 1 steg 1: utöka config för BingX/data-qual
 **Interfaces:**
 - Produces: `InstrumentMetadata`, `Kline`, `Ticker`, `FundingRate`, `OpenInterest` — var och en med en `from_raw(...)`-classmethod som mappar BingX:s verifierade råsvar. Konsumeras av Task 4 (connector) indirekt via Task 6/7.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/schemas/test_market.py
@@ -302,12 +317,12 @@ def test_open_interest_from_raw():
     assert oi.observed_at == datetime.fromtimestamp(1787692230396 / 1000, tz=UTC)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/schemas/test_market.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/schemas/market.py
@@ -434,12 +449,12 @@ class OpenInterest(BaseModel):
         )
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/schemas/test_market.py -v`
 Expected: PASS (5 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/schemas/market.py tests/crypto_trading/schemas/test_market.py
@@ -458,7 +473,7 @@ git commit -m "crypto_trading Phase 1 steg 2: market-scheman (InstrumentMetadata
 **Interfaces:**
 - Produces: `ConnectorError` (bas), `ConnectorUnavailableError` — konsumeras av Task 4/5.
 
-- [ ] **Step 1: Skapa filerna**
+- [x] **Step 1: Skapa filerna**
 
 ```python
 # crypto_trading/connectors/exceptions.py
@@ -478,12 +493,12 @@ class ConnectorUnavailableError(ConnectorError):
 
 `crypto_trading/connectors/__init__.py` och `tests/crypto_trading/connectors/__init__.py` skapas tomma (samma `tests.crypto_trading.*`-namngivningsprincip som Phase 0 låste — se Phase 0:s Task 1-rättning).
 
-- [ ] **Step 2: Verifiera import**
+- [x] **Step 2: Verifiera import**
 
 Run: `python -c "from crypto_trading.connectors.exceptions import ConnectorError, ConnectorUnavailableError"`
 Expected: inget fel.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crypto_trading/connectors/exceptions.py crypto_trading/connectors/__init__.py tests/crypto_trading/connectors/__init__.py
@@ -502,7 +517,7 @@ git commit -m "crypto_trading Phase 1 steg 3: connector-undantag"
 **Interfaces:**
 - Produces: `BaseMarketDataConnector` (delad infra), `BingXMarketDataConnector` med `get_contracts()`, `get_ticker(symbol)`, `get_klines(symbol, interval, limit)`, `get_funding_rate(symbol, limit)`, `get_open_interest(symbol)` — alla returnerar **rådata** (dict/list[dict]), ingen Pydantic-mappning här. Konsumeras av Task 5 (retry-tester), Task 7 (integrationstest).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/connectors/test_bingx_market_data.py
@@ -599,12 +614,12 @@ def test_connector_only_calls_whitelisted_market_data_paths():
         assert "/trade" not in path
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/connectors/test_bingx_market_data.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/connectors/base.py
@@ -758,12 +773,12 @@ class BingXMarketDataConnector(BaseMarketDataConnector):
         return int(time.time() * 1000)
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/connectors/test_bingx_market_data.py -v`
 Expected: PASS (6 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/connectors/base.py crypto_trading/connectors/bingx_market_data.py tests/crypto_trading/connectors/test_bingx_market_data.py
@@ -782,7 +797,7 @@ git commit -m "crypto_trading Phase 1 steg 4: BaseMarketDataConnector + BingXMar
 
 **Rättad under exekvering:** `test_cache_avoids_duplicate_http_call_within_ttl` avslöjade en verklig bugg i Task 4:s `base.py`: cache-nyckeln inkluderade `timestamp`-parametern, som ändras varje anrop (BingX-signeringsbrus) — cachen missade därför alltid, oavsett `cache_ttl_seconds`. Åtgärdat i `_get()`: cache-nyckeln beräknas nu från `params` med `timestamp` explicit exkluderad, eftersom det inte är del av förfrågans semantiska identitet. Se separat commit.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Lägg till i samma testfil (`import time`, `pytest`, `TimeoutException` läggs till i importsektionen):
 
@@ -862,19 +877,19 @@ def test_cache_avoids_duplicate_http_call_within_ttl():
     assert route.call_count == 1  # andra anropet kom från cachen, inget nytt HTTP-anrop
 ```
 
-- [ ] **Step 2: Run tests to verify they fail or pass honestly**
+- [x] **Step 2: Run tests to verify they fail or pass honestly**
 
 Run: `pytest tests/crypto_trading/connectors/test_bingx_market_data.py -v`
 Expected: samtliga sex nya tester PASS direkt — implementationen från Task 4 (retry/rate-limit/cache i `base.py`) uppfyller redan kraven. Detta bekräftar AC2 med explicita tester, inget nytt produktionskod behövs (avsiktligt inte ett rött-grönt TDD-steg för just dessa sex, se rubriken "Run tests to verify they fail or pass honestly").
 
 *(Om något FAILAR: `base.py`s retry/rate-limit/cache-logik från Task 4 har en bugg — åtgärda där, inte här.)*
 
-- [ ] **Step 3: Run full connector test file to verify total count**
+- [x] **Step 3: Run full connector test file to verify total count**
 
 Run: `pytest tests/crypto_trading/connectors/test_bingx_market_data.py -v`
 Expected: PASS (12 tester: 6 från Task 4 + 6 nya).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/crypto_trading/connectors/test_bingx_market_data.py
@@ -892,7 +907,7 @@ git commit -m "crypto_trading Phase 1 steg 5: retry/timeout/rate-limit/cache-tes
 **Interfaces:**
 - Produces: `DataQualityResult = Literal["ok", "invalid"]`, `check_completeness(raw, required_fields) -> DataQualityResult`, `check_staleness(observed_at, now, max_age_seconds) -> DataQualityResult`, `check_kline_consistency(klines, tolerance_pct) -> DataQualityResult`, `classify(*results) -> DataQualityResult`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/connectors/test_data_quality.py
@@ -1015,12 +1030,12 @@ def test_classify_return_type_excludes_degraded():
     assert typing.get_args(DataQualityResult) == ("ok", "invalid")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/connectors/test_data_quality.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/connectors/data_quality.py
@@ -1085,12 +1100,12 @@ def classify(*results: DataQualityResult) -> DataQualityResult:
     return "invalid" if "invalid" in results else "ok"
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/connectors/test_data_quality.py -v`
 Expected: PASS (16 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/connectors/data_quality.py tests/crypto_trading/connectors/test_data_quality.py
@@ -1107,7 +1122,7 @@ git commit -m "crypto_trading Phase 1 steg 6: data_quality.py — §8.1 stale/of
 **Interfaces:**
 - Consumes: `BingXMarketDataConnector` (Task 4), `Ticker.from_raw`/`Kline.from_raw` (Task 2), `check_completeness`/`check_staleness`/`check_kline_consistency`/`classify` (Task 6). Inga nya produktionsfiler — bevisar att de tre lagren faktiskt fogas ihop korrekt.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/connectors/test_market_data_integration.py
@@ -1197,17 +1212,17 @@ def test_incomplete_ticker_is_invalid_before_even_reaching_pydantic():
     assert completeness == "invalid"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/connectors/test_market_data_integration.py -v`
 Expected: Om Task 2/4/6 redan är korrekt implementerade PASSAR detta direkt (inget nytt produktionskod). Om något FAILAR avslöjar det en integrationsbugg mellan lagren — åtgärda i det berörda lagret (schema-mappning, connector, eller data-quality), inte här.
 
-- [ ] **Step 3: Run test to verify it passes**
+- [x] **Step 3: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/connectors/test_market_data_integration.py -v`
 Expected: PASS (3 tests)
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/crypto_trading/connectors/test_market_data_integration.py
@@ -1224,7 +1239,7 @@ git commit -m "crypto_trading Phase 1 steg 7: integrationstest — hämta→mapp
 **Interfaces:**
 - Consumes: `BingXMarketDataConnector`, `InstrumentMetadata`/`Ticker`/`Kline`/`FundingRate`/`OpenInterest`. Märkt `@pytest.mark.live` — exkluderad från default `pytest`, kräver riktig nätverksåtkomst.
 
-- [ ] **Step 1: Write the live test**
+- [x] **Step 1: Write the live test**
 
 ```python
 # tests/crypto_trading/connectors/test_bingx_live.py
@@ -1287,19 +1302,19 @@ markers = [
 ]
 ```
 
-- [ ] **Step 2: Verifiera att default pytest INTE kör detta test**
+- [x] **Step 2: Verifiera att default pytest INTE kör detta test**
 
 Run: `pytest tests/crypto_trading/ -v`
 Expected: `test_all_five_endpoints_work_against_real_bingx_api` syns INTE i outputen (varken PASS, FAIL eller SKIP) — default-körningen filtrerar bort `live`-markerade tester helt, kräver ingen nätverksåtkomst.
 
 *(Om testet visas som `deselected` i en summary-rad är det också korrekt — poängen är att det inte försöker köras.)*
 
-- [ ] **Step 3: Kör testet manuellt mot riktig BingX-data**
+- [x] **Step 3: Kör testet manuellt mot riktig BingX-data**
 
 Run: `pytest tests/crypto_trading/connectors/test_bingx_live.py -v -m live`
 Expected: PASS mot riktig, aktuell BingX-data. Dokumentera det faktiska resultatet (pris, antal kontrakt etc.) i commit-meddelandet som bevis — samma mönster som Fas 1:s slutliga körning mot riktig Hacker News-data.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add tests/crypto_trading/connectors/test_bingx_live.py pyproject.toml
@@ -1312,12 +1327,12 @@ git commit -m "crypto_trading Phase 1 steg 8: manuell live-verifiering mot rikti
 
 **Files:** inga nya — verifierar hela Phase 1.
 
-- [ ] **Step 1: Full testsvit för crypto_trading (utan live-tester)**
+- [x] **Step 1: Full testsvit för crypto_trading (utan live-tester)**
 
 Run: `pytest tests/crypto_trading/ -v`
 Expected: alla tester gröna.
 
-- [ ] **Step 2: Ruff check + format**
+- [x] **Step 2: Ruff check + format**
 
 Run: `ruff check crypto_trading/ tests/crypto_trading/`
 Expected: inga fel.
@@ -1325,22 +1340,22 @@ Expected: inga fel.
 Run: `ruff format --check crypto_trading/ tests/crypto_trading/`
 Expected: inga diff.
 
-- [ ] **Step 3: Verifiera att intelligence/ fortfarande är orört**
+- [x] **Step 3: Verifiera att intelligence/ fortfarande är orört**
 
 Run: `git diff master -- intelligence/`
 Expected: tom output.
 
-- [ ] **Step 4: Full repo-testsvit (bekräfta att inget i Phase 0/intelligence gick sönder)**
+- [x] **Step 4: Full repo-testsvit (bekräfta att inget i Phase 0/intelligence gick sönder)**
 
 Run: `pytest -v`
 Expected: alla tester (crypto_trading Phase 0 + Phase 1, intelligence, test_setup) gröna, ingen regression.
 
-- [ ] **Step 5: Verifiera importgräns och broker-frihet fortfarande håller**
+- [x] **Step 5: Verifiera importgräns och broker-frihet fortfarande håller**
 
 Run: `pytest tests/crypto_trading/test_no_intelligence_coupling.py -v`
 Expected: PASS — testet globar hela `crypto_trading/` och fångar därmed automatiskt Phase 1:s nya filer utan att ha ändrats.
 
-- [ ] **Step 6: Uppdatera PLAN_CRYPTO_PHASE1.md**
+- [x] **Step 6: Uppdatera PLAN_CRYPTO_PHASE1.md**
 
 Kryssa i samtliga `- [ ]` i denna fil till `- [x]` och lägg till en statusbanner högst upp med exakt testantal och ev. avvikelser upptäckta under exekvering.
 

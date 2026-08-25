@@ -13,32 +13,58 @@ from crypto_trading.schemas.market import (
 # under Phase 1-brainstormingen (2026-08-25).
 
 _RAW_CONTRACT = {
-    "contractId": "100", "symbol": "BTC-USDT", "size": "0.0001",
-    "quantityPrecision": 4, "pricePrecision": 1, "feeRate": 0.0005,
-    "tradeMinUSDT": 2, "currency": "USDT", "asset": "BTC", "status": 1,
-    "launchTime": 1586275200000, "displayName": "BTC-USDT",
+    "contractId": "100",
+    "symbol": "BTC-USDT",
+    "size": "0.0001",
+    "quantityPrecision": 4,
+    "pricePrecision": 1,
+    "feeRate": 0.0005,
+    "tradeMinUSDT": 2,
+    "currency": "USDT",
+    "asset": "BTC",
+    "status": 1,
+    "launchTime": 1586275200000,
+    "displayName": "BTC-USDT",
 }
 
 _RAW_KLINE = {
-    "open": "78162.6", "close": "77930.1", "high": "78260.0",
-    "low": "77831.0", "volume": "361.4139", "time": 1787691600000,
+    "open": "78162.6",
+    "close": "77930.1",
+    "high": "78260.0",
+    "low": "77831.0",
+    "volume": "361.4139",
+    "time": 1787691600000,
 }
 
 _RAW_TICKER = {
-    "symbol": "BTC-USDT", "priceChange": "-1019.8", "priceChangePercent": "-1.29",
-    "lastPrice": "77955.4", "highPrice": "81263.0", "lowPrice": "77831.0",
-    "volume": "16449.4100", "quoteVolume": "1306179101.75", "openPrice": "78975.2",
-    "openTime": 1787605813000, "closeTime": 1787692213000,
-    "askPrice": "77993.5", "askQty": "1.2853", "bidPrice": "77993.4", "bidQty": "24.1266",
+    "symbol": "BTC-USDT",
+    "priceChange": "-1019.8",
+    "priceChangePercent": "-1.29",
+    "lastPrice": "77955.4",
+    "highPrice": "81263.0",
+    "lowPrice": "77831.0",
+    "volume": "16449.4100",
+    "quoteVolume": "1306179101.75",
+    "openPrice": "78975.2",
+    "openTime": 1787605813000,
+    "closeTime": 1787692213000,
+    "askPrice": "77993.5",
+    "askQty": "1.2853",
+    "bidPrice": "77993.4",
+    "bidQty": "24.1266",
 }
 
 _RAW_FUNDING_RATE = {
-    "symbol": "BTC-USDT", "fundingRate": "0.00010000",
-    "fundingTime": 1787673600000, "markPrice": "79463.4",
+    "symbol": "BTC-USDT",
+    "fundingRate": "0.00010000",
+    "fundingTime": 1787673600000,
+    "markPrice": "79463.4",
 }
 
 _RAW_OPEN_INTEREST = {
-    "openInterest": "1100360743.1", "symbol": "BTC-USDT", "time": 1787692230396,
+    "openInterest": "1100360743.1",
+    "symbol": "BTC-USDT",
+    "time": 1787692230396,
 }
 
 

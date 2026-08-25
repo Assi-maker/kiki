@@ -43,9 +43,7 @@ class PipelineConfig(BaseModel):
 
     @field_validator("required_fields")
     @classmethod
-    def required_fields_covers_all_data_types(
-        cls, v: dict[str, list[str]]
-    ) -> dict[str, list[str]]:
+    def required_fields_covers_all_data_types(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
         missing = _REQUIRED_DATA_TYPES - v.keys()
         if missing:
             raise ValueError(f"required_fields missing required keys: {missing}")

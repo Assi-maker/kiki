@@ -42,7 +42,14 @@ def test_get_klines_returns_raw_list():
                 "code": 0,
                 "msg": "",
                 "data": [
-                    {"open": "1", "close": "2", "high": "3", "low": "0.5", "volume": "10", "time": 1}
+                    {
+                        "open": "1",
+                        "close": "2",
+                        "high": "3",
+                        "low": "0.5",
+                        "volume": "10",
+                        "time": 1,
+                    }
                 ],
             },
         )
@@ -55,7 +62,9 @@ def test_get_klines_returns_raw_list():
 @respx.mock
 def test_get_contracts_returns_raw_list():
     respx.get(f"{_BASE_URL}/openApi/swap/v2/quote/contracts").mock(
-        return_value=Response(200, json={"code": 0, "msg": "", "data": [{"symbol": "BTC-USDT", "status": 1}]})
+        return_value=Response(
+            200, json={"code": 0, "msg": "", "data": [{"symbol": "BTC-USDT", "status": 1}]}
+        )
     )
     result = _connector().get_contracts()
     assert result == [{"symbol": "BTC-USDT", "status": 1}]
@@ -65,7 +74,8 @@ def test_get_contracts_returns_raw_list():
 def test_get_funding_rate_returns_raw_list():
     respx.get(f"{_BASE_URL}/openApi/swap/v2/quote/fundingRate").mock(
         return_value=Response(
-            200, json={"code": 0, "msg": "", "data": [{"symbol": "BTC-USDT", "fundingRate": "0.0001"}]}
+            200,
+            json={"code": 0, "msg": "", "data": [{"symbol": "BTC-USDT", "fundingRate": "0.0001"}]},
         )
     )
     result = _connector().get_funding_rate("BTC-USDT")
@@ -75,7 +85,9 @@ def test_get_funding_rate_returns_raw_list():
 @respx.mock
 def test_get_open_interest_returns_raw_dict():
     respx.get(f"{_BASE_URL}/openApi/swap/v2/quote/openInterest").mock(
-        return_value=Response(200, json={"code": 0, "msg": "", "data": {"symbol": "BTC-USDT", "openInterest": "123"}})
+        return_value=Response(
+            200, json={"code": 0, "msg": "", "data": {"symbol": "BTC-USDT", "openInterest": "123"}}
+        )
     )
     result = _connector().get_open_interest("BTC-USDT")
     assert result == {"symbol": "BTC-USDT", "openInterest": "123"}
