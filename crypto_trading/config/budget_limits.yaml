@@ -1,0 +1,4 @@
+max_candidates_per_discovery_run: 10
+max_ai_calls_per_discovery_run: 70
+max_ai_calls_per_day: 500
+warning_threshold_pct: "0.8"
