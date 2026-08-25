@@ -1,0 +1,12 @@
+discovery_interval_minutes: 15
+monitoring_interval_seconds: 30
+top_n: 30
+cooldown_minutes: 60
+max_data_age_seconds:
+  ticker: 30
+  kline: 120
+  funding_rate: 3600
+  open_interest: 300
+min_sample_size_for_calibration: 30
+calibration_preliminary_sample_size: 10
+sqlite_busy_timeout_ms: 5000

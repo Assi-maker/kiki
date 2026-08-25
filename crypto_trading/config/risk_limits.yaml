@@ -1,0 +1,9 @@
+# OBS: alla penningvärden citerade som strängar - Decimal ska ALDRIG passera
+# via ett YAML-flyttal (float-precision skulle då redan ha smugit in vid inläsning).
+starting_capital_usdt: "10000"
+risk_per_trade_pct: "0.01"
+max_concurrent_positions: 5
+max_total_exposure_pct: "0.25"
+spread_pct: "0.0005"
+slippage_pct: "0.0005"
+fee_pct: "0.0004"
