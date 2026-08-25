@@ -1,5 +1,7 @@
 # Crypto Trading — Phase 0 (Foundation) Implementation Plan
 
+> **Status: PHASE 0 AVSLUTAD (2026-08-25).** Alla 17 tasks implementerade, testade och committade på branchen `crypto-trading/phase-0`. 194/194 tester gröna i hela repot (90 crypto_trading + 103 intelligence + 1 setup), `ruff check`/`ruff format` rent, `intelligence/` verifierat orört (0 rader diff mot `master`). Tre verkliga fel upptäcktes och åtgärdades under exekvering (dokumenterade inline vid respektive task): en pytest-paketnamnskollision (Task 1, två rättningsrundor), ett skrivskyddat `sqlite3.Connection.execute`-attribut (Task 11), och en trådbunden sqlite3-anslutning använd i fel tråd (Task 14).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Bygga grunden för `crypto_trading/` — scheman, config-lager, SQLite-storage (WAL, append-only event-logg, idempotens), och en deterministisk state machine med crash-safety — helt testbar utan nätverk, utan att röra `intelligence/`.
@@ -63,11 +65,11 @@ Om separata tabeller för någon av dessa ändå önskas innan respektive fas b�
 **Interfaces:**
 - Produces: paketet `crypto_trading` är importerbart (`import crypto_trading`).
 
-- [ ] **Step 1: Skapa paketskelettet**
+- [x] **Step 1: Skapa paketskelettet**
 
 Filerna under `crypto_trading/` skapas som tomma (`__init__.py` helt utan innehåll — inga re-exports än, inget att exportera). `tests/__init__.py` och hela `tests/crypto_trading/`-hierarkins `__init__.py`-filer skapas likaså tomma (se rättningen ovan för varför de krävs).
 
-- [ ] **Step 2: Lägg till crypto_trading-databasen i `.gitignore`**
+- [x] **Step 2: Lägg till crypto_trading-databasen i `.gitignore`**
 
 Lägg till i `.gitignore` (efter den befintliga `# Intelligence-systemet`-sektionen):
 
@@ -79,12 +81,12 @@ data/crypto_trading.db-wal
 data/crypto_trading.db-shm
 ```
 
-- [ ] **Step 3: Verifiera att paketet importeras**
+- [x] **Step 3: Verifiera att paketet importeras**
 
 Run: `python -c "import crypto_trading"`
 Expected: inget fel, ingen output.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crypto_trading/__init__.py crypto_trading/schemas/__init__.py crypto_trading/config/__init__.py crypto_trading/storage/__init__.py .gitignore
@@ -102,7 +104,7 @@ git commit -m "crypto_trading Phase 0 steg 1: paketskelett"
 **Interfaces:**
 - Produces: `CandidateStatus`, `PositionStatus`, `AssessmentStatus`, `DataQualityStatus` — alla `typing.Literal`-typalias, importeras av alla senare scheman.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/schemas/test_common.py
@@ -145,12 +147,12 @@ def test_data_quality_status_values():
     assert set(get_args(DataQualityStatus)) == {"ok", "degraded", "invalid"}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/schemas/test_common.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'crypto_trading.schemas.common'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/schemas/common.py
@@ -176,12 +178,12 @@ AssessmentStatus = Literal["ok", "failed", "timeout"]
 DataQualityStatus = Literal["ok", "degraded", "invalid"]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/schemas/test_common.py -v`
 Expected: PASS (5 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/schemas/common.py tests/crypto_trading/schemas/test_common.py
@@ -200,7 +202,7 @@ git commit -m "crypto_trading Phase 0 steg 2: statustyper (common.py)"
 - Consumes: inget (beroendefritt utöver pydantic/datetime).
 - Produces: `Event` (pydantic `BaseModel`) med fälten `event_id, event_type, aggregate_type, aggregate_id, occurred_at, run_id, schema_version, payload`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/schemas/test_event.py
@@ -238,12 +240,12 @@ def test_event_run_id_is_optional():
     assert event.run_id is None
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/schemas/test_event.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/schemas/event.py
@@ -265,12 +267,12 @@ class Event(BaseModel):
     payload: dict
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/schemas/test_event.py -v`
 Expected: PASS (2 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/schemas/event.py tests/crypto_trading/schemas/test_event.py
@@ -289,7 +291,7 @@ git commit -m "crypto_trading Phase 0 steg 3: Event-schema"
 - Consumes: `DataQualityStatus` från `crypto_trading.schemas.common`.
 - Produces: `CandidateEvidenceRecord`, `compute_evidence_hash(record) -> str`, `compute_candidate_idempotency_key(instrument, discovery_run_id, evidence_hash) -> str`. Dessa två funktioner används av Task 10 (repository) och av framtida Phase 2 (candidate_engine).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/schemas/test_evidence.py
@@ -361,12 +363,12 @@ def test_idempotency_key_differs_for_different_instruments():
     assert key1 != key2
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/schemas/test_evidence.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/schemas/evidence.py
@@ -445,12 +447,12 @@ def compute_candidate_idempotency_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/schemas/test_evidence.py -v`
 Expected: PASS (5 tests — rättat räknefel upptäckt vid exekvering, testfilen har alltid haft 5 def test_-funktioner)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/schemas/evidence.py tests/crypto_trading/schemas/test_evidence.py
@@ -469,7 +471,7 @@ git commit -m "crypto_trading Phase 0 steg 4: CandidateEvidenceRecord + idempote
 - Consumes: `AssessmentStatus` från `crypto_trading.schemas.common`.
 - Produces: `AssessmentBase` + `NewsSentimentAssessment`, `TechnicalAssessment`, `BullThesisAssessment`, `ForecastAssessment`, `RiskAssessment`, `BearAdversarialAssessment`, `QAAssessment` — konsumeras av Task 6 (`Candidate`).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/schemas/test_assessments.py
@@ -562,12 +564,12 @@ def test_technical_and_bull_thesis_construct():
     )
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/schemas/test_assessments.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/schemas/assessments.py
@@ -638,12 +640,12 @@ class QAAssessment(AssessmentBase):
     violations: list[str]
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/schemas/test_assessments.py -v`
 Expected: PASS (7 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/schemas/assessments.py tests/crypto_trading/schemas/test_assessments.py
@@ -668,7 +670,7 @@ git commit -m "crypto_trading Phase 0 steg 5: sju AssessmentTyper"
 `CORRUPT_STATE_DETECTED`-event (se Task 10). `CandidateStatus` (Task 2) har
 exakt åtta giltiga värden och inget "UNKNOWN_STATE"-medlem.*
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/schemas/test_candidate.py
@@ -730,12 +732,12 @@ def test_candidate_starts_with_all_assessments_none():
     assert candidate.status == "CANDIDATE"
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/schemas/test_candidate.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/schemas/candidate.py
@@ -778,12 +780,12 @@ class Candidate(BaseModel):
     qa: QAAssessment | None = None
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/schemas/test_candidate.py -v`
 Expected: PASS (1 test)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/schemas/candidate.py tests/crypto_trading/schemas/test_candidate.py
@@ -804,7 +806,7 @@ git commit -m "crypto_trading Phase 0 steg 6: Candidate-aggregat"
 - Consumes: `PositionStatus` (common.py).
 - Produces: `Position` (med `Decimal`-fält enligt SPEC §11), `ForecastRecord` — konsumeras av Task 9 (db-schema) och senare faser (Phase 4/8).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/schemas/test_trade.py
@@ -894,12 +896,12 @@ def test_forecast_record_outcome_fields_start_none():
     assert record.outcome_timestamp is None
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/schemas/test_trade.py tests/crypto_trading/schemas/test_forecast.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/schemas/trade.py
@@ -967,12 +969,12 @@ class ForecastRecord(BaseModel):
         return v
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/schemas/test_trade.py tests/crypto_trading/schemas/test_forecast.py -v`
 Expected: PASS (4 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/schemas/trade.py crypto_trading/schemas/forecast.py tests/crypto_trading/schemas/test_trade.py tests/crypto_trading/schemas/test_forecast.py
@@ -994,7 +996,7 @@ git commit -m "crypto_trading Phase 0 steg 7: Position (Decimal) + ForecastRecor
 **Interfaces:**
 - Produces: `ConfigError`, `PipelineConfig`, `RiskLimitsConfig`, `BudgetLimitsConfig`, `Settings`, `get_settings() -> Settings`. `get_settings()` är entrypointen framtida faser använder.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/config/test_loader.py
@@ -1065,12 +1067,12 @@ def test_missing_config_file_raises_config_error(tmp_path, monkeypatch):
         get_settings()
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/config/test_loader.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write the YAML files**
+- [x] **Step 3: Write the YAML files**
 
 ```yaml
 # crypto_trading/config/pipeline.yaml
@@ -1109,7 +1111,7 @@ max_ai_calls_per_day: 500
 warning_threshold_pct: "0.8"
 ```
 
-- [ ] **Step 4: Write minimal implementation**
+- [x] **Step 4: Write minimal implementation**
 
 ```python
 # crypto_trading/config/exceptions.py
@@ -1201,12 +1203,12 @@ def get_settings() -> Settings:
     )
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/config/test_loader.py -v`
 Expected: PASS (5 tests)
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crypto_trading/config/exceptions.py crypto_trading/config/loader.py crypto_trading/config/pipeline.yaml crypto_trading/config/risk_limits.yaml crypto_trading/config/budget_limits.yaml tests/crypto_trading/config/test_loader.py
@@ -1224,7 +1226,7 @@ git commit -m "crypto_trading Phase 0 steg 8: config-lager (YAML + Pydantic-vali
 **Interfaces:**
 - Produces: `get_connection(path, busy_timeout_ms) -> sqlite3.Connection`, `init_schema(conn)`, `SCHEMA_VERSION` — konsumeras av Task 10/11 (repository). Denna task låser även den konkreta `Decimal -> str`-serialiseringskonventionen (SQLite `TEXT`-kolumner och JSON-payloads) som alla senare faser (särskilt Phase 4:s paper trading) måste följa — testad direkt mot en redan existerande `TEXT`-kolumn i schemat, utan att bygga någon positions-repository-logik i Phase 0.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/storage/test_db.py
@@ -1384,12 +1386,12 @@ def test_decimal_json_roundtrip_is_exact_never_via_float(value):
     assert isinstance(deserialized["amount"], str)  # aldrig ett JSON-tal/float
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/storage/test_db.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/storage/db.py
@@ -1524,12 +1526,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/storage/test_db.py -v`
 Expected: PASS (14 tester: 7 schema/WAL-tester + 3 Decimal/SQLite-rundtur + 1 float-precisionsbevis + 3 Decimal/JSON-rundtur)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/storage/db.py tests/crypto_trading/storage/test_db.py
@@ -1549,7 +1551,7 @@ git commit -m "crypto_trading Phase 0 steg 9: SQLite-schema, WAL, append-only ev
 - Consumes: `get_connection` (db.py), `Candidate` (candidate.py), `CandidateEvidenceRecord` (evidence.py), `Event` (event.py).
 - Produces: `Repository` (Protocol), `SQLiteRepository.create_candidate_with_event(candidate, event) -> bool`, `SQLiteRepository.get_candidate(candidate_id) -> Candidate | None`, `SQLiteRepository.find_candidates_by_status(status) -> list[Candidate]`, `CorruptCandidateStateError` — konsumeras av Task 11 (atomicitet), Task 12/13 (state_machine, inkl. sweepen som förlitar sig på att `find_candidates_by_status` hoppar över korrupta rader istället för att avbryta), Task 14 (samtidighet).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/storage/test_repository_candidate.py
@@ -1774,12 +1776,12 @@ def test_repository_protocol_exposes_no_update_or_delete_event_method():
     assert not hasattr(SQLiteRepository, "delete_event")
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/storage/test_repository_candidate.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/storage/exceptions.py
@@ -1977,12 +1979,12 @@ class SQLiteRepository:
         return result
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/storage/test_repository_candidate.py -v`
 Expected: PASS (8 tester: create+persist, idempotent retry, missing candidate, korrupt status, korrupt evidence_record, korrupt timestamp, find_candidates_by_status hoppar över korrupt rad, protokollet saknar update/delete-event)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/storage/exceptions.py crypto_trading/storage/repository.py tests/crypto_trading/storage/test_repository_candidate.py
@@ -1999,7 +2001,7 @@ git commit -m "crypto_trading Phase 0 steg 10: Repository — idempotent candida
 **Interfaces:**
 - Consumes: `SQLiteRepository.transition_candidate_with_event` (redan implementerad i Task 10).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tillägg i tests/crypto_trading/storage/test_repository_candidate.py
@@ -2062,14 +2064,14 @@ def test_transition_candidate_with_event_rolls_back_atomically_on_failure(tmp_pa
 
 Denna test läggs till sist i samma testfil som Task 10 skapade (importerna `pytest`, `sqlite3` och hjälpfunktionerna `_make_candidate`/`_make_event` finns redan där).
 
-- [ ] **Step 2: Run test to verify it already passes**
+- [x] **Step 2: Run test to verify it already passes**
 
 Run: `pytest tests/crypto_trading/storage/test_repository_candidate.py::test_transition_candidate_with_event_rolls_back_atomically_on_failure -v`
 Expected: PASS direkt — implementationen från Task 10 (try/except/rollback i `transition_candidate_with_event`) uppfyller redan kravet. Detta steg **bekräftar** atomiciteten med ett explicit test, ingen ny kod behövs (avsiktligt inte ett rött-grönt TDD-steg, se rubriken).
 
 *(Om testet oväntat FAILAR: det betyder `transition_candidate_with_event`s `try/except: rollback(); raise`-mönster från Task 10 inte fångar rätt — lägg då till samma mönster som redan finns i `create_candidate_with_event`.)*
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/crypto_trading/storage/test_repository_candidate.py
@@ -2087,7 +2089,7 @@ git commit -m "crypto_trading Phase 0 steg 11: explicit atomicitetstest för tra
 **Interfaces:**
 - Produces: `ALLOWED_TRANSITIONS: dict[str, frozenset[str]]`, `can_transition(current_status: str, target_status: str) -> tuple[bool, str]` — konsumeras av Task 13 (sweep) och alla framtida faser som ändrar `CandidateStatus`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/test_state_machine.py
@@ -2166,12 +2168,12 @@ def test_can_transition_is_defensive_against_unknown_source_status():
     assert "unknown source state" in reason
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/test_state_machine.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/state_machine.py (del 1 av 2 — resten läggs till i Task 13)
@@ -2213,12 +2215,12 @@ def can_transition(current_status: str, target_status: str) -> tuple[bool, str]:
     return True, "ok"
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/test_state_machine.py -v`
 Expected: PASS (24 tester: 8 tillåtna övergångar + 7 förbjudna övergångar + 8 terminal-status-fall + 1 defensivt fall)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/state_machine.py tests/crypto_trading/test_state_machine.py
@@ -2237,7 +2239,7 @@ git commit -m "crypto_trading Phase 0 steg 12: state machine — ALLOWED_TRANSIT
 - Consumes: `Repository`-protokollet (`storage.repository`), `Event` (`schemas.event`). Förlitar sig på att `find_candidates_by_status` (Task 10) redan hoppar över `CorruptCandidateStateError`-rader istället för att avbryta — sweepen behöver ingen egen felhantering för det.
 - Produces: `sweep_interrupted_analyses(repo: Repository, swept_at: datetime, run_id: str) -> list[str]`. En korrupt candidate bland de svepta rapporteras via det `CORRUPT_STATE_DETECTED`-event `get_candidate` redan skrev, men syns inte i returvärdet — den blockerar aldrig behandlingen av övriga giltiga candidates.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/test_state_machine_sweep.py
@@ -2392,12 +2394,12 @@ def test_sweep_continues_past_corrupt_candidate_and_still_interrupts_valid_ones(
     assert corrupt_event is not None  # den korrupta candidate:n auditerades ändå
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/test_state_machine_sweep.py -v`
 Expected: FAIL with `ImportError: cannot import name 'sweep_interrupted_analyses'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Lägg till i `crypto_trading/state_machine.py` (efter `can_transition`):
 
@@ -2443,12 +2445,12 @@ def sweep_interrupted_analyses(
 
 Notera: importen av `Event` flyttas till toppen av filen (slå ihop med Task 12:s importsektion — `from __future__ import annotations` följt av `from datetime import datetime`, `from typing import TYPE_CHECKING`, `from crypto_trading.schemas.event import Event`).
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/test_state_machine_sweep.py -v`
 Expected: PASS (5 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/state_machine.py tests/crypto_trading/test_state_machine_sweep.py
@@ -2470,7 +2472,7 @@ git commit -m "crypto_trading Phase 0 steg 13: ANALYSIS_INTERRUPTED startup-swee
 förlita sig på att trådschemaläggning råkar skapa den — deterministiskt,
 inte beroende av tur.*
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/storage/test_repository_concurrency.py
@@ -2639,21 +2641,21 @@ def test_busy_timeout_is_respected_write_fails_after_timeout_elapses(tmp_path):
     assert count == 0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/storage/test_repository_concurrency.py -v`
 Expected: FAIL — inte pga saknad kod (allt finns redan från Task 10), detta är det första samtidighetstestet. Kör det för att se om det passerar direkt eller avslöjar ett låsningsproblem.
 
-- [ ] **Step 3: Åtgärda om det behövs**
+- [x] **Step 3: Åtgärda om det behövs**
 
 Om `test_busy_timeout_lets_writer_wait_for_lock_and_succeed` visar ett `database is locked`-fel trots `busy_timeout`: verifiera att `PRAGMA journal_mode=WAL` faktiskt slog igenom (SQLite kan tysta falla tillbaka till rollback-journal på vissa filsystem) genom att logga `conn.execute("PRAGMA journal_mode").fetchone()`. Om WAL inte aktiveras, undersök filsystemets stöd för memory-mapped I/O i testmiljön — en känd SQLite-begränsning, inte ett kodfel i `crypto_trading/`. Dokumentera fyndet istället för att gissa en fix.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/storage/test_repository_concurrency.py -v`
 Expected: PASS (2 tester)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add tests/crypto_trading/storage/test_repository_concurrency.py
@@ -2670,7 +2672,7 @@ git commit -m "crypto_trading Phase 0 steg 14: deterministiskt samtidighetstest 
 **Interfaces:**
 - Consumes: hela `crypto_trading`-paketet (importgranskning).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/test_no_intelligence_coupling.py
@@ -2722,12 +2724,12 @@ def test_crypto_trading_has_no_broker_account_or_order_code():
     assert offenders == [], f"forbidden broker/order terms found: {offenders}"
 ```
 
-- [ ] **Step 2: Run test to verify it already passes**
+- [x] **Step 2: Run test to verify it already passes**
 
 Run: `pytest tests/crypto_trading/test_no_intelligence_coupling.py -v`
 Expected: PASS direkt (ingen kod skriven hittills bryter mot detta, avsiktligt inte ett rött-grönt TDD-steg) — om det oväntat FAILAR avslöjar det en redan existerande kopplingsbugg i tidigare tasks, åtgärda innan du fortsätter.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add tests/crypto_trading/test_no_intelligence_coupling.py
@@ -2745,7 +2747,7 @@ git commit -m "crypto_trading Phase 0 steg 15: importgräns mot intelligence/ + 
 **Interfaces:**
 - Produces: `new_run_id() -> str`, `redact(data: dict) -> dict`, `log_event(run_id: str, **fields) -> None`. Samma kontrakt som `intelligence/logging.py` — egen fil, ingen import från `intelligence/` (Global Constraints).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # tests/crypto_trading/test_logging.py
@@ -2783,12 +2785,12 @@ def test_log_event_never_emits_raw_secret(caplog):
     assert "run-1" in caplog.text
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/test_logging.py -v`
 Expected: FAIL with `ModuleNotFoundError`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 ```python
 # crypto_trading/logging.py
@@ -2832,12 +2834,12 @@ def log_event(run_id: str, **fields) -> None:
     _logger.info(json.dumps(payload, default=str))
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `pytest tests/crypto_trading/test_logging.py -v`
 Expected: PASS (4 tests)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crypto_trading/logging.py tests/crypto_trading/test_logging.py
@@ -2850,12 +2852,12 @@ git commit -m "crypto_trading Phase 0 steg 16: logging.py — run_id och secret-
 
 **Files:** inga nya — verifierar hela Phase 0.
 
-- [ ] **Step 1: Full testsvit för crypto_trading**
+- [x] **Step 1: Full testsvit för crypto_trading**
 
 Run: `pytest tests/crypto_trading/ -v`
 Expected: alla tester gröna (samtliga Task 1–16).
 
-- [ ] **Step 2: Ruff check + format**
+- [x] **Step 2: Ruff check + format**
 
 Run: `ruff check crypto_trading/ tests/crypto_trading/`
 Expected: inga fel.
@@ -2863,17 +2865,17 @@ Expected: inga fel.
 Run: `ruff format --check crypto_trading/ tests/crypto_trading/`
 Expected: inga diff.
 
-- [ ] **Step 3: Verifiera att intelligence/ fortfarande är orört**
+- [x] **Step 3: Verifiera att intelligence/ fortfarande är orört**
 
 Run: `git diff HEAD -- intelligence/`
 Expected: tom output (jämfört mot senaste commit innan Phase 0-arbetet startade).
 
-- [ ] **Step 4: Full repo-testsvit (bekräfta att inget i intelligence/ gick sönder)**
+- [x] **Step 4: Full repo-testsvit (bekräfta att inget i intelligence/ gick sönder)**
 
 Run: `pytest -v`
 Expected: alla tester (både `tests/intelligence/` och `tests/crypto_trading/`) gröna.
 
-- [ ] **Step 5: Uppdatera PLAN_CRYPTO_PHASE0.md**
+- [x] **Step 5: Uppdatera PLAN_CRYPTO_PHASE0.md**
 
 Kryssa i samtliga `- [ ]` i denna fil till `- [x]` (samma mönster som Fas 1:s avslut) och lägg till en statusbanner högst upp: `> **Status: PHASE 0 AVSLUTAD (datum).**`
 
