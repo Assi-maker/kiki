@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+from crypto_trading.schemas.event import Event
+
+if TYPE_CHECKING:
+    from crypto_trading.storage.repository import Repository
+
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "CANDIDATE": frozenset({"DATA_INVALID", "BUDGET_LIMITED", "UNDER_AI_ANALYSIS"}),
     "UNDER_AI_ANALYSIS": frozenset({"ANALYSIS_INTERRUPTED", "REJECTED", "NO_TRADE", "CONFIRMED"}),
@@ -34,3 +42,32 @@ def can_transition(current_status: str, target_status: str) -> tuple[bool, str]:
     if target_status not in allowed_targets:
         return False, f"transition {current_status} -> {target_status} is not allowed"
     return True, "ok"
+
+
+def sweep_interrupted_analyses(
+    repo: "Repository", swept_at: datetime, run_id: str
+) -> list[str]:
+    """Vid start av discovery-processen: varje candidate som redan ligger i
+    UNDER_AI_ANALYSIS är per definition föräldralös (denna process skrev den
+    inte - den startar precis nu). Sveper dem till ANALYSIS_INTERRUPTED,
+    enkelriktat - återupplivar ALDRIG automatiskt (SPEC §8.5, Phase 0-design)."""
+    interrupted_ids: list[str] = []
+    for candidate in repo.find_candidates_by_status("UNDER_AI_ANALYSIS"):
+        allowed, reason = can_transition(candidate.status, "ANALYSIS_INTERRUPTED")
+        if not allowed:
+            raise AssertionError(f"sweep produced an illegal transition: {reason}")
+        event = Event(
+            event_id=f"ANALYSIS_INTERRUPTED_DETECTED:{candidate.candidate_id}:{run_id}",
+            event_type="ANALYSIS_INTERRUPTED_DETECTED",
+            aggregate_type="candidate",
+            aggregate_id=candidate.candidate_id,
+            occurred_at=swept_at,
+            run_id=run_id,
+            schema_version=1,
+            payload={"previous_status": candidate.status},
+        )
+        repo.transition_candidate_with_event(
+            candidate.candidate_id, "ANALYSIS_INTERRUPTED", swept_at, event
+        )
+        interrupted_ids.append(candidate.candidate_id)
+    return interrupted_ids
