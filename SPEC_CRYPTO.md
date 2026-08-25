@@ -156,8 +156,8 @@ CANDIDATE → DATA_INVALID (terminal, om kritisk data saknas/stale/inkonsekvent 
                                → REJECTED (analyserad, underkänd av AI-teamet/QA)
                                → NO_TRADE (QA godkände, men Risk/Signal Gate blockerade)
                                → CONFIRMED (godkänd av samtliga gates)
-                    (okänd/orepresenterad state → UNKNOWN_STATE, se §8.3)
 ```
+Ett okänt/korrupt statusvärde är **inte** ett `CandidateStatus`-värde — det är ett repository-/fail-safe-fel (`CorruptCandidateStateError`), se §8.3.
 `NOT_A_CANDIDATE` (screenern kvalificerade aldrig instrumentet) loggas på debug-nivå, persisteras inte som en `Candidate`-rad.
 
 **B. PositionStatus** (bara för `CONFIRMED` → faktisk paper trade): `OPEN_POSITION → CLOSED`.
@@ -171,8 +171,9 @@ CANDIDATE → DATA_INVALID (terminal, om kritisk data saknas/stale/inkonsekvent 
 | `NO_TRADE` | Nådde QA/Gate men blockerades av den deterministiska Risk/Signal Gate. |
 | `BUDGET_LIMITED` | Kvalificerade sig som candidate men fick aldrig AI-analys på grund av resurstak — **inte** ett underkännande. |
 | `DATA_INVALID` | Blockerad innan AI-analys på grund av otillräcklig/stale/inkonsekvent kritisk data. |
-| `ANALYSIS_INTERRUPTED` | Tekniskt avbruten process (krasch/restart) mitt i AI-analys — kräver explicit recovery-policy, blir aldrig ett permanent tyst läge. |
-| `UNKNOWN_STATE` | Data-/schemakorruption eller ett orepresenterat state upptäckt av state machine — fryst, flaggad för manuell granskning, går aldrig vidare mot `CONFIRMED` (§8.3). |
+| `ANALYSIS_INTERRUPTED` | Tekniskt avbruten process (krasch/restart) mitt i AI-analys — kräver explicit recovery-policy (ny analys, nytt `analysis_run_id`), blir aldrig ett permanent tyst läge, och sweepen som upptäcker den återupplivar aldrig automatiskt. |
+
+Data-/schemakorruption (ett lagrat statusvärde som inte matchar någon av ovanstående) är **inte** ett `CandidateStatus`-värde och skapar aldrig ett `Candidate`-objekt — se §8.3.
 
 ## 6. Agentteam (7 roller)
 
@@ -213,7 +214,7 @@ BingX-marknadsdata klassad `invalid` enligt §8.1 → instrumentet får `DATA_IN
 - QA/Gate-fel eller `passed=False` → ingen `CONFIRMED`
 - Risk/Signal Gate-fel eller regelbrott → ingen `CONFIRMED`
 - budgettak nått → `BUDGET_LIMITED`, **aldrig** `REJECTED` (skiljer resursbrist från sakligt underkännande) → ingen `CONFIRMED`
-- **okänd/orepresenterad state** — om state machine möter ett `Candidate`-objekt i ett state den inte känner igen (t.ex. efter en schemamigrering eller datakorruption) tolkas det som ett fel, aldrig ett implicit godkännande: candidate:n fryses i ett explicit `UNKNOWN_STATE`-fel-state, flaggas för manuell granskning, går aldrig vidare mot `CONFIRMED`
+- **okänt/korrupt lagrat statusvärde** — om ett lagrat `status`-värde inte matchar något giltigt `CandidateStatus` (t.ex. efter datakorruption) konstrueras **aldrig** ett `Candidate`-objekt med det värdet — det är inte ett domänstatus. Repository-lagret kastar ett explicit `CorruptCandidateStateError` och skriver ett `CORRUPT_STATE_DETECTED`-audit-event via en väg som inte kräver att den korrupta raden deserialiseras. Anroparen måste hantera felet explicit; det finns ingen tyst eller automatisk väg vidare mot `CONFIRMED`
 - systemfel (oväntat undantag) → aldrig en gissning eller implicit godkännande; candidate stannar i sitt sista kända säkra state.
 
 ### 8.4 Ingen framtida information får läcka in (look-ahead bias)
@@ -345,6 +346,6 @@ Varje fas har egna acceptance criteria och automatiska tester; nästa fas påbö
 | Kan `candidate_score` misstas för AI-confidence/forecast-sannolikhet/vinstchans? | Nej — separat tabell i §4 låser vad varje tal betyder; inget kombinerat "confidence"-fält existerar. |
 | Kan ett lågt kalibreringsunderlag presenteras som ett tillförlitligt resultat? | Nej — explicit `CalibrationStatus` (`insufficient_data`/`preliminary`/`calibrated`) visas alltid tillsammans med sample size (§9). |
 | Kan en paper trade se mer exakt/verklig ut än modellen faktiskt kan garantera? | Nej — `theoretical_entry`/`simulated_fill_price` separerade fält, `fill_model_version` taggad, alltid märkt som simulerad (§11). |
-| Kan ett okänt/korrupt state tolkas som ett godkännande? | Nej — fryses explicit som `UNKNOWN_STATE`, går aldrig vidare mot `CONFIRMED` (§8.3). |
+| Kan ett okänt/korrupt state tolkas som ett godkännande? | Nej — konstrueras aldrig som ett `Candidate`-objekt; repository kastar `CorruptCandidateStateError` + skriver `CORRUPT_STATE_DETECTED`-event, går aldrig vidare mot `CONFIRMED` (§8.3). |
 
 Ingen öppen inkonsekvens identifierad. Redo för din slutgranskning.

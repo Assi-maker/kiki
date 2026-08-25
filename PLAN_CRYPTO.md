@@ -14,7 +14,7 @@ Status: **Fasroadmap — inte godkänd för implementation.** Detta är en fasin
 - `crypto_trading/` paketskelett enligt SPEC_CRYPTO.md §3.
 - `config/pipeline.yaml`, `config/risk_limits.yaml`, `config/budget_limits.yaml` — alla nycklar från SPEC §7/§10/§11, inget hårdkodat.
 - Alla scheman i `schemas/` (§4): `CandidateEvidenceRecord`, sju `*Assessment`-typer, `ForecastRecord`, `Position`/`Trade`, `Candidate` + `CandidateStatus`/`PositionStatus` (§5).
-- `state_machine.py`: rena, testbara funktioner för samtliga övergångar i §5, inklusive `ANALYSIS_INTERRUPTED`-recovery-logik (§8.5), `UNKNOWN_STATE`-hantering (§8.3) och idempotens-kontroller (§8.6).
+- `state_machine.py`: rena, testbara funktioner för samtliga övergångar i §5, inklusive `ANALYSIS_INTERRUPTED`-recovery-logik (§8.5), okänt/korrupt state-hantering via `CorruptCandidateStateError` (§8.3) och idempotens-kontroller (§8.6).
 - `storage/`: `Repository`-protokoll + `SQLiteRepository`, tabeller enligt §16.
 - Event/audit-logg: en enda skrivväg som Telegram (Phase 6) och dashboard (Phase 7) senare båda läser från — grunden läggs nu så att ingen framtida fas kan skapa en avvikande "sanning".
 - Testinfrastruktur: `tests/crypto_trading/` speglar paketet, `MockAgentRunner`/`respx`-mönster återanvänt från Fas 1, noll nätverk/API-nycklar i default `pytest`.
@@ -25,7 +25,7 @@ Status: **Fasroadmap — inte godkänd för implementation.** Detta är en fasin
 3. Ett test simulerar en process-krasch mitt i `UNDER_AI_ANALYSIS` och verifierar att recovery ger `ANALYSIS_INTERRUPTED`, aldrig ett tyst/permanent state.
 4. Config-nycklar läses uteslutande från YAML — ett test asserterar att inget av §7/§10/§11:s parametrar är hårdkodat i Python.
 5. Ingen import mellan `crypto_trading/` och `intelligence/` i någon riktning — verifierat med en enkel importgranskning/test.
-6. Ett test ger state machine ett orepresenterat/korrupt state och verifierar att utfallet är `UNKNOWN_STATE` (§8.3) — aldrig en krasch, aldrig ett tyst godkännande, aldrig ett steg vidare mot `CONFIRMED`.
+6. Ett test läser en `candidates`-rad med ett orepresenterat/korrupt `status`-värde och verifierar att repository-lagret kastar `CorruptCandidateStateError` och skriver ett `CORRUPT_STATE_DETECTED`-event — aldrig konstruerar ett `Candidate`-objekt med det värdet, aldrig en okontrollerad krasch, aldrig ett tyst godkännande eller ett steg vidare mot `CONFIRMED` (§8.3).
 7. Idempotens-test på schema-/repository-nivå: samma candidate-identifierare (instrument + discovery-run-id + evidence-hash, §8.6) skapar aldrig två `Candidate`-rader.
 
 ---
