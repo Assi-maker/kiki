@@ -2541,13 +2541,18 @@ def test_busy_timeout_lets_writer_wait_for_lock_and_succeed(tmp_path):
     och sedan lyckas när A släpper låset - bevisar att busy_timeout faktiskt
     används, deterministiskt, utan att förlita sig på trådschemaläggning."""
     db_path = tmp_path / "concurrent_wait.db"
-    repo_a = SQLiteRepository(db_path, busy_timeout_ms=2000)
     repo_b = SQLiteRepository(db_path, busy_timeout_ms=2000)
 
     hold_seconds = 0.4
     lock_acquired = threading.Event()
 
     def hold_write_lock():
+        # repo_a skapas HÄR, inne i tråden - en sqlite3-anslutning är
+        # trådbunden (check_same_thread=True som default) och kan inte
+        # skapas i huvudtråden men användas i en annan tråd (upptäckt vid
+        # exekvering: "SQLite objects created in a thread can only be used
+        # in that same thread").
+        repo_a = SQLiteRepository(db_path, busy_timeout_ms=2000)
         repo_a._conn.execute("BEGIN IMMEDIATE")
         lock_acquired.set()
         time.sleep(hold_seconds)
@@ -2584,7 +2589,6 @@ def test_busy_timeout_is_respected_write_fails_after_timeout_elapses(tmp_path):
     direkt (vilket skulle bevisa att busy_timeout ignoreras) eller efter hela
     A:s hålltid (vilket skulle bevisa att B väntade på fel/inget villkor)."""
     db_path = tmp_path / "concurrent_timeout.db"
-    repo_a = SQLiteRepository(db_path, busy_timeout_ms=2000)
     short_timeout_ms = 200
     repo_b = SQLiteRepository(db_path, busy_timeout_ms=short_timeout_ms)
 
@@ -2592,6 +2596,8 @@ def test_busy_timeout_is_respected_write_fails_after_timeout_elapses(tmp_path):
     lock_acquired = threading.Event()
 
     def hold_write_lock():
+        # repo_a skapas i tråden - se kommentar i föregående test.
+        repo_a = SQLiteRepository(db_path, busy_timeout_ms=2000)
         repo_a._conn.execute("BEGIN IMMEDIATE")
         lock_acquired.set()
         time.sleep(hold_seconds)
