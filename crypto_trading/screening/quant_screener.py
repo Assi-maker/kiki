@@ -92,7 +92,12 @@ def _compute_zscore(latest: Decimal, history: list[Decimal]) -> Decimal:
     mean = sum(history) / len(history)
     variance = sum((x - mean) ** 2 for x in history) / len(history)
     if variance <= 0:
-        return Decimal("0")
+        # Nollvarians i historiken: en avvikelse här är matematiskt odefinierad
+        # (division med noll), men i praktiken det MEST anomala fallet som
+        # finns - en helt platt historik som plötsligt avviker, inte ett
+        # "inget mätbart" fall. En identisk latest mot en platt historik är
+        # fortsatt noll avvikelse.
+        return Decimal("0") if latest == mean else Decimal("1000")
     stddev = variance.sqrt()
     return (latest - mean) / stddev
 
