@@ -56,6 +56,7 @@ class Repository(Protocol):
         self, candidate_id: str, decision: str, reasons: list[str], evaluated_at: datetime
     ) -> None: ...
     def count_open_positions(self) -> int: ...
+    def sum_open_positions_notional(self) -> Decimal: ...
     def create_position_with_event(self, position: Position, event: Event) -> bool: ...
     def get_position(self, position_id: str) -> Position | None: ...
     def find_open_positions(self) -> list[Position]: ...
@@ -263,6 +264,12 @@ class SQLiteRepository:
             "SELECT COUNT(*) AS n FROM positions WHERE status = 'OPEN_POSITION'"
         ).fetchone()
         return row["n"]
+
+    def sum_open_positions_notional(self) -> Decimal:
+        rows = self._conn.execute(
+            "SELECT size FROM positions WHERE status = 'OPEN_POSITION'"
+        ).fetchall()
+        return sum((Decimal(row["size"]) for row in rows), Decimal("0"))
 
     def create_position_with_event(self, position: Position, event: Event) -> bool:
         try:
