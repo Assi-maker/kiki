@@ -68,6 +68,7 @@ class RiskLimitsConfig(BaseModel):
     spread_pct: Decimal = Field(ge=0)
     slippage_pct: Decimal = Field(ge=0)
     fee_pct: Decimal = Field(ge=0)
+    max_position_hold_hours: int = Field(gt=0)
 
 
 class BudgetLimitsConfig(BaseModel):

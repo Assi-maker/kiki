@@ -7,3 +7,4 @@ max_total_exposure_pct: "0.25"
 spread_pct: "0.0005"
 slippage_pct: "0.0005"
 fee_pct: "0.0004"
+max_position_hold_hours: 24

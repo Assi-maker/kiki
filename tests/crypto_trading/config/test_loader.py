@@ -107,17 +107,34 @@ def test_pipeline_config_rejects_missing_required_fields_key():
         PipelineConfig(**_valid_pipeline_kwargs(required_fields=incomplete))
 
 
+def _valid_risk_limits_kwargs(**overrides) -> dict:
+    defaults = dict(
+        starting_capital_usdt=Decimal("10000"),
+        risk_per_trade_pct=Decimal("0.01"),
+        max_concurrent_positions=5,
+        max_total_exposure_pct=Decimal("0.25"),
+        spread_pct=Decimal("0.0005"),
+        slippage_pct=Decimal("0.0005"),
+        fee_pct=Decimal("0.0004"),
+        max_position_hold_hours=24,
+    )
+    defaults.update(overrides)
+    return defaults
+
+
 def test_risk_limits_config_rejects_risk_pct_over_one():
     with pytest.raises(ValidationError):
-        RiskLimitsConfig(
-            starting_capital_usdt=Decimal("10000"),
-            risk_per_trade_pct=Decimal("1.5"),
-            max_concurrent_positions=5,
-            max_total_exposure_pct=Decimal("0.25"),
-            spread_pct=Decimal("0.0005"),
-            slippage_pct=Decimal("0.0005"),
-            fee_pct=Decimal("0.0004"),
-        )
+        RiskLimitsConfig(**_valid_risk_limits_kwargs(risk_per_trade_pct=Decimal("1.5")))
+
+
+def test_get_settings_loads_phase4_fields():
+    settings = get_settings()
+    assert settings.risk_limits.max_position_hold_hours > 0
+
+
+def test_risk_limits_config_rejects_zero_max_position_hold_hours():
+    with pytest.raises(ValidationError):
+        RiskLimitsConfig(**_valid_risk_limits_kwargs(max_position_hold_hours=0))
 
 
 def test_budget_limits_config_rejects_zero_calls():
