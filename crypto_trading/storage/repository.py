@@ -7,11 +7,34 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
+from crypto_trading.schemas.assessments import (
+    AssessmentBase,
+    BearAdversarialAssessment,
+    BullThesisAssessment,
+    ForecastAssessment,
+    NewsSentimentAssessment,
+    QAAssessment,
+    RiskAssessment,
+    TechnicalAssessment,
+)
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import CandidateEvidenceRecord
 from crypto_trading.storage.db import get_connection
 from crypto_trading.storage.exceptions import CorruptCandidateStateError
+
+# Oberoende av crypto_trading.agents.roles.ROLE_MAP med avsikt - storage/ ska
+# aldrig bero på agents/ (se PLAN_CRYPTO_PHASE3.md Global Constraints/
+# Self-review). Innehållsmässigt identisk mappning, medvetet duplicerad.
+_ASSESSMENT_FIELD_TYPES: dict[str, type[AssessmentBase]] = {
+    "news_sentiment": NewsSentimentAssessment,
+    "technical": TechnicalAssessment,
+    "bull_thesis": BullThesisAssessment,
+    "forecast": ForecastAssessment,
+    "risk": RiskAssessment,
+    "bear_adversarial": BearAdversarialAssessment,
+    "qa": QAAssessment,
+}
 
 
 class Repository(Protocol):
@@ -23,6 +46,9 @@ class Repository(Protocol):
     ) -> Candidate | None: ...
     def transition_candidate_with_event(
         self, candidate_id: str, new_status: str, updated_at: datetime, event: Event
+    ) -> None: ...
+    def save_assessment(
+        self, candidate_id: str, field_name: str, assessment: AssessmentBase
     ) -> None: ...
 
 
@@ -130,6 +156,24 @@ class SQLiteRepository:
             self._insert_corrupt_state_event(candidate_id, raw_status, "timestamp")
             raise CorruptCandidateStateError(candidate_id, raw_status, "timestamp") from exc
 
+        assessment_rows = self._conn.execute(
+            "SELECT field_name, payload FROM assessments WHERE candidate_id = ?", (candidate_id,)
+        ).fetchall()
+        for assessment_row in assessment_rows:
+            field_name = assessment_row["field_name"]
+            assessment_type = _ASSESSMENT_FIELD_TYPES.get(field_name)
+            if assessment_type is None:
+                continue  # okänt fältnamn i tabellen - ignoreras, inte ett candidate-korrupt-fel
+            try:
+                data[field_name] = assessment_type.model_validate_json(assessment_row["payload"])
+            except (ValidationError, ValueError) as exc:
+                self._insert_corrupt_state_event(
+                    candidate_id, raw_status, f"assessment:{field_name}"
+                )
+                raise CorruptCandidateStateError(
+                    candidate_id, raw_status, f"assessment:{field_name}"
+                ) from exc
+
         try:
             return Candidate(**data)
         except ValidationError as exc:
@@ -170,6 +214,16 @@ class SQLiteRepository:
             payload={"raw_status": raw_status, "corrupted_field": corrupted_field},
         )
         self._insert_event(event)
+        self._conn.commit()
+
+    def save_assessment(
+        self, candidate_id: str, field_name: str, assessment: AssessmentBase
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO assessments (candidate_id, field_name, payload) VALUES (?, ?, ?) "
+            "ON CONFLICT(candidate_id, field_name) DO UPDATE SET payload = excluded.payload",
+            (candidate_id, field_name, assessment.model_dump_json()),
+        )
         self._conn.commit()
 
     def find_candidates_by_status(self, status: str) -> list[Candidate]:

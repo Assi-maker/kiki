@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from crypto_trading.schemas.assessments import RiskAssessment
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import (
@@ -15,6 +16,21 @@ from crypto_trading.schemas.evidence import (
 )
 from crypto_trading.storage.exceptions import CorruptCandidateStateError
 from crypto_trading.storage.repository import SQLiteRepository
+
+
+def _risk_assessment() -> RiskAssessment:
+    return RiskAssessment(
+        agent_name="crypto-risk-agent",
+        run_id="run-1",
+        created_at=datetime.now(UTC),
+        status="ok",
+        suggested_stop_loss="1",
+        suggested_target="2",
+        downside="d",
+        liquidity_risk="l",
+        model_risk="m",
+        timing_risk="t",
+    )
 
 
 def _make_evidence() -> CandidateEvidenceRecord:
@@ -254,6 +270,54 @@ def test_find_latest_candidate_by_instrument_and_status_propagates_corrupt_state
 
     with pytest.raises(CorruptCandidateStateError):
         repo.find_latest_candidate_by_instrument_and_status("BTCUSDT", "REJECTED")
+
+
+def test_save_assessment_persists_and_get_candidate_reloads_it(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate()
+    repo.create_candidate_with_event(candidate, _make_event(candidate, "CANDIDATE_CREATED"))
+
+    repo.save_assessment(candidate.candidate_id, "risk", _risk_assessment())
+
+    reloaded = repo.get_candidate(candidate.candidate_id)
+    assert reloaded.risk is not None
+    assert reloaded.risk.downside == "d"
+    assert reloaded.news_sentiment is None  # oskrivna fält förblir None
+
+
+def test_save_assessment_is_idempotent_overwrite_on_retry(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate()
+    repo.create_candidate_with_event(candidate, _make_event(candidate, "CANDIDATE_CREATED"))
+
+    repo.save_assessment(candidate.candidate_id, "risk", _risk_assessment())
+    updated = _risk_assessment().model_copy(update={"downside": "changed"})
+    repo.save_assessment(candidate.candidate_id, "risk", updated)
+
+    reloaded = repo.get_candidate(candidate.candidate_id)
+    assert reloaded.risk.downside == "changed"
+    count = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM assessments WHERE candidate_id = ?", (candidate.candidate_id,)
+    ).fetchone()["n"]
+    assert count == 1  # overwrite, inte dubblett
+
+
+def test_get_candidate_raises_corrupt_state_error_on_corrupt_assessment(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate()
+    repo.create_candidate_with_event(candidate, _make_event(candidate, "CANDIDATE_CREATED"))
+    repo.save_assessment(candidate.candidate_id, "risk", _risk_assessment())
+    repo._conn.execute(
+        "UPDATE assessments SET payload = 'not valid json' "
+        "WHERE candidate_id = ? AND field_name = 'risk'",
+        (candidate.candidate_id,),
+    )
+    repo._conn.commit()
+
+    with pytest.raises(CorruptCandidateStateError) as exc_info:
+        repo.get_candidate(candidate.candidate_id)
+
+    assert exc_info.value.corrupted_field == "assessment:risk"
 
 
 def test_repository_protocol_exposes_no_update_or_delete_event_method():
