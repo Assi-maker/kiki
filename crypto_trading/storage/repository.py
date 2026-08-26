@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
 
@@ -20,6 +21,7 @@ from crypto_trading.schemas.assessments import (
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import CandidateEvidenceRecord
+from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.db import get_connection
 from crypto_trading.storage.exceptions import CorruptCandidateStateError
 
@@ -54,6 +56,20 @@ class Repository(Protocol):
         self, candidate_id: str, decision: str, reasons: list[str], evaluated_at: datetime
     ) -> None: ...
     def count_open_positions(self) -> int: ...
+    def create_position_with_event(self, position: Position, event: Event) -> bool: ...
+    def get_position(self, position_id: str) -> Position | None: ...
+    def find_open_positions(self) -> list[Position]: ...
+    def close_position_with_event(
+        self,
+        position_id: str,
+        theoretical_exit: Decimal,
+        simulated_fill_exit: Decimal,
+        exit_reason: str,
+        fees: Decimal,
+        funding: Decimal,
+        closed_at: datetime,
+        event: Event,
+    ) -> None: ...
 
 
 class SQLiteRepository:
@@ -247,6 +263,107 @@ class SQLiteRepository:
             "SELECT COUNT(*) AS n FROM positions WHERE status = 'OPEN_POSITION'"
         ).fetchone()
         return row["n"]
+
+    def create_position_with_event(self, position: Position, event: Event) -> bool:
+        try:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO positions "
+                "(position_id, candidate_id, instrument, direction, status, theoretical_entry, "
+                "simulated_fill_entry, stop_loss, target, size, fill_model_version, opened_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    position.position_id,
+                    position.candidate_id,
+                    position.instrument,
+                    position.direction,
+                    position.status,
+                    str(position.theoretical_entry),
+                    str(position.simulated_fill_entry),
+                    str(position.stop_loss),
+                    str(position.target),
+                    str(position.size),
+                    position.fill_model_version,
+                    position.opened_at.isoformat(),
+                ),
+            )
+            created = cur.rowcount > 0
+            if created:
+                self._insert_event(event)
+            self._conn.commit()
+            return created
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_position(self, position_id: str) -> Position | None:
+        row = self._conn.execute(
+            "SELECT * FROM positions WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_position(row)
+
+    @staticmethod
+    def _row_to_position(row) -> Position:
+        data = dict(row)
+        data["theoretical_entry"] = Decimal(data["theoretical_entry"])
+        data["simulated_fill_entry"] = Decimal(data["simulated_fill_entry"])
+        data["stop_loss"] = Decimal(data["stop_loss"])
+        data["target"] = Decimal(data["target"])
+        data["size"] = Decimal(data["size"])
+        data["opened_at"] = datetime.fromisoformat(data["opened_at"])
+        data["theoretical_exit"] = (
+            Decimal(data["theoretical_exit"]) if data["theoretical_exit"] is not None else None
+        )
+        data["simulated_fill_exit"] = (
+            Decimal(data["simulated_fill_exit"])
+            if data["simulated_fill_exit"] is not None
+            else None
+        )
+        data["fees"] = Decimal(data["fees"]) if data["fees"] is not None else None
+        data["funding"] = Decimal(data["funding"]) if data["funding"] is not None else None
+        data["closed_at"] = (
+            datetime.fromisoformat(data["closed_at"]) if data["closed_at"] is not None else None
+        )
+        return Position(**data)
+
+    def find_open_positions(self) -> list[Position]:
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE status = 'OPEN_POSITION'"
+        ).fetchall()
+        return [self._row_to_position(row) for row in rows]
+
+    def close_position_with_event(
+        self,
+        position_id: str,
+        theoretical_exit: Decimal,
+        simulated_fill_exit: Decimal,
+        exit_reason: str,
+        fees: Decimal,
+        funding: Decimal,
+        closed_at: datetime,
+        event: Event,
+    ) -> None:
+        try:
+            self._conn.execute(
+                "UPDATE positions SET status = 'CLOSED', theoretical_exit = ?, "
+                "simulated_fill_exit = ?, exit_reason = ?, fees = ?, funding = ?, closed_at = ? "
+                "WHERE position_id = ?",
+                (
+                    str(theoretical_exit),
+                    str(simulated_fill_exit),
+                    exit_reason,
+                    str(fees),
+                    str(funding),
+                    closed_at.isoformat(),
+                    position_id,
+                ),
+            )
+            self._insert_event(event)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def find_candidates_by_status(self, status: str) -> list[Candidate]:
         """Ett korrupt candidate-state (CorruptCandidateStateError) hoppas
