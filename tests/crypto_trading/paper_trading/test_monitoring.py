@@ -84,6 +84,51 @@ def test_no_time_limit_trigger_before_max_hold_hours():
     assert result is None
 
 
+def test_gap_down_through_stop_loss_fills_at_candle_low_not_stop_level():
+    """AC5, gap ned: priset gappar långt under stop_loss (49000) mellan två
+    övervakningstillfällen - fill-priset ska vara candle_low (49500... nej,
+    lägre än stop), aldrig den exakta stop-nivån."""
+    result = check_exit_trigger(
+        _position(stop_loss="49000"),
+        candle_low=Decimal("47500"),  # gappade långt under stop
+        candle_high=Decimal("49800"),
+        current_price=Decimal("47600"),
+        now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24,
+    )
+    assert result == ("stop_loss", Decimal("47500"))
+    exit_reason, trigger_price = result
+    assert trigger_price != Decimal("49000")  # aldrig exakt SL-nivån vid gap
+    assert trigger_price < Decimal("49000")  # strikt sämre än stop, konservativt
+
+
+def test_gap_up_through_target_fills_at_target_not_candle_high():
+    """AC5, gap upp: priset gappar långt över target (52000) mellan två
+    övervakningstillfällen - fill-priset ska vara target, aldrig det
+    gynnsamma extremvärdet (candle_high)."""
+    result = check_exit_trigger(
+        _position(target="52000"),
+        candle_low=Decimal("51800"),
+        candle_high=Decimal("54000"),  # gappade långt över target
+        current_price=Decimal("53900"),
+        now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24,
+    )
+    assert result == ("target", Decimal("52000"))
+    exit_reason, trigger_price = result
+    assert trigger_price != Decimal("54000")  # aldrig det gynnsamma extremvärdet
+    assert trigger_price == Decimal("52000")  # konservativt: aldrig bättre än target
+
+
+def test_fill_model_version_is_available_for_the_resulting_position():
+    """Påminnelse: fill_model_version sätts på Position-objektet av
+    position_opening.py/position_closing.py (Task 7/8) - check_exit_trigger
+    själv rör inte Position-persistens, bara beslutet."""
+    from crypto_trading.paper_trading.execution import FILL_MODEL_VERSION
+
+    assert FILL_MODEL_VERSION == "v1"
+
+
 def test_stop_loss_checked_before_time_limit_when_both_true():
     """Deterministisk prioritetsordning: SL/TP kollas alltid före tidsgräns."""
     result = check_exit_trigger(
