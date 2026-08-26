@@ -80,7 +80,11 @@ def test_opens_position_with_theoretical_and_simulated_fields_separated(tmp_path
     candidate = _confirmed_candidate()
 
     position = open_position_for_candidate(
-        candidate, repo, _risk_limits(), reference_price=Decimal("50000"), opened_at=_NOW,
+        candidate,
+        repo,
+        _risk_limits(),
+        reference_price=Decimal("50000"),
+        opened_at=_NOW,
         run_id="run-1",
     )
 
@@ -97,7 +101,11 @@ def test_position_id_equals_candidate_id(tmp_path):
     candidate = _confirmed_candidate(candidate_id="cand-xyz")
 
     position = open_position_for_candidate(
-        candidate, repo, _risk_limits(), reference_price=Decimal("50000"), opened_at=_NOW,
+        candidate,
+        repo,
+        _risk_limits(),
+        reference_price=Decimal("50000"),
+        opened_at=_NOW,
         run_id="run-1",
     )
 
@@ -110,11 +118,19 @@ def test_calling_twice_for_same_candidate_creates_only_one_position(tmp_path):
     candidate = _confirmed_candidate()
 
     first = open_position_for_candidate(
-        candidate, repo, _risk_limits(), reference_price=Decimal("50000"), opened_at=_NOW,
+        candidate,
+        repo,
+        _risk_limits(),
+        reference_price=Decimal("50000"),
+        opened_at=_NOW,
         run_id="run-1",
     )
     second = open_position_for_candidate(
-        candidate, repo, _risk_limits(), reference_price=Decimal("50000"), opened_at=_NOW,
+        candidate,
+        repo,
+        _risk_limits(),
+        reference_price=Decimal("50000"),
+        opened_at=_NOW,
         run_id="run-2",
     )
 
@@ -128,7 +144,11 @@ def test_returns_none_when_candidate_not_confirmed(tmp_path):
     candidate = _confirmed_candidate(status="NO_TRADE")
 
     result = open_position_for_candidate(
-        candidate, repo, _risk_limits(), reference_price=Decimal("50000"), opened_at=_NOW,
+        candidate,
+        repo,
+        _risk_limits(),
+        reference_price=Decimal("50000"),
+        opened_at=_NOW,
         run_id="run-1",
     )
 
@@ -141,7 +161,11 @@ def test_direction_is_always_long(tmp_path):
     candidate = _confirmed_candidate()
 
     position = open_position_for_candidate(
-        candidate, repo, _risk_limits(), reference_price=Decimal("50000"), opened_at=_NOW,
+        candidate,
+        repo,
+        _risk_limits(),
+        reference_price=Decimal("50000"),
+        opened_at=_NOW,
         run_id="run-1",
     )
 
