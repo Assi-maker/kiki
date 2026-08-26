@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS candidates (
     updated_at TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_candidates_instrument_status
+    ON candidates(instrument, status, created_at);
+
 CREATE TABLE IF NOT EXISTS assessments (
     candidate_id TEXT NOT NULL,
     field_name TEXT NOT NULL,

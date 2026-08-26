@@ -18,6 +18,9 @@ class Repository(Protocol):
     def create_candidate_with_event(self, candidate: Candidate, event: Event) -> bool: ...
     def get_candidate(self, candidate_id: str) -> Candidate | None: ...
     def find_candidates_by_status(self, status: str) -> list[Candidate]: ...
+    def find_latest_candidate_by_instrument_and_status(
+        self, instrument: str, status: str
+    ) -> Candidate | None: ...
     def transition_candidate_with_event(
         self, candidate_id: str, new_status: str, updated_at: datetime, event: Event
     ) -> None: ...
@@ -134,6 +137,24 @@ class SQLiteRepository:
             corrupted_field = "status" if status_error else "candidate"
             self._insert_corrupt_state_event(candidate_id, raw_status, corrupted_field)
             raise CorruptCandidateStateError(candidate_id, raw_status, corrupted_field) from exc
+
+    def find_latest_candidate_by_instrument_and_status(
+        self, instrument: str, status: str
+    ) -> Candidate | None:
+        """Till skillnad från `find_candidates_by_status()` sväljer denna
+        metod INTE ett `CorruptCandidateStateError` - den returnerar en
+        specifik, namngiven rad, och om just den raden är korrupt är det
+        direkt relevant för anroparen (dedup/cooldown-beslutet får då
+        fail-closed genom att låta felet propagera, inte tyst falla
+        tillbaka till "ingen cooldown finns")."""
+        row = self._conn.execute(
+            "SELECT candidate_id FROM candidates WHERE instrument = ? AND status = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (instrument, status),
+        ).fetchone()
+        if row is None:
+            return None
+        return self.get_candidate(row["candidate_id"])
 
     def _insert_corrupt_state_event(
         self, candidate_id: str, raw_status: str, corrupted_field: str

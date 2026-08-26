@@ -215,6 +215,47 @@ def test_find_candidates_by_status_skips_corrupt_rows_and_keeps_valid_ones(tmp_p
     assert corrupt_event is not None  # ändå auditerad, trots att den uteslöts ur resultatet
 
 
+def test_find_latest_candidate_by_instrument_and_status_returns_none_when_no_match(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    assert repo.find_latest_candidate_by_instrument_and_status("BTCUSDT", "REJECTED") is None
+
+
+def test_find_latest_candidate_by_instrument_and_status_returns_most_recent(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    older = _make_candidate(candidate_id="cand-old", idempotency_key="key-old", status="REJECTED")
+    newer = _make_candidate(candidate_id="cand-new", idempotency_key="key-new", status="REJECTED")
+    older = older.model_copy(update={"created_at": datetime(2026, 8, 20, tzinfo=UTC)})
+    newer = newer.model_copy(update={"created_at": datetime(2026, 8, 21, tzinfo=UTC)})
+    repo.create_candidate_with_event(older, _make_event(older, "CANDIDATE_CREATED"))
+    repo.create_candidate_with_event(newer, _make_event(newer, "CANDIDATE_CREATED"))
+
+    result = repo.find_latest_candidate_by_instrument_and_status("BTCUSDT", "REJECTED")
+
+    assert result is not None
+    assert result.candidate_id == "cand-new"
+
+
+def test_find_latest_candidate_by_instrument_and_status_ignores_other_status(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate(status="CANDIDATE")
+    repo.create_candidate_with_event(candidate, _make_event(candidate, "CANDIDATE_CREATED"))
+
+    assert repo.find_latest_candidate_by_instrument_and_status("BTCUSDT", "REJECTED") is None
+
+
+def test_find_latest_candidate_by_instrument_and_status_propagates_corrupt_state_error(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate(status="REJECTED")
+    repo.create_candidate_with_event(candidate, _make_event(candidate, "CANDIDATE_CREATED"))
+    repo._conn.execute(
+        "UPDATE candidates SET evidence_record = 'not valid json' WHERE candidate_id = 'cand-1'"
+    )
+    repo._conn.commit()
+
+    with pytest.raises(CorruptCandidateStateError):
+        repo.find_latest_candidate_by_instrument_and_status("BTCUSDT", "REJECTED")
+
+
 def test_repository_protocol_exposes_no_update_or_delete_event_method():
     assert not hasattr(SQLiteRepository, "update_event")
     assert not hasattr(SQLiteRepository, "delete_event")
