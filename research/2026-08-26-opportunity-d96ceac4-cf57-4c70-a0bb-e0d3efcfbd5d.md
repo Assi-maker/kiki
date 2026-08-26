@@ -1,0 +1,60 @@
+# OPPORTUNITY #d96ceac4-cf57-4c70-a0bb-e0d3efcfbd5d
+
+## Vad hände?
+d
+
+## Varför är detta intressant?
+i
+
+## Vilka bevis finns?
+- s
+
+## Marknadsdata
+Ingen marknadsdata registrerad
+i
+
+## Vad talar FÖR?
+h
+
+## Vad talar EMOT?
+Inga motargument registrerade
+
+## Vilka alternativa förklaringar finns?
+Inga alternativa förklaringar registrerade
+
+## Vad kan hända?
+- up: 60%
+
+## Sannolikheter:
+- up: 60%
+
+## Risk:
+Downside: d
+Likviditetsrisk: l
+Modellrisk: m
+Timingrisk: t
+
+## Historiska jämförelser:
+Ej tillgängligt i Fas 1 — Historical/Backtest Agent byggs i Fas 3.
+
+## Data quality:
+0.2
+
+## Confidence:
+0.6
+
+## Overall opportunity score:
+0.487
+
+## Time horizon:
+okänt — bedöms av Forecasting Agent
+
+## Vad skulle falsifiera hypotesen?
+f
+
+## Status:
+reported
+
+---
+*Ej finansiell rådgivning: Detta är research. Inga verkliga trades har
+genomförts eller föreslagits genomföras av mig.*

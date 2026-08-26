@@ -4,12 +4,12 @@ from datetime import datetime
 from decimal import Decimal
 
 from crypto_trading.schemas.candidate import Candidate
+from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import (
     CandidateEvidenceRecord,
     compute_candidate_idempotency_key,
     compute_evidence_hash,
 )
-from crypto_trading.schemas.event import Event
 from crypto_trading.state_machine import can_transition
 from crypto_trading.storage.repository import Repository
 

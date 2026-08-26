@@ -182,7 +182,9 @@ def test_process_evidence_allows_reanalysis_after_cooldown_expires(tmp_path):
 
 
 def _candidate_via_process_evidence(repo, instrument, score, run_id="run-1", at=_NOW):
-    evidence = _evidence(instrument=instrument, trigger_reasons=["price_volatility"], candidate_score=score)
+    evidence = _evidence(
+        instrument=instrument, trigger_reasons=["price_volatility"], candidate_score=score
+    )
     return process_evidence(repo, evidence, discovery_run_id=run_id, created_at=at)
 
 

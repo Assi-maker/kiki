@@ -143,9 +143,7 @@ def build_funding_oi_evidence(
     history = ordered[:-1]
     value = abs(latest.funding_rate) * 100
     baseline = (
-        sum(abs(f.funding_rate) for f in history) / len(history) * 100
-        if history
-        else Decimal("0")
+        sum(abs(f.funding_rate) for f in history) / len(history) * 100 if history else Decimal("0")
     )
     return FundingOpenInterestEvidence(
         triggered=value > threshold_pct,

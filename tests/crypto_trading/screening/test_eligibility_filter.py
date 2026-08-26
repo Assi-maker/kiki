@@ -136,7 +136,10 @@ def test_select_top_n_membership_alone_never_touches_storage():
     source = Path("crypto_trading/screening/eligibility_filter.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     imported_modules = {
-        alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
     } | {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
     assert not any(m.startswith("crypto_trading.storage") for m in imported_modules)
 

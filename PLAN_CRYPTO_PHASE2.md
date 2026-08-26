@@ -1,10 +1,19 @@
 # Crypto Trading — Phase 2 (Universe + Quant Screening) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
-## Status: EJ PÅBÖRJAD (skriven 2026-08-26)
+## Status: KLAR (2026-08-26)
 
-Fas 1 är avslutad och mergad till `master` (commit `647bd12`). Denna plan väntar på användarens granskning och godkännande innan någon kod skrivs. Ingen exekvering har startat.
+Alla 10 tasks genomförda på branch `crypto-trading/phase-2`. 177 tester i `tests/crypto_trading/` (129 från Phase 0+1 + 48 nya, exklusive 1 `@pytest.mark.live`-test avsiktligt exkluderad). Full repo-svit (`intelligence/` + `crypto_trading/` + `test_setup`): 281 passed, 1 deselected. `ruff check` och `ruff format --check`: rena. `git diff master -- intelligence/`: tom. `test_no_intelligence_coupling.py`: 3/3 PASS. Grep-guard mot BUY/SELL/LONG/SHORT i `crypto_trading/screening/`: inga träffar.
+
+**Två verkliga buggar hittade och åtgärdade under exekvering** (utöver planens ordalydelse, se Task 5:s commit):
+
+1. **RSI-kant (momentum/breakout):** ett helt platt klines-fönster (inga gains, inga losses) gav `RSI=100` (tolkat som maximalt överköpt) istället för det korrekta neutrala `50` — `avg_gain==0 and avg_loss==0` hanterades inte som ett eget fall.
+2. **Volym-zscore-kant:** nollvarians i den historiska volymen (helt identiska tidigare klines) gav `zscore=0` (ingen anomali) även när det senaste värdet var en kraftig spik mot den flata historiken — matematiskt odefinierat fall (division med noll) behandlades felaktigt som "inget att se" istället för det mest anomala fallet som finns.
+
+Två testfixture-buggar (inte implementationsbuggar) upptäcktes och rättades i samma steg: `funding_rate="0.001"` (0,1 %) låg redan över den avsedda "låg funding rate"-testets tröskel på `0.05` (0,05 %) — bytt till `"0.0001"` (0,01 %) i de två drabbade testerna.
+
+Väntar på användarens slutliga granskning innan merge till `master`. Phase 3 är inte påbörjad.
 
 ---
 
@@ -39,7 +48,7 @@ Fas 1 är avslutad och mergad till `master` (commit `647bd12`). Denna plan vänt
 **Interfaces:**
 - Produces: `PipelineConfig` får tio nya fält (eligibility- och screener-trösklar + cooldown-override-tröskel), alla `Decimal` där de representerar penning-/procentvärden (samma "aldrig via float"-princip som `risk_limits.yaml`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Lägg till i `tests/crypto_trading/config/test_loader.py`:
 
@@ -113,12 +122,12 @@ def _valid_phase2_pipeline_kwargs() -> dict:
 
 (Befintliga Phase 1-negativtester som konstruerar `PipelineConfig` direkt med en fullständig kwargs-dict måste också uppdateras att inkludera de nya obligatoriska fälten — annars blir de `TypeError` istället för det avsedda `ValidationError`. Uppdatera `test_pipeline_config_rejects_missing_max_data_age_seconds_key` och `test_pipeline_config_rejects_missing_required_fields_key` att använda `_valid_phase2_pipeline_kwargs()` som bas med respektive fält borttaget/trunkerat, istället för de hårdkodade dictarna.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/config/test_loader.py -v`
 Expected: de tre nya testerna FAIL (`AttributeError`/`TypeError` — fälten finns inte än).
 
-- [ ] **Step 3: Modify `pipeline.yaml`**
+- [x] **Step 3: Modify `pipeline.yaml`**
 
 Lägg till efter `kline_consistency_tolerance_pct`:
 
@@ -137,7 +146,7 @@ evidence_change_threshold_for_reanalysis: "0.15"
 
 (Trösklarna är strategi-parametrar, inte BingX-verifierade fakta som Phase 1:s `required_fields` — de är avsiktligt konservativa startvärden, fritt omställbara i config utan kodändring.)
 
-- [ ] **Step 4: Modify `loader.py`**
+- [x] **Step 4: Modify `loader.py`**
 
 Lägg till i `PipelineConfig` (efter `kline_consistency_tolerance_pct`):
 
@@ -154,7 +163,7 @@ Lägg till i `PipelineConfig` (efter `kline_consistency_tolerance_pct`):
     evidence_change_threshold_for_reanalysis: Decimal = Field(ge=0)
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/config/test_loader.py -v`
 Expected: alla tester PASS, inklusive de tre nya och de två uppdaterade negativtesterna.
@@ -171,7 +180,7 @@ Expected: alla tester PASS, inklusive de tre nya och de två uppdaterade negativ
 **Interfaces:**
 - Produces: `Repository.find_latest_candidate_by_instrument_and_status(instrument: str, status: str) -> Candidate | None`. Ett index `idx_candidates_instrument_status` på `candidates(instrument, status, created_at)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Lägg till i `tests/crypto_trading/storage/test_repository_candidate.py`:
 
@@ -218,12 +227,12 @@ def test_find_latest_candidate_by_instrument_and_status_propagates_corrupt_state
         repo.find_latest_candidate_by_instrument_and_status("BTCUSDT", "REJECTED")
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/storage/test_repository_candidate.py -v`
 Expected: de fyra nya testerna FAIL med `AttributeError` (metoden finns inte än).
 
-- [ ] **Step 3: Modify `storage/db.py`**
+- [x] **Step 3: Modify `storage/db.py`**
 
 Lägg till index i `_SCHEMA`, direkt efter `candidates`-tabellens definition:
 
@@ -232,7 +241,7 @@ CREATE INDEX IF NOT EXISTS idx_candidates_instrument_status
     ON candidates(instrument, status, created_at);
 ```
 
-- [ ] **Step 4: Modify `storage/repository.py`**
+- [x] **Step 4: Modify `storage/repository.py`**
 
 Lägg till i `Repository`-protokollet:
 
@@ -264,7 +273,7 @@ Lägg till i `SQLiteRepository` (efter `find_candidates_by_status`):
         return self.get_candidate(row["candidate_id"])
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/storage/ -v`
 Expected: alla tester PASS, inklusive de fyra nya och samtliga befintliga (ingen regression av index-tillägget).
@@ -282,7 +291,7 @@ Expected: alla tester PASS, inklusive de fyra nya och samtliga befintliga (ingen
 **Interfaces:**
 - Produces: `check_eligibility(instrument: InstrumentMetadata, ticker: Ticker, data_quality_status: Literal["ok","invalid"], min_quote_volume_24h_usdt: Decimal, max_spread_pct: Decimal) -> tuple[bool, str]`, `compute_spread_pct(ticker: Ticker) -> Decimal`, `select_top_n(eligible: list[Ticker], n: int) -> list[str]`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/crypto_trading/screening/test_eligibility_filter.py`:
 
@@ -410,12 +419,12 @@ def test_select_top_n_membership_alone_never_touches_storage():
     assert not any(m.startswith("crypto_trading.storage") for m in imported_modules)
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/screening/test_eligibility_filter.py -v`
 Expected: FAIL med `ModuleNotFoundError` (paketet finns inte än).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crypto_trading/screening/__init__.py`: tom fil.
 
@@ -464,7 +473,7 @@ def select_top_n(eligible: list[Ticker], n: int) -> list[str]:
     return [t.instrument for t in ranked[:n]]
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/screening/test_eligibility_filter.py -v`
 Expected: alla tester PASS.
@@ -480,7 +489,7 @@ Expected: alla tester PASS.
 **Interfaces:**
 - Produces: `build_price_volatility_evidence(klines, threshold_pct, lookback, evaluated_at) -> PriceVolatilityEvidence`, `build_momentum_breakout_evidence(klines, rsi_period, overbought_threshold, evaluated_at) -> MomentumBreakoutEvidence`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/crypto_trading/screening/test_quant_screener.py` (grund som utökas i Task 5):
 
@@ -574,12 +583,12 @@ def test_momentum_breakout_does_not_trigger_on_flat_prices():
 
 (`import pytest` läggs till högst upp för `pytest.approx`.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/screening/test_quant_screener.py -v`
 Expected: FAIL med `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crypto_trading/screening/quant_screener.py` (grund + Del A):
 
@@ -661,7 +670,7 @@ def build_momentum_breakout_evidence(
     )
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/screening/test_quant_screener.py -v`
 Expected: alla tester PASS.
@@ -679,7 +688,7 @@ Expected: alla tester PASS.
 
 **Verifierad upptäckt (dokumenterad, ej blockerande):** `BingXMarketDataConnector.get_open_interest()` (Phase 1) returnerar bara en aktuell engångssnapshot — ingen OI-historik-endpoint implementerades i Phase 1 (SPEC §14 nämner orderbok/spread och OI som tillgängliga, men ingen OI-tidsserie). `funding_oi_evidence` baseras därför i Phase 2 uteslutande på funding-rate-historik (redan stödd av `get_funding_rate(symbol, limit=N)`), vilket är tillräckligt för ett deterministiskt, reproducerbart signalmått. Aktuell `open_interest` är fortsatt en del av den kritiska data som §8.1/`required_fields` kräver för `data_quality_status`, men bidrar inte till detta signalmåttets numeriska baseline i Phase 2 — en enkel, SPEC-förenlig avgränsning, inte en spec-avvikelse (SPEC kräver bara att `funding_oi_evidence`-typen finns och är deterministisk).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Lägg till i `tests/crypto_trading/screening/test_quant_screener.py`:
 
@@ -817,12 +826,12 @@ def test_evaluate_candidate_short_circuits_on_invalid_data_quality():
     assert record.candidate_score == 0.0
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/screening/test_quant_screener.py -v`
 Expected: nya testerna FAIL med `ImportError`/`AttributeError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Lägg till i `crypto_trading/screening/quant_screener.py`:
 
@@ -987,7 +996,7 @@ def evaluate_candidate(
 
 (Flytta `Literal`-importen och `CandidateEvidenceRecord`/`VolumeEvidence`/`FundingOpenInterestEvidence`/`FundingRate`-importerna upp till filens toppimport-block tillsammans med Del A:s importer, inte som separata mitt-i-filen-importer — ovan visat separat bara för läsbarhet i denna plan.)
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/screening/test_quant_screener.py -v`
 Expected: alla tester PASS.
@@ -1003,7 +1012,7 @@ Expected: alla tester PASS.
 **Interfaces:**
 - Produces: `process_evidence(repo, evidence, discovery_run_id, created_at) -> Candidate | None`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/crypto_trading/screening/test_candidate_engine.py`:
 
@@ -1169,12 +1178,12 @@ def _rejection_event(candidate_id: str):
     )
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/screening/test_candidate_engine.py -v`
 Expected: FAIL med `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crypto_trading/screening/candidate_engine.py`:
 
@@ -1308,7 +1317,7 @@ def process_evidence(
     return _persist_new_candidate(repo, evidence, discovery_run_id, created_at)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/screening/test_candidate_engine.py -v`
 Expected: alla tester PASS.
@@ -1324,7 +1333,7 @@ Expected: alla tester PASS.
 **Interfaces:**
 - Produces: `prioritize_and_apply_budget(repo, candidates, liquidity_by_instrument, max_candidates_per_discovery_run, evaluated_at, run_id) -> tuple[list[Candidate], list[Candidate]]`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Lägg till i `tests/crypto_trading/screening/test_candidate_engine.py`:
 
@@ -1396,12 +1405,12 @@ def test_prioritize_and_apply_budget_uses_liquidity_as_tiebreaker(tmp_path):
     assert [c.instrument for c in within] == ["BBBUSDT"]  # högre likviditet vinner vid oavgjort
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/screening/test_candidate_engine.py -v`
 Expected: nya testerna FAIL med `AttributeError`/`ImportError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Lägg till i `crypto_trading/screening/candidate_engine.py`:
 
@@ -1441,7 +1450,7 @@ def prioritize_and_apply_budget(
     return within_budget, limited
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/screening/test_candidate_engine.py -v`
 Expected: alla tester PASS.
@@ -1455,7 +1464,7 @@ Expected: alla tester PASS.
 
 **Interfaces:** inga nya — rent testtillägg mot befintlig `select_top_n`/`check_eligibility`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Lägg till i `tests/crypto_trading/screening/test_eligibility_filter.py`:
 
@@ -1494,12 +1503,12 @@ def test_top_n_selection_alone_creates_no_candidate_rows():
 
 (Den strukturella importgräns-testen `test_select_top_n_membership_alone_never_touches_storage` från Task 3 kompletterar redan denna AC — tillsammans täcker de båda halvorna av AC4.)
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/screening/test_eligibility_filter.py -v -k top_n_membership_changes`
 Expected: FAIL — Top N-funktionen finns redan (Task 3), så detta test ska egentligen redan kunna passera om Task 3 implementerades korrekt. Om det FAILAR av annan anledning än att testet är nytt (t.ex. sorteringsbugg), fixa `select_top_n` innan Step 3.
 
-- [ ] **Step 3: Confirm passing (ingen ny produktionskod förväntas)**
+- [x] **Step 3: Confirm passing (ingen ny produktionskod förväntas)**
 
 Run: `pytest tests/crypto_trading/screening/test_eligibility_filter.py -v`
 Expected: alla tester PASS, inklusive de två nya. Om `select_top_n` redan var korrekt implementerad i Task 3 är detta en ren regressions-/AC-bekräftelsetask utan kodändring.
@@ -1514,7 +1523,7 @@ Expected: alla tester PASS, inklusive de två nya. Om `select_top_n` redan var k
 
 **Interfaces:** inga nya — rena tester mot befintliga scheman/moduler.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/crypto_trading/screening/test_evidence_schema_guard.py`:
 
@@ -1666,12 +1675,12 @@ def test_full_discovery_chain_from_eligibility_to_persisted_candidate(tmp_path):
     assert reloaded.evidence_record.data_quality_status == "ok"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/screening/test_evidence_schema_guard.py tests/crypto_trading/screening/test_screening_integration.py -v`
 Expected: om alla tidigare tasks är korrekt implementerade FAILAR dessa bara om ett verkligt AC5-brott eller integrationsfel upptäcks — annars är de gröna direkt (rent verifieringstillägg, ingen ny produktionskod krävs). Kör ändå innan Step 3 för att bekräfta.
 
-- [ ] **Step 3: Fix any discovered issues, then confirm passing**
+- [x] **Step 3: Fix any discovered issues, then confirm passing**
 
 Run: `pytest tests/crypto_trading/screening/ -v`
 Expected: samtliga screening-tester PASS.
@@ -1682,12 +1691,12 @@ Expected: samtliga screening-tester PASS.
 
 **Files:** inga (bara verifieringskommandon).
 
-- [ ] **Step 1: Full testsvit för crypto_trading**
+- [x] **Step 1: Full testsvit för crypto_trading**
 
 Run: `pytest tests/crypto_trading/ -v`
 Expected: alla tester gröna, inklusive alla nya `screening/`-tester.
 
-- [ ] **Step 2: Ruff check + format**
+- [x] **Step 2: Ruff check + format**
 
 Run: `ruff check crypto_trading/ tests/crypto_trading/`
 Expected: inga fel.
@@ -1695,29 +1704,29 @@ Expected: inga fel.
 Run: `ruff format --check crypto_trading/ tests/crypto_trading/`
 Expected: inga diff.
 
-- [ ] **Step 3: Verifiera att intelligence/ fortfarande är orört**
+- [x] **Step 3: Verifiera att intelligence/ fortfarande är orört**
 
 Run: `git diff master -- intelligence/`
 Expected: tom output.
 
-- [ ] **Step 4: Full repo-testsvit**
+- [x] **Step 4: Full repo-testsvit**
 
 Run: `pytest -v`
 Expected: alla tester (crypto_trading Phase 0/1/2, intelligence, test_setup) gröna, ingen regression.
 
-- [ ] **Step 5: Verifiera importgräns och broker-frihet fortfarande håller**
+- [x] **Step 5: Verifiera importgräns och broker-frihet fortfarande håller**
 
 Run: `pytest tests/crypto_trading/test_no_intelligence_coupling.py -v`
 Expected: PASS — testet globar hela `crypto_trading/` och fångar Phase 2:s nya filer automatiskt.
 
-- [ ] **Step 6: Explicit grep-guard mot riktningsord i screening/**
+- [x] **Step 6: Explicit grep-guard mot riktningsord i screening/**
 
 Run: `grep -rniE "\b(buy|sell|long|short)\b" crypto_trading/screening/`
 Expected: ingen träff (utöver ev. kommentarer som citerar SPEC:ens förbudslista själva — granska manuellt om något matchar).
 
-- [ ] **Step 7: Uppdatera PLAN_CRYPTO_PHASE2.md**
+- [x] **Step 7: Uppdatera PLAN_CRYPTO_PHASE2.md**
 
-Kryssa i samtliga `- [ ]` till `- [x]` och lägg till en statusbanner högst upp med exakt testantal och ev. avvikelser upptäckta under exekvering, i samma format som `PLAN_CRYPTO_PHASE1.md`.
+Kryssa i samtliga `- [x]` till `- [x]` och lägg till en statusbanner högst upp med exakt testantal och ev. avvikelser upptäckta under exekvering, i samma format som `PLAN_CRYPTO_PHASE1.md`.
 
 ---
 

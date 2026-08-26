@@ -139,9 +139,7 @@ def test_funding_oi_evidence_triggers_on_high_abs_funding_rate():
 
 def test_funding_oi_evidence_does_not_trigger_on_low_funding_rate():
     history = [_funding("0.0001", offset_hours=8 * i) for i in range(0, 5)]
-    evidence = build_funding_oi_evidence(
-        history, threshold_pct=Decimal("0.05"), evaluated_at=_NOW
-    )
+    evidence = build_funding_oi_evidence(history, threshold_pct=Decimal("0.05"), evaluated_at=_NOW)
     assert evidence.triggered is False
 
 

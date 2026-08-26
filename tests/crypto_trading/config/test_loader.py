@@ -146,7 +146,9 @@ def test_get_settings_loads_phase2_fields():
 
 def test_pipeline_config_rejects_negative_eligibility_min_volume():
     with pytest.raises(ValidationError):
-        PipelineConfig(**_valid_pipeline_kwargs(eligibility_min_quote_volume_24h_usdt=Decimal("-1")))
+        PipelineConfig(
+            **_valid_pipeline_kwargs(eligibility_min_quote_volume_24h_usdt=Decimal("-1"))
+        )
 
 
 def test_pipeline_config_rejects_spread_pct_above_one():
