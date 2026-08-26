@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import (
@@ -8,7 +9,10 @@ from crypto_trading.schemas.evidence import (
     PriceVolatilityEvidence,
     VolumeEvidence,
 )
-from crypto_trading.screening.candidate_engine import process_evidence
+from crypto_trading.screening.candidate_engine import (
+    prioritize_and_apply_budget,
+    process_evidence,
+)
 from crypto_trading.storage.repository import SQLiteRepository
 
 _NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
@@ -175,3 +179,82 @@ def test_process_evidence_allows_reanalysis_after_cooldown_expires(tmp_path):
     )
 
     assert result is not None
+
+
+def _candidate_via_process_evidence(repo, instrument, score, run_id="run-1", at=_NOW):
+    evidence = _evidence(instrument=instrument, trigger_reasons=["price_volatility"], candidate_score=score)
+    return process_evidence(repo, evidence, discovery_run_id=run_id, created_at=at)
+
+
+def test_prioritize_and_apply_budget_keeps_highest_score_within_budget(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    low = _candidate_via_process_evidence(repo, "AAAUSDT", score=0.2)
+    high = _candidate_via_process_evidence(repo, "BBBUSDT", score=0.9)
+
+    within, over = prioritize_and_apply_budget(
+        repo,
+        [low, high],
+        liquidity_by_instrument={},
+        max_candidates_per_discovery_run=1,
+        evaluated_at=_NOW,
+        run_id="run-1",
+    )
+
+    assert [c.instrument for c in within] == ["BBBUSDT"]
+    assert [c.instrument for c in over] == ["AAAUSDT"]
+
+
+def test_prioritize_and_apply_budget_transitions_excess_to_budget_limited(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    low = _candidate_via_process_evidence(repo, "AAAUSDT", score=0.2)
+    high = _candidate_via_process_evidence(repo, "BBBUSDT", score=0.9)
+
+    prioritize_and_apply_budget(
+        repo,
+        [low, high],
+        liquidity_by_instrument={},
+        max_candidates_per_discovery_run=1,
+        evaluated_at=_NOW,
+        run_id="run-1",
+    )
+
+    reloaded_low = repo.get_candidate(low.candidate_id)
+    reloaded_high = repo.get_candidate(high.candidate_id)
+    assert reloaded_low.status == "BUDGET_LIMITED"
+    assert reloaded_high.status == "CANDIDATE"  # oförändrad - inga AI-anrop i denna fas
+
+
+def test_prioritize_and_apply_budget_never_marks_excess_as_rejected(tmp_path):
+    """SPEC §10: BUDGET_LIMITED, aldrig REJECTED - skiljer resursbrist från
+    sakligt underkännande."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    only = _candidate_via_process_evidence(repo, "AAAUSDT", score=0.2)
+
+    prioritize_and_apply_budget(
+        repo,
+        [only],
+        liquidity_by_instrument={},
+        max_candidates_per_discovery_run=0,
+        evaluated_at=_NOW,
+        run_id="run-1",
+    )
+
+    reloaded = repo.get_candidate(only.candidate_id)
+    assert reloaded.status == "BUDGET_LIMITED"
+
+
+def test_prioritize_and_apply_budget_uses_liquidity_as_tiebreaker(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    a = _candidate_via_process_evidence(repo, "AAAUSDT", score=0.5)
+    b = _candidate_via_process_evidence(repo, "BBBUSDT", score=0.5)  # samma score
+
+    within, _over = prioritize_and_apply_budget(
+        repo,
+        [a, b],
+        liquidity_by_instrument={"AAAUSDT": Decimal("1000"), "BBBUSDT": Decimal("9000")},
+        max_candidates_per_discovery_run=1,
+        evaluated_at=_NOW,
+        run_id="run-1",
+    )
+
+    assert [c.instrument for c in within] == ["BBBUSDT"]  # högre likviditet vinner vid oavgjort
