@@ -68,7 +68,9 @@ class BaseMarketDataConnector:
         except httpx.HTTPError as exc:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             detail = f"HTTP {status_code}" if status_code is not None else type(exc).__name__
-            raise ConnectorUnavailableError(f"BingX otillgänglig: {path} ({detail})") from exc
+            raise ConnectorUnavailableError(
+                f"{self._source_name} otillgänglig: {path} ({detail})"
+            ) from exc
         self._cache_set(cache_key, data)
         return data
 
@@ -84,14 +86,24 @@ class BaseMarketDataConnector:
             with httpx.Client(timeout=self._timeout_seconds) as client:
                 response = client.get(f"{self._base_url}{path}", params=params)
                 response.raise_for_status()
-                body = response.json()
-            if body.get("code") != 0:
-                raise ConnectorUnavailableError(
-                    f"BingX API-fel {body.get('code')}: {body.get('msg')} ({path})"
-                )
-            return body["data"]
+            return self._parse_response(response, path)
 
         return _do()
+
+    # Klassattribut, override:as av subklasser för tydligare felmeddelanden
+    # (t.ex. "BingX otillgänglig: ..." vs "CoinDesk RSS otillgänglig: ...").
+    _source_name: str = "market data source"
+
+    def _parse_response(self, response: httpx.Response, path: str) -> object:
+        """Hook: tolkar det råa HTTP-svaret till anropbar data. BASEN gör
+        INGET antagande om svarsformat (JSON/XML, envelope eller inte) -
+        varje connector-familj (BingX-envelope, RSS, Fear&Greed-JSON, ...)
+        implementerar sin egen tolkning. Delad infrastruktur ovanför denna
+        punkt (timeout/retry/rate-limit/cache) är generell för alla
+        market-data-/nyhets-/external-data-connectors (SPEC §15)."""
+        raise NotImplementedError(
+            f"{type(self).__name__} måste implementera _parse_response()"
+        )
 
     def _now(self) -> datetime:
         return datetime.now(UTC)

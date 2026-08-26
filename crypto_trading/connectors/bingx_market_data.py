@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from crypto_trading.connectors.base import BaseMarketDataConnector
+from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 
 # Verifierade live 2026-08-25 mot https://open-api.bingx.com - se
 # SPEC_CRYPTO.md §14 och konversationshistoriken för de faktiska svaren.
@@ -17,6 +18,19 @@ class BingXMarketDataConnector(BaseMarketDataConnector):
     """Uteslutande publika BingX swap (USDT-marginerade futures) market-
     data-endpoints. Ingen kod här refererar ett konto, en order eller en
     broker-credential (SPEC §1/§19)."""
+
+    _source_name = "BingX"
+
+    def _parse_response(self, response, path: str) -> object:
+        """BingX-specifik svarsenvelope: {"code": 0, "msg": "", "data": ...}.
+        Flyttad hit från BaseMarketDataConnector (Fas 3) - basen gör inget
+        antagande om envelope-format, se base.py:s _parse_response-hook."""
+        body = response.json()
+        if body.get("code") != 0:
+            raise ConnectorUnavailableError(
+                f"BingX API-fel {body.get('code')}: {body.get('msg')} ({path})"
+            )
+        return body["data"]
 
     def get_contracts(self) -> list[dict]:
         return self._get(_CONTRACTS_PATH, {"timestamp": self._timestamp_ms()})
