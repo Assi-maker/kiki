@@ -10,7 +10,7 @@ from crypto_trading.gate.risk_signal_gate import evaluate_risk_signal_gate
 from crypto_trading.logging import log_event
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
-from crypto_trading.state_machine import can_transition
+from crypto_trading.state_machine import can_transition, sweep_interrupted_analyses
 from crypto_trading.storage.repository import Repository
 
 _ROLE_ORDER = (
@@ -94,3 +94,37 @@ class Orchestrator:
             "evidence_record": candidate.evidence_record.model_dump(mode="json"),
             "run_id": run_id,
         }
+
+
+def run_discovery_cycle(
+    repo: Repository, runner: AgentRunner, settings: Settings, run_id: str
+) -> list[Candidate]:
+    """Discovery-loop-wiring: (1) sveper föräldralösa UNDER_AI_ANALYSIS-
+    candidates till ANALYSIS_INTERRUPTED (Fas 0:s sweep_interrupted_analyses,
+    SPEC §8.5), (2) hämtar alla CANDIDATE-status-candidates (Fas 2:s
+    candidate_engine lämnar budget-godkända candidates här), (3) transitionerar
+    var och en till UNDER_AI_ANALYSIS, (4) kör Orchestrator.process_candidate
+    på var och en."""
+    sweep_interrupted_analyses(repo, swept_at=datetime.now(UTC), run_id=run_id)
+
+    orchestrator = Orchestrator(repo=repo, runner=runner, settings=settings)
+    results: list[Candidate] = []
+    for candidate in repo.find_candidates_by_status("CANDIDATE"):
+        allowed, reason = can_transition(candidate.status, "UNDER_AI_ANALYSIS")
+        if not allowed:
+            raise AssertionError(f"illegal transition attempted: {reason}")
+        now = datetime.now(UTC)
+        event = Event(
+            event_id=f"CANDIDATE_TRANSITIONED:{candidate.candidate_id}:UNDER_AI_ANALYSIS",
+            event_type="CANDIDATE_TRANSITIONED",
+            aggregate_type="candidate",
+            aggregate_id=candidate.candidate_id,
+            occurred_at=now,
+            run_id=run_id,
+            schema_version=1,
+            payload={"from": candidate.status, "to": "UNDER_AI_ANALYSIS"},
+        )
+        repo.transition_candidate_with_event(candidate.candidate_id, "UNDER_AI_ANALYSIS", now, event)
+        candidate.status = "UNDER_AI_ANALYSIS"
+        results.append(orchestrator.process_candidate(candidate, run_id))
+    return results
