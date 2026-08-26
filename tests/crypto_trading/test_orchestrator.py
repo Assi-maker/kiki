@@ -83,6 +83,7 @@ def _settings(max_ai_calls_per_discovery_run: int = 70) -> Settings:
             spread_pct=Decimal("0.0005"),
             slippage_pct=Decimal("0.0005"),
             fee_pct=Decimal("0.0004"),
+            max_position_hold_hours=24,
         ),
         budget_limits=BudgetLimitsConfig(
             max_candidates_per_discovery_run=10,
