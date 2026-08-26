@@ -286,6 +286,49 @@ def test_replay_produces_a_confirmed_position_and_closes_it_at_target(tmp_path):
     assert position.simulated_fill_exit != position.theoretical_exit
 
 
+def test_replay_decision_at_time_t_is_unaffected_by_injected_future_data(tmp_path):
+    """AC2: en kraftigt avvikande, framtida datapunkt injicerad i en tidigare
+    snapshots klines-lista har bevisligen noll effekt på resultatet."""
+    repo_clean = SQLiteRepository(tmp_path / "clean.db")
+    repo_tampered = SQLiteRepository(tmp_path / "tampered.db")
+
+    clean_snapshots = _build_snapshots()
+    tampered_snapshots = _build_snapshots()
+
+    # Injicera en extrem, framtida datapunkt (daterad EFTER steg 1:s
+    # simulated_now) i steg 1:s klines-lista - simulerar att en framtida
+    # candle av misstag hamnat i en tidigare hämtning.
+    step1 = tampered_snapshots[0]
+    future_kline = Kline(
+        instrument="BTCUSDT",
+        interval="1h",
+        open=Decimal("999999"),
+        high=Decimal("999999"),
+        low=Decimal("999999"),
+        close=Decimal("999999"),
+        volume=Decimal("999999"),
+        observed_at=step1.simulated_now + timedelta(hours=1),
+    )
+    step1.klines["BTCUSDT"] = [*step1.klines["BTCUSDT"], future_kline]
+
+    runner_clean = MockAgentRunner(fixtures=_happy_fixtures())
+    runner_tampered = MockAgentRunner(fixtures=_happy_fixtures())
+
+    positions_clean = run_replay(
+        clean_snapshots, repo_clean, runner_clean, _settings(), run_id="run-1"
+    )
+    positions_tampered = run_replay(
+        tampered_snapshots, repo_tampered, runner_tampered, _settings(), run_id="run-1"
+    )
+
+    assert len(positions_clean) == len(positions_tampered) == 1
+    clean, tampered = positions_clean[0], positions_tampered[0]
+    assert clean.theoretical_entry == tampered.theoretical_entry
+    assert clean.simulated_fill_entry == tampered.simulated_fill_entry
+    assert clean.exit_reason == tampered.exit_reason
+    assert clean.theoretical_exit == tampered.theoretical_exit
+
+
 def test_replay_is_deterministic_on_repeated_runs(tmp_path):
     """AC1: samma indata -> samma trades, vid upprepad körning mot separata,
     färska repo-instanser."""
