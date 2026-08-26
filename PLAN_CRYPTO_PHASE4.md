@@ -1,10 +1,14 @@
 # Crypto Trading — Phase 4 (Paper Trading + Historical Replay) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
-## Status: EJ PÅBÖRJAD (skriven 2026-08-26)
+## Status: KLAR (2026-08-26)
 
-Fas 3 är avslutad och mergad till `master` (commit `e843444`). Denna plan väntar på användarens granskning och godkännande innan någon kod skrivs eller något test körs. Ingen exekvering har startat.
+Alla 12 tasks genomförda på branch `crypto-trading/phase-4`. 268 tester i `tests/crypto_trading/` (222 från Fas 0-3 + 46 nya, exklusive 1 `@pytest.mark.live`-test avsiktligt exkluderad). Full repo-svit (`intelligence/` + `crypto_trading/` + `test_setup`): 372 passed, 1 deselected. `ruff check` och `ruff format --check`: rena. `git diff 647bd12 -- intelligence/`: tom. `test_no_intelligence_coupling.py`: 3/3 PASS. Grep-guard: inga `BUY`/`SELL` någonstans i `paper_trading/`; `SHORT` förekommer bara i `execution.py`s riktningsagnostiska `compute_fill_price()`-formel (och dess docstring) — aldrig tilldelat till en faktisk `Position.direction`, som är hårdkodad `"LONG"` på exakt ett ställe (`position_opening.py`). Matchar beslut 1 exakt: SHORT kvarstår giltigt i typsystemet, produceras bara aldrig.
+
+**En mekanisk regression hittad och åtgärdad under slutverifieringen** (inte en SPEC/plan-konflikt): Task 1:s nya obligatoriska `max_position_hold_hours`-fält gjorde `tests/crypto_trading/test_orchestrator.py`s `_settings()`-hjälpare (byggd i Fas 3) ogiltig, vilket kaskaderade till `test_discovery_wiring.py` och `test_phase3_integration.py` (importerar samma hjälpare). Fixat med en enradsändring, 268/268 gröna igen. Committat separat (steg 12a).
+
+Väntar på användarens slutliga granskning innan merge till `master`. Fas 5 är inte påbörjad.
 
 ---
 
@@ -65,7 +69,7 @@ Fas 3 är avslutad och mergad till `master` (commit `e843444`). Denna plan vänt
 
 **Interfaces:** `RiskLimitsConfig.max_position_hold_hours: int = Field(gt=0)`.
 
-- [ ] **Step 1: Write the failing tests** — lägg till i den befintliga `_valid_...`-hjälparen för `RiskLimitsConfig` (om ingen finns, skapa en i samma stil som Fas 2/3:s `_valid_pipeline_kwargs`) plus:
+- [x] **Step 1: Write the failing tests** — lägg till i den befintliga `_valid_...`-hjälparen för `RiskLimitsConfig` (om ingen finns, skapa en i samma stil som Fas 2/3:s `_valid_pipeline_kwargs`) plus:
 
 ```python
 def test_get_settings_loads_phase4_fields():
@@ -78,10 +82,10 @@ def test_risk_limits_config_rejects_zero_max_position_hold_hours():
         RiskLimitsConfig(**_valid_risk_limits_kwargs(max_position_hold_hours=0))
 ```
 
-- [ ] **Step 2: Run tests to verify they fail** — `pytest tests/crypto_trading/config/test_loader.py -v`, förväntat `AttributeError`/`ValidationError`-brist.
-- [ ] **Step 3: Lägg till i `risk_limits.yaml`:** `max_position_hold_hours: 24` (strategiparameter, inte SPEC-verifierat faktum — matchar screener_timeframes 1h/4h med en konservativ övre gräns).
-- [ ] **Step 4: Lägg till fältet i `RiskLimitsConfig`.**
-- [ ] **Step 5: Run tests to verify they pass.**
+- [x] **Step 2: Run tests to verify they fail** — `pytest tests/crypto_trading/config/test_loader.py -v`, förväntat `AttributeError`/`ValidationError`-brist.
+- [x] **Step 3: Lägg till i `risk_limits.yaml`:** `max_position_hold_hours: 24` (strategiparameter, inte SPEC-verifierat faktum — matchar screener_timeframes 1h/4h med en konservativ övre gräns).
+- [x] **Step 4: Lägg till fältet i `RiskLimitsConfig`.**
+- [x] **Step 5: Run tests to verify they pass.**
 
 ---
 
@@ -94,10 +98,10 @@ def test_risk_limits_config_rejects_zero_max_position_hold_hours():
 **Interfaces:**
 - Produces: `Repository.create_position_with_event(position: Position, event: Event) -> bool`, `get_position(position_id: str) -> Position | None`, `find_open_positions() -> list[Position]`, `close_position_with_event(position_id, theoretical_exit, simulated_fill_exit, exit_reason, fees, funding, closed_at, event) -> None`.
 
-- [ ] **Step 1: Write the failing tests** — samma stil som `test_repository_candidate.py`: `test_create_position_with_event_persists_both`, `test_create_position_with_event_is_idempotent_on_retry` (AC6, direkt), `test_get_position_returns_none_when_missing`, `test_find_open_positions_returns_only_open_status`, `test_close_position_with_event_updates_exit_fields_and_status`, `test_close_position_with_event_is_atomic_on_failure` (samma `_FailingConnection`-mönster som candidate-testerna).
-- [ ] **Step 2: Run tests to verify they fail.**
-- [ ] **Step 3: Implement** — `INSERT OR IGNORE`/`UPDATE` mot `positions`-tabellen, samma struktur som `create_candidate_with_event`/`transition_candidate_with_event`. Ingen ny korrupt-state-hantering krävs utöver vad `Position`s egen Pydantic-validering redan ger (positions har ingen motsvarighet till `CandidateEvidenceRecord`s fria-formatsfält, så samma djupa korrupt-state-täckning som candidates är inte nödvändig — en enklare `Position.model_validate(dict(row))` räcker).
-- [ ] **Step 4: Run tests to verify they pass.**
+- [x] **Step 1: Write the failing tests** — samma stil som `test_repository_candidate.py`: `test_create_position_with_event_persists_both`, `test_create_position_with_event_is_idempotent_on_retry` (AC6, direkt), `test_get_position_returns_none_when_missing`, `test_find_open_positions_returns_only_open_status`, `test_close_position_with_event_updates_exit_fields_and_status`, `test_close_position_with_event_is_atomic_on_failure` (samma `_FailingConnection`-mönster som candidate-testerna).
+- [x] **Step 2: Run tests to verify they fail.**
+- [x] **Step 3: Implement** — `INSERT OR IGNORE`/`UPDATE` mot `positions`-tabellen, samma struktur som `create_candidate_with_event`/`transition_candidate_with_event`. Ingen ny korrupt-state-hantering krävs utöver vad `Position`s egen Pydantic-validering redan ger (positions har ingen motsvarighet till `CandidateEvidenceRecord`s fria-formatsfält, så samma djupa korrupt-state-täckning som candidates är inte nödvändig — en enklare `Position.model_validate(dict(row))` räcker).
+- [x] **Step 4: Run tests to verify they pass.**
 
 ---
 
@@ -111,10 +115,10 @@ def test_risk_limits_config_rejects_zero_max_position_hold_hours():
 
 **Interfaces:** `compute_position_size(entry_price: Decimal, stop_loss_price: Decimal, capital: Decimal, risk_per_trade_pct: Decimal, open_positions_notional: Decimal, max_total_exposure_pct: Decimal) -> Decimal`.
 
-- [ ] **Step 1: Write the failing tests** — handräknat exempel (AC3-anda även här, även om AC3 formellt gäller fees/funding/slippage): entry=50000, stop=49000 (2% stop-avstånd), capital=10000, risk_per_trade_pct=0.01 → risk_amount=100, size=100/0.02=5000. Plus: `test_position_size_capped_by_remaining_exposure` (redan 2000 av max 2500 exponering använt → storlek klipps till 500), `test_position_size_is_zero_for_degenerate_zero_distance_stop` (fail-closed).
-- [ ] **Step 2: Run tests to verify they fail.**
-- [ ] **Step 3: Implement** — ren funktion enligt formeln i plan-headern.
-- [ ] **Step 4: Run tests to verify they pass.**
+- [x] **Step 1: Write the failing tests** — handräknat exempel (AC3-anda även här, även om AC3 formellt gäller fees/funding/slippage): entry=50000, stop=49000 (2% stop-avstånd), capital=10000, risk_per_trade_pct=0.01 → risk_amount=100, size=100/0.02=5000. Plus: `test_position_size_capped_by_remaining_exposure` (redan 2000 av max 2500 exponering använt → storlek klipps till 500), `test_position_size_is_zero_for_degenerate_zero_distance_stop` (fail-closed).
+- [x] **Step 2: Run tests to verify they fail.**
+- [x] **Step 3: Implement** — ren funktion enligt formeln i plan-headern.
+- [x] **Step 4: Run tests to verify they pass.**
 
 ---
 
@@ -126,7 +130,7 @@ def test_risk_limits_config_rejects_zero_max_position_hold_hours():
 
 **Interfaces:** `compute_fill_price(reference_price, direction, spread_pct, slippage_pct, side: Literal["entry","exit"]) -> Decimal`, `compute_fees(fill_price, size, fee_pct) -> Decimal`, `compute_funding(size, funding_rate, hold_hours) -> Decimal`, `_FILL_MODEL_VERSION = "v1"`.
 
-- [ ] **Step 1: Write the failing tests** — handräknade exempel (AC3, explicit i testnamnen):
+- [x] **Step 1: Write the failing tests** — handräknade exempel (AC3, explicit i testnamnen):
 
 ```python
 def test_compute_fill_price_long_entry_is_worse_than_reference():
@@ -148,9 +152,9 @@ def test_compute_funding_matches_hand_calculation():
 
 Plus: `test_theoretical_and_simulated_fill_are_never_equal_when_spread_or_slippage_nonzero` (AC4, direkt).
 
-- [ ] **Step 2: Run tests to verify they fail.**
-- [ ] **Step 3: Implement** enligt formlerna i plan-headern. Dokumentera explicit i docstring: `compute_funding` samplar en enda funding rate vid positionens öppning och multiplicerar med antal 8h-perioder — en medveten förenkling (verklig funding rate fluktuerar var 8:e timme; att modellera det skulle kräva en tidsserie av funding-observationer under hela hålltiden, utanför denna fas scope).
-- [ ] **Step 4: Run tests to verify they pass.**
+- [x] **Step 2: Run tests to verify they fail.**
+- [x] **Step 3: Implement** enligt formlerna i plan-headern. Dokumentera explicit i docstring: `compute_funding` samplar en enda funding rate vid positionens öppning och multiplicerar med antal 8h-perioder — en medveten förenkling (verklig funding rate fluktuerar var 8:e timme; att modellera det skulle kräva en tidsserie av funding-observationer under hela hålltiden, utanför denna fas scope).
+- [x] **Step 4: Run tests to verify they pass.**
 
 ---
 
@@ -162,10 +166,10 @@ Plus: `test_theoretical_and_simulated_fill_are_never_equal_when_spread_or_slippa
 
 **Interfaces:** `check_exit_trigger(position: Position, candle_low: Decimal, candle_high: Decimal, now: datetime, max_position_hold_hours: int) -> tuple[str, Decimal] | None` (returnerar `(exit_reason, trigger_price)` eller `None`).
 
-- [ ] **Step 1: Write the failing tests** — `test_no_trigger_when_price_stays_within_range`, `test_stop_loss_triggers_at_exact_touch`, `test_target_triggers_at_exact_touch`, `test_time_limit_triggers_after_max_hold_hours`, `test_stop_loss_checked_before_time_limit_when_both_true` (deterministisk prioritetsordning — SL/TP kollas alltid före tidsgräns, dokumenterat i docstring).
-- [ ] **Step 2: Run tests to verify they fail.**
-- [ ] **Step 3: Implement** (LONG-only, se Global Constraints/beslut 1 — funktionen tar ingen `direction`-parameter i denna fas, hårdkodat LONG-beteende, dokumenterat i docstring varför).
-- [ ] **Step 4: Run tests to verify they pass.**
+- [x] **Step 1: Write the failing tests** — `test_no_trigger_when_price_stays_within_range`, `test_stop_loss_triggers_at_exact_touch`, `test_target_triggers_at_exact_touch`, `test_time_limit_triggers_after_max_hold_hours`, `test_stop_loss_checked_before_time_limit_when_both_true` (deterministisk prioritetsordning — SL/TP kollas alltid före tidsgräns, dokumenterat i docstring).
+- [x] **Step 2: Run tests to verify they fail.**
+- [x] **Step 3: Implement** (LONG-only, se Global Constraints/beslut 1 — funktionen tar ingen `direction`-parameter i denna fas, hårdkodat LONG-beteende, dokumenterat i docstring varför).
+- [x] **Step 4: Run tests to verify they pass.**
 
 ---
 
@@ -177,10 +181,10 @@ Plus: `test_theoretical_and_simulated_fill_are_never_equal_when_spread_or_slippa
 
 **Interfaces:** samma `check_exit_trigger`, nu med de faktiska gap-fill-formlerna från Global Constraints/beslut 4 istället för platshållare.
 
-- [ ] **Step 1: Write the failing tests** — `test_gap_through_stop_loss_fills_at_candle_low_not_stop_level` (candle_low långt under stop → trigger_price == candle_low, `!=` stop_loss), `test_gap_through_target_fills_at_target_not_candle_high` (candle_high långt över target → trigger_price == target, `!=` candle_high), `test_fill_model_version_is_set_on_the_resulting_position` (verifieras i Task 8:s wiring-test, refereras här som påminnelse).
-- [ ] **Step 2: Run tests to verify they fail.**
-- [ ] **Step 3: Implement** — `min(candle_low, stop_loss)` / `min(candle_high, target)` enligt beslut 4.
-- [ ] **Step 4: Run tests to verify they pass.**
+- [x] **Step 1: Write the failing tests** — `test_gap_through_stop_loss_fills_at_candle_low_not_stop_level` (candle_low långt under stop → trigger_price == candle_low, `!=` stop_loss), `test_gap_through_target_fills_at_target_not_candle_high` (candle_high långt över target → trigger_price == target, `!=` candle_high), `test_fill_model_version_is_set_on_the_resulting_position` (verifieras i Task 8:s wiring-test, refereras här som påminnelse).
+- [x] **Step 2: Run tests to verify they fail.**
+- [x] **Step 3: Implement** — `min(candle_low, stop_loss)` / `min(candle_high, target)` enligt beslut 4.
+- [x] **Step 4: Run tests to verify they pass.**
 
 ---
 
@@ -192,13 +196,13 @@ Plus: `test_theoretical_and_simulated_fill_are_never_equal_when_spread_or_slippa
 
 **Interfaces:** `open_position_for_candidate(candidate: Candidate, repo: Repository, risk_limits: RiskLimitsConfig, reference_price: Decimal, funding_rate: Decimal, opened_at: datetime, run_id: str) -> Position | None` (returnerar `None` om `candidate.status != "CONFIRMED"` eller om `candidate.risk` saknas — defensivt, ska aldrig hända givet Fas 3:s garantier, men fail-closed snarare än att krascha).
 
-- [ ] **Step 1: Write the failing tests** — `test_opens_position_with_theoretical_and_simulated_fields_separated`, `test_position_id_equals_candidate_id`, `test_calling_twice_for_same_candidate_creates_only_one_position` (AC6, explicit dubbel-anrop-test), `test_returns_none_when_candidate_not_confirmed`, `test_direction_is_always_long` (dokumenterar beslut 1 som ett levande test, inte bara en kommentar).
-- [ ] **Step 2: Run tests to verify they fail.**
-- [ ] **Step 3: Implement** — parsar `candidate.risk.suggested_stop_loss`/`suggested_target` (strängar) till `Decimal`, anropar `position_sizing.compute_position_size` (med `repo`-läst `open_positions_notional`, se nedan) och `execution.compute_fill_price`, skriver via `repo.create_position_with_event`.
+- [x] **Step 1: Write the failing tests** — `test_opens_position_with_theoretical_and_simulated_fields_separated`, `test_position_id_equals_candidate_id`, `test_calling_twice_for_same_candidate_creates_only_one_position` (AC6, explicit dubbel-anrop-test), `test_returns_none_when_candidate_not_confirmed`, `test_direction_is_always_long` (dokumenterar beslut 1 som ett levande test, inte bara en kommentar).
+- [x] **Step 2: Run tests to verify they fail.**
+- [x] **Step 3: Implement** — parsar `candidate.risk.suggested_stop_loss`/`suggested_target` (strängar) till `Decimal`, anropar `position_sizing.compute_position_size` (med `repo`-läst `open_positions_notional`, se nedan) och `execution.compute_fill_price`, skriver via `repo.create_position_with_event`.
 
   **Notera:** `open_positions_notional` kräver en summa av `size` över alla öppna positioner — `count_open_positions()` (Fas 3) räcker inte (den räknar bara antal, inte notional-summa). Lägg till en liten hjälpmetod i samma task: `Repository.sum_open_positions_notional() -> Decimal`, med eget litet Red/Green-steg innan `open_position_for_candidate` skrivs.
 
-- [ ] **Step 4: Run tests to verify they pass.**
+- [x] **Step 4: Run tests to verify they pass.**
 
 ---
 
@@ -210,10 +214,10 @@ Plus: `test_theoretical_and_simulated_fill_are_never_equal_when_spread_or_slippa
 
 **Interfaces:** `close_triggered_positions(repo: Repository, price_lookup: dict[str, tuple[Decimal, Decimal]], now: datetime, risk_limits: RiskLimitsConfig, run_id: str) -> list[Position]` — itererar `repo.find_open_positions()`, kör `monitoring.check_exit_trigger` per position mot dess instruments `(low, high)` i `price_lookup`, stänger de som triggar via `execution.compute_fill_price(..., side="exit")` + `compute_fees`/`compute_funding`, skriver via `repo.close_position_with_event`.
 
-- [ ] **Step 1: Write the failing tests** — `test_closes_position_on_stop_loss_trigger_with_correct_exit_reason`, `test_closes_position_on_time_limit_trigger`, `test_leaves_position_open_when_nothing_triggers`, `test_closing_is_idempotent_when_called_twice` (positionen är redan `CLOSED` andra gången — ingen dubbel `CLOSED`-event, SPEC §8.6).
-- [ ] **Step 2: Run tests to verify they fail.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run tests to verify they pass.**
+- [x] **Step 1: Write the failing tests** — `test_closes_position_on_stop_loss_trigger_with_correct_exit_reason`, `test_closes_position_on_time_limit_trigger`, `test_leaves_position_open_when_nothing_triggers`, `test_closing_is_idempotent_when_called_twice` (positionen är redan `CLOSED` andra gången — ingen dubbel `CLOSED`-event, SPEC §8.6).
+- [x] **Step 2: Run tests to verify they fail.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run tests to verify they pass.**
 
 ---
 
@@ -227,10 +231,10 @@ Plus: `test_theoretical_and_simulated_fill_are_never_equal_when_spread_or_slippa
 
 Kör per snapshot, i tidsordning: (1) `eligibility_filter` + `select_top_n`, (2) `quant_screener.evaluate_candidate` per instrument (med `evaluated_at=snapshot.simulated_now`), (3) `candidate_engine.process_evidence` + `prioritize_and_apply_budget`, (4) `orchestrator.run_discovery_cycle`, (5) för varje ny `CONFIRMED`: `position_opening.open_position_for_candidate`, (6) `position_closing.close_triggered_positions` mot samma snapshots pris.
 
-- [ ] **Step 1: Write the failing tests** — en liten, handkonstruerad 3-stegs historisk fixture (t.ex. BTCUSDT: steg 1 flat, steg 2 pris-spik som triggar `worth_deeper_analysis` → `CONFIRMED`, steg 3 pris rör sig till target). `test_replay_produces_a_confirmed_position_and_closes_it_at_target`, `test_replay_is_deterministic_on_repeated_runs` (AC1, explicit: kör `run_replay` två gånger mot separata, färska `repo`-instanser med identisk fixture, jämför resulterande `Position`-listor fältvis, exklusive genererade ID:n som redan är deterministiska via `position_id=candidate_id`).
-- [ ] **Step 2: Run tests to verify they fail.**
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: Run tests to verify they pass.**
+- [x] **Step 1: Write the failing tests** — en liten, handkonstruerad 3-stegs historisk fixture (t.ex. BTCUSDT: steg 1 flat, steg 2 pris-spik som triggar `worth_deeper_analysis` → `CONFIRMED`, steg 3 pris rör sig till target). `test_replay_produces_a_confirmed_position_and_closes_it_at_target`, `test_replay_is_deterministic_on_repeated_runs` (AC1, explicit: kör `run_replay` två gånger mot separata, färska `repo`-instanser med identisk fixture, jämför resulterande `Position`-listor fältvis, exklusive genererade ID:n som redan är deterministiska via `position_id=candidate_id`).
+- [x] **Step 2: Run tests to verify they fail.**
+- [x] **Step 3: Implement.**
+- [x] **Step 4: Run tests to verify they pass.**
 
 ---
 
@@ -241,9 +245,9 @@ Kör per snapshot, i tidsordning: (1) `eligibility_filter` + `select_top_n`, (2)
 
 **Interfaces:** inga nya — rent testtillägg mot `run_replay`.
 
-- [ ] **Step 1: Write the failing test** — `test_replay_decision_at_time_t_is_unaffected_by_injected_future_data`: kör samma fixture som Task 9, men injicera en extra, kraftigt avvikande kline daterad **efter** den sista `simulated_now` i en av snapshots klines-listor (simulerar att en framtida datapunkt av misstag hamnat i en tidigare hämtning). Jämför resultatet mot en körning utan den injicerade framtidspunkten — identiskt resultat.
-- [ ] **Step 2: Run test to verify it fails** (eller passerar direkt om `quant_screener`s befintliga `_sorted_up_to`-skydd redan räcker end-to-end — i så fall är detta test en ren regressionsbekräftelse, ingen ny produktionskod).
-- [ ] **Step 3: Fix any discovered gap, then confirm passing.**
+- [x] **Step 1: Write the failing test** — `test_replay_decision_at_time_t_is_unaffected_by_injected_future_data`: kör samma fixture som Task 9, men injicera en extra, kraftigt avvikande kline daterad **efter** den sista `simulated_now` i en av snapshots klines-listor (simulerar att en framtida datapunkt av misstag hamnat i en tidigare hämtning). Jämför resultatet mot en körning utan den injicerade framtidspunkten — identiskt resultat.
+- [x] **Step 2: Run test to verify it fails** (eller passerar direkt om `quant_screener`s befintliga `_sorted_up_to`-skydd redan räcker end-to-end — i så fall är detta test en ren regressionsbekräftelse, ingen ny produktionskod).
+- [x] **Step 3: Fix any discovered gap, then confirm passing.**
 
 ---
 
@@ -254,9 +258,9 @@ Kör per snapshot, i tidsordning: (1) `eligibility_filter` + `select_top_n`, (2)
 
 **Interfaces:** inga nya.
 
-- [ ] **Step 1: Write the failing test** — `test_full_lifecycle_candidate_confirmed_position_opened_and_closed`: från en redan `CONFIRMED`-candidate (byggd med samma hjälpmönster som Fas 3:s `test_phase3_integration.py`) genom `open_position_for_candidate` → `close_triggered_positions` (SL-scenario) → verifiera slutgiltig `Position`-rad i repot har `status="CLOSED"`, `exit_reason="stop_loss"`, `simulated_fill_exit != theoretical_exit`, `fees is not None`, `funding is not None`.
-- [ ] **Step 2: Run test to verify it fails.**
-- [ ] **Step 3: Confirm passing** (bör vara grönt direkt om Task 1–10 är korrekt implementerade — rent regressions-/AC-bekräftelsetest).
+- [x] **Step 1: Write the failing test** — `test_full_lifecycle_candidate_confirmed_position_opened_and_closed`: från en redan `CONFIRMED`-candidate (byggd med samma hjälpmönster som Fas 3:s `test_phase3_integration.py`) genom `open_position_for_candidate` → `close_triggered_positions` (SL-scenario) → verifiera slutgiltig `Position`-rad i repot har `status="CLOSED"`, `exit_reason="stop_loss"`, `simulated_fill_exit != theoretical_exit`, `fees is not None`, `funding is not None`.
+- [x] **Step 2: Run test to verify it fails.**
+- [x] **Step 3: Confirm passing** (bör vara grönt direkt om Task 1–10 är korrekt implementerade — rent regressions-/AC-bekräftelsetest).
 
 ---
 
@@ -264,13 +268,13 @@ Kör per snapshot, i tidsordning: (1) `eligibility_filter` + `select_top_n`, (2)
 
 **Files:** inga (bara verifieringskommandon).
 
-- [ ] **Step 1: Full testsvit för crypto_trading** — `pytest tests/crypto_trading/ -v`, alla gröna.
-- [ ] **Step 2: Ruff check + format** — `ruff check crypto_trading/ tests/crypto_trading/`, `ruff format --check crypto_trading/ tests/crypto_trading/`, inga fel/diff.
-- [ ] **Step 3: Verifiera att intelligence/ fortfarande är orört** — `git diff master -- intelligence/`, tom output.
-- [ ] **Step 4: Full repo-testsvit** — `pytest -v`, ingen regression.
-- [ ] **Step 5: Importgräns och broker-frihet** — `pytest tests/crypto_trading/test_no_intelligence_coupling.py -v`, PASS (fångar `paper_trading/` automatiskt).
-- [ ] **Step 6: Grep-guard mot riktningsord utöver LONG** — `grep -rniE "\b(buy|sell|short)\b" crypto_trading/paper_trading/` (LONG är avsiktligt tillåtet denna fas, se beslut 1) — ingen träff förväntad.
-- [ ] **Step 7: Uppdatera PLAN_CRYPTO_PHASE4.md** — kryssa i alla `- [ ]`, lägg till statusbanner med exakt testantal och ev. avvikelser upptäckta under exekvering, samma format som Fas 1–3.
+- [x] **Step 1: Full testsvit för crypto_trading** — `pytest tests/crypto_trading/ -v`, alla gröna.
+- [x] **Step 2: Ruff check + format** — `ruff check crypto_trading/ tests/crypto_trading/`, `ruff format --check crypto_trading/ tests/crypto_trading/`, inga fel/diff.
+- [x] **Step 3: Verifiera att intelligence/ fortfarande är orört** — `git diff master -- intelligence/`, tom output.
+- [x] **Step 4: Full repo-testsvit** — `pytest -v`, ingen regression.
+- [x] **Step 5: Importgräns och broker-frihet** — `pytest tests/crypto_trading/test_no_intelligence_coupling.py -v`, PASS (fångar `paper_trading/` automatiskt).
+- [x] **Step 6: Grep-guard mot riktningsord utöver LONG** — `grep -rniE "\b(buy|sell|short)\b" crypto_trading/paper_trading/` (LONG är avsiktligt tillåtet denna fas, se beslut 1) — ingen träff förväntad.
+- [x] **Step 7: Uppdatera PLAN_CRYPTO_PHASE4.md** — kryssa i alla `- [x]`, lägg till statusbanner med exakt testantal och ev. avvikelser upptäckta under exekvering, samma format som Fas 1–3.
 
 ---
 

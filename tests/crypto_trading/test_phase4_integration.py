@@ -84,7 +84,11 @@ def test_full_lifecycle_candidate_confirmed_position_opened_and_closed(tmp_path)
     candidate = _confirmed_candidate()
 
     opened = open_position_for_candidate(
-        candidate, repo, risk_limits, reference_price=Decimal("50000"), opened_at=_NOW,
+        candidate,
+        repo,
+        risk_limits,
+        reference_price=Decimal("50000"),
+        opened_at=_NOW,
         run_id="run-1",
     )
     assert opened is not None
