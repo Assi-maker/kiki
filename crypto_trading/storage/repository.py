@@ -50,6 +50,10 @@ class Repository(Protocol):
     def save_assessment(
         self, candidate_id: str, field_name: str, assessment: AssessmentBase
     ) -> None: ...
+    def save_gate_decision(
+        self, candidate_id: str, decision: str, reasons: list[str], evaluated_at: datetime
+    ) -> None: ...
+    def count_open_positions(self) -> int: ...
 
 
 class SQLiteRepository:
@@ -225,6 +229,24 @@ class SQLiteRepository:
             (candidate_id, field_name, assessment.model_dump_json()),
         )
         self._conn.commit()
+
+    def save_gate_decision(
+        self, candidate_id: str, decision: str, reasons: list[str], evaluated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO gate_decisions (candidate_id, decision, reasons, evaluated_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(candidate_id) DO UPDATE SET "
+            "decision = excluded.decision, reasons = excluded.reasons, "
+            "evaluated_at = excluded.evaluated_at",
+            (candidate_id, decision, json.dumps(reasons), evaluated_at.isoformat()),
+        )
+        self._conn.commit()
+
+    def count_open_positions(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM positions WHERE status = 'OPEN_POSITION'"
+        ).fetchone()
+        return row["n"]
 
     def find_candidates_by_status(self, status: str) -> list[Candidate]:
         """Ett korrupt candidate-state (CorruptCandidateStateError) hoppas

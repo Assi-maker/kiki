@@ -320,6 +320,72 @@ def test_get_candidate_raises_corrupt_state_error_on_corrupt_assessment(tmp_path
     assert exc_info.value.corrupted_field == "assessment:risk"
 
 
+def test_save_gate_decision_persists_row(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate()
+    repo.create_candidate_with_event(candidate, _make_event(candidate, "CANDIDATE_CREATED"))
+
+    repo.save_gate_decision(
+        candidate.candidate_id,
+        decision="CONFIRMED",
+        reasons=["all checks passed"],
+        evaluated_at=datetime.now(UTC),
+    )
+
+    row = repo._conn.execute(
+        "SELECT decision, reasons FROM gate_decisions WHERE candidate_id = ?",
+        (candidate.candidate_id,),
+    ).fetchone()
+    assert row["decision"] == "CONFIRMED"
+    assert "all checks passed" in row["reasons"]
+
+
+def test_save_gate_decision_is_idempotent_overwrite_on_retry(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate()
+    repo.create_candidate_with_event(candidate, _make_event(candidate, "CANDIDATE_CREATED"))
+
+    repo.save_gate_decision(
+        candidate.candidate_id, decision="NO_TRADE", reasons=["r1"], evaluated_at=datetime.now(UTC)
+    )
+    repo.save_gate_decision(
+        candidate.candidate_id, decision="CONFIRMED", reasons=["r2"], evaluated_at=datetime.now(UTC)
+    )
+
+    count = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM gate_decisions WHERE candidate_id = ?", (candidate.candidate_id,)
+    ).fetchone()["n"]
+    assert count == 1
+    row = repo._conn.execute(
+        "SELECT decision FROM gate_decisions WHERE candidate_id = ?", (candidate.candidate_id,)
+    ).fetchone()
+    assert row["decision"] == "CONFIRMED"
+
+
+def test_count_open_positions_returns_zero_when_none(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    assert repo.count_open_positions() == 0
+
+
+def test_count_open_positions_counts_only_open_status(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    repo._conn.execute(
+        "INSERT INTO positions (position_id, candidate_id, instrument, direction, status, "
+        "theoretical_entry, simulated_fill_entry, stop_loss, target, size, "
+        "fill_model_version, opened_at) VALUES "
+        "('p1','c1','BTCUSDT','LONG','OPEN_POSITION','1','1','1','1','1','v1','2026-08-26')"
+    )
+    repo._conn.execute(
+        "INSERT INTO positions (position_id, candidate_id, instrument, direction, status, "
+        "theoretical_entry, simulated_fill_entry, stop_loss, target, size, "
+        "fill_model_version, opened_at) VALUES "
+        "('p2','c2','ETHUSDT','LONG','CLOSED','1','1','1','1','1','v1','2026-08-26')"
+    )
+    repo._conn.commit()
+
+    assert repo.count_open_positions() == 1
+
+
 def test_repository_protocol_exposes_no_update_or_delete_event_method():
     assert not hasattr(SQLiteRepository, "update_event")
     assert not hasattr(SQLiteRepository, "delete_event")
