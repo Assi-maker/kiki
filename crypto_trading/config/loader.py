@@ -32,6 +32,16 @@ class PipelineConfig(BaseModel):
     bingx_cache_ttl_seconds: float = Field(ge=0)
     bingx_max_retries: int = Field(gt=0)
     kline_consistency_tolerance_pct: Decimal = Field(gt=0, le=1)
+    eligibility_min_quote_volume_24h_usdt: Decimal = Field(gt=0)
+    eligibility_max_spread_pct: Decimal = Field(gt=0, le=1)
+    screener_lookback_periods: int = Field(gt=1)
+    screener_price_volatility_threshold_pct: Decimal = Field(gt=0)
+    screener_rsi_period: int = Field(gt=1)
+    screener_rsi_overbought_threshold: Decimal = Field(gt=0, le=100)
+    screener_volume_zscore_threshold: Decimal = Field(gt=0)
+    screener_funding_rate_threshold_pct: Decimal = Field(gt=0)
+    screener_funding_history_limit: int = Field(gt=1)
+    evidence_change_threshold_for_reanalysis: Decimal = Field(ge=0)
 
     @field_validator("max_data_age_seconds")
     @classmethod

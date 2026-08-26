@@ -54,6 +54,16 @@ def _valid_pipeline_kwargs(**overrides) -> dict:
         bingx_cache_ttl_seconds=5,
         bingx_max_retries=3,
         kline_consistency_tolerance_pct=Decimal("0.5"),
+        eligibility_min_quote_volume_24h_usdt=Decimal("5000000"),
+        eligibility_max_spread_pct=Decimal("0.002"),
+        screener_lookback_periods=20,
+        screener_price_volatility_threshold_pct=Decimal("2.0"),
+        screener_rsi_period=14,
+        screener_rsi_overbought_threshold=Decimal("70"),
+        screener_volume_zscore_threshold=Decimal("2.5"),
+        screener_funding_rate_threshold_pct=Decimal("0.05"),
+        screener_funding_history_limit=10,
+        evidence_change_threshold_for_reanalysis=Decimal("0.15"),
     )
     defaults.update(overrides)
     return defaults
@@ -118,6 +128,30 @@ def test_budget_limits_config_rejects_zero_calls():
             max_ai_calls_per_day=500,
             warning_threshold_pct=Decimal("0.8"),
         )
+
+
+def test_get_settings_loads_phase2_fields():
+    settings = get_settings()
+    assert settings.pipeline.eligibility_min_quote_volume_24h_usdt > 0
+    assert 0 < settings.pipeline.eligibility_max_spread_pct <= 1
+    assert settings.pipeline.screener_lookback_periods > 1
+    assert settings.pipeline.screener_price_volatility_threshold_pct > 0
+    assert settings.pipeline.screener_rsi_period > 1
+    assert 0 < settings.pipeline.screener_rsi_overbought_threshold <= 100
+    assert settings.pipeline.screener_volume_zscore_threshold > 0
+    assert settings.pipeline.screener_funding_rate_threshold_pct > 0
+    assert settings.pipeline.screener_funding_history_limit > 1
+    assert settings.pipeline.evidence_change_threshold_for_reanalysis >= 0
+
+
+def test_pipeline_config_rejects_negative_eligibility_min_volume():
+    with pytest.raises(ValidationError):
+        PipelineConfig(**_valid_pipeline_kwargs(eligibility_min_quote_volume_24h_usdt=Decimal("-1")))
+
+
+def test_pipeline_config_rejects_spread_pct_above_one():
+    with pytest.raises(ValidationError):
+        PipelineConfig(**_valid_pipeline_kwargs(eligibility_max_spread_pct=Decimal("1.5")))
 
 
 def test_missing_config_file_raises_config_error(tmp_path, monkeypatch):

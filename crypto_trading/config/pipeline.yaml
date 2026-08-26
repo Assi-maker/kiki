@@ -23,3 +23,13 @@ bingx_requests_per_second: 10
 bingx_cache_ttl_seconds: 5
 bingx_max_retries: 3
 kline_consistency_tolerance_pct: "0.5"
+eligibility_min_quote_volume_24h_usdt: "5000000"
+eligibility_max_spread_pct: "0.002"
+screener_lookback_periods: 20
+screener_price_volatility_threshold_pct: "2.0"
+screener_rsi_period: 14
+screener_rsi_overbought_threshold: "70"
+screener_volume_zscore_threshold: "2.5"
+screener_funding_rate_threshold_pct: "0.05"
+screener_funding_history_limit: 10
+evidence_change_threshold_for_reanalysis: "0.15"
