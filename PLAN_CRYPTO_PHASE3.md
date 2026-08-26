@@ -1,10 +1,16 @@
 # Crypto Trading — Phase 3 (AI Intelligence Pipeline) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
-## Status: EJ PÅBÖRJAD (skriven 2026-08-26)
+## Status: KLAR (2026-08-26)
 
-Fas 2 är avslutad och mergad till `master` (commit `1a0b5de`). Denna plan väntar på användarens granskning och godkännande innan någon kod skrivs eller något test körs. Ingen exekvering har startat.
+Alla 14 tasks genomförda på branch `crypto-trading/phase-3`. 222 tester i `tests/crypto_trading/` (177 från Fas 0-2 + 45 nya, exklusive 1 `@pytest.mark.live`-test avsiktligt exkluderad). Full repo-svit (`intelligence/` + `crypto_trading/` + `test_setup`): 326 passed, 1 deselected. `ruff check` och `ruff format --check`: rena. `git diff master -- intelligence/`: tom. `test_no_intelligence_coupling.py`: 3/3 PASS. AC7 explicit bekräftat med tom `ANTHROPIC_API_KEY`: 222/222 fortfarande gröna. Grep-guard mot BUY/SELL/LONG/SHORT i `agents/`, `gate/`, `orchestrator.py`, de två nya connectorerna och de sju nya agentprompterna: inga träffar.
+
+**En verifierad, blockerande arkitekturupptäckt hanterad under exekvering** (Task 4, innan `news_rss.py` skrevs): `BaseMarketDataConnector._get_with_retry()` (Fas 1) antog BingX-specifik JSON-envelope (`{"code":0,"data":...}`) direkt i basklassen — skulle brutit både `news_rss.py` (RSS/XML, inte JSON) och `external_data.py` (alternative.me saknar `"code"`-fältet, hade alltid rest `ConnectorUnavailableError`). Stannade och lade fram tre lösningsalternativ för användaren; godkänt val: generalisera basen via en override-bar `_parse_response()`-hook, med BingX-envelopet oförändrat flyttat till `BingXMarketDataConnector`. Regressionsverifierat innan vidare arbete: alla 31 befintliga Fas 1-connector-tester gröna, identiskt med baseline (commit `47d5562`).
+
+**En verklig implementationsbugg hittad och åtgärdad** (test-skrivfel, inte designfel): `test_real_claude_runner_parses_valid_json_response` (Task 3) saknade `run_id` i den mockade LLM-JSON-responsen — `RealClaudeRunner` sätter aldrig `run_id` via `setdefault` (till skillnad från `agent_name`/`status`/`created_at`), eftersom modellen förväntas leverera det själv enligt det schema den får (samma kontrakt som `intelligence/`s runner). Testfixturen rättad, ingen produktionskodändring.
+
+Väntar på användarens slutliga granskning innan merge till `master`. Fas 4 är inte påbörjad.
 
 ---
 
@@ -63,13 +69,13 @@ Fas 2 är avslutad och mergad till `master` (commit `1a0b5de`). Denna plan vänt
 
 Samma frontmatter-format som `intelligence/`s agentfiler (`name`, `description`, `tools`), egna, distinkta namn (SPEC §0: principer återanvänds, koden/prompterna inte). Innehåll:
 
-- [ ] **`crypto-news-sentiment.md`** — roll: separera strikt `verified_facts` (källbelagt) / `source_claims` (vad källan påstår, overifierat) / `interpretation` (tolkning). Får aldrig ensam skapa en riktningssignal (SPEC §4). Tools: `Read`.
-- [ ] **`crypto-technical-analyst.md`** — roll: tolka `market_data` (pris/volym/volatilitet/momentum/funding/OI, redan strukturerat av Fas 2:s `CandidateEvidenceRecord` i kontexten) och leverera `interpretation`. Tools: `Read`.
-- [ ] **`crypto-bull-thesis.md`** — roll: formulera `hypothesis`/`catalyst`/`setup` för varför candidateN är värd att agera på. Explicit gräns: ingen risk-, storleks- eller timing-rekommendation (det är Risk Agents och gatens jobb). Tools: `Read`.
-- [ ] **`crypto-forecast-agent.md`** — roll: `scenario_probabilities` (måste summera till 1.0, valideras redan av `ForecastAssessment.probabilities_sum_to_one`), `horizon`, `forecast_version`. Explicit: sannolikhet för ett *prisscenario*, aldrig för vinst (SPEC §4-tabellen), kan aldrig ensam skapa `CONFIRMED` (SPEC §9).
-- [ ] **`crypto-risk-agent.md`** — roll: `suggested_stop_loss`, `suggested_target`, `downside`, `liquidity_risk`, `model_risk`, `timing_risk` — rådgivande, aldrig beslutande (SPEC §4). Adapterad från `.claude/agents/risk-agent.md` (samma princip, egna fält för stop/target).
-- [ ] **`crypto-bear-adversarial.md`** — roll: `counterarguments`, `alternative_explanations`, `falsification_conditions`. Närvaro är kravet, inte ett positivt utfall (SPEC §4).
-- [ ] **`crypto-qa-gate.md`** — roll: `passed: bool`, `violations: list[str]` — granskar de sex föregående assessmentens schema-komplethet och INTERNA konsistens (t.ex. motsäger Bull Thesis och Bear Adversarial varandra på ett sätt som inte är förklarat, saknar Forecast en horisont Risk Agent förutsätter) — bedömer aldrig sakinnehållet i sig (samma avgränsning som `intelligence/`s `qa-agent.md`).
+- [x] **`crypto-news-sentiment.md`** — roll: separera strikt `verified_facts` (källbelagt) / `source_claims` (vad källan påstår, overifierat) / `interpretation` (tolkning). Får aldrig ensam skapa en riktningssignal (SPEC §4). Tools: `Read`.
+- [x] **`crypto-technical-analyst.md`** — roll: tolka `market_data` (pris/volym/volatilitet/momentum/funding/OI, redan strukturerat av Fas 2:s `CandidateEvidenceRecord` i kontexten) och leverera `interpretation`. Tools: `Read`.
+- [x] **`crypto-bull-thesis.md`** — roll: formulera `hypothesis`/`catalyst`/`setup` för varför candidateN är värd att agera på. Explicit gräns: ingen risk-, storleks- eller timing-rekommendation (det är Risk Agents och gatens jobb). Tools: `Read`.
+- [x] **`crypto-forecast-agent.md`** — roll: `scenario_probabilities` (måste summera till 1.0, valideras redan av `ForecastAssessment.probabilities_sum_to_one`), `horizon`, `forecast_version`. Explicit: sannolikhet för ett *prisscenario*, aldrig för vinst (SPEC §4-tabellen), kan aldrig ensam skapa `CONFIRMED` (SPEC §9).
+- [x] **`crypto-risk-agent.md`** — roll: `suggested_stop_loss`, `suggested_target`, `downside`, `liquidity_risk`, `model_risk`, `timing_risk` — rådgivande, aldrig beslutande (SPEC §4). Adapterad från `.claude/agents/risk-agent.md` (samma princip, egna fält för stop/target).
+- [x] **`crypto-bear-adversarial.md`** — roll: `counterarguments`, `alternative_explanations`, `falsification_conditions`. Närvaro är kravet, inte ett positivt utfall (SPEC §4).
+- [x] **`crypto-qa-gate.md`** — roll: `passed: bool`, `violations: list[str]` — granskar de sex föregående assessmentens schema-komplethet och INTERNA konsistens (t.ex. motsäger Bull Thesis och Bear Adversarial varandra på ett sätt som inte är förklarat, saknar Forecast en horisont Risk Agent förutsätter) — bedömer aldrig sakinnehållet i sig (samma avgränsning som `intelligence/`s `qa-agent.md`).
 
 Exempel, `crypto-risk-agent.md` (fullständigt, övriga sex skrivs i samma stil under exekvering):
 
@@ -102,8 +108,8 @@ textbeskrivningar (stop/target som strängar, t.ex. "42150.0"), inte poäng.
 - Fattar aldrig det slutliga beslutet — det gör den deterministiska Risk/Signal Gate, oavsett vad du skriver här.
 ```
 
-- [ ] **Step 1: skriv samtliga sju filer** enligt ovanstående roller, i samma stil/längd som exemplet.
-- [ ] **Step 2: verifiera frontmatter** — varje fil har giltig YAML-frontmatter (`name`/`description`/`tools`) som `agents/loader.py` (Task 2) kan parsa; `name`-fältet matchar filnamnet utan `.md`.
+- [x] **Step 1: skriv samtliga sju filer** enligt ovanstående roller, i samma stil/längd som exemplet.
+- [x] **Step 2: verifiera frontmatter** — varje fil har giltig YAML-frontmatter (`name`/`description`/`tools`) som `agents/loader.py` (Task 2) kan parsa; `name`-fältet matchar filnamnet utan `.md`.
 
 ---
 
@@ -120,7 +126,7 @@ textbeskrivningar (stop/target som strängar, t.ex. "42150.0"), inte poäng.
 **Interfaces:**
 - Produces: `AgentDefinition` (pydantic: `name`, `description`, `tools`, `system_prompt`), `load_agent_definition(filename, agents_dir=None) -> AgentDefinition`, `RoleSpec` (`agent_file`, `assessment_type`), `ROLE_MAP: dict[str, RoleSpec]` med de sju rollnycklarna `news_sentiment`, `technical`, `bull_thesis`, `forecast`, `risk`, `bear_adversarial`, `qa` (matchar `Candidate`s fältnamn exakt — se Global Constraints).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/crypto_trading/agents/test_loader.py` (adapterad rakt av från `intelligence/`s motsvarande test, men mot `crypto_trading`-modulen och en `tmp_path`-fixture-agentfil):
 
@@ -197,12 +203,12 @@ def test_role_map_keys_match_candidate_optional_field_names():
     assert set(ROLE_MAP.keys()) <= candidate_fields
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/agents/ -v`
 Expected: FAIL med `ModuleNotFoundError` (paketet finns inte än).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crypto_trading/agents/loader.py` (identisk logik som `intelligence/agents/loader.py`, egen `_PROJECT_ROOT`-beräkning och docstring, ingen import av `intelligence`):
 
@@ -296,7 +302,7 @@ ROLE_MAP: dict[str, RoleSpec] = {
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/agents/test_loader.py tests/crypto_trading/agents/test_roles.py -v`
 Expected: alla tester PASS (kräver att Task 1:s sju filer redan finns på disk).
@@ -312,7 +318,7 @@ Expected: alla tester PASS (kräver att Task 1:s sju filer redan finns på disk)
 **Interfaces:**
 - Produces: `AgentRunner` (ABC, `run(agent_def, context, output_schema) -> AssessmentBase`), `MockAgentRunner(fixtures, fail_agents=None, timeout_agents=None)`, `RealClaudeRunner(api_key, model, timeout_seconds, max_retries, timeout_overrides=None)`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 `tests/crypto_trading/agents/test_runner.py` (adapterad från `intelligence/`s motsvarande test-svit — samma beteendekontrakt, mot `crypto_trading`-scheman):
 
@@ -407,12 +413,12 @@ def test_real_claude_runner_falls_back_to_failed_status_after_retries_exhausted(
 
 (Exakt `APIError`-konstruktionssignatur stäms av mot den installerade `anthropic`-SDK-versionen vid exekvering — samma mönster som `intelligence/`s befintliga, redan gröna testsvit mot samma SDK.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/agents/test_runner.py -v`
 Expected: FAIL med `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crypto_trading/agents/runner.py` — praktiskt taget identisk med `intelligence/agents/runner.py` (samma bevisade felhantering/retry/redaction), men importerar `crypto_trading.agents.loader`/`crypto_trading.logging`/`crypto_trading.schemas.assessments`:
 
@@ -538,7 +544,7 @@ class RealClaudeRunner(AgentRunner):
         return ""
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/agents/test_runner.py -v`
 Expected: alla tester PASS.
@@ -556,7 +562,7 @@ Expected: alla tester PASS.
 
 **Leverantörsval (SPEC §14-kriterier: kostnadsfri, verifierbar, källangiven):** CoinDesk RSS (`https://www.coindesk.com/arc/outboundfeeds/rss/`) — etablerad, gratis, nyckellös, käll-attribuerad kryptonyhetskälla. Exakt feedformat (RSS 2.0 `<item>`-fält: `title`, `link`, `pubDate`, `description`) verifieras live i en dedikerad `@pytest.mark.live`-täckt task vid exekvering (samma mönster som Fas 1:s BingX-verifiering) — inte antaget här.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 import respx
@@ -604,16 +610,16 @@ def test_get_latest_items_respects_limit():
     assert len(items) == 1
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/connectors/test_news_rss.py -v`
 Expected: FAIL med `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crypto_trading/connectors/news_rss.py` — återanvänder `BaseMarketDataConnector`s timeout/retry/rate-limit/cache-infrastruktur (Fas 1), lägger bara till RSS-parsning (`xml.etree.ElementTree`, standardbibliotek, ingen ny dependency) ovanpå `_get()`. Exakt kod (fältmappning, felhantering vid trasig XML) specificeras under exekvering efter Task-egen live-verifiering av det faktiska feed-formatet.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/connectors/test_news_rss.py -v`
 Expected: alla tester PASS.
@@ -631,7 +637,7 @@ Expected: alla tester PASS.
 
 **Leverantörsval:** `alternative.me`s publika Fear & Greed Index-API (`https://api.alternative.me/fng/`) — gratis, nyckellös, väletablerad, källangiven i SPEC §14:s mening. Exakt svarsformat verifieras live vid exekvering, samma mönster som Task 4.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 import respx
@@ -655,16 +661,16 @@ def test_get_fear_greed_index_returns_parsed_value():
     assert result["value_classification"] == "Fear"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/connectors/test_external_data.py -v`
 Expected: FAIL med `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 `crypto_trading/connectors/external_data.py` — samma `BaseMarketDataConnector`-bas som Task 4, en enda `get_fear_greed_index()`-metod ovanpå `_get()`.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/connectors/test_external_data.py -v`
 Expected: alla tester PASS.
@@ -682,7 +688,7 @@ Expected: alla tester PASS.
 
 **Verifierad upptäckt (dokumenterad, inte blockerande):** `assessments`-tabellen (Fas 0) har aldrig kopplats till `get_candidate()` — en candidate med persisterade assessments skulle idag komma tillbaka med alla sju fält som `None`, eftersom `candidates`-tabellen inte har kolumner för dem (bara `evidence_record`). Detta åtgärdas här; ingen befintlig Fas 0-2-test berörs (ingen av dem seedar `assessments`-tabellen, så de fortsätter få `None` som tidigare, oförändrat beteende för dem).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Lägg till i `tests/crypto_trading/storage/test_repository_candidate.py`:
 
@@ -746,12 +752,12 @@ def test_get_candidate_raises_corrupt_state_error_on_corrupt_assessment(tmp_path
     assert exc_info.value.corrupted_field == "assessment:risk"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/storage/test_repository_candidate.py -v`
 Expected: nya testerna FAIL med `AttributeError` (`save_assessment` finns inte än).
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Lägg till i `Repository`-protokollet:
 
@@ -813,7 +819,7 @@ Utöka `get_candidate()`: efter att `data["evidence_record"]`/timestamps/`Candid
             ) from exc
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/storage/ -v`
 Expected: alla tester PASS, inklusive de tre nya och samtliga befintliga (ingen regression).
@@ -829,7 +835,7 @@ Expected: alla tester PASS, inklusive de tre nya och samtliga befintliga (ingen 
 **Interfaces:**
 - Produces: `Repository.save_gate_decision(candidate_id, decision, reasons, evaluated_at) -> None`, `Repository.count_open_positions() -> int`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_save_gate_decision_persists_row(tmp_path):
@@ -874,12 +880,12 @@ def test_count_open_positions_counts_only_open_status(tmp_path):
     assert repo.count_open_positions() == 1
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/storage/test_repository_candidate.py -v`
 Expected: FAIL med `AttributeError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 def save_gate_decision(
@@ -903,7 +909,7 @@ def count_open_positions(self) -> int:
 
 Lägg till motsvarande metodsignaturer i `Repository`-protokollet.
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/storage/ -v`
 Expected: alla tester PASS.
@@ -921,7 +927,7 @@ Expected: alla tester PASS.
 **Interfaces:**
 - Produces: `run_qa_gate(candidate: Candidate, runner: AgentRunner, run_id: str) -> QAAssessment` — tunn wrapper runt roll #7 (samma anropsform som de övriga sex, samlad i ett eget modul för att matcha SPEC §3:s filstruktur, se `gate/`-motivering i Global Constraints).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 from datetime import UTC, datetime
@@ -955,12 +961,12 @@ def test_run_qa_gate_propagates_failed_status(_full_candidate):
 
 (`_full_candidate`-fixturen definieras lokalt i testfilen: en `Candidate` med samtliga sex föregående assessments ifyllda, byggd med samma hjälpmönster som `tests/crypto_trading/storage/test_repository_candidate.py`s `_make_candidate()`.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/gate/test_qa_gate.py -v`
 Expected: FAIL med `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 from __future__ import annotations
@@ -991,7 +997,7 @@ def run_qa_gate(candidate: Candidate, runner: AgentRunner, run_id: str) -> QAAss
     return runner.run(agent_def, context, QAAssessment)
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/gate/test_qa_gate.py -v`
 Expected: alla tester PASS.
@@ -1007,7 +1013,7 @@ Expected: alla tester PASS.
 **Interfaces:**
 - Produces: `GateDecision` (litet resultat-objekt: `outcome: Literal["CONFIRMED","NO_TRADE","REJECTED"]`, `reasons: list[str]`), `evaluate_risk_signal_gate(candidate: Candidate, open_positions: int, max_concurrent_positions: int) -> GateDecision`. **Ren funktion — importerar aldrig `agents/` eller `storage/`** (Global Constraints: gaten är oberoende av AI-utfallet).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 from crypto_trading.gate.risk_signal_gate import evaluate_risk_signal_gate
@@ -1063,12 +1069,12 @@ def test_failed_status_assessment_blocks_confirmed_and_is_not_rejected():
     assert decision.outcome == "NO_TRADE"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/gate/test_risk_signal_gate.py -v`
 Expected: FAIL med `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 from __future__ import annotations
@@ -1117,7 +1123,7 @@ def evaluate_risk_signal_gate(
     return GateDecision(outcome="CONFIRMED", reasons=["all_checks_passed"])
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/gate/test_risk_signal_gate.py -v`
 Expected: alla tester PASS.
@@ -1133,7 +1139,7 @@ Expected: alla tester PASS.
 **Interfaces:**
 - Produces: `Orchestrator(repo, runner, settings, risk_limits)`, metod `process_candidate(candidate: Candidate, run_id: str) -> Candidate`. Kör: transition `CANDIDATE`→`UNDER_AI_ANALYSIS` → de sju rollerna i `ROLE_MAP`-ordning (persisterar varje assessment direkt, per-run AI-anropstak) → `evaluate_risk_signal_gate` → terminal transition + `save_gate_decision`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 from crypto_trading.orchestrator import Orchestrator
@@ -1189,12 +1195,12 @@ def test_process_candidate_stops_role_loop_at_ai_call_budget(tmp_path):
 
 (Hjälpfunktionerna `_persisted_candidate_in_under_ai_analysis`, `_happy_fixtures`, `_settings_with` definieras lokalt i testfilen, i samma stil som Fas 2:s `test_screening_integration.py`.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/test_orchestrator.py -v`
 Expected: FAIL med `ModuleNotFoundError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 from __future__ import annotations
@@ -1276,7 +1282,7 @@ class Orchestrator:
 
 (Transition till `UNDER_AI_ANALYSIS` sker INNAN `process_candidate()` anropas — se Task 11:s discovery-loop-wiring, samma separation som Fas 2:s `candidate_engine.py` mellan att skapa/transitionera en candidate och att bedöma den.)
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/test_orchestrator.py -v`
 Expected: alla tester PASS.
@@ -1292,7 +1298,7 @@ Expected: alla tester PASS.
 **Interfaces:**
 - Produces: en funktion (t.ex. `run_discovery_cycle(repo, runner, settings, risk_limits, run_id) -> list[Candidate]`) som: (1) anropar `sweep_interrupted_analyses` (Fas 0), (2) hämtar alla `CANDIDATE`-status-candidates via `repo.find_candidates_by_status("CANDIDATE")`, (3) transitionerar var och en till `UNDER_AI_ANALYSIS`, (4) kör `Orchestrator.process_candidate` på var och en.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```python
 def test_run_discovery_cycle_sweeps_interrupted_analyses_first(tmp_path):
@@ -1316,12 +1322,12 @@ def test_run_discovery_cycle_transitions_candidate_status_before_analysis(tmp_pa
     assert results[0].status == "CONFIRMED"
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/test_discovery_wiring.py -v`
 Expected: FAIL med `ImportError`/`AttributeError`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```python
 def run_discovery_cycle(repo, runner, settings, risk_limits, run_id) -> list[Candidate]:
@@ -1346,7 +1352,7 @@ def run_discovery_cycle(repo, runner, settings, risk_limits, run_id) -> list[Can
     return results
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/crypto_trading/test_discovery_wiring.py -v`
 Expected: alla tester PASS.
@@ -1360,7 +1366,7 @@ Expected: alla tester PASS.
 
 **Interfaces:** inga nya — strukturellt/konfigurationsverifierande test.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 """AC7: default pytest-körning kräver noll Claude API-anrop."""
@@ -1392,12 +1398,12 @@ def test_no_test_in_crypto_trading_constructs_a_real_anthropic_client_at_import_
                 pass  # detaljerad scope-kontroll implementeras vid exekvering om behov visar sig
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `pytest tests/crypto_trading/agents/test_no_real_api_calls_by_default.py -v`
 Expected: FAIL innan filen finns (`ModuleNotFoundError` för testfilen självt går inte — det är själva testfilen; verifiera istället att den samlas in utan syntaxfel och att första testet är rött av rätt anledning om miljövariabeln råkar vara satt lokalt).
 
-- [ ] **Step 3: Confirm passing**
+- [x] **Step 3: Confirm passing**
 
 Run: `pytest tests/crypto_trading/agents/test_no_real_api_calls_by_default.py -v`
 Expected: PASS.
@@ -1411,7 +1417,7 @@ Expected: PASS.
 
 **Interfaces:** inga nya — end-to-end-test mot `run_discovery_cycle`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Tre scenarier i en fil, samma anda som Fas 2:s `test_screening_integration.py`:
 
@@ -1430,12 +1436,12 @@ def test_end_to_end_no_trade_path_via_gate_capacity(tmp_path):
     count_open_positions() >= max_concurrent_positions -> NO_TRADE (AC4)."""
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `pytest tests/crypto_trading/test_phase3_integration.py -v`
 Expected: FAIL om något av de tidigare tasken har en integrationslucka — annars gröna direkt (rent verifieringstillägg).
 
-- [ ] **Step 3: Fix any discovered issues, then confirm passing**
+- [x] **Step 3: Fix any discovered issues, then confirm passing**
 
 Run: `pytest tests/crypto_trading/ -v -k phase3_integration`
 Expected: PASS.
@@ -1446,40 +1452,40 @@ Expected: PASS.
 
 **Files:** inga (bara verifieringskommandon).
 
-- [ ] **Step 1: Full testsvit för crypto_trading**
+- [x] **Step 1: Full testsvit för crypto_trading**
 
 Run: `pytest tests/crypto_trading/ -v`
 Expected: alla tester gröna, inklusive alla nya `agents/`/`gate/`/orchestrator-tester.
 
-- [ ] **Step 2: Ruff check + format**
+- [x] **Step 2: Ruff check + format**
 
 Run: `ruff check crypto_trading/ tests/crypto_trading/`
 Run: `ruff format --check crypto_trading/ tests/crypto_trading/`
 Expected: inga fel, inga diff.
 
-- [ ] **Step 3: Verifiera att intelligence/ fortfarande är orört**
+- [x] **Step 3: Verifiera att intelligence/ fortfarande är orört**
 
 Run: `git diff master -- intelligence/`
 Expected: tom output.
 
-- [ ] **Step 4: Full repo-testsvit**
+- [x] **Step 4: Full repo-testsvit**
 
 Run: `pytest -v`
 Expected: alla tester (crypto_trading Fas 0-3, intelligence, test_setup) gröna, ingen regression.
 
-- [ ] **Step 5: Verifiera importgräns och broker-frihet fortfarande håller**
+- [x] **Step 5: Verifiera importgräns och broker-frihet fortfarande håller**
 
 Run: `pytest tests/crypto_trading/test_no_intelligence_coupling.py -v`
 Expected: PASS.
 
-- [ ] **Step 6: AC7-bekräftelse**
+- [x] **Step 6: AC7-bekräftelse**
 
 Run: `ANTHROPIC_API_KEY= pytest tests/crypto_trading/ -v` (tom miljövariabel)
 Expected: alla tester ändå gröna — inget riktigt API-anrop krävs.
 
-- [ ] **Step 7: Uppdatera PLAN_CRYPTO_PHASE3.md**
+- [x] **Step 7: Uppdatera PLAN_CRYPTO_PHASE3.md**
 
-Kryssa i samtliga `- [ ]` till `- [x]`, lägg till statusbanner (samma format som Fas 1/2) med exakt testantal och ev. avvikelser upptäckta under exekvering.
+Kryssa i samtliga `- [x]` till `- [x]`, lägg till statusbanner (samma format som Fas 1/2) med exakt testantal och ev. avvikelser upptäckta under exekvering.
 
 ---
 

@@ -62,16 +62,27 @@ def test_full_discovery_cycle_works_end_to_end_without_anthropic_api_key(tmp_pat
         outcome="worth_deeper_analysis",
     )
     candidate = Candidate(
-        candidate_id="cand-1", idempotency_key="key-1", instrument="BTCUSDT",
-        discovery_run_id="run-1", evidence_hash="hash-1", status="CANDIDATE",
-        evidence_record=evidence, created_at=_NOW, updated_at=_NOW,
+        candidate_id="cand-1",
+        idempotency_key="key-1",
+        instrument="BTCUSDT",
+        discovery_run_id="run-1",
+        evidence_hash="hash-1",
+        status="CANDIDATE",
+        evidence_record=evidence,
+        created_at=_NOW,
+        updated_at=_NOW,
     )
     repo.create_candidate_with_event(
         candidate,
         Event(
-            event_id="CANDIDATE_CREATED:cand-1", event_type="CANDIDATE_CREATED",
-            aggregate_type="candidate", aggregate_id="cand-1", occurred_at=_NOW,
-            run_id="run-1", schema_version=1, payload={},
+            event_id="CANDIDATE_CREATED:cand-1",
+            event_type="CANDIDATE_CREATED",
+            aggregate_type="candidate",
+            aggregate_id="cand-1",
+            occurred_at=_NOW,
+            run_id="run-1",
+            schema_version=1,
+            payload={},
         ),
     )
 

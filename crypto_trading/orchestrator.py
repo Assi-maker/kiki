@@ -80,7 +80,9 @@ class Orchestrator:
         self._repo.transition_candidate_with_event(
             candidate.candidate_id, decision.outcome, now, event
         )
-        self._repo.save_gate_decision(candidate.candidate_id, decision.outcome, decision.reasons, now)
+        self._repo.save_gate_decision(
+            candidate.candidate_id, decision.outcome, decision.reasons, now
+        )
 
         candidate.status = decision.outcome
         candidate.updated_at = now
@@ -124,7 +126,9 @@ def run_discovery_cycle(
             schema_version=1,
             payload={"from": candidate.status, "to": "UNDER_AI_ANALYSIS"},
         )
-        repo.transition_candidate_with_event(candidate.candidate_id, "UNDER_AI_ANALYSIS", now, event)
+        repo.transition_candidate_with_event(
+            candidate.candidate_id, "UNDER_AI_ANALYSIS", now, event
+        )
         candidate.status = "UNDER_AI_ANALYSIS"
         results.append(orchestrator.process_candidate(candidate, run_id))
     return results

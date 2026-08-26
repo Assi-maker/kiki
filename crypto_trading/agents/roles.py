@@ -32,9 +32,7 @@ ROLE_MAP: dict[str, RoleSpec] = {
     "bull_thesis": RoleSpec(
         agent_file="crypto-bull-thesis.md", assessment_type=BullThesisAssessment
     ),
-    "forecast": RoleSpec(
-        agent_file="crypto-forecast-agent.md", assessment_type=ForecastAssessment
-    ),
+    "forecast": RoleSpec(agent_file="crypto-forecast-agent.md", assessment_type=ForecastAssessment),
     "risk": RoleSpec(agent_file="crypto-risk-agent.md", assessment_type=RiskAssessment),
     "bear_adversarial": RoleSpec(
         agent_file="crypto-bear-adversarial.md", assessment_type=BearAdversarialAssessment

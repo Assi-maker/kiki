@@ -101,9 +101,7 @@ class BaseMarketDataConnector:
         implementerar sin egen tolkning. Delad infrastruktur ovanför denna
         punkt (timeout/retry/rate-limit/cache) är generell för alla
         market-data-/nyhets-/external-data-connectors (SPEC §15)."""
-        raise NotImplementedError(
-            f"{type(self).__name__} måste implementera _parse_response()"
-        )
+        raise NotImplementedError(f"{type(self).__name__} måste implementera _parse_response()")
 
     def _now(self) -> datetime:
         return datetime.now(UTC)

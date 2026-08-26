@@ -47,16 +47,25 @@ def _persisted_candidate_in_status(repo, status: str, candidate_id: str = "cand-
         updated_at=_NOW,
     )
     creation_event = Event(
-        event_id=f"CANDIDATE_CREATED:{candidate_id}", event_type="CANDIDATE_CREATED",
-        aggregate_type="candidate", aggregate_id=candidate_id, occurred_at=_NOW,
-        run_id="run-1", schema_version=1, payload={},
+        event_id=f"CANDIDATE_CREATED:{candidate_id}",
+        event_type="CANDIDATE_CREATED",
+        aggregate_type="candidate",
+        aggregate_id=candidate_id,
+        occurred_at=_NOW,
+        run_id="run-1",
+        schema_version=1,
+        payload={},
     )
     repo.create_candidate_with_event(candidate, creation_event)
     if status != "CANDIDATE":
         transition_event = Event(
             event_id=f"CANDIDATE_TRANSITIONED:{candidate_id}:{status}",
-            event_type="CANDIDATE_TRANSITIONED", aggregate_type="candidate",
-            aggregate_id=candidate_id, occurred_at=_NOW, run_id="run-1", schema_version=1,
+            event_type="CANDIDATE_TRANSITIONED",
+            aggregate_type="candidate",
+            aggregate_id=candidate_id,
+            occurred_at=_NOW,
+            run_id="run-1",
+            schema_version=1,
             payload={"from": "CANDIDATE", "to": status},
         )
         repo.transition_candidate_with_event(candidate_id, status, _NOW, transition_event)
@@ -65,7 +74,9 @@ def _persisted_candidate_in_status(repo, status: str, candidate_id: str = "cand-
 
 def test_run_discovery_cycle_sweeps_interrupted_analyses_first(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
-    stuck = _persisted_candidate_in_status(repo, "UNDER_AI_ANALYSIS")  # föräldralös, simulerar krasch
+    stuck = _persisted_candidate_in_status(
+        repo, "UNDER_AI_ANALYSIS"
+    )  # föräldralös, simulerar krasch
 
     run_discovery_cycle(
         repo=repo, runner=MockAgentRunner(fixtures={}), settings=_settings(), run_id="run-2"

@@ -41,52 +41,86 @@ def _evidence() -> CandidateEvidenceRecord:
 
 def _news(status="ok") -> NewsSentimentAssessment:
     return NewsSentimentAssessment(
-        agent_name="crypto-news-sentiment", run_id="run-1", created_at=_NOW, status=status,
-        verified_facts=["f"], source_claims=["c"], interpretation="i",
+        agent_name="crypto-news-sentiment",
+        run_id="run-1",
+        created_at=_NOW,
+        status=status,
+        verified_facts=["f"],
+        source_claims=["c"],
+        interpretation="i",
     )
 
 
 def _technical(status="ok") -> TechnicalAssessment:
     return TechnicalAssessment(
-        agent_name="crypto-technical-analyst", run_id="run-1", created_at=_NOW, status=status,
-        market_data={}, interpretation="i",
+        agent_name="crypto-technical-analyst",
+        run_id="run-1",
+        created_at=_NOW,
+        status=status,
+        market_data={},
+        interpretation="i",
     )
 
 
 def _bull(status="ok") -> BullThesisAssessment:
     return BullThesisAssessment(
-        agent_name="crypto-bull-thesis", run_id="run-1", created_at=_NOW, status=status,
-        hypothesis="h", catalyst="c", setup="s",
+        agent_name="crypto-bull-thesis",
+        run_id="run-1",
+        created_at=_NOW,
+        status=status,
+        hypothesis="h",
+        catalyst="c",
+        setup="s",
     )
 
 
 def _forecast(status="ok") -> ForecastAssessment:
     return ForecastAssessment(
-        agent_name="crypto-forecast-agent", run_id="run-1", created_at=_NOW, status=status,
+        agent_name="crypto-forecast-agent",
+        run_id="run-1",
+        created_at=_NOW,
+        status=status,
         scenario_probabilities={"bullish": 0.6, "neutral": 0.3, "bearish": 0.1},
-        horizon="4h", forecast_version="v1",
+        horizon="4h",
+        forecast_version="v1",
     )
 
 
 def _risk(status="ok") -> RiskAssessment:
     return RiskAssessment(
-        agent_name="crypto-risk-agent", run_id="run-1", created_at=_NOW, status=status,
-        suggested_stop_loss="1", suggested_target="2",
-        downside="d", liquidity_risk="l", model_risk="m", timing_risk="t",
+        agent_name="crypto-risk-agent",
+        run_id="run-1",
+        created_at=_NOW,
+        status=status,
+        suggested_stop_loss="1",
+        suggested_target="2",
+        downside="d",
+        liquidity_risk="l",
+        model_risk="m",
+        timing_risk="t",
     )
 
 
 def _bear(status="ok") -> BearAdversarialAssessment:
     return BearAdversarialAssessment(
-        agent_name="crypto-bear-adversarial", run_id="run-1", created_at=_NOW, status=status,
-        counterarguments=["c"], alternative_explanations=["a"], falsification_conditions="f",
+        agent_name="crypto-bear-adversarial",
+        run_id="run-1",
+        created_at=_NOW,
+        status=status,
+        counterarguments=["c"],
+        alternative_explanations=["a"],
+        falsification_conditions="f",
     )
 
 
 def _qa(status="ok", passed=True) -> QAAssessment:
     return QAAssessment(
-        agent_name="crypto-qa-gate", run_id="run-1", created_at=_NOW, status=status,
-        passed=passed, violations=[],
+        agent_name="crypto-qa-gate",
+        run_id="run-1",
+        created_at=_NOW,
+        status=status,
+        passed=passed,
+        violations=[],
     )
 
 

@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from crypto_trading.agents.runner import MockAgentRunner
@@ -42,15 +42,21 @@ def _settings(max_ai_calls_per_discovery_run: int = 70) -> Settings:
             top_n=30,
             cooldown_minutes=60,
             max_data_age_seconds={
-                "ticker": 30, "kline": 120, "funding_rate": 3600,
-                "open_interest": 300, "contracts": 86400,
+                "ticker": 30,
+                "kline": 120,
+                "funding_rate": 3600,
+                "open_interest": 300,
+                "contracts": 86400,
             },
             min_sample_size_for_calibration=30,
             calibration_preliminary_sample_size=10,
             sqlite_busy_timeout_ms=5000,
             required_fields={
-                "ticker": ["lastPrice"], "kline": ["open"], "funding_rate": ["fundingRate"],
-                "open_interest": ["openInterest"], "contracts": ["symbol"],
+                "ticker": ["lastPrice"],
+                "kline": ["open"],
+                "funding_rate": ["fundingRate"],
+                "open_interest": ["openInterest"],
+                "contracts": ["symbol"],
             },
             screener_timeframes=["1h"],
             bingx_base_url="https://open-api.bingx.com",
@@ -117,15 +123,24 @@ def _persisted_candidate_in_under_ai_analysis(repo) -> Candidate:
         updated_at=_NOW,
     )
     creation_event = Event(
-        event_id="CANDIDATE_CREATED:cand-1", event_type="CANDIDATE_CREATED",
-        aggregate_type="candidate", aggregate_id="cand-1", occurred_at=_NOW,
-        run_id="run-1", schema_version=1, payload={},
+        event_id="CANDIDATE_CREATED:cand-1",
+        event_type="CANDIDATE_CREATED",
+        aggregate_type="candidate",
+        aggregate_id="cand-1",
+        occurred_at=_NOW,
+        run_id="run-1",
+        schema_version=1,
+        payload={},
     )
     repo.create_candidate_with_event(candidate, creation_event)
     transition_event = Event(
         event_id="CANDIDATE_TRANSITIONED:cand-1:UNDER_AI_ANALYSIS",
-        event_type="CANDIDATE_TRANSITIONED", aggregate_type="candidate",
-        aggregate_id="cand-1", occurred_at=_NOW, run_id="run-1", schema_version=1,
+        event_type="CANDIDATE_TRANSITIONED",
+        aggregate_type="candidate",
+        aggregate_id="cand-1",
+        occurred_at=_NOW,
+        run_id="run-1",
+        schema_version=1,
         payload={"from": "CANDIDATE", "to": "UNDER_AI_ANALYSIS"},
     )
     repo.transition_candidate_with_event("cand-1", "UNDER_AI_ANALYSIS", _NOW, transition_event)
@@ -135,34 +150,68 @@ def _persisted_candidate_in_under_ai_analysis(repo) -> Candidate:
 def _happy_fixtures() -> dict:
     return {
         "crypto-news-sentiment": NewsSentimentAssessment(
-            agent_name="crypto-news-sentiment", run_id="run-1", created_at=_NOW, status="ok",
-            verified_facts=["f"], source_claims=["c"], interpretation="i",
+            agent_name="crypto-news-sentiment",
+            run_id="run-1",
+            created_at=_NOW,
+            status="ok",
+            verified_facts=["f"],
+            source_claims=["c"],
+            interpretation="i",
         ),
         "crypto-technical-analyst": TechnicalAssessment(
-            agent_name="crypto-technical-analyst", run_id="run-1", created_at=_NOW, status="ok",
-            market_data={}, interpretation="i",
+            agent_name="crypto-technical-analyst",
+            run_id="run-1",
+            created_at=_NOW,
+            status="ok",
+            market_data={},
+            interpretation="i",
         ),
         "crypto-bull-thesis": BullThesisAssessment(
-            agent_name="crypto-bull-thesis", run_id="run-1", created_at=_NOW, status="ok",
-            hypothesis="h", catalyst="c", setup="s",
+            agent_name="crypto-bull-thesis",
+            run_id="run-1",
+            created_at=_NOW,
+            status="ok",
+            hypothesis="h",
+            catalyst="c",
+            setup="s",
         ),
         "crypto-forecast-agent": ForecastAssessment(
-            agent_name="crypto-forecast-agent", run_id="run-1", created_at=_NOW, status="ok",
+            agent_name="crypto-forecast-agent",
+            run_id="run-1",
+            created_at=_NOW,
+            status="ok",
             scenario_probabilities={"bullish": 0.6, "neutral": 0.3, "bearish": 0.1},
-            horizon="4h", forecast_version="v1",
+            horizon="4h",
+            forecast_version="v1",
         ),
         "crypto-risk-agent": RiskAssessment(
-            agent_name="crypto-risk-agent", run_id="run-1", created_at=_NOW, status="ok",
-            suggested_stop_loss="1", suggested_target="2",
-            downside="d", liquidity_risk="l", model_risk="m", timing_risk="t",
+            agent_name="crypto-risk-agent",
+            run_id="run-1",
+            created_at=_NOW,
+            status="ok",
+            suggested_stop_loss="1",
+            suggested_target="2",
+            downside="d",
+            liquidity_risk="l",
+            model_risk="m",
+            timing_risk="t",
         ),
         "crypto-bear-adversarial": BearAdversarialAssessment(
-            agent_name="crypto-bear-adversarial", run_id="run-1", created_at=_NOW, status="ok",
-            counterarguments=["c"], alternative_explanations=["a"], falsification_conditions="f",
+            agent_name="crypto-bear-adversarial",
+            run_id="run-1",
+            created_at=_NOW,
+            status="ok",
+            counterarguments=["c"],
+            alternative_explanations=["a"],
+            falsification_conditions="f",
         ),
         "crypto-qa-gate": QAAssessment(
-            agent_name="crypto-qa-gate", run_id="run-1", created_at=_NOW, status="ok",
-            passed=True, violations=[],
+            agent_name="crypto-qa-gate",
+            run_id="run-1",
+            created_at=_NOW,
+            status="ok",
+            passed=True,
+            violations=[],
         ),
     }
 
@@ -216,7 +265,9 @@ def test_process_candidate_stops_role_loop_at_ai_call_budget(tmp_path):
     candidate = _persisted_candidate_in_under_ai_analysis(repo)
     runner = MockAgentRunner(fixtures=_happy_fixtures())
 
-    orch = Orchestrator(repo=repo, runner=runner, settings=_settings(max_ai_calls_per_discovery_run=3))
+    orch = Orchestrator(
+        repo=repo, runner=runner, settings=_settings(max_ai_calls_per_discovery_run=3)
+    )
     result = orch.process_candidate(candidate, run_id="run-1")
 
     assert result.risk is None or result.bear_adversarial is None  # loopen bröts tidigt
