@@ -173,6 +173,23 @@ def test_pipeline_config_rejects_spread_pct_above_one():
         PipelineConfig(**_valid_pipeline_kwargs(eligibility_max_spread_pct=Decimal("1.5")))
 
 
+def test_get_settings_loads_phase5_5_news_urls():
+    settings = get_settings()
+    assert settings.pipeline.news_rss_base_url == "https://www.coindesk.com/arc/outboundfeeds/rss/"
+    assert settings.pipeline.fear_greed_base_url == "https://api.alternative.me/fng/"
+
+
+def test_pipeline_config_allows_overriding_news_urls():
+    config = PipelineConfig(
+        **_valid_pipeline_kwargs(
+            news_rss_base_url="https://example.com/rss",
+            fear_greed_base_url="https://example.com/fng",
+        )
+    )
+    assert config.news_rss_base_url == "https://example.com/rss"
+    assert config.fear_greed_base_url == "https://example.com/fng"
+
+
 def test_missing_config_file_raises_config_error(tmp_path, monkeypatch):
     import crypto_trading.config.loader as loader_module
 

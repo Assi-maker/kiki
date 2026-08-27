@@ -21,6 +21,7 @@ from crypto_trading.schemas.assessments import (
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import CandidateEvidenceRecord
+from crypto_trading.schemas.forecast import ForecastRecord
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.db import get_connection
 from crypto_trading.storage.exceptions import CorruptCandidateStateError
@@ -71,6 +72,14 @@ class Repository(Protocol):
         closed_at: datetime,
         event: Event,
     ) -> None: ...
+    def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
+    def complete_run(
+        self, run_id: str, completed_at: datetime, status: str, errors: list[str]
+    ) -> None: ...
+    def record_ai_call_event(self, event: Event) -> None: ...
+    def count_ai_calls_since(self, cutoff: datetime) -> int: ...
+    def save_forecast_record(self, record: ForecastRecord) -> None: ...
+    def get_forecast_record(self, candidate_id: str) -> ForecastRecord | None: ...
 
 
 class SQLiteRepository:
@@ -371,6 +380,75 @@ class SQLiteRepository:
         except Exception:
             self._conn.rollback()
             raise
+
+    def save_forecast_record(self, record: ForecastRecord) -> None:
+        self._conn.execute(
+            "INSERT INTO forecasts (forecast_id, candidate_id, instrument, "
+            "forecast_timestamp, horizon, scenario_probabilities, forecast_version, "
+            "market_state_metadata) VALUES (?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(forecast_id) DO UPDATE SET "
+            "candidate_id = excluded.candidate_id, instrument = excluded.instrument, "
+            "forecast_timestamp = excluded.forecast_timestamp, horizon = excluded.horizon, "
+            "scenario_probabilities = excluded.scenario_probabilities, "
+            "forecast_version = excluded.forecast_version, "
+            "market_state_metadata = excluded.market_state_metadata",
+            (
+                record.forecast_id,
+                record.candidate_id,
+                record.instrument,
+                record.forecast_timestamp.isoformat(),
+                record.horizon,
+                json.dumps(record.scenario_probabilities),
+                record.forecast_version,
+                json.dumps(record.market_state_metadata),
+            ),
+        )
+        self._conn.commit()
+
+    def get_forecast_record(self, candidate_id: str) -> ForecastRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM forecasts WHERE candidate_id = ?", (candidate_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["scenario_probabilities"] = json.loads(data["scenario_probabilities"])
+        data["market_state_metadata"] = json.loads(data["market_state_metadata"])
+        data["forecast_timestamp"] = datetime.fromisoformat(data["forecast_timestamp"])
+        data["outcome_timestamp"] = (
+            datetime.fromisoformat(data["outcome_timestamp"])
+            if data["outcome_timestamp"] is not None
+            else None
+        )
+        return ForecastRecord(**data)
+
+    def record_ai_call_event(self, event: Event) -> None:
+        self._insert_event(event)
+        self._conn.commit()
+
+    def count_ai_calls_since(self, cutoff: datetime) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE event_type = 'AI_CALL_MADE' "
+            "AND occurred_at >= ?",
+            (cutoff.isoformat(),),
+        ).fetchone()
+        return row["n"]
+
+    def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None:
+        self._conn.execute(
+            "INSERT INTO runs (run_id, run_type, started_at, status) VALUES (?,?,?,'running')",
+            (run_id, run_type, started_at.isoformat()),
+        )
+        self._conn.commit()
+
+    def complete_run(
+        self, run_id: str, completed_at: datetime, status: str, errors: list[str]
+    ) -> None:
+        self._conn.execute(
+            "UPDATE runs SET completed_at = ?, status = ?, errors = ? WHERE run_id = ?",
+            (completed_at.isoformat(), status, json.dumps(errors), run_id),
+        )
+        self._conn.commit()
 
     def find_candidates_by_status(self, status: str) -> list[Candidate]:
         """Ett korrupt candidate-state (CorruptCandidateStateError) hoppas

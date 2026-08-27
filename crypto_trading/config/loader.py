@@ -42,6 +42,8 @@ class PipelineConfig(BaseModel):
     screener_funding_rate_threshold_pct: Decimal = Field(gt=0)
     screener_funding_history_limit: int = Field(gt=1)
     evidence_change_threshold_for_reanalysis: Decimal = Field(ge=0)
+    news_rss_base_url: str = "https://www.coindesk.com/arc/outboundfeeds/rss/"
+    fear_greed_base_url: str = "https://api.alternative.me/fng/"
 
     @field_validator("max_data_age_seconds")
     @classmethod

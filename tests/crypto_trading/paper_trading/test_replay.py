@@ -8,7 +8,7 @@ from crypto_trading.config.loader import (
     RiskLimitsConfig,
     Settings,
 )
-from crypto_trading.paper_trading.replay import MarketSnapshot, run_replay
+from crypto_trading.paper_trading.replay import MarketSnapshot, run_replay, run_single_cycle
 from crypto_trading.schemas.assessments import (
     BearAdversarialAssessment,
     BullThesisAssessment,
@@ -327,6 +327,20 @@ def test_replay_decision_at_time_t_is_unaffected_by_injected_future_data(tmp_pat
     assert clean.simulated_fill_entry == tampered.simulated_fill_entry
     assert clean.exit_reason == tampered.exit_reason
     assert clean.theoretical_exit == tampered.theoretical_exit
+
+
+def test_run_single_cycle_can_be_called_directly_with_one_snapshot(tmp_path):
+    """Låser run_single_cycle()s fristående kontrakt (Task 5): discovery_loop.py
+    (Fas 5) ska kunna anropa den en gång per tick, utan run_replay()s loop."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    spike_snapshot = _build_snapshots()[1]
+
+    positions = run_single_cycle(spike_snapshot, repo, runner, _settings(), run_id="run-1")
+
+    assert len(positions) == 1
+    assert positions[0].instrument == "BTCUSDT"
+    assert positions[0].status == "OPEN_POSITION"
 
 
 def test_replay_is_deterministic_on_repeated_runs(tmp_path):

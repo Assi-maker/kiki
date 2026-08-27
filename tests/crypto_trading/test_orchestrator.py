@@ -8,6 +8,7 @@ from crypto_trading.config.loader import (
     RiskLimitsConfig,
     Settings,
 )
+from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.orchestrator import Orchestrator
 from crypto_trading.schemas.assessments import (
     BearAdversarialAssessment,
@@ -33,7 +34,9 @@ from crypto_trading.storage.repository import SQLiteRepository
 _NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
 
 
-def _settings(max_ai_calls_per_discovery_run: int = 70) -> Settings:
+def _settings(
+    max_ai_calls_per_discovery_run: int = 70, max_ai_calls_per_day: int = 500
+) -> Settings:
     return Settings(
         db_path="unused",
         pipeline=PipelineConfig(
@@ -88,7 +91,7 @@ def _settings(max_ai_calls_per_discovery_run: int = 70) -> Settings:
         budget_limits=BudgetLimitsConfig(
             max_candidates_per_discovery_run=10,
             max_ai_calls_per_discovery_run=max_ai_calls_per_discovery_run,
-            max_ai_calls_per_day=500,
+            max_ai_calls_per_day=max_ai_calls_per_day,
             warning_threshold_pct=Decimal("0.8"),
         ),
     )
@@ -259,6 +262,173 @@ def test_rejected_to_confirmed_transition_is_always_false():
     """AC5 - strukturell verifiering av redan befintlig Fas 0-garanti."""
     allowed, _reason = can_transition("REJECTED", "CONFIRMED")
     assert allowed is False
+
+
+class _SpyRunner(MockAgentRunner):
+    """Fångar det faktiska context-argumentet per rollanrop, utan att ändra
+    MockAgentRunners befintliga beteende (Fas 5.5 Task 2 - bevisar att
+    news_headlines/fear_greed_index faktiskt når fram, inte bara att inget
+    kraschar)."""
+
+    def __init__(self, fixtures, fail_agents=None, timeout_agents=None):
+        super().__init__(fixtures, fail_agents, timeout_agents)
+        self.captured_contexts: dict[str, dict] = {}
+
+    def run(self, agent_def, context, output_schema):
+        self.captured_contexts[agent_def.name] = context
+        return super().run(agent_def, context, output_schema)
+
+
+class _StubNewsConnector:
+    def get_latest_items(self, limit: int) -> list[dict]:
+        return [{"title": "UNIK_TESTRUBRIK", "link": "l", "pub_date": "p", "description": "d"}]
+
+
+class _StubExternalDataConnector:
+    def get_fear_greed_index(self) -> dict:
+        return {"value": "50", "value_classification": "Neutral"}
+
+
+class _RaisingNewsConnector:
+    def get_latest_items(self, limit: int) -> list[dict]:
+        raise ConnectorUnavailableError("news_rss otillgänglig")
+
+
+class _RaisingExternalDataConnector:
+    def get_fear_greed_index(self) -> dict:
+        raise ConnectorUnavailableError("fear_greed otillgänglig")
+
+
+def test_build_context_includes_news_and_fear_greed_only_for_news_sentiment_role(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    spy = _SpyRunner(_happy_fixtures())
+
+    orch = Orchestrator(
+        repo=repo,
+        runner=spy,
+        settings=_settings(),
+        news_connector=_StubNewsConnector(),
+        external_data_connector=_StubExternalDataConnector(),
+    )
+    orch.process_candidate(candidate, run_id="run-1")
+
+    news_context = spy.captured_contexts["crypto-news-sentiment"]
+    assert news_context["news_headlines"] == [
+        {"title": "UNIK_TESTRUBRIK", "link": "l", "pub_date": "p", "description": "d"}
+    ]
+    assert news_context["fear_greed_index"] == {"value": "50", "value_classification": "Neutral"}
+    assert "evidence_record" in news_context  # befintligt fält kvar oförändrat
+
+    other_context = spy.captured_contexts["crypto-technical-analyst"]
+    assert "news_headlines" not in other_context
+    assert "fear_greed_index" not in other_context
+    assert "evidence_record" in other_context
+
+
+def test_build_context_omits_news_keys_when_connectors_are_none(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    spy = _SpyRunner(_happy_fixtures())
+
+    orch = Orchestrator(repo=repo, runner=spy, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    news_context = spy.captured_contexts["crypto-news-sentiment"]
+    assert "news_headlines" not in news_context
+    assert "fear_greed_index" not in news_context
+    assert "evidence_record" in news_context
+
+
+def test_build_context_degrades_gracefully_when_news_connector_raises(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    runner = MockAgentRunner(_happy_fixtures())
+
+    orch = Orchestrator(
+        repo=repo,
+        runner=runner,
+        settings=_settings(),
+        news_connector=_RaisingNewsConnector(),
+        external_data_connector=_StubExternalDataConnector(),
+    )
+    result = orch.process_candidate(candidate, run_id="run-1")  # kastar aldrig
+
+    assert result.news_sentiment.status == "ok"
+    assert result.status == "CONFIRMED"
+
+
+def test_build_context_degrades_gracefully_when_external_data_connector_raises(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    runner = MockAgentRunner(_happy_fixtures())
+
+    orch = Orchestrator(
+        repo=repo,
+        runner=runner,
+        settings=_settings(),
+        news_connector=_StubNewsConnector(),
+        external_data_connector=_RaisingExternalDataConnector(),
+    )
+    result = orch.process_candidate(candidate, run_id="run-1")  # kastar aldrig
+
+    assert result.news_sentiment.status == "ok"
+    assert result.status == "CONFIRMED"
+
+
+def test_process_candidate_records_one_ai_call_event_per_role_invocation(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+
+    orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    assert repo.count_ai_calls_since(_NOW) == 7
+
+
+def test_process_candidate_records_ai_call_event_even_when_role_times_out(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    runner = MockAgentRunner(fixtures=_happy_fixtures(), timeout_agents={"crypto-risk-agent"})
+
+    orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    # anropet kostade även om utfallet blev timeout - samtliga sju roller körs
+    # fortfarande (bara Risk-rollen timeoutar, resten status="ok").
+    assert repo.count_ai_calls_since(_NOW) == 7
+
+
+def test_process_candidate_persists_forecast_record_on_successful_forecast_role(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    runner = MockAgentRunner(_happy_fixtures())
+
+    orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    record = repo.get_forecast_record(candidate.candidate_id)
+    assert record is not None
+    assert record.candidate_id == candidate.candidate_id
+    assert record.instrument == "BTCUSDT"
+    assert record.scenario_probabilities == {"bullish": 0.6, "neutral": 0.3, "bearish": 0.1}
+    assert record.horizon == "4h"
+    assert record.forecast_version == "v1"
+    assert record.market_state_metadata == candidate.evidence_record.model_dump(mode="json")
+    assert record.actual_outcome is None
+    assert record.outcome_timestamp is None
+
+
+def test_process_candidate_does_not_persist_forecast_record_when_forecast_role_fails(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    runner = MockAgentRunner(_happy_fixtures(), timeout_agents={"crypto-forecast-agent"})
+
+    orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    assert repo.get_forecast_record(candidate.candidate_id) is None
 
 
 def test_process_candidate_stops_role_loop_at_ai_call_budget(tmp_path):

@@ -33,3 +33,5 @@ screener_volume_zscore_threshold: "2.5"
 screener_funding_rate_threshold_pct: "0.05"
 screener_funding_history_limit: 10
 evidence_change_threshold_for_reanalysis: "0.15"
+news_rss_base_url: "https://www.coindesk.com/arc/outboundfeeds/rss/"
+fear_greed_base_url: "https://api.alternative.me/fng/"
