@@ -80,6 +80,12 @@ class Repository(Protocol):
     def count_ai_calls_since(self, cutoff: datetime) -> int: ...
     def save_forecast_record(self, record: ForecastRecord) -> None: ...
     def get_forecast_record(self, candidate_id: str) -> ForecastRecord | None: ...
+    def record_telegram_event(
+        self, telegram_event_id: str, notification_type: str, sent_at: datetime
+    ) -> bool: ...
+    def has_telegram_event_been_sent(self, telegram_event_id: str) -> bool: ...
+    def find_candidates_pending_notification(self, status: str) -> list[Candidate]: ...
+    def find_positions_pending_notification(self) -> list[Position]: ...
 
 
 class SQLiteRepository:
@@ -449,6 +455,56 @@ class SQLiteRepository:
             (completed_at.isoformat(), status, json.dumps(errors), run_id),
         )
         self._conn.commit()
+
+    def record_telegram_event(
+        self, telegram_event_id: str, notification_type: str, sent_at: datetime
+    ) -> bool:
+        """INSERT OR IGNORE - samma idempotenskontrakt som _insert_event()/
+        AI_CALL_MADE-events (Fas 5): True bara om raden faktiskt är ny,
+        False om notisen redan skickats (omkörning/omstart av notify_loop,
+        Fas 6 §8.6)."""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO telegram_events "
+            "(telegram_event_id, notification_type, sent_at) VALUES (?, ?, ?)",
+            (telegram_event_id, notification_type, sent_at.isoformat()),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def has_telegram_event_been_sent(self, telegram_event_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM telegram_events WHERE telegram_event_id = ?", (telegram_event_id,)
+        ).fetchone()
+        return row is not None
+
+    def find_candidates_pending_notification(self, status: str) -> list[Candidate]:
+        """Anti-join mot telegram_events, nycklad `f'{status}:{candidate_id}'`
+        (Fas 6 Beslut 4) - snabbare och enklare än att replaya hela
+        events-loggen, fortfarande härlett från samma materialiserade
+        sanningskälla."""
+        rows = self._conn.execute(
+            "SELECT candidate_id FROM candidates WHERE status = ? "
+            "AND (? || ':' || candidate_id) NOT IN "
+            "(SELECT telegram_event_id FROM telegram_events)",
+            (status, status),
+        ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                candidate = self.get_candidate(row["candidate_id"])
+            except CorruptCandidateStateError:
+                continue
+            if candidate is not None:
+                result.append(candidate)
+        return result
+
+    def find_positions_pending_notification(self) -> list[Position]:
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE status = 'CLOSED' "
+            "AND ('CLOSED:' || position_id) NOT IN "
+            "(SELECT telegram_event_id FROM telegram_events)"
+        ).fetchall()
+        return [self._row_to_position(row) for row in rows]
 
     def find_candidates_by_status(self, status: str) -> list[Candidate]:
         """Ett korrupt candidate-state (CorruptCandidateStateError) hoppas

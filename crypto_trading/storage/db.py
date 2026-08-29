@@ -103,6 +103,12 @@ CREATE TABLE IF NOT EXISTS forecasts (
     outcome_timestamp TEXT
 );
 
+CREATE TABLE IF NOT EXISTS telegram_events (
+    telegram_event_id TEXT PRIMARY KEY,
+    notification_type TEXT NOT NULL,
+    sent_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT NOT NULL,
     run_type TEXT NOT NULL,
