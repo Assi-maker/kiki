@@ -3,7 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Literal
 
-from crypto_trading.schemas.trade import Direction
+from crypto_trading.schemas.trade import Direction, Position
 
 FILL_MODEL_VERSION = "v1"
 
@@ -44,3 +44,17 @@ def compute_funding(size: Decimal, funding_rate: Decimal, hold_hours: Decimal) -
     debiterar funding vid fasta 8h-tidpunkter, inte prorata."""
     whole_periods = int(hold_hours // _FUNDING_PERIOD_HOURS)
     return size * funding_rate * whole_periods
+
+
+def compute_pnl(position: Position) -> Decimal:
+    """Fas 6 (Telegram CLOSED-notis, SPEC §12): result = notional (size) *
+    prisavkastning, minus fees/funding - LONG-only (samma antagande som
+    position_opening.py/position_closing.py). Beräknas rent, ephemeralt för
+    notisformatering - lagras ALDRIG som ett eget Position-fält (undviker
+    en andra sanning/schemaändring för ett värde som alltid kan härledas
+    från redan persisterade fält)."""
+    price_return = (position.simulated_fill_exit - position.simulated_fill_entry) / (
+        position.simulated_fill_entry
+    )
+    gross_pnl = position.size * price_return
+    return gross_pnl - position.fees - position.funding

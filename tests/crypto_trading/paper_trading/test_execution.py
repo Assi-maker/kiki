@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from crypto_trading.paper_trading.execution import (
@@ -5,7 +6,9 @@ from crypto_trading.paper_trading.execution import (
     compute_fees,
     compute_fill_price,
     compute_funding,
+    compute_pnl,
 )
+from crypto_trading.schemas.trade import Position
 
 
 def test_compute_fill_price_long_entry_is_worse_than_reference():
@@ -85,3 +88,44 @@ def test_theoretical_and_simulated_fill_are_never_equal_when_spread_or_slippage_
 def test_fill_model_version_is_a_stable_string_constant():
     assert isinstance(FILL_MODEL_VERSION, str)
     assert FILL_MODEL_VERSION == "v1"
+
+
+def _closed_position(
+    simulated_fill_entry="50000",
+    simulated_fill_exit="51000",
+    size="5000",
+    fees="2",
+    funding="1",
+) -> Position:
+    return Position(
+        position_id="pos-1",
+        candidate_id="cand-1",
+        instrument="BTCUSDT",
+        direction="LONG",
+        status="CLOSED",
+        theoretical_entry="50000",
+        simulated_fill_entry=simulated_fill_entry,
+        stop_loss="49000",
+        target="52000",
+        size=size,
+        fill_model_version=FILL_MODEL_VERSION,
+        opened_at=datetime(2026, 8, 29, 10, 0, tzinfo=UTC),
+        theoretical_exit="51000",
+        simulated_fill_exit=simulated_fill_exit,
+        exit_reason="target",
+        fees=fees,
+        funding=funding,
+        closed_at=datetime(2026, 8, 29, 14, 0, tzinfo=UTC),
+    )
+
+
+def test_compute_pnl_matches_hand_calculation():
+    # (51000-50000)/50000 = 2% * 5000 notional = 100 gross - 2 fees - 1 funding = 97 net.
+    position = _closed_position()
+    assert compute_pnl(position) == Decimal("97")
+
+
+def test_compute_pnl_is_negative_when_exit_below_entry():
+    position = _closed_position(simulated_fill_exit="49500")
+    # (49500-50000)/50000 = -1% * 5000 = -50 gross - 2 fees - 1 funding = -53 net.
+    assert compute_pnl(position) == Decimal("-53")
