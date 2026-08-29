@@ -1,12 +1,15 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from crypto_trading.config.loader import (
     BudgetLimitsConfig,
     PipelineConfig,
     RiskLimitsConfig,
     Settings,
 )
+from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.market_snapshot import build_live_snapshot
 
 _NOW = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
@@ -157,6 +160,44 @@ def _ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
+class _TickerFailingConnector(_StubConnector):
+    """AC3-live-körningen 2026-08-28 kraschade hela discovery-ticken när
+    BingX svarade med ett API-fel (kod 109415, en pausad symbol) för EN
+    symbol bland hela instrumentuniversumet - build_live_snapshot() hade
+    ingen per-symbol-isolering runt get_ticker(), till skillnad från det
+    redan etablerade mönstret i monitoring_loop.py."""
+
+    def __init__(self, *args, fail_symbol: str, exc: Exception, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._fail_symbol = fail_symbol
+        self._exc = exc
+
+    def get_ticker(self, symbol):
+        if symbol == self._fail_symbol:
+            raise self._exc
+        return super().get_ticker(symbol)
+
+
+class _KlinesFailingConnector(_StubConnector):
+    """Samma AC3-regression, andra loopen (klines/funding/open interest för
+    top_n-symbolerna) - lika oskyddad mot ett enskilt instruments fel."""
+
+    def __init__(self, *args, fail_symbol: str, exc: Exception, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._fail_symbol = fail_symbol
+        self._exc = exc
+        self.funding_calls: list[str] = []
+
+    def get_klines(self, symbol, interval, limit=100):
+        if symbol == self._fail_symbol:
+            raise self._exc
+        return super().get_klines(symbol, interval, limit)
+
+    def get_funding_rate(self, symbol, limit=1):
+        self.funding_calls.append(symbol)
+        return super().get_funding_rate(symbol, limit)
+
+
 def test_build_live_snapshot_produces_ok_quality_for_complete_fresh_data():
     contracts = [_raw_contract("BTCUSDT")]
     tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
@@ -232,6 +273,99 @@ def test_build_live_snapshot_only_fetches_klines_funding_oi_for_top_n_symbols():
     build_live_snapshot(connector, _settings(top_n=1), _NOW)
 
     assert connector.klines_calls == ["BTCUSDT"]
+
+
+def test_build_live_snapshot_skips_a_symbol_whose_ticker_raises_connector_unavailable():
+    """AC3-regression: en ConnectorUnavailableError för ETT instruments
+    ticker-hämtning (t.ex. en pausad symbol på BingX) ska markera bara det
+    instrumentet 'invalid' och aldrig abortera resten av snapshoten."""
+    contracts = [_raw_contract("BADUSDT"), _raw_contract("BTCUSDT")]
+    tickers = {
+        "BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW)),
+    }
+    klines = {
+        "BTCUSDT": [
+            _raw_kline("50000", _ms(_NOW - timedelta(hours=2))),
+            _raw_kline("50100", _ms(_NOW - timedelta(hours=1))),
+            _raw_kline("50200", _ms(_NOW)),
+        ]
+    }
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _TickerFailingConnector(
+        contracts,
+        tickers,
+        klines,
+        funding_rates,
+        open_interest,
+        fail_symbol="BADUSDT",
+        exc=ConnectorUnavailableError("BingX API-fel 109415: BADUSDT is pause currently"),
+    )
+
+    snapshot = build_live_snapshot(connector, _settings(top_n=2), _NOW)
+
+    assert snapshot.data_quality_status["BADUSDT"] == "invalid"
+    assert "BADUSDT" not in snapshot.tickers
+    assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+    assert "BTCUSDT" in snapshot.tickers
+    assert connector.klines_calls == ["BTCUSDT"]  # BADUSDT nådde aldrig Top N
+
+
+def test_build_live_snapshot_skips_a_symbol_whose_klines_raise_connector_unavailable():
+    """Samma regression, andra loopen: en ConnectorUnavailableError vid
+    get_klines() för en top_n-symbol ska hoppa över HELA den symbolens
+    återstående bearbetning (funding/open interest anropas aldrig för den),
+    utan att påverka övriga top_n-symboler."""
+    contracts = [_raw_contract("BADUSDT"), _raw_contract("BTCUSDT")]
+    tickers = {
+        "BADUSDT": _raw_ticker("BADUSDT", "10", "5000000", _ms(_NOW)),
+        "BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW)),
+    }
+    klines = {
+        "BTCUSDT": [
+            _raw_kline("50000", _ms(_NOW - timedelta(hours=2))),
+            _raw_kline("50100", _ms(_NOW - timedelta(hours=1))),
+            _raw_kline("50200", _ms(_NOW)),
+        ]
+    }
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _KlinesFailingConnector(
+        contracts,
+        tickers,
+        klines,
+        funding_rates,
+        open_interest,
+        fail_symbol="BADUSDT",
+        exc=ConnectorUnavailableError("BingX API-fel: BADUSDT klines otillgängliga"),
+    )
+
+    snapshot = build_live_snapshot(connector, _settings(top_n=2), _NOW)
+
+    assert snapshot.data_quality_status["BADUSDT"] == "invalid"
+    assert snapshot.klines["BADUSDT"] == []
+    assert "BADUSDT" not in connector.funding_calls  # hela symbolen hoppades över
+    assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+    assert len(snapshot.klines["BTCUSDT"]) > 0
+
+
+def test_build_live_snapshot_does_not_mask_unexpected_non_connector_errors():
+    """Kravet är strikt avgränsat till ConnectorUnavailableError - ett
+    genuint oväntat fel (programmeringsbugg, inte ett känt connector-fel)
+    ska fortfarande propagera okontrollerat, precis som tidigare, så att
+    discovery_loop.run_discovery_tick()s befintliga fail-safe (Global
+    Constraints, SPEC §8.3) kan fånga och logga det på tick-nivå."""
+    contracts = [_raw_contract("BADUSDT"), _raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    connector = _TickerFailingConnector(
+        contracts,
+        tickers,
+        fail_symbol="BADUSDT",
+        exc=RuntimeError("genuint oväntad programmeringsbugg"),
+    )
+
+    with pytest.raises(RuntimeError):
+        build_live_snapshot(connector, _settings(top_n=2), _NOW)
 
 
 def test_build_live_snapshot_uses_only_the_first_configured_screener_timeframe():

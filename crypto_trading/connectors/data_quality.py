@@ -8,6 +8,16 @@ from crypto_trading.schemas.market import Kline
 
 DataQualityResult = Literal["ok", "invalid"]
 
+_FUTURE_TIMESTAMP_GRACE_SECONDS = 5
+"""AC3 2026-08-28: en riktig BingX-ticker vars closeTime landade ~3s efter
+lokal `now` avslöjade att en skarp 0-gräns gjorde ALL live-data "invalid" -
+en levande tickers closeTime speglar börsens klocka vid svarstillfället,
+som normalt hinner passera klientens `now` (fångad före request-latensen)
+även för det allra första anropet i en tick. En liten, explicit tolerans
+för denna normala klock-/nätverksskew, inte en lucka i fail-closed-
+principen: tydligt framtida tidsstämplar (bortom denna gräns) är
+fortfarande lika otillförlitliga som för gamla."""
+
 
 def check_completeness(raw: dict, required_fields: list[str]) -> DataQualityResult:
     for field in required_fields:
@@ -20,8 +30,8 @@ def check_staleness(
     observed_at: datetime, now: datetime, max_age_seconds: float
 ) -> DataQualityResult:
     age_seconds = (now - observed_at).total_seconds()
-    if age_seconds < 0:
-        return "invalid"  # framtida tidsstämpel är lika orimligt som för gammal
+    if age_seconds < -_FUTURE_TIMESTAMP_GRACE_SECONDS:
+        return "invalid"  # bortom grace-perioden: fortfarande lika orimligt som för gammal
     if age_seconds > max_age_seconds:
         return "invalid"
     return "ok"

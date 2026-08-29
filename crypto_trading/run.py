@@ -6,7 +6,7 @@ import threading
 from crypto_trading import discovery_loop, monitoring_loop
 from crypto_trading.agents.runner import AgentRunner, RealClaudeRunner
 from crypto_trading.config.exceptions import ConfigError
-from crypto_trading.config.loader import get_settings
+from crypto_trading.config.loader import Settings, get_settings
 from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.connectors.external_data import ExternalDataConnector
 from crypto_trading.connectors.news_rss import NewsRSSConnector
@@ -29,6 +29,39 @@ def build_runner_from_env() -> AgentRunner:
         timeout_seconds=float(os.environ.get("CRYPTO_TRADING_AGENT_TIMEOUT_SECONDS", "60")),
         max_retries=int(os.environ.get("CRYPTO_TRADING_AGENT_MAX_RETRIES", "3")),
     )
+
+
+def _run_discovery_forever(
+    connector: BingXMarketDataConnector,
+    runner: AgentRunner,
+    settings: Settings,
+    news_connector: NewsRSSConnector | None,
+    external_data_connector: ExternalDataConnector | None,
+) -> None:
+    """Konstruerar sin egen Repository (och därmed sqlite3-anslutning) HÄR,
+    inne i den tråd som faktiskt kör discovery-loopen. En sqlite3-anslutning
+    är trådbunden (check_same_thread=True som default i storage/db.py) -
+    AC3-live-körningen 2026-08-28 kraschade omedelbart med
+    sqlite3.ProgrammingError eftersom Repository tidigare konstruerades i
+    huvudtråden (main()) och sedan skickades in i denna threading.Thread.
+    Samma mönster som redan används i
+    tests/crypto_trading/storage/test_repository_concurrency.py."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    discovery_loop.run_forever(
+        connector,
+        repo,
+        runner,
+        settings,
+        news_connector=news_connector,
+        external_data_connector=external_data_connector,
+    )
+
+
+def _run_monitoring_forever(connector: BingXMarketDataConnector, settings: Settings) -> None:
+    """Samma trådbundna-anslutning-fix som _run_discovery_forever() ovan,
+    monitoring-sidan."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    monitoring_loop.run_forever(connector, repo, settings)
 
 
 def main() -> None:
@@ -60,24 +93,15 @@ def main() -> None:
         requests_per_second=1,
         cache_ttl_seconds=300,
     )
-    # Två separata Repository-instanser, en per tråd - loopar delar databas
-    # men körs oberoende (SPEC §7); sqlite_busy_timeout_ms är redan
-    # konfigurerad exakt för denna samtidiga-skrivning-situation.
-    discovery_repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
-    monitoring_repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
 
     discovery_thread = threading.Thread(
-        target=discovery_loop.run_forever,
-        args=(connector, discovery_repo, runner, settings),
-        kwargs={
-            "news_connector": news_connector,
-            "external_data_connector": external_data_connector,
-        },
+        target=_run_discovery_forever,
+        args=(connector, runner, settings, news_connector, external_data_connector),
         daemon=True,
     )
     monitoring_thread = threading.Thread(
-        target=monitoring_loop.run_forever,
-        args=(connector, monitoring_repo, settings),
+        target=_run_monitoring_forever,
+        args=(connector, settings),
         daemon=True,
     )
     discovery_thread.start()

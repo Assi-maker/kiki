@@ -66,8 +66,21 @@ def test_staleness_invalid_beyond_max_age():
     assert check_staleness(observed_at, datetime.now(UTC), max_age_seconds=30) == "invalid"
 
 
-def test_staleness_invalid_for_future_timestamp():
-    observed_at = datetime.now(UTC) + timedelta(seconds=5)
+def test_staleness_ok_within_grace_period_for_minor_future_skew():
+    """AC3 2026-08-28: BingX ticker closeTime landar ofta någon sekund efter
+    klientens lokala `now` (request-latens/normal klockskew mellan system) -
+    ett verkligt observerat fynd, inte ett hypotetiskt scenario. En sådan
+    mindre framtida tidsstämpel ska INTE göra datan otillförlitlig."""
+    observed_at = datetime.now(UTC) + timedelta(seconds=2)
+    assert check_staleness(observed_at, datetime.now(UTC), max_age_seconds=30) == "ok"
+
+
+def test_staleness_invalid_for_clearly_future_timestamp():
+    """Bortom grace period ska en framtida tidsstämpel fortfarande vara lika
+    otillförlitlig som tidigare - fail-closed-beteendet är oförändrat, bara
+    gränsen för vad som räknas som "framtida" har fått en liten, explicit
+    tolerans för normal skew."""
+    observed_at = datetime.now(UTC) + timedelta(seconds=30)
     assert check_staleness(observed_at, datetime.now(UTC), max_age_seconds=30) == "invalid"
 
 
