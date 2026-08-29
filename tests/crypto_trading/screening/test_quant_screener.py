@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from crypto_trading.schemas.evidence import CandidateEvidenceRecord
+from crypto_trading.schemas.evidence import CandidateEvidenceRecord, SecondaryTimeframeEvidence
 from crypto_trading.schemas.market import FundingRate, Kline
 from crypto_trading.screening.quant_screener import (
     build_funding_oi_evidence,
@@ -155,6 +155,14 @@ def test_evaluate_candidate_never_exposes_a_direction_field():
         CandidateEvidenceRecord.model_fields["funding_oi_evidence"].annotation,
     ):
         assert not (set(sub.model_fields.keys()) & forbidden)
+    secondary = SecondaryTimeframeEvidence
+    for sub in (
+        secondary.model_fields["price_volatility_evidence"].annotation,
+        secondary.model_fields["momentum_breakout_evidence"].annotation,
+        secondary.model_fields["volume_evidence"].annotation,
+        secondary.model_fields["funding_oi_evidence"].annotation,
+    ):
+        assert not (set(sub.model_fields.keys()) & forbidden)
 
 
 def test_evaluate_candidate_is_deterministic():
@@ -249,3 +257,104 @@ def test_evaluate_candidate_short_circuits_on_invalid_data_quality():
     assert record.outcome == "not_a_candidate"
     assert record.trigger_reasons == []
     assert record.candidate_score == 0.0
+
+
+def _base_kwargs(**overrides):
+    klines = _flat_klines(21, price="100")
+    klines.append(_kline("110", offset_hours=0))  # triggers price_volatility on primary (1h)
+    funding = [_funding("0.001", offset_hours=8 * i) for i in range(1, 6)]
+    kwargs = dict(
+        instrument="BTCUSDT",
+        timeframes=["1h", "4h"],
+        klines=klines,
+        funding_rates=funding,
+        data_quality_status="ok",
+        evaluated_at=_NOW,
+        price_volatility_threshold_pct=Decimal("2.0"),
+        lookback=20,
+        rsi_period=14,
+        rsi_overbought_threshold=Decimal("70"),
+        volume_zscore_threshold=Decimal("2.5"),
+        funding_rate_threshold_pct=Decimal("0.05"),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_evaluate_candidate_populates_secondary_timeframe_evidence_when_sufficient_data():
+    """'Primary triggers, secondary confirms': när tillräcklig 4h-data finns
+    beräknas secondary_timeframe_evidence med SAMMA byggfunktioner/trösklar
+    som primary, bara på 4h-klines/funding istället för 1h."""
+    secondary_klines = _flat_klines(21, price="100")
+    secondary_klines.append(_kline("110", offset_hours=0))
+    secondary_funding = [_funding("0.001", offset_hours=8 * i) for i in range(1, 6)]
+
+    record = evaluate_candidate(
+        **_base_kwargs(
+            secondary_timeframe="4h",
+            secondary_klines=secondary_klines,
+            secondary_funding_rates=secondary_funding,
+        )
+    )
+
+    assert record.secondary_timeframe_evidence is not None
+    assert record.secondary_timeframe_evidence.timeframe == "4h"
+    assert record.secondary_timeframe_evidence.price_volatility_evidence.triggered is True
+
+
+def test_evaluate_candidate_secondary_timeframe_evidence_is_none_when_no_secondary_data_given():
+    record = evaluate_candidate(**_base_kwargs())
+    assert record.secondary_timeframe_evidence is None
+
+
+def test_evaluate_candidate_secondary_timeframe_evidence_is_none_when_secondary_data_insufficient():
+    """Otillräcklig 4h-historik (färre klines än vad byggfunktionerna kräver)
+    ska ge None, aldrig ett fel eller en gissning - secondary är rent
+    bekräftande, aldrig gatande."""
+    record = evaluate_candidate(
+        **_base_kwargs(
+            secondary_timeframe="4h",
+            secondary_klines=_flat_klines(3, price="100"),
+            secondary_funding_rates=[_funding("0.001", offset_hours=0)],
+        )
+    )
+    assert record.secondary_timeframe_evidence is None
+
+
+def test_evaluate_candidate_secondary_never_influences_outcome_or_score():
+    """Kärnkontraktet: 1h avgör outcome/trigger_reasons/candidate_score helt
+    ensamt. En 4h-serie som INTE skulle triggera något själv ändrar aldrig
+    resultatet av en redan primary-triggad candidate, och en 4h-serie som
+    SKULLE triggera kan aldrig själv skapa en candidate när 1h inte gör det."""
+    flat_secondary = _flat_klines(21, price="100")
+    flat_funding = [_funding("0.0001", offset_hours=8 * i) for i in range(0, 5)]
+
+    with_flat_secondary = evaluate_candidate(
+        **_base_kwargs(
+            secondary_timeframe="4h",
+            secondary_klines=flat_secondary,
+            secondary_funding_rates=flat_funding,
+        )
+    )
+    without_secondary = evaluate_candidate(**_base_kwargs())
+
+    assert with_flat_secondary.outcome == without_secondary.outcome == "worth_deeper_analysis"
+    assert with_flat_secondary.trigger_reasons == without_secondary.trigger_reasons
+    assert with_flat_secondary.candidate_score == without_secondary.candidate_score
+
+    # Nu omvänt: primary flat (inget triggar), secondary skulle ha triggat -
+    # candidate:n förblir "not_a_candidate", secondary får den aldrig ensam skapas.
+    triggering_secondary = _flat_klines(21, price="100")
+    triggering_secondary.append(_kline("110", offset_hours=0))
+    record = evaluate_candidate(
+        **_base_kwargs(
+            klines=_flat_klines(21, price="100"),  # primary: helt platt, inget triggar
+            funding_rates=[_funding("0.0001", offset_hours=8 * i) for i in range(0, 5)],
+            secondary_timeframe="4h",
+            secondary_klines=triggering_secondary,
+            secondary_funding_rates=[_funding("0.001", offset_hours=8 * i) for i in range(1, 6)],
+        )
+    )
+    assert record.outcome == "not_a_candidate"
+    assert record.trigger_reasons == []
+    assert record.secondary_timeframe_evidence.price_volatility_evidence.triggered is True

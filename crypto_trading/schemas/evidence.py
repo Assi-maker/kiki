@@ -42,6 +42,19 @@ class FundingOpenInterestEvidence(BaseModel):
     threshold: float
 
 
+class SecondaryTimeframeEvidence(BaseModel):
+    """Bekräftande, aldrig gatande (SPEC-beslut 2026-08-29 "primary triggers,
+    secondary confirms"): samma fyra evidenstyper som primary, beräknade på
+    en högre, sekundär timeframe. Påverkar aldrig candidate_score,
+    trigger_reasons eller outcome - se evaluate_candidate()."""
+
+    timeframe: str
+    price_volatility_evidence: PriceVolatilityEvidence
+    momentum_breakout_evidence: MomentumBreakoutEvidence
+    volume_evidence: VolumeEvidence
+    funding_oi_evidence: FundingOpenInterestEvidence
+
+
 class CandidateEvidenceRecord(BaseModel):
     instrument: str
     timeframes: list[str]
@@ -50,6 +63,7 @@ class CandidateEvidenceRecord(BaseModel):
     momentum_breakout_evidence: MomentumBreakoutEvidence
     volume_evidence: VolumeEvidence
     funding_oi_evidence: FundingOpenInterestEvidence
+    secondary_timeframe_evidence: SecondaryTimeframeEvidence | None = None
     candidate_score: float
     trigger_reasons: list[str]
     data_quality_status: DataQualityStatus

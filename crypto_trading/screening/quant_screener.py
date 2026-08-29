@@ -9,6 +9,7 @@ from crypto_trading.schemas.evidence import (
     FundingOpenInterestEvidence,
     MomentumBreakoutEvidence,
     PriceVolatilityEvidence,
+    SecondaryTimeframeEvidence,
     VolumeEvidence,
 )
 from crypto_trading.schemas.market import FundingRate, Kline
@@ -154,6 +155,47 @@ def build_funding_oi_evidence(
     )
 
 
+def _build_secondary_timeframe_evidence(
+    secondary_timeframe: str | None,
+    secondary_klines: list[Kline] | None,
+    secondary_funding_rates: list[FundingRate] | None,
+    evaluated_at: datetime,
+    price_volatility_threshold_pct: Decimal,
+    lookback: int,
+    rsi_period: int,
+    rsi_overbought_threshold: Decimal,
+    volume_zscore_threshold: Decimal,
+    funding_rate_threshold_pct: Decimal,
+) -> SecondaryTimeframeEvidence | None:
+    """'Primary triggers, secondary confirms' (beslut 2026-08-29): samma
+    byggfunktioner/trösklar som primary, bara på en högre timeframes data -
+    rent bekräftande, aldrig gatande (se evaluate_candidate()). Otillräcklig
+    eller saknad sekundärdata ger None, aldrig en gissning eller ett fel -
+    samma fail-safe-princip som redan gäller icke-kritiska källor (SPEC
+    §8.2)."""
+    if secondary_timeframe is None or not secondary_funding_rates:
+        return None
+    min_klines_required = max(lookback + 2, rsi_period + 1)
+    if secondary_klines is None or len(secondary_klines) < min_klines_required:
+        return None
+
+    return SecondaryTimeframeEvidence(
+        timeframe=secondary_timeframe,
+        price_volatility_evidence=build_price_volatility_evidence(
+            secondary_klines, price_volatility_threshold_pct, lookback, evaluated_at
+        ),
+        momentum_breakout_evidence=build_momentum_breakout_evidence(
+            secondary_klines, rsi_period, rsi_overbought_threshold, evaluated_at
+        ),
+        volume_evidence=build_volume_evidence(
+            secondary_klines, volume_zscore_threshold, lookback, evaluated_at
+        ),
+        funding_oi_evidence=build_funding_oi_evidence(
+            secondary_funding_rates, funding_rate_threshold_pct, evaluated_at
+        ),
+    )
+
+
 def _compute_candidate_score(evidences: list) -> float:
     """Transparent och reproducerbart (SPEC §4): för varje signal, hur
     mycket överstiger value sitt threshold (i förhållande till threshold),
@@ -201,13 +243,23 @@ def evaluate_candidate(
     rsi_overbought_threshold: Decimal,
     volume_zscore_threshold: Decimal,
     funding_rate_threshold_pct: Decimal,
+    secondary_timeframe: str | None = None,
+    secondary_klines: list[Kline] | None = None,
+    secondary_funding_rates: list[FundingRate] | None = None,
 ) -> CandidateEvidenceRecord:
     """Ren funktion: samma indata -> alltid identisk output (AC2). Kräver
     att data_quality_status redan är beräknad av anroparen via Phase 1:s
     connectors.data_quality (check_completeness/check_staleness/
     check_kline_consistency/classify) - screenern gissar aldrig själv om
     datan är pålitlig. Uttalar sig aldrig om riktning (AC1) - schemat har
-    strukturellt inget sådant fält."""
+    strukturellt inget sådant fält.
+
+    `secondary_timeframe`/`secondary_klines`/`secondary_funding_rates`
+    (beslut 2026-08-29, "primary triggers, secondary confirms"): candidate_
+    score/trigger_reasons/outcome beräknas UTESLUTANDE från primary (klines/
+    funding_rates) - identiskt med tidigare beteende. Sekundärdata bidrar
+    bara till secondary_timeframe_evidence, rent informativt/bekräftande,
+    och kan aldrig skapa eller förhindra en candidate på egen hand."""
     if data_quality_status == "invalid":
         return _invalid_data_record(instrument, timeframes, evaluated_at)
 
@@ -228,6 +280,19 @@ def evaluate_candidate(
     ]
     trigger_reasons = [name for name, ev in named if ev.triggered]
 
+    secondary_evidence = _build_secondary_timeframe_evidence(
+        secondary_timeframe,
+        secondary_klines,
+        secondary_funding_rates,
+        evaluated_at,
+        price_volatility_threshold_pct,
+        lookback,
+        rsi_period,
+        rsi_overbought_threshold,
+        volume_zscore_threshold,
+        funding_rate_threshold_pct,
+    )
+
     return CandidateEvidenceRecord(
         instrument=instrument,
         timeframes=timeframes,
@@ -236,6 +301,7 @@ def evaluate_candidate(
         momentum_breakout_evidence=momentum_ev,
         volume_evidence=volume_ev,
         funding_oi_evidence=funding_ev,
+        secondary_timeframe_evidence=secondary_evidence,
         candidate_score=_compute_candidate_score([price_ev, momentum_ev, volume_ev, funding_ev]),
         trigger_reasons=trigger_reasons,
         data_quality_status=data_quality_status,
