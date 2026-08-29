@@ -94,9 +94,16 @@ def build_live_snapshot(
             eligible.append(ticker)
     top_n_symbols = set(select_top_n(eligible, settings.pipeline.top_n))
 
-    interval = settings.pipeline.screener_timeframes[0]  # Beslut 5 - inte löst här
+    interval = settings.pipeline.screener_timeframes[0]  # primary - styr evidence-gating (§8.1)
+    secondary_interval = (
+        settings.pipeline.screener_timeframes[1]
+        if len(settings.pipeline.screener_timeframes) > 1
+        else None
+    )
     klines: dict[str, list[Kline]] = {}
     funding_rates: dict[str, list[FundingRate]] = {}
+    secondary_klines: dict[str, list[Kline]] = {}
+    secondary_funding_rates: dict[str, list[FundingRate]] = {}
     data_quality_status: dict[str, DataQualityResult] = {}
 
     for symbol in top_n_symbols:
@@ -196,12 +203,65 @@ def build_live_snapshot(
             funding_rates[symbol] = []
             data_quality_status[symbol] = "invalid"
 
+        # Sekundär timeframe (beslut 2026-08-29, "primary triggers, secondary
+        # confirms"): en EGEN try/except, helt frikopplad från primary-blocket
+        # ovan - ett fel här får ALDRIG påverka data_quality_status, klines
+        # eller tickers för symbolen (secondary är rent bekräftande, aldrig
+        # gatande, se schemas/evidence.py::SecondaryTimeframeEvidence).
+        secondary_klines[symbol] = []
+        secondary_funding_rates[symbol] = []
+        if secondary_interval is not None:
+            try:
+                raw_secondary_klines = connector.get_klines(
+                    symbol,
+                    secondary_interval,
+                    limit=settings.pipeline.screener_lookback_periods + 5,
+                )
+                secondary_kline_completeness = (
+                    classify(
+                        *(
+                            check_completeness(raw, settings.pipeline.required_fields["kline"])
+                            for raw in raw_secondary_klines
+                        )
+                    )
+                    if raw_secondary_klines
+                    else "invalid"
+                )
+                if secondary_kline_completeness == "ok":
+                    secondary_klines[symbol] = [
+                        Kline.from_raw(k, symbol, secondary_interval) for k in raw_secondary_klines
+                    ]
+
+                raw_secondary_funding = connector.get_funding_rate(
+                    symbol, limit=settings.pipeline.screener_funding_history_limit
+                )
+                secondary_funding_completeness = (
+                    classify(
+                        *(
+                            check_completeness(
+                                raw, settings.pipeline.required_fields["funding_rate"]
+                            )
+                            for raw in raw_secondary_funding
+                        )
+                    )
+                    if raw_secondary_funding
+                    else "invalid"
+                )
+                if secondary_funding_completeness == "ok":
+                    secondary_funding_rates[symbol] = [
+                        FundingRate.from_raw(f) for f in raw_secondary_funding
+                    ]
+            except ConnectorUnavailableError:
+                pass  # secondary_klines/secondary_funding_rates redan [] ovan
+
     return MarketSnapshot(
         simulated_now=now,
         instruments=instruments,
         tickers=tickers,
         klines=klines,
         funding_rates=funding_rates,
+        secondary_klines=secondary_klines,
+        secondary_funding_rates=secondary_funding_rates,
         data_quality_status=data_quality_status
         | {
             s: "invalid"

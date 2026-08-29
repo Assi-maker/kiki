@@ -34,6 +34,8 @@ class MarketSnapshot(BaseModel):
     klines: dict[str, list[Kline]]
     funding_rates: dict[str, list[FundingRate]]
     data_quality_status: dict[str, Literal["ok", "invalid"]]
+    secondary_klines: dict[str, list[Kline]] = {}
+    secondary_funding_rates: dict[str, list[FundingRate]] = {}
 
 
 def run_replay(

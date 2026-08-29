@@ -89,6 +89,7 @@ class _StubConnector:
         self._open_interest = open_interest or {}
         self.klines_calls: list[str] = []
         self.klines_interval_used: str | None = None
+        self.klines_calls_by_interval: dict[str, list[str]] = {}
 
     def get_contracts(self):
         return self._contracts
@@ -99,6 +100,7 @@ class _StubConnector:
     def get_klines(self, symbol, interval, limit=100):
         self.klines_calls.append(symbol)
         self.klines_interval_used = interval
+        self.klines_calls_by_interval.setdefault(interval, []).append(symbol)
         return self._klines[symbol][-limit:]
 
     def get_funding_rate(self, symbol, limit=1):
@@ -196,6 +198,23 @@ class _KlinesFailingConnector(_StubConnector):
     def get_funding_rate(self, symbol, limit=1):
         self.funding_calls.append(symbol)
         return super().get_funding_rate(symbol, limit)
+
+
+class _SecondaryIntervalFailingConnector(_StubConnector):
+    """En sekundär-timeframe-hämtning (t.ex. 4h) som fallerar ska aldrig
+    påverka primary-datan eller symbolens data_quality_status - secondary är
+    rent bekräftande (beslut 2026-08-29 "primary triggers, secondary
+    confirms"), aldrig gatande."""
+
+    def __init__(self, *args, fail_interval: str, exc: Exception, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._fail_interval = fail_interval
+        self._exc = exc
+
+    def get_klines(self, symbol, interval, limit=100):
+        if interval == self._fail_interval:
+            raise self._exc
+        return super().get_klines(symbol, interval, limit)
 
 
 def test_build_live_snapshot_produces_ok_quality_for_complete_fresh_data():
@@ -368,8 +387,13 @@ def test_build_live_snapshot_does_not_mask_unexpected_non_connector_errors():
         build_live_snapshot(connector, _settings(top_n=2), _NOW)
 
 
-def test_build_live_snapshot_uses_only_the_first_configured_screener_timeframe():
-    """Beslut 5, dokumenterat som ett levande test."""
+def test_build_live_snapshot_uses_the_first_configured_screener_timeframe_as_primary():
+    """Beslut 5 (2026-08-27), uppdaterat 2026-08-29 ("primary triggers,
+    secondary confirms"): screener_timeframes[0] är alltjämt primary (den
+    ENDA som styr klines[symbol]/data_quality_status/evidence-gating).
+    Tidigare var detta test dokumentation av en olöst begränsning (bara 1h
+    hämtades någonsin) - nu är det en kontraktsgaranti: primary-slotten är
+    fortfarande [0], oavsett hur många timeframes som konfigureras."""
     contracts = [_raw_contract("BTCUSDT")]
     tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
     klines = {"BTCUSDT": [_raw_kline("50000", _ms(_NOW))]}
@@ -377,6 +401,89 @@ def test_build_live_snapshot_uses_only_the_first_configured_screener_timeframe()
     open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
     connector = _StubConnector(contracts, tickers, klines, funding_rates, open_interest)
 
-    build_live_snapshot(connector, _settings(top_n=1, screener_timeframes=["1h", "4h"]), _NOW)
+    snapshot = build_live_snapshot(
+        connector, _settings(top_n=1, screener_timeframes=["1h", "4h"]), _NOW
+    )
 
-    assert connector.klines_interval_used == "1h"
+    assert len(snapshot.klines["BTCUSDT"]) > 0
+    assert snapshot.klines["BTCUSDT"][0].interval == "1h"
+
+
+def test_build_live_snapshot_also_fetches_the_second_configured_timeframe_as_secondary():
+    """Beslut 2026-08-29: när screener_timeframes har en andra timeframe
+    hämtas den också (klines OCH funding), lagrad separat i secondary_klines/
+    secondary_funding_rates - stänger Fas 5-luckan där 4h aldrig hämtades."""
+    contracts = [_raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    klines = {
+        "BTCUSDT": [
+            _raw_kline("50000", _ms(_NOW - timedelta(hours=2))),
+            _raw_kline("50100", _ms(_NOW - timedelta(hours=1))),
+            _raw_kline("50200", _ms(_NOW)),
+        ]
+    }
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _StubConnector(contracts, tickers, klines, funding_rates, open_interest)
+
+    snapshot = build_live_snapshot(
+        connector, _settings(top_n=1, screener_timeframes=["1h", "4h"]), _NOW
+    )
+
+    assert connector.klines_calls_by_interval["1h"] == ["BTCUSDT"]
+    assert connector.klines_calls_by_interval["4h"] == ["BTCUSDT"]
+    assert len(snapshot.secondary_klines["BTCUSDT"]) > 0
+    assert snapshot.secondary_klines["BTCUSDT"][0].interval == "4h"
+    assert len(snapshot.secondary_funding_rates["BTCUSDT"]) > 0
+
+
+def test_build_live_snapshot_secondary_is_empty_when_only_one_timeframe_configured():
+    """Bakåtkompatibilitet: en config med bara EN timeframe (t.ex. befintliga
+    tester/miljöer) ska aldrig försöka hämta en sekundär serie."""
+    contracts = [_raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    klines = {"BTCUSDT": [_raw_kline("50000", _ms(_NOW))]}
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _StubConnector(contracts, tickers, klines, funding_rates, open_interest)
+
+    snapshot = build_live_snapshot(connector, _settings(top_n=1), _NOW)  # default: ["1h"] only
+
+    assert snapshot.secondary_klines["BTCUSDT"] == []
+    assert snapshot.secondary_funding_rates["BTCUSDT"] == []
+    assert "4h" not in connector.klines_calls_by_interval
+
+
+def test_build_live_snapshot_secondary_fetch_failure_does_not_affect_primary_or_data_quality():
+    """Kärnkontraktet: secondary är rent bekräftande. Ett fel vid 4h-hämtning
+    får aldrig göra symbolen invalid eller påverka klines[symbol]/tickers -
+    bara secondary_klines[symbol] blir tom."""
+    contracts = [_raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    klines = {
+        "BTCUSDT": [
+            _raw_kline("50000", _ms(_NOW - timedelta(hours=2))),
+            _raw_kline("50100", _ms(_NOW - timedelta(hours=1))),
+            _raw_kline("50200", _ms(_NOW)),
+        ]
+    }
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _SecondaryIntervalFailingConnector(
+        contracts,
+        tickers,
+        klines,
+        funding_rates,
+        open_interest,
+        fail_interval="4h",
+        exc=ConnectorUnavailableError("BingX API-fel: 4h klines otillgängliga"),
+    )
+
+    snapshot = build_live_snapshot(
+        connector, _settings(top_n=1, screener_timeframes=["1h", "4h"]), _NOW
+    )
+
+    assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+    assert "BTCUSDT" in snapshot.tickers
+    assert len(snapshot.klines["BTCUSDT"]) > 0
+    assert snapshot.secondary_klines["BTCUSDT"] == []
