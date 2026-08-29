@@ -329,6 +329,44 @@ def test_replay_decision_at_time_t_is_unaffected_by_injected_future_data(tmp_pat
     assert clean.theoretical_exit == tampered.theoretical_exit
 
 
+def test_run_single_cycle_wires_secondary_timeframe_evidence_into_candidate(tmp_path):
+    """Beslut 2026-08-29 'primary triggers, secondary confirms': när
+    screener_timeframes har en andra timeframe konfigurerad och snapshoten
+    har secondary_klines/secondary_funding_rates, ska den skapade
+    candidate:ns evidence_record.secondary_timeframe_evidence vara ifylld -
+    stänger wiring-halvan av Fas 5:s multi-timeframe-lucka (market_snapshot.py
+    hämtar redan sekundärdatan sedan föregående commit; detta bevisar att
+    run_single_cycle -> evaluate_candidate faktiskt konsumerar den)."""
+    base_settings = _settings()
+    settings = base_settings.model_copy(
+        update={
+            "pipeline": base_settings.pipeline.model_copy(
+                update={"screener_timeframes": ["1h", "4h"]}
+            )
+        }
+    )
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    spike_snapshot = _build_snapshots()[1]
+    # screener_lookback_periods=3, screener_rsi_period=3 -> minst 5 klines krävs.
+    secondary_klines = [_kline("100", offset_hours=-(5 - i)) for i in range(5)]
+    secondary_funding = [_funding("0.0001", offset_hours=-(5 - i)) for i in range(5)]
+    snapshot_with_secondary = spike_snapshot.model_copy(
+        update={
+            "secondary_klines": {"BTCUSDT": secondary_klines},
+            "secondary_funding_rates": {"BTCUSDT": secondary_funding},
+        }
+    )
+
+    run_single_cycle(snapshot_with_secondary, repo, runner, settings, run_id="run-1")
+
+    candidates = repo.find_candidates_by_status("CONFIRMED")
+    assert len(candidates) == 1
+    secondary_evidence = candidates[0].evidence_record.secondary_timeframe_evidence
+    assert secondary_evidence is not None
+    assert secondary_evidence.timeframe == "4h"
+
+
 def test_run_single_cycle_can_be_called_directly_with_one_snapshot(tmp_path):
     """Låser run_single_cycle()s fristående kontrakt (Task 5): discovery_loop.py
     (Fas 5) ska kunna anropa den en gång per tick, utan run_replay()s loop."""

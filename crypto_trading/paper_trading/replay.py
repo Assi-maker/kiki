@@ -80,6 +80,12 @@ def run_single_cycle(
     eligible_tickers = _select_eligible_tickers(snapshot, settings)
     top_n_symbols = select_top_n(eligible_tickers, settings.pipeline.top_n)
 
+    secondary_timeframe = (
+        settings.pipeline.screener_timeframes[1]
+        if len(settings.pipeline.screener_timeframes) > 1
+        else None
+    )
+
     new_candidates = []
     for symbol in top_n_symbols:
         evidence = evaluate_candidate(
@@ -95,6 +101,9 @@ def run_single_cycle(
             rsi_overbought_threshold=settings.pipeline.screener_rsi_overbought_threshold,
             volume_zscore_threshold=settings.pipeline.screener_volume_zscore_threshold,
             funding_rate_threshold_pct=settings.pipeline.screener_funding_rate_threshold_pct,
+            secondary_timeframe=secondary_timeframe,
+            secondary_klines=snapshot.secondary_klines.get(symbol, []),
+            secondary_funding_rates=snapshot.secondary_funding_rates.get(symbol, []),
         )
         candidate = process_evidence(
             repo,
