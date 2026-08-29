@@ -132,7 +132,14 @@ Status: **Fasroadmap — inte godkänd för implementation.** Detta är en fasin
 
 ## Phase 6 — Telegram
 
-**Omfattning:** CONFIRMED-, CLOSED- och daily report-notiser, notisnivåer (important/decisions/debug), samma eventmodell som dashboarden.
+**Status: KÄRNAN KLAR OCH LIVE-VERIFIERAD (2026-08-29).** CONFIRMED- och CLOSED-notiser implementerade, TDD, och verifierade end-to-end mot en riktig Telegram-bot (två isolerade smoke-tester: en syntetisk CONFIRMED-candidate respektive en syntetisk CLOSED-position i en temporär SQLite-databas — aldrig produktions-DB:n, aldrig `crypto_trading.run`/någon loop startad, inga BingX-/Claude-/orderanrop). Idempotens (AC3) bekräftad både i automatiserade tester och i de riktiga smoke-testerna: en andra `run_notify_tick()`-körning mot samma data skickade noll nya meddelanden i båda fallen. Sex commits, `815e120`..`5791715`, pushade till `origin/main`.
+
+**Explicit inte implementerat än (medvetet avgränsat, inte glömt):**
+- **Daily report-notisen** (tredje notistypen i ursprungsomfattningen) — inte byggd.
+- **Notisnivåerna `decisions`/`debug`** — `NotifyConfig.notification_level` finns i schemat men styr inget beteende ännu; `notify_loop.py` skickar alltid CONFIRMED/CLOSED oavsett konfigurerad nivå (dokumenterat i modulens egen docstring).
+- **AC2 (NO_TRADE syns i loggen men notifieras aldrig)** — uppfylld bara genom att NO_TRADE aldrig hämtas alls än, inte via en dedikerad, testad logikgren.
+
+**Omfattning (ursprunglig, delvis kvarstående):** CONFIRMED-, CLOSED- och daily report-notiser, notisnivåer (important/decisions/debug), samma eventmodell som dashboarden.
 
 **Levererar:**
 - `notify/telegram.py`, läser uteslutande från event-/audit-loggen (Phase 0) — genererar aldrig egen data.
@@ -140,10 +147,10 @@ Status: **Fasroadmap — inte godkänd för implementation.** Detta är en fasin
 - Konfigurerbar notisnivå.
 
 **Acceptance criteria:**
-1. Varje notistyp har ett test som verifierar samtliga obligatoriska fält (§12) är närvarande och korrekt formaterade.
-2. `NO_TRADE` genererar ingen Telegram-notis på `important`-nivå (default), men syns i loggen — testat explicit.
-3. Idempotens: samma event skickar aldrig dubbla Telegram-meddelanden vid omkörning/restart (§8.6).
-4. Notis-innehåll och det som samtidigt skulle visas i dashboarden (Phase 7) härleds bevisligen från samma underliggande rad i event-loggen — inte två separata beräkningar.
+1. **[Delvis]** Varje notistyp har ett test som verifierar samtliga obligatoriska fält (§12) är närvarande och korrekt formaterade. — Uppfyllt för CONFIRMED och CLOSED (`tests/crypto_trading/notify/test_telegram.py`), plus live-bekräftat mot en riktig bot. Daily report-notistypen finns inte, så AC1 är inte fullständigt uppfylld.
+2. **[Uppfyllt, svagt]** `NO_TRADE` genererar ingen Telegram-notis på `important`-nivå (default), men syns i loggen. — Sant idag, men bara för att NO_TRADE aldrig hämtas av `notify_loop.py` över huvud taget, inte via ett dedikerat, testat undantag.
+3. **[Uppfyllt]** Idempotens: samma event skickar aldrig dubbla Telegram-meddelanden vid omkörning/restart (§8.6). — Testat automatiserat och bekräftat i två riktiga Telegram-smoke-tester (CONFIRMED och CLOSED), 2026-08-29.
+4. **[Uppfyllt]** Notis-innehåll och det som samtidigt skulle visas i dashboarden (Phase 7) härleds bevisligen från samma underliggande rad i event-loggen — inte två separata beräkningar. — `format_confirmed_message()`/`format_closed_message()` tar redan hämtade `Candidate`/`Position`-objekt, gör aldrig egna DB-frågor.
 
 ---
 
