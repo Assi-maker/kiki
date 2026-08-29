@@ -24,6 +24,25 @@ def test_redact_masks_embedded_token_in_string_value():
     assert "***REDACTED***" in out["error_message"]
 
 
+def test_redact_masks_telegram_bot_token_embedded_in_url_path():
+    """Fas 6, Beslut 3: Telegram Bot API:ets URL-format
+    (https://api.telegram.org/bot<TOKEN>/sendMessage) har token i PATH:en,
+    inte som en key=value-parameter - _SECRET_VALUE_PATTERN (byggd för
+    api_key=.../token=... i frågesträngar) fångar inte detta mönster.
+    Andra skyddslager om disciplinen att aldrig logga hela URL:en
+    (notify/telegram.py::TelegramNotifier.send()) någonsin bryts."""
+    data = {
+        "error_message": (
+            "request to https://api.telegram.org/bot123456789:ABCdefGhIJKlmNoPQRsTuVwxYZ/"
+            "sendMessage failed"
+        )
+    }
+    out = redact(data)
+    assert "123456789:ABCdefGhIJKlmNoPQRsTuVwxYZ" not in out["error_message"]
+    assert "***REDACTED***" in out["error_message"]
+    assert "sendMessage" in out["error_message"]  # resten av URL:en/meddelandet kvar, oskadat
+
+
 def test_log_event_never_emits_raw_secret(caplog):
     with caplog.at_level(logging.INFO, logger="crypto_trading"):
         log_event("run-1", telegram_bot_token="super-secret-value", instrument="BTCUSDT")

@@ -8,6 +8,11 @@ import uuid
 _SECRET_KEY_MARKERS = ("api_key", "apikey", "token", "secret", "credential")
 
 _SECRET_VALUE_PATTERN = re.compile(r"(?i)(?:api_key|apikey|token)=[^&\s]+")
+# Fas 6, Beslut 3: Telegram Bot API:ets URL-format har token i PATH:en
+# (https://api.telegram.org/bot<TOKEN>/sendMessage), inte som en
+# key=value-parameter - fångas inte av mönstret ovan. Andra skyddslager om
+# disciplinen att aldrig logga hela URL:en (notify/telegram.py) bryts.
+_TELEGRAM_BOT_URL_PATTERN = re.compile(r"/bot\d+:[\w-]+")
 
 _logger = logging.getLogger("crypto_trading")
 if not _logger.handlers:
@@ -27,7 +32,8 @@ def redact(data: dict) -> dict:
         if any(marker in key.lower() for marker in _SECRET_KEY_MARKERS):
             out[key] = "***REDACTED***"
         elif isinstance(value, str):
-            out[key] = _SECRET_VALUE_PATTERN.sub("***REDACTED***", value)
+            masked = _SECRET_VALUE_PATTERN.sub("***REDACTED***", value)
+            out[key] = _TELEGRAM_BOT_URL_PATTERN.sub("/bot***REDACTED***", masked)
         else:
             out[key] = value
     return out
