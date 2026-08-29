@@ -3,13 +3,15 @@ from __future__ import annotations
 import os
 import threading
 
-from crypto_trading import discovery_loop, monitoring_loop
+from crypto_trading import discovery_loop, monitoring_loop, notify_loop
 from crypto_trading.agents.runner import AgentRunner, RealClaudeRunner
 from crypto_trading.config.exceptions import ConfigError
 from crypto_trading.config.loader import Settings, get_settings
 from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.connectors.external_data import ExternalDataConnector
 from crypto_trading.connectors.news_rss import NewsRSSConnector
+from crypto_trading.logging import log_event
+from crypto_trading.notify.telegram import TelegramNotifier
 from crypto_trading.storage.repository import SQLiteRepository
 
 
@@ -29,6 +31,18 @@ def build_runner_from_env() -> AgentRunner:
         timeout_seconds=float(os.environ.get("CRYPTO_TRADING_AGENT_TIMEOUT_SECONDS", "60")),
         max_retries=int(os.environ.get("CRYPTO_TRADING_AGENT_MAX_RETRIES", "3")),
     )
+
+
+def build_notifier_from_env() -> TelegramNotifier | None:
+    """Fas 6 Beslut 2: Telegram är valfritt, INTE fail-fast som
+    ANTHROPIC_API_KEY - systemet fungerar helt utan den (bara notify-tråden
+    uteblir), samma mönster som news_connector/external_data_connector
+    (Fas 5.5) redan hanteras som valfria icke-kritiska källor."""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        return None
+    return TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
 
 
 def _run_discovery_forever(
@@ -62,6 +76,13 @@ def _run_monitoring_forever(connector: BingXMarketDataConnector, settings: Setti
     monitoring-sidan."""
     repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
     monitoring_loop.run_forever(connector, repo, settings)
+
+
+def _run_notify_forever(notifier: TelegramNotifier, settings: Settings) -> None:
+    """Samma trådbundna-anslutning-fix som _run_discovery_forever()/
+    _run_monitoring_forever() ovan - Fas 6:s tredje, oberoende loop."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    notify_loop.run_forever(notifier, repo, settings)
 
 
 def main() -> None:
@@ -104,10 +125,24 @@ def main() -> None:
         args=(connector, settings),
         daemon=True,
     )
-    discovery_thread.start()
-    monitoring_thread.start()
-    discovery_thread.join()
-    monitoring_thread.join()
+    threads = [discovery_thread, monitoring_thread]
+
+    notifier = build_notifier_from_env()
+    if notifier is not None:
+        threads.append(
+            threading.Thread(target=_run_notify_forever, args=(notifier, settings), daemon=True)
+        )
+    else:
+        log_event(
+            "startup",
+            event="telegram_notify_disabled",
+            reason="TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing",
+        )
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
 
 
 if __name__ == "__main__":

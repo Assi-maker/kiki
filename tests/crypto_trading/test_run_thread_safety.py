@@ -83,3 +83,36 @@ def test_run_monitoring_forever_constructs_its_own_repository_inside_the_worker_
     conn = sqlite3.connect(settings.db_path)
     row = conn.execute("SELECT status FROM runs WHERE run_id = 'run-2'").fetchone()
     assert row is not None, "the tick's write never reached the database"
+
+
+def test_run_notify_forever_constructs_its_own_repository_inside_the_worker_thread(
+    tmp_path, monkeypatch
+):
+    """Fas 6: notify_loop.run_forever() följer samma trådbundna-anslutning-
+    fix som discovery/monitoring - se testerna ovan."""
+    settings = _settings_with_db(tmp_path)
+    errors: list[BaseException] = []
+    tick_thread_ids: list[int] = []
+
+    def fake_run_forever(notifier, repo, settings):
+        try:
+            repo.start_run("run-3", "notify", datetime.now(UTC))
+            tick_thread_ids.append(threading.get_ident())
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(run_module.notify_loop, "run_forever", fake_run_forever)
+
+    worker = threading.Thread(
+        target=run_module._run_notify_forever,
+        args=(object(), settings),
+    )
+    worker.start()
+    worker.join(timeout=5)
+
+    assert errors == [], f"repo built outside the worker thread raised: {errors}"
+    assert tick_thread_ids == [worker.ident]
+
+    conn = sqlite3.connect(settings.db_path)
+    row = conn.execute("SELECT status FROM runs WHERE run_id = 'run-3'").fetchone()
+    assert row is not None, "the tick's write never reached the database"
