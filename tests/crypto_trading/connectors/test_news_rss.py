@@ -70,3 +70,21 @@ def test_get_latest_items_returns_all_when_fewer_than_limit():
     items = _connector().get_latest_items(limit=10)
     assert len(items) == 2
     assert items[1]["title"] == "Ethereum funding rate spikes"
+
+
+@respx.mock
+def test_get_latest_items_follows_trailing_slash_redirect():
+    """CoinDesk svarar med 308 Permanent Redirect till en URL med
+    efterföljande slash - connectorn ska följa den, inte behandla den
+    som ett fel (upptäckt mot den riktiga endpointen)."""
+    respx.get("https://www.coindesk.com/arc/outboundfeeds/rss/").mock(
+        return_value=Response(
+            308,
+            headers={"Location": "https://www.coindesk.com/arc/outboundfeeds/rss/index.xml"},
+        )
+    )
+    respx.get("https://www.coindesk.com/arc/outboundfeeds/rss/index.xml").mock(
+        return_value=Response(200, text=_ONE_ITEM_RSS)
+    )
+    items = _connector().get_latest_items(limit=10)
+    assert items[0]["title"] == "Bitcoin surges past resistance"

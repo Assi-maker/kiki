@@ -83,7 +83,7 @@ class BaseMarketDataConnector:
         )
         def _do() -> object:
             self._rate_limit()
-            with httpx.Client(timeout=self._timeout_seconds) as client:
+            with httpx.Client(timeout=self._timeout_seconds, follow_redirects=True) as client:
                 response = client.get(f"{self._base_url}{path}", params=params)
                 response.raise_for_status()
             return self._parse_response(response, path)
