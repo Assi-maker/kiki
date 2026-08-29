@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from crypto_trading.config.exceptions import ConfigError
 from crypto_trading.config.loader import (
     BudgetLimitsConfig,
+    NotifyConfig,
     PipelineConfig,
     RiskLimitsConfig,
     get_settings,
@@ -188,6 +189,22 @@ def test_pipeline_config_allows_overriding_news_urls():
     )
     assert config.news_rss_base_url == "https://example.com/rss"
     assert config.fear_greed_base_url == "https://example.com/fng"
+
+
+def test_get_settings_loads_phase6_notify_fields():
+    settings = get_settings()
+    assert settings.notify.notification_level in ("important", "decisions", "debug")
+    assert settings.notify.notify_interval_seconds > 0
+
+
+def test_notify_config_rejects_invalid_notification_level():
+    with pytest.raises(ValidationError):
+        NotifyConfig(notification_level="bogus", notify_interval_seconds=60)
+
+
+def test_notify_config_rejects_zero_notify_interval_seconds():
+    with pytest.raises(ValidationError):
+        NotifyConfig(notification_level="important", notify_interval_seconds=0)
 
 
 def test_missing_config_file_raises_config_error(tmp_path, monkeypatch):

@@ -4,6 +4,7 @@ from decimal import Decimal
 from crypto_trading.agents.runner import MockAgentRunner
 from crypto_trading.config.loader import (
     BudgetLimitsConfig,
+    NotifyConfig,
     PipelineConfig,
     RiskLimitsConfig,
     Settings,
@@ -94,6 +95,7 @@ def _settings(
             max_ai_calls_per_day=max_ai_calls_per_day,
             warning_threshold_pct=Decimal("0.8"),
         ),
+        notify=NotifyConfig(notification_level="important", notify_interval_seconds=60),
     )
 
 

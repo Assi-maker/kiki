@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from dotenv import load_dotenv
@@ -80,11 +81,17 @@ class BudgetLimitsConfig(BaseModel):
     warning_threshold_pct: Decimal = Field(gt=0, le=1)
 
 
+class NotifyConfig(BaseModel):
+    notification_level: Literal["important", "decisions", "debug"]
+    notify_interval_seconds: int = Field(gt=0)
+
+
 class Settings(BaseModel):
     db_path: Path
     pipeline: PipelineConfig
     risk_limits: RiskLimitsConfig
     budget_limits: BudgetLimitsConfig
+    notify: NotifyConfig
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -109,4 +116,5 @@ def get_settings() -> Settings:
         pipeline=_load_yaml_model(_CONFIG_DIR / "pipeline.yaml", PipelineConfig),
         risk_limits=_load_yaml_model(_CONFIG_DIR / "risk_limits.yaml", RiskLimitsConfig),
         budget_limits=_load_yaml_model(_CONFIG_DIR / "budget_limits.yaml", BudgetLimitsConfig),
+        notify=_load_yaml_model(_CONFIG_DIR / "notify.yaml", NotifyConfig),
     )
