@@ -340,6 +340,38 @@ def test_build_context_omits_news_keys_when_connectors_are_none(tmp_path):
     assert "evidence_record" in news_context
 
 
+def test_qa_role_is_routed_through_run_qa_gate_with_six_prior_assessments(tmp_path):
+    """QA-gate-kontext-luckan (flaggad 2026-08-29): produktions-QA-rollen
+    gick tidigare genom den generiska _build_context() (bara evidence_record)
+    istället för den redan testade run_qa_gate() (de sex föregående
+    rollernas fulla assessments) - omöjligt för QA att göra sitt faktiska
+    jobb (intern konsistens, se .claude/agents/crypto-qa-gate.md). Detta
+    bevisar att Orchestrator.process_candidate() nu routar "qa" genom
+    run_qa_gate() istället."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    spy = _SpyRunner(_happy_fixtures())
+
+    orch = Orchestrator(repo=repo, runner=spy, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    qa_context = spy.captured_contexts["crypto-qa-gate"]
+    assert "evidence_record" not in qa_context  # bevisar run_qa_gate(), inte generiska pathen
+    for role_key in (
+        "news_sentiment",
+        "technical",
+        "bull_thesis",
+        "forecast",
+        "risk",
+        "bear_adversarial",
+    ):
+        assert role_key in qa_context
+        assert qa_context[role_key] is not None
+    assert qa_context["candidate_id"] == candidate.candidate_id
+    assert qa_context["instrument"] == candidate.instrument
+    assert qa_context["run_id"] == "run-1"
+
+
 def test_build_context_degrades_gracefully_when_news_connector_raises(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     candidate = _persisted_candidate_in_under_ai_analysis(repo)

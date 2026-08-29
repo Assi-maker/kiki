@@ -7,6 +7,7 @@ from crypto_trading.agents.roles import ROLE_MAP
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
+from crypto_trading.gate.qa_gate import run_qa_gate
 from crypto_trading.gate.risk_signal_gate import evaluate_risk_signal_gate
 from crypto_trading.logging import log_event
 from crypto_trading.schemas.assessments import ForecastAssessment
@@ -55,8 +56,18 @@ class Orchestrator:
                 break
             spec = ROLE_MAP[role]
             agent_def = load_agent_definition(spec.agent_file)
-            context = self._build_context(candidate, role, run_id)
-            assessment = self._runner.run(agent_def, context, spec.assessment_type)
+            if role == "qa":
+                # QA:s jobb (SPEC §4/§6, .claude/agents/crypto-qa-gate.md) är
+                # intern konsistens MELLAN de sex föregående rollernas
+                # bedömningar - strukturellt omöjligt via den generiska
+                # _build_context() (bara evidence_record). run_qa_gate() är
+                # redan testad (tests/crypto_trading/gate/test_qa_gate.py) -
+                # återanvänds här istället för att duplicera dess
+                # kontext-uppbyggnad.
+                assessment = run_qa_gate(candidate, self._runner, run_id)
+            else:
+                context = self._build_context(candidate, role, run_id)
+                assessment = self._runner.run(agent_def, context, spec.assessment_type)
             ai_calls += 1
             self._repo.record_ai_call_event(
                 Event(
