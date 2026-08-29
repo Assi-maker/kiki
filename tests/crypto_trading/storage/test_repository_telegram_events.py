@@ -172,3 +172,75 @@ def test_find_positions_pending_notification_only_returns_closed(tmp_path):
     pending = repo.find_positions_pending_notification()
 
     assert [p.position_id for p in pending] == ["pos-closed"]
+
+
+def test_find_no_trade_candidates_pending_notification_returns_candidate_and_reasons(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _make_candidate("cand-no-trade", status="NO_TRADE")
+    repo.create_candidate_with_event(candidate, _make_candidate_event(candidate))
+    repo.save_gate_decision(
+        "cand-no-trade",
+        "NO_TRADE",
+        ["max_concurrent_positions reached: 5/5"],
+        _NOW,
+    )
+
+    pending = repo.find_no_trade_candidates_pending_notification()
+
+    assert len(pending) == 1
+    candidate_out, reasons = pending[0]
+    assert candidate_out.candidate_id == "cand-no-trade"
+    assert reasons == ["max_concurrent_positions reached: 5/5"]
+
+
+def test_find_no_trade_candidates_pending_notification_excludes_already_notified(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    cand_a = _make_candidate("cand-a", status="NO_TRADE")
+    cand_b = _make_candidate("cand-b", status="NO_TRADE")
+    repo.create_candidate_with_event(cand_a, _make_candidate_event(cand_a))
+    repo.create_candidate_with_event(cand_b, _make_candidate_event(cand_b))
+    repo.save_gate_decision("cand-a", "NO_TRADE", ["reason-a"], _NOW)
+    repo.save_gate_decision("cand-b", "NO_TRADE", ["reason-b"], _NOW)
+    repo.record_telegram_event("NO_TRADE:cand-a", "NO_TRADE", _NOW)
+
+    pending = repo.find_no_trade_candidates_pending_notification()
+
+    assert [c.candidate_id for c, _ in pending] == ["cand-b"]
+
+
+def test_find_no_trade_candidates_pending_notification_excludes_other_statuses(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    no_trade = _make_candidate("cand-no-trade", status="NO_TRADE")
+    confirmed = _make_candidate("cand-confirmed", status="CONFIRMED")
+    repo.create_candidate_with_event(no_trade, _make_candidate_event(no_trade))
+    repo.create_candidate_with_event(confirmed, _make_candidate_event(confirmed))
+    repo.save_gate_decision("cand-no-trade", "NO_TRADE", ["reason"], _NOW)
+
+    pending = repo.find_no_trade_candidates_pending_notification()
+
+    assert [c.candidate_id for c, _ in pending] == ["cand-no-trade"]
+
+
+def test_find_error_runs_pending_notification_excludes_already_notified(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.start_run("run-a", "discovery", _NOW)
+    repo.complete_run("run-a", _NOW, "error", ["boom-a"])
+    repo.start_run("run-b", "monitoring", _NOW)
+    repo.complete_run("run-b", _NOW, "error", ["boom-b"])
+    repo.record_telegram_event("error_run:run-a", "error_run", _NOW)
+
+    pending = repo.find_error_runs_pending_notification()
+
+    assert [r["run_id"] for r in pending] == ["run-b"]
+
+
+def test_find_error_runs_pending_notification_excludes_ok_runs(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.start_run("run-ok", "discovery", _NOW)
+    repo.complete_run("run-ok", _NOW, "ok", [])
+    repo.start_run("run-error", "discovery", _NOW)
+    repo.complete_run("run-error", _NOW, "error", ["boom"])
+
+    pending = repo.find_error_runs_pending_notification()
+
+    assert [r["run_id"] for r in pending] == ["run-error"]

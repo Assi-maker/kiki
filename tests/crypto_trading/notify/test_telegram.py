@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 import respx
 from httpx import Response
@@ -9,6 +10,9 @@ from crypto_trading.notify.telegram import (
     TelegramSendError,
     format_closed_message,
     format_confirmed_message,
+    format_daily_report_message,
+    format_debug_error_message,
+    format_no_trade_message,
 )
 from crypto_trading.schemas.assessments import (
     BullThesisAssessment,
@@ -193,6 +197,99 @@ def test_format_closed_message_handles_missing_forecast_record_gracefully():
     assert "BTCUSDT" in text
 
 
+def _no_trade_candidate() -> Candidate:
+    return Candidate(
+        candidate_id="cand-no-trade",
+        idempotency_key="key-no-trade",
+        instrument="ETHUSDT",
+        discovery_run_id="run-1",
+        evidence_hash="hash-1",
+        status="NO_TRADE",
+        evidence_record=_evidence(),
+        created_at=_NOW,
+        updated_at=_NOW,
+    )
+
+
+def test_format_no_trade_message_includes_instrument_score_evidence_and_reasons():
+    text = format_no_trade_message(_no_trade_candidate(), ["max_concurrent_positions reached: 5/5"])
+    assert "ETHUSDT" in text
+    assert "0.82" in text  # candidate score
+    assert "price_volatility" in text  # trigger_reasons
+    assert "max_concurrent_positions reached: 5/5" in text
+
+
+def test_format_daily_report_message_includes_all_minimal_counts():
+    from datetime import date
+
+    text = format_daily_report_message(
+        report_date=date(2026, 8, 29),
+        instruments_scanned=1119,
+        candidates_created=7,
+        ai_analyses=21,
+        confirmed=2,
+        no_trade=3,
+        rejected=1,
+        open_positions=4,
+        system_errors=0,
+    )
+    assert "2026-08-29" in text
+    assert "1119" in text
+    assert "7" in text
+    assert "21" in text
+    assert "2" in text
+    assert "3" in text
+    assert "4" in text
+    # system_errors=0 ska visas explicit, inte utelämnas
+    assert "0" in text
+
+
+def test_format_debug_error_message_includes_run_details():
+    run = {
+        "run_id": "run-abc",
+        "run_type": "discovery",
+        "started_at": "2026-08-29T10:00:00+00:00",
+        "errors": '["ConnectorUnavailableError: BingX otillg\\u00e4nglig"]',
+    }
+    text = format_debug_error_message(run)
+    assert "run-abc" in text
+    assert "discovery" in text
+    assert "ConnectorUnavailableError" in text
+
+
+def test_format_debug_error_message_redacts_secrets_as_defense_in_depth():
+    """Andra skyddslagret (code review-fynd 2026-08-29): Repository.
+    complete_run() redigerar redan errors innan persistering, men denna
+    formatteringsfunktion redigerar ÄNDÅ igen defensivt - skyddar även mot
+    en redan existerande, oredigerad historisk rad (skapad innan
+    complete_run()s egen fix fanns) som annars skulle visas rått över
+    Telegram på debug-nivå. FEJKAT, ofarligt secret-mönster, aldrig en
+    riktig hemlighet."""
+    run = {
+        "run_id": "run-abc",
+        "run_type": "discovery",
+        "started_at": "2026-08-29T10:00:00+00:00",
+        "errors": (
+            '["request to https://api.telegram.org/bot123456789:'
+            'FAKEBOTTOKENFAKEFAKEFAKE/sendMessage failed"]'
+        ),
+    }
+    text = format_debug_error_message(run)
+    assert "123456789:FAKEBOTTOKENFAKEFAKEFAKE" not in text
+    assert "***REDACTED***" in text
+
+
+def test_format_debug_error_message_handles_empty_errors_list():
+    run = {
+        "run_id": "run-abc",
+        "run_type": "discovery",
+        "started_at": "2026-08-29T10:00:00+00:00",
+        "errors": "[]",
+    }
+    text = format_debug_error_message(run)
+    assert "run-abc" in text
+
+
 @respx.mock
 def test_telegram_notifier_send_posts_to_correct_endpoint():
     route = respx.post("https://api.telegram.org/botFAKE_TOKEN/sendMessage").mock(
@@ -209,7 +306,7 @@ def test_telegram_notifier_send_posts_to_correct_endpoint():
 
 @respx.mock
 def test_telegram_notifier_send_raises_sanitized_error_never_exposing_token():
-    respx.post("https://api.telegram.org/botFAKE_TOKEN/sendMessage").mock(
+    route = respx.post("https://api.telegram.org/botFAKE_TOKEN/sendMessage").mock(
         return_value=Response(401, json={"ok": False, "description": "Unauthorized"})
     )
     notifier = TelegramNotifier(bot_token="FAKE_TOKEN", chat_id="12345")
@@ -219,3 +316,66 @@ def test_telegram_notifier_send_raises_sanitized_error_never_exposing_token():
 
     assert "FAKE_TOKEN" not in str(exc_info.value)
     assert "401" in str(exc_info.value)
+    # Duplicate-send fynd (code review 2026-08-29): en definitiv HTTP-
+    # felstatus betyder att Telegram FAKTISKT svarade - att retrya den
+    # automatiskt inom samma send()-anrop riskerar ingenting extra här
+    # (401 kommer alltid vara 401), men bekräftar att vi INTE gör onödiga
+    # extra försök för ett redan definitivt svar.
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_telegram_notifier_retries_on_connect_error_and_eventually_succeeds():
+    """Ett anslutningsfel (ConnectError/ConnectTimeout) betyder att
+    request:en ALDRIG nådde Telegram - säkert att retrya automatiskt,
+    ingen risk för en dubblettsändning."""
+    route = respx.post("https://api.telegram.org/botFAKE_TOKEN/sendMessage").mock(
+        side_effect=[
+            httpx.ConnectError("connection refused"),
+            Response(200, json={"ok": True}),
+        ]
+    )
+    notifier = TelegramNotifier(bot_token="FAKE_TOKEN", chat_id="12345")
+
+    notifier.send("test message")  # ska inte kasta - andra försöket lyckas
+
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_telegram_notifier_does_not_retry_on_ambiguous_timeout_after_request_sent():
+    """Duplicate-send-fyndet (code review 2026-08-29): sendMessage är en
+    side-effecting POST utan idempotenskyckel. En ReadTimeout inträffar
+    EFTER att requesten redan skickats - Telegram kan redan ha tagit emot
+    och behandlat den. Att automatiskt retrya här (som tidigare, då ALLA
+    httpx.HTTPError retryades) riskerar en dubblettnotis. Detta test
+    bevisar att send() INTE gör fler försök för denna feltyp - bara ETT
+    anrop, sedan ett rapporterat, sanerat fel."""
+    route = respx.post("https://api.telegram.org/botFAKE_TOKEN/sendMessage").mock(
+        side_effect=httpx.ReadTimeout("timed out waiting for response")
+    )
+    notifier = TelegramNotifier(bot_token="FAKE_TOKEN", chat_id="12345")
+
+    with pytest.raises(TelegramSendError) as exc_info:
+        notifier.send("test message")
+
+    assert route.call_count == 1  # INGEN retry - request:en kan redan ha nått Telegram
+    assert "FAKE_TOKEN" not in str(exc_info.value)
+
+
+@respx.mock
+def test_telegram_notifier_does_not_retry_on_5xx_status():
+    """En 5xx är ett definitivt, mottaget svar (till skillnad från en
+    timeout) - men klassas ändå som INTE säker att retrya automatiskt här,
+    eftersom vissa serverfel kan inträffa efter att meddelandet redan
+    levererats. Konservativt: bara connection-nivå-fel (som aldrig når
+    servern) retryas automatiskt."""
+    route = respx.post("https://api.telegram.org/botFAKE_TOKEN/sendMessage").mock(
+        return_value=Response(500, json={"ok": False, "description": "Internal Server Error"})
+    )
+    notifier = TelegramNotifier(bot_token="FAKE_TOKEN", chat_id="12345")
+
+    with pytest.raises(TelegramSendError):
+        notifier.send("test message")
+
+    assert route.call_count == 1

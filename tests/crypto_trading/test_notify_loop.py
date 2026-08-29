@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from crypto_trading.config.loader import NotifyConfig
 from crypto_trading.notify.telegram import TelegramSendError
 from crypto_trading.notify_loop import run_notify_tick
 from crypto_trading.schemas.assessments import (
@@ -20,6 +21,43 @@ from crypto_trading.schemas.evidence import (
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import SQLiteRepository
 from tests.crypto_trading.test_market_snapshot import _settings
+
+
+def _settings_with_level(level: str):
+    base = _settings()
+    return base.model_copy(
+        update={"notify": NotifyConfig(notification_level=level, notify_interval_seconds=60)}
+    )
+
+
+def _seed_no_trade_candidate(repo, candidate_id, reasons, instrument="BTCUSDT"):
+    candidate = Candidate(
+        candidate_id=candidate_id,
+        idempotency_key=f"key-{candidate_id}",
+        instrument=instrument,
+        discovery_run_id="run-1",
+        evidence_hash="hash-1",
+        status="NO_TRADE",
+        evidence_record=_evidence(),
+        created_at=_NOW,
+        updated_at=_NOW,
+    )
+    repo.create_candidate_with_event(
+        candidate,
+        Event(
+            event_id=f"CANDIDATE_CREATED:{candidate_id}",
+            event_type="CANDIDATE_CREATED",
+            aggregate_type="candidate",
+            aggregate_id=candidate_id,
+            occurred_at=_NOW,
+            run_id="run-1",
+            schema_version=1,
+            payload={},
+        ),
+    )
+    repo.save_gate_decision(candidate_id, "NO_TRADE", reasons, _NOW)
+    return candidate
+
 
 _NOW = datetime(2026, 8, 29, 12, 0, tzinfo=UTC)
 
@@ -208,10 +246,14 @@ def test_run_notify_tick_sends_confirmed_notification_and_records_idempotency(tm
 
     sent = run_notify_tick(notifier, repo, _settings())
 
-    assert sent == 1
-    assert len(notifier.sent) == 1
+    # 1 CONFIRMED + 1 daily report - daily report is baseline "important"
+    # content and fires on every tick where today's report hasn't been
+    # sent yet, regardless of what else is pending.
+    assert sent == 2
+    assert len(notifier.sent) == 2
     assert "BTCUSDT" in notifier.sent[0]
     assert repo.has_telegram_event_been_sent("CONFIRMED:cand-1") is True
+    assert any(msg.startswith("📊 Daily report") for msg in notifier.sent)
 
 
 def test_run_notify_tick_never_sends_the_same_confirmed_notification_twice(tmp_path):
@@ -222,7 +264,9 @@ def test_run_notify_tick_never_sends_the_same_confirmed_notification_twice(tmp_p
     run_notify_tick(notifier, repo, _settings())
     run_notify_tick(notifier, repo, _settings())
 
-    assert len(notifier.sent) == 1  # andra ticket ska inte skicka en dubblett
+    # 1 CONFIRMED + 1 daily report total - andra ticket ska inte skicka
+    # någon dubblett av vare sig CONFIRMED eller dagens daily report.
+    assert len(notifier.sent) == 2
 
 
 def test_run_notify_tick_sends_closed_notification_and_records_idempotency(tmp_path):
@@ -232,9 +276,10 @@ def test_run_notify_tick_sends_closed_notification_and_records_idempotency(tmp_p
 
     sent = run_notify_tick(notifier, repo, _settings())
 
-    assert sent == 1
+    assert sent == 2  # 1 CLOSED + 1 daily report
     assert "BTCUSDT" in notifier.sent[0]
     assert repo.has_telegram_event_been_sent("CLOSED:pos-1") is True
+    assert any(msg.startswith("📊 Daily report") for msg in notifier.sent)
 
 
 def test_run_notify_tick_skips_confirmed_candidate_without_a_position_yet(tmp_path):
@@ -270,8 +315,11 @@ def test_run_notify_tick_skips_confirmed_candidate_without_a_position_yet(tmp_pa
 
     sent = run_notify_tick(notifier, repo, _settings())
 
-    assert sent == 0
-    assert notifier.sent == []
+    # Ingen CONFIRMED-notis (candidaten saknar position) - men daily
+    # reporten skickas ändå, den beror inte på just den candidaten.
+    assert sent == 1
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].startswith("📊 Daily report")
     assert repo.has_telegram_event_been_sent("CONFIRMED:cand-no-position") is False
 
 
@@ -286,7 +334,7 @@ def test_run_notify_tick_continues_after_one_send_failure(tmp_path):
 
     sent = run_notify_tick(notifier, repo, _settings())
 
-    assert sent == 1
+    assert sent == 2  # cand-ok CONFIRMED + daily report - cand-fail hoppas över
     assert any("BTCUSDT" in msg for msg in notifier.sent)
     assert repo.has_telegram_event_been_sent("CONFIRMED:cand-ok") is True
     assert repo.has_telegram_event_been_sent("CONFIRMED:cand-fail") is False
@@ -316,3 +364,107 @@ def test_run_notify_tick_never_raises_on_unexpected_error(tmp_path, monkeypatch)
 
     sent = run_notify_tick(_StubNotifier(), repo, _settings())  # ska aldrig kasta
     assert sent == 0
+
+
+def test_run_notify_tick_sends_daily_report_once_and_is_idempotent_same_day(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    notifier = _StubNotifier()
+
+    first = run_notify_tick(notifier, repo, _settings())
+    second = run_notify_tick(notifier, repo, _settings())
+
+    assert first == 1  # bara daily report, ingen annan data i DB:n
+    assert second == 0  # redan skickad idag
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].startswith("📊 Daily report")
+
+
+def test_run_notify_tick_important_level_never_sends_no_trade(tmp_path):
+    """AC2, explicit: NO_TRADE genererar ingen Telegram-notis på
+    important-nivå (default), oavsett om den är "relevant" eller inte."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_no_trade_candidate(repo, "cand-relevant", ["max_concurrent_positions reached: 5/5"])
+    notifier = _StubNotifier()
+
+    sent = run_notify_tick(notifier, repo, _settings())  # default: important
+
+    assert not any("NO_TRADE" in msg for msg in notifier.sent)
+    assert repo.has_telegram_event_been_sent("NO_TRADE:cand-relevant") is False
+    assert sent == 1  # bara daily report
+
+
+def test_run_notify_tick_decisions_level_sends_relevant_no_trade(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_no_trade_candidate(repo, "cand-relevant", ["max_concurrent_positions reached: 5/5"])
+    notifier = _StubNotifier()
+
+    sent = run_notify_tick(notifier, repo, _settings_with_level("decisions"))
+
+    assert any("NO_TRADE" in msg for msg in notifier.sent)
+    assert any("max_concurrent_positions" in msg for msg in notifier.sent)
+    assert repo.has_telegram_event_been_sent("NO_TRADE:cand-relevant") is True
+    assert sent == 2  # NO_TRADE + daily report
+
+
+def test_run_notify_tick_decisions_level_excludes_other_no_trade(tmp_path):
+    """ "Övrig" NO_TRADE (saknad/misslyckad assessment) är INTE relevant på
+    decisions-nivå - bara debug-nivå (Beslut 7)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_no_trade_candidate(repo, "cand-other", ["missing_or_failed_assessment:technical"])
+    notifier = _StubNotifier()
+
+    sent = run_notify_tick(notifier, repo, _settings_with_level("decisions"))
+
+    assert not any("NO_TRADE" in msg for msg in notifier.sent)
+    assert repo.has_telegram_event_been_sent("NO_TRADE:cand-other") is False
+    assert sent == 1  # bara daily report
+
+
+def test_run_notify_tick_debug_level_sends_other_no_trade_too(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_no_trade_candidate(repo, "cand-other", ["missing_or_failed_assessment:technical"])
+    notifier = _StubNotifier()
+
+    sent = run_notify_tick(notifier, repo, _settings_with_level("debug"))
+
+    assert any("NO_TRADE" in msg for msg in notifier.sent)
+    assert repo.has_telegram_event_been_sent("NO_TRADE:cand-other") is True
+    assert sent == 2  # NO_TRADE + daily report
+
+
+def test_run_notify_tick_debug_level_sends_error_run_notifications(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.start_run("run-broken", "discovery", _NOW)
+    repo.complete_run("run-broken", _NOW, "error", ["ConnectorUnavailableError: BingX nere"])
+    notifier = _StubNotifier()
+
+    sent = run_notify_tick(notifier, repo, _settings_with_level("debug"))
+
+    assert any("run-broken" in msg for msg in notifier.sent)
+    assert repo.has_telegram_event_been_sent("error_run:run-broken") is True
+    assert sent == 2  # error_run + daily report
+
+
+def test_run_notify_tick_decisions_level_does_not_send_error_run_notifications(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.start_run("run-broken", "discovery", _NOW)
+    repo.complete_run("run-broken", _NOW, "error", ["boom"])
+    notifier = _StubNotifier()
+
+    sent = run_notify_tick(notifier, repo, _settings_with_level("decisions"))
+
+    assert not any("run-broken" in msg for msg in notifier.sent)
+    assert repo.has_telegram_event_been_sent("error_run:run-broken") is False
+    assert sent == 1  # bara daily report
+
+
+def test_run_notify_tick_error_run_notification_is_idempotent(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.start_run("run-broken", "discovery", _NOW)
+    repo.complete_run("run-broken", _NOW, "error", ["boom"])
+    notifier = _StubNotifier()
+
+    run_notify_tick(notifier, repo, _settings_with_level("debug"))
+    second = run_notify_tick(notifier, repo, _settings_with_level("debug"))
+
+    assert second == 0  # allt redan skickat idag (error_run + daily report)

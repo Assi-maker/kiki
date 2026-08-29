@@ -37,6 +37,62 @@ def test_init_schema_is_idempotent(tmp_path):
     assert row is not None
 
 
+def test_runs_table_has_instruments_scanned_column_on_a_fresh_database(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert "instruments_scanned" in columns
+
+
+def test_migration_adds_instruments_scanned_column_to_a_pre_existing_database_without_it(
+    tmp_path,
+):
+    """Fas 6 daily report (2026-08-29): runs-tabellen fick kolumnen
+    instruments_scanned efter att riktiga produktionsdatabaser (data/
+    crypto_trading.db) redan existerade med den GAMLA runs-strukturen.
+    CREATE TABLE IF NOT EXISTS gör INGENTING mot en redan existerande
+    tabell - detta test simulerar exakt den situationen: en databas skapad
+    med det gamla schemat (utan kolumnen), sedan öppnad igen via
+    get_connection() (som en riktig omstart av processen skulle göra),
+    och bevisar att migreringen lägger till kolumnen utan att förstöra
+    befintliga rader."""
+    db_path = tmp_path / "pre_existing.db"
+
+    # Simulerar en riktig, redan existerande produktionsdatabas skapad
+    # INNAN instruments_scanned fanns - bygger bara den gamla runs-formen,
+    # inte via _SCHEMA (som redan inkluderar kolumnen).
+    old_conn = sqlite3.connect(db_path)
+    old_conn.execute(
+        "CREATE TABLE runs (run_id TEXT NOT NULL, run_type TEXT NOT NULL, "
+        "started_at TEXT, completed_at TEXT, status TEXT, errors TEXT)"
+    )
+    old_conn.execute(
+        "INSERT INTO runs (run_id, run_type, started_at, status) "
+        "VALUES ('old-run-1', 'discovery', '2026-08-01T00:00:00+00:00', 'ok')"
+    )
+    old_conn.commit()
+    old_conn.close()
+
+    # En riktig omstart: get_connection() öppnar samma fil igen.
+    conn = get_connection(db_path)
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    assert "instruments_scanned" in columns
+
+    # Den gamla raden finns kvar, oförstörd, med NULL i den nya kolumnen.
+    row = conn.execute("SELECT * FROM runs WHERE run_id = 'old-run-1'").fetchone()
+    assert row is not None
+    assert row["status"] == "ok"
+    assert row["instruments_scanned"] is None
+
+
+def test_migration_is_idempotent_across_repeated_connections(tmp_path):
+    db_path = tmp_path / "test.db"
+    get_connection(db_path)
+    conn2 = get_connection(db_path)  # andra anslutningen ska inte krascha på ALTER TABLE igen
+    columns = {row["name"] for row in conn2.execute("PRAGMA table_info(runs)").fetchall()}
+    assert "instruments_scanned" in columns
+
+
 def test_schema_version_is_recorded(tmp_path):
     conn = get_connection(tmp_path / "test.db")
     row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()

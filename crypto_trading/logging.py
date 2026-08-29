@@ -26,17 +26,34 @@ def new_run_id() -> str:
     return str(uuid.uuid4())
 
 
+def _redact_string(value: str) -> str:
+    masked = _SECRET_VALUE_PATTERN.sub("***REDACTED***", value)
+    return _TELEGRAM_BOT_URL_PATTERN.sub("/bot***REDACTED***", masked)
+
+
 def redact(data: dict) -> dict:
     out = {}
     for key, value in data.items():
         if any(marker in key.lower() for marker in _SECRET_KEY_MARKERS):
             out[key] = "***REDACTED***"
         elif isinstance(value, str):
-            masked = _SECRET_VALUE_PATTERN.sub("***REDACTED***", value)
-            out[key] = _TELEGRAM_BOT_URL_PATTERN.sub("/bot***REDACTED***", masked)
+            out[key] = _redact_string(value)
         else:
             out[key] = value
     return out
+
+
+def redact_error_list(errors: list[str]) -> list[str]:
+    """Samma skyddsmönster som redact(), men för en bar lista med
+    felsträngar - dict-formen på redact() passar inte
+    Repository.complete_run()s `errors: list[str]`-argument, som
+    persisteras till `runs.errors` (och, sedan Fas 6, kan visas i klartext
+    via notify/telegram.py::format_debug_error_message() på debug-nivå).
+    Upptäckt vid code review 2026-08-29: complete_run() gick tidigare
+    förbi redact() helt - ett undantagsmeddelande som råkade innehålla en
+    secret (t.ex. ett httpx-undantag som inte fångades av
+    TelegramNotifier.send()s egen except-sats) skulle persisteras rått."""
+    return [_redact_string(e) for e in errors]
 
 
 def log_event(run_id: str, **fields) -> None:

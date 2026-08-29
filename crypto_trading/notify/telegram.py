@@ -1,16 +1,34 @@
 from __future__ import annotations
 
+import json
+from datetime import date
 from decimal import Decimal
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from crypto_trading.logging import redact_error_list
 from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.forecast import ForecastRecord
 from crypto_trading.schemas.trade import Position
 
 _TELEGRAM_API_BASE = "https://api.telegram.org"
+
+# Duplicate-send-fynd (code review 2026-08-29): sendMessage är en
+# side-effecting POST utan idempotenskyckel - att blint retrya på VARJE
+# httpx.HTTPError (som tidigare) riskerar att skicka samma meddelande två
+# gånger om felet inträffade EFTER att requesten redan nått Telegram (t.ex.
+# en timeout medan vi väntade på svaret). Bara fel som garanterat betyder
+# att requesten ALDRIG lämnade klienten - ett misslyckat
+# anslutningsförsök - är säkra att retrya automatiskt här. Allt annat
+# (timeout efter att requesten skickats, ett trasigt svar, en definitiv
+# HTTP-felstatus som en 5xx) rapporteras som ETT sändningsfel, aldrig ett
+# blint nytt försök inom samma send()-anrop - en genuin, opersisterad rad
+# försöks ändå igen på notify_loop.py:s NÄSTA schemalagda tick, ett mycket
+# säkrare intervall (minuter, inte millisekunder) för en eventuell
+# retry än ett omedelbart nytt anrop.
+_SAFE_TO_RETRY_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
 
 
 class TelegramSendError(Exception):
@@ -86,6 +104,76 @@ def format_closed_message(position: Position, forecast: ForecastRecord | None) -
     return "\n".join(lines)
 
 
+def format_no_trade_message(candidate: Candidate, reasons: list[str]) -> str:
+    """Fas 6 `decisions`-notisnivå (Beslut 6, 2026-08-29): "relevant"
+    NO_TRADE - samtliga sju assessments var status='ok' och QA godkände,
+    men den DETERMINISTISKA Risk/Signal Gate blockerade ändå (t.ex.
+    max_concurrent_positions nått). `reasons` kommer direkt från redan
+    persisterade `gate_decisions.reasons` - ingen egen tolkning här."""
+    evidence = candidate.evidence_record
+    return "\n".join(
+        [
+            f"⏸ NO_TRADE — {candidate.instrument}",
+            f"Candidate score: {evidence.candidate_score:.2f}",
+            f"Evidence: {', '.join(evidence.trigger_reasons)}",
+            f"Gate blocked: {'; '.join(reasons)}",
+            f"Time: {candidate.updated_at.isoformat()}",
+        ]
+    )
+
+
+def format_daily_report_message(
+    report_date: date,
+    instruments_scanned: int,
+    candidates_created: int,
+    ai_analyses: int,
+    confirmed: int,
+    no_trade: int,
+    rejected: int,
+    open_positions: int,
+    system_errors: int,
+) -> str:
+    """Fas 6 daily report (2026-08-29 beslut: minimal version - endast
+    entydiga operativa räknetal, INGA performance-mått som win rate/
+    expectancy/cumulative PnL/drawdown - de hör hemma i Fas 8:s
+    kalibreringsmodul, för att undvika duplicerad beräkningslogik)."""
+    return "\n".join(
+        [
+            f"📊 Daily report — {report_date.isoformat()}",
+            f"Instruments scanned: {instruments_scanned}",
+            f"Candidates created: {candidates_created}",
+            f"AI analyses: {ai_analyses}",
+            f"Confirmed: {confirmed}",
+            f"No trade: {no_trade}",
+            f"Rejected: {rejected}",
+            f"Open positions: {open_positions}",
+            f"System errors: {system_errors}",
+        ]
+    )
+
+
+def format_debug_error_message(run: dict) -> str:
+    """Fas 6 `debug`-notisnivå (Beslut 7): en `runs`-rad med status='error'.
+    Tar redan hämtad rad-data (dict från Repository.
+    find_error_runs_pending_notification()) - ingen egen DB-fråga.
+
+    `redact_error_list()` här är ett ANDRA skyddslager (code review-fynd
+    2026-08-29): Repository.complete_run() redigerar redan errors innan
+    persistering, men denna funktion redigerar ändå igen defensivt - en
+    redan existerande, historisk rad (skapad innan complete_run()s egen
+    fix fanns) ska aldrig kunna visa en oredigerad secret bara för att den
+    redan låg oredigerad i databasen."""
+    raw_errors = json.loads(run["errors"]) if run["errors"] else []
+    safe_errors = redact_error_list(raw_errors)
+    return "\n".join(
+        [
+            f"🐛 DEBUG error — run {run['run_id']} ({run['run_type']})",
+            f"Started at: {run['started_at']}",
+            f"Errors: {'; '.join(safe_errors) if safe_errors else 'none'}",
+        ]
+    )
+
+
 class TelegramNotifier:
     def __init__(
         self,
@@ -105,7 +193,7 @@ class TelegramNotifier:
         @retry(
             stop=stop_after_attempt(self._max_retries),
             wait=wait_exponential(multiplier=0.5, max=5),
-            retry=retry_if_exception_type(httpx.HTTPError),
+            retry=retry_if_exception_type(_SAFE_TO_RETRY_EXCEPTIONS),
             reraise=True,
         )
         def _do() -> None:

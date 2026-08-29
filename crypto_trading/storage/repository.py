@@ -8,6 +8,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
+from crypto_trading.logging import redact_error_list
 from crypto_trading.schemas.assessments import (
     AssessmentBase,
     BearAdversarialAssessment,
@@ -74,7 +75,12 @@ class Repository(Protocol):
     ) -> None: ...
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
     def complete_run(
-        self, run_id: str, completed_at: datetime, status: str, errors: list[str]
+        self,
+        run_id: str,
+        completed_at: datetime,
+        status: str,
+        errors: list[str],
+        instruments_scanned: int | None = None,
     ) -> None: ...
     def record_ai_call_event(self, event: Event) -> None: ...
     def count_ai_calls_since(self, cutoff: datetime) -> int: ...
@@ -86,6 +92,14 @@ class Repository(Protocol):
     def has_telegram_event_been_sent(self, telegram_event_id: str) -> bool: ...
     def find_candidates_pending_notification(self, status: str) -> list[Candidate]: ...
     def find_positions_pending_notification(self) -> list[Position]: ...
+    def count_candidates_created_since(self, cutoff: datetime) -> int: ...
+    def count_candidates_by_status_since(self, status: str, cutoff: datetime) -> int: ...
+    def count_runs_by_status_since(self, status: str, cutoff: datetime) -> int: ...
+    def sum_instruments_scanned_since(self, cutoff: datetime) -> int: ...
+    def find_no_trade_candidates_pending_notification(
+        self,
+    ) -> list[tuple[Candidate, list[str]]]: ...
+    def find_error_runs_pending_notification(self) -> list[dict]: ...
 
 
 class SQLiteRepository:
@@ -448,13 +462,103 @@ class SQLiteRepository:
         self._conn.commit()
 
     def complete_run(
-        self, run_id: str, completed_at: datetime, status: str, errors: list[str]
+        self,
+        run_id: str,
+        completed_at: datetime,
+        status: str,
+        errors: list[str],
+        instruments_scanned: int | None = None,
     ) -> None:
-        self._conn.execute(
-            "UPDATE runs SET completed_at = ?, status = ?, errors = ? WHERE run_id = ?",
-            (completed_at.isoformat(), status, json.dumps(errors), run_id),
-        )
+        # Fas 6-fynd (code review 2026-08-29): redact() opererar bara på
+        # dict-värden, så errors (en bar list[str]) gick tidigare förbi den
+        # helt. Redigeras HÄR, vid persistering - inte bara vid visning -
+        # så en secret aldrig ens når disk, oavsett vilken framtida
+        # konsument (dashboard, Telegram debug-notis, ...) som senare läser
+        # runs.errors.
+        safe_errors = redact_error_list(errors)
+        if instruments_scanned is not None:
+            self._conn.execute(
+                "UPDATE runs SET completed_at = ?, status = ?, errors = ?, "
+                "instruments_scanned = ? WHERE run_id = ?",
+                (
+                    completed_at.isoformat(),
+                    status,
+                    json.dumps(safe_errors),
+                    instruments_scanned,
+                    run_id,
+                ),
+            )
+        else:
+            self._conn.execute(
+                "UPDATE runs SET completed_at = ?, status = ?, errors = ? WHERE run_id = ?",
+                (completed_at.isoformat(), status, json.dumps(safe_errors), run_id),
+            )
         self._conn.commit()
+
+    def count_candidates_created_since(self, cutoff: datetime) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM candidates WHERE created_at >= ?", (cutoff.isoformat(),)
+        ).fetchone()
+        return row["n"]
+
+    def count_candidates_by_status_since(self, status: str, cutoff: datetime) -> int:
+        """Fas 6 daily report: `updated_at` (inte `created_at`) - en
+        candidate skapad igår men som nådde `status` idag ska räknas mot
+        idag, samma princip som `find_latest_candidate_by_instrument_and_
+        status()` redan använder `updated_at` för statusövergångar."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM candidates WHERE status = ? AND updated_at >= ?",
+            (status, cutoff.isoformat()),
+        ).fetchone()
+        return row["n"]
+
+    def count_runs_by_status_since(self, status: str, cutoff: datetime) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM runs WHERE status = ? AND started_at >= ?",
+            (status, cutoff.isoformat()),
+        ).fetchone()
+        return row["n"]
+
+    def sum_instruments_scanned_since(self, cutoff: datetime) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(instruments_scanned), 0) AS n FROM runs "
+            "WHERE run_type = 'discovery' AND started_at >= ?",
+            (cutoff.isoformat(),),
+        ).fetchone()
+        return row["n"]
+
+    def find_no_trade_candidates_pending_notification(self) -> list[tuple[Candidate, list[str]]]:
+        """Returnerar (candidate, gate_decisions.reasons) för varje NO_TRADE-
+        candidate som inte redan notifierats (nyckel `NO_TRADE:{candidate_id}`).
+        Klassificeringen "relevant" (decisions-nivå) vs "övrig" (debug-nivå)
+        görs av notify_loop.py utifrån `reasons` - denna metod gör bara den
+        redan persisterade kopplingen mellan candidates/gate_decisions/
+        telegram_events tillgänglig, ingen egen tolkning."""
+        rows = self._conn.execute(
+            "SELECT c.candidate_id, g.reasons FROM candidates c "
+            "LEFT JOIN gate_decisions g ON g.candidate_id = c.candidate_id "
+            "WHERE c.status = 'NO_TRADE' "
+            "AND ('NO_TRADE:' || c.candidate_id) NOT IN "
+            "(SELECT telegram_event_id FROM telegram_events)"
+        ).fetchall()
+        result = []
+        for row in rows:
+            reasons = json.loads(row["reasons"]) if row["reasons"] is not None else []
+            try:
+                candidate = self.get_candidate(row["candidate_id"])
+            except CorruptCandidateStateError:
+                continue
+            if candidate is not None:
+                result.append((candidate, reasons))
+        return result
+
+    def find_error_runs_pending_notification(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT run_id, run_type, started_at, errors FROM runs WHERE status = 'error' "
+            "AND ('error_run:' || run_id) NOT IN "
+            "(SELECT telegram_event_id FROM telegram_events)"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def record_telegram_event(
         self, telegram_event_id: str, notification_type: str, sent_at: datetime

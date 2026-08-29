@@ -50,7 +50,9 @@ def run_discovery_tick(
             news_connector=news_connector,
             external_data_connector=external_data_connector,
         )
-        repo.complete_run(run_id, datetime.now(UTC), "ok", [])
+        repo.complete_run(
+            run_id, datetime.now(UTC), "ok", [], instruments_scanned=len(snapshot.instruments)
+        )
         return positions
     except Exception as exc:
         log_event(

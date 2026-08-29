@@ -158,8 +158,27 @@ def _set_wal_mode_with_retry(conn: sqlite3.Connection, busy_timeout_ms: int) -> 
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
+    _migrate_runs_add_instruments_scanned(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
     )
     conn.commit()
+
+
+def _migrate_runs_add_instruments_scanned(conn: sqlite3.Connection) -> None:
+    """Fas 6 daily report (2026-08-29): runs.instruments_scanned lades till
+    EFTER att riktiga produktionsdatabaser (data/crypto_trading.db) redan
+    existerade med den gamla runs-strukturen. `CREATE TABLE IF NOT EXISTS`
+    ovan gör INGENTING mot en redan existerande tabell - en explicit,
+    idempotent `ALTER TABLE` krävs. `_SCHEMA` innehåller MEDVETET inte
+    denna kolumn i sin egen `runs`-definition, så att både en helt ny
+    databas och en redan existerande går via exakt samma kodväg här,
+    istället för två divergerande sätt att få kolumnen. Kontrolleras via
+    `PRAGMA table_info` (inte "IF NOT EXISTS" på `ALTER TABLE`, som inte
+    stöds av alla SQLite-versioner) - säker att köra om vid varje
+    anslutning, förstör aldrig befintliga rader (nya kolumnen blir NULL
+    för dem, aldrig ett fel eller en gissning)."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if "instruments_scanned" not in columns:
+        conn.execute("ALTER TABLE runs ADD COLUMN instruments_scanned INTEGER")

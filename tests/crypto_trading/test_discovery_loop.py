@@ -104,6 +104,20 @@ def test_run_discovery_tick_persists_a_runs_row_on_success(tmp_path):
     assert row["completed_at"] is not None
 
 
+def test_run_discovery_tick_persists_instruments_scanned_count_on_success(tmp_path):
+    """Fas 6 daily report (2026-08-29): antalet instrument i BingX-
+    universumet (len(snapshot.instruments), inte bara top_n) persisteras
+    på run-recordet - härlett direkt från redan hämtad data, ingen
+    separat räkning."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    connector = _stub_connector_with_one_healthy_symbol()  # exakt 1 kontrakt
+
+    run_discovery_tick(connector, repo, MockAgentRunner(_happy_fixtures()), _settings(top_n=1))
+
+    row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'discovery'").fetchone()
+    assert row["instruments_scanned"] == 1
+
+
 def test_run_discovery_tick_marks_run_as_error_and_does_not_raise_on_connector_failure(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     connector = _RaisingConnector(ConnectorUnavailableError("BingX nere"))

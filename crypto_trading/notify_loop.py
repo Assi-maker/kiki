@@ -10,8 +10,31 @@ from crypto_trading.notify.telegram import (
     TelegramSendError,
     format_closed_message,
     format_confirmed_message,
+    format_daily_report_message,
+    format_debug_error_message,
+    format_no_trade_message,
 )
 from crypto_trading.storage.repository import Repository
+
+_LEVEL_ORDER = {"important": 0, "decisions": 1, "debug": 2}
+
+
+def _level_at_least(configured: str, minimum: str) -> bool:
+    return _LEVEL_ORDER[configured] >= _LEVEL_ORDER[minimum]
+
+
+def _utc_day_start(now: datetime) -> datetime:
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _is_relevant_no_trade(reasons: list[str]) -> bool:
+    """Beslut 6 (2026-08-29): "relevant" NO_TRADE = samtliga sju assessments
+    var status='ok' och QA godkände, men den deterministiska Risk/Signal
+    Gate blockerade ändå (t.ex. max_concurrent_positions). En saknad/
+    misslyckad assessment ger reasons som börjar med
+    "missing_or_failed_assessment:" (se gate/risk_signal_gate.py) - det är
+    INTE en relevant/intressant NO_TRADE, bara redan hanterat/loggat."""
+    return not any(r.startswith("missing_or_failed_assessment:") for r in reasons)
 
 
 class NotifierProtocol(Protocol):
@@ -26,10 +49,17 @@ def run_notify_tick(notifier: NotifierProtocol, repo: Repository, settings: Sett
     Risk/Signal Gate har redan avgjort CONFIRMED/NO_TRADE/REJECTED innan en
     rad ens kan dyka upp här (SPEC §1 kärnprincip 1).
 
-    Minimal implementation (Fas 6, första versionen): skickar alltid
-    CONFIRMED- och CLOSED-notiser oavsett `settings.notify.notification_level`
-    - notisnivåerna decisions/debug (NO_TRADE, detaljerade pipeline-events)
-    är INTE implementerade ännu, medvetet utanför denna första leverans.
+    Notisnivåer (SPEC §12): `important` (default) skickar alltid CONFIRMED,
+    CLOSED och daily report. `decisions` lägger till "relevanta" NO_TRADE
+    (Beslut 6 - alla sju assessments ok + QA godkände, men gaten blockerade
+    ändå). `debug` lägger till alla ÖVRIGA NO_TRADE (Beslut 7) samt
+    `runs.status='error'`-rader. Daily report är INTE nivå-styrd - den
+    skickas oavsett konfigurerad nivå, som bas-`important`-innehåll.
+    Daily report i denna version innehåller ENDAST entydiga operativa
+    räknetal (instrument scannade, candidates, AI-analyser, CONFIRMED,
+    NO_TRADE, REJECTED, öppna positioner, systemfel) - INGA performance-mått
+    (win rate/expectancy/cumulative PnL/drawdown), medvetet uppskjutet till
+    Fas 8:s kalibreringsmodul för att undvika duplicerad beräkningslogik.
 
     Två fail-safe-lager, samma mönster som discovery_loop.py/
     monitoring_loop.py: ett enskilt sändningsfel (TelegramSendError) hoppar
@@ -63,6 +93,52 @@ def run_notify_tick(notifier: NotifierProtocol, repo: Repository, settings: Sett
                 sent_count += 1
             except TelegramSendError as exc:
                 errors.append(f"{telegram_event_id}: {exc}")
+
+        today = now.date()
+        daily_report_id = f"daily_report:{today.isoformat()}"
+        if not repo.has_telegram_event_been_sent(daily_report_id):
+            day_start = _utc_day_start(now)
+            message = format_daily_report_message(
+                report_date=today,
+                instruments_scanned=repo.sum_instruments_scanned_since(day_start),
+                candidates_created=repo.count_candidates_created_since(day_start),
+                ai_analyses=repo.count_ai_calls_since(day_start),
+                confirmed=repo.count_candidates_by_status_since("CONFIRMED", day_start),
+                no_trade=repo.count_candidates_by_status_since("NO_TRADE", day_start),
+                rejected=repo.count_candidates_by_status_since("REJECTED", day_start),
+                open_positions=repo.count_open_positions(),
+                system_errors=repo.count_runs_by_status_since("error", day_start),
+            )
+            try:
+                notifier.send(message)
+                repo.record_telegram_event(daily_report_id, "daily_report", datetime.now(UTC))
+                sent_count += 1
+            except TelegramSendError as exc:
+                errors.append(f"{daily_report_id}: {exc}")
+
+        level = settings.notify.notification_level
+        if _level_at_least(level, "decisions"):
+            for candidate, reasons in repo.find_no_trade_candidates_pending_notification():
+                relevant = _is_relevant_no_trade(reasons)
+                if not (relevant or _level_at_least(level, "debug")):
+                    continue  # "övrig" NO_TRADE - bara debug-nivå, hoppa över på decisions
+                telegram_event_id = f"NO_TRADE:{candidate.candidate_id}"
+                try:
+                    notifier.send(format_no_trade_message(candidate, reasons))
+                    repo.record_telegram_event(telegram_event_id, "NO_TRADE", datetime.now(UTC))
+                    sent_count += 1
+                except TelegramSendError as exc:
+                    errors.append(f"{telegram_event_id}: {exc}")
+
+        if _level_at_least(level, "debug"):
+            for run in repo.find_error_runs_pending_notification():
+                telegram_event_id = f"error_run:{run['run_id']}"
+                try:
+                    notifier.send(format_debug_error_message(run))
+                    repo.record_telegram_event(telegram_event_id, "error_run", datetime.now(UTC))
+                    sent_count += 1
+                except TelegramSendError as exc:
+                    errors.append(f"{telegram_event_id}: {exc}")
 
         repo.complete_run(
             run_id, datetime.now(UTC), "ok" if not errors else "partial_error", errors

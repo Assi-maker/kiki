@@ -1,6 +1,6 @@
 import logging
 
-from crypto_trading.logging import log_event, new_run_id, redact
+from crypto_trading.logging import log_event, new_run_id, redact, redact_error_list
 
 
 def test_new_run_id_returns_unique_uuid_strings():
@@ -41,6 +41,33 @@ def test_redact_masks_telegram_bot_token_embedded_in_url_path():
     assert "123456789:ABCdefGhIJKlmNoPQRsTuVwxYZ" not in out["error_message"]
     assert "***REDACTED***" in out["error_message"]
     assert "sendMessage" in out["error_message"]  # resten av URL:en/meddelandet kvar, oskadat
+
+
+def test_redact_error_list_masks_key_value_secrets_in_each_string():
+    """Fas 6-fynd (code review 2026-08-29): Repository.complete_run()s
+    `errors: list[str]` gick tidigare direkt till `runs.errors` UTAN
+    redact() (som bara opererar på dict-värden) - en oredigerad secret i
+    ett undantagsmeddelande skulle persisteras rått och senare kunna
+    visas i klartext av format_debug_error_message() över Telegram."""
+    errors = ["request failed: token=abc123&other=1", "harmless error, no secret here"]
+    out = redact_error_list(errors)
+    assert "abc123" not in out[0]
+    assert "***REDACTED***" in out[0]
+    assert out[1] == "harmless error, no secret here"
+
+
+def test_redact_error_list_masks_telegram_bot_url_token_in_each_string():
+    errors = [
+        "request to https://api.telegram.org/bot123456789:ABCdefGhIJKlmNoPQRsTuVwxYZ/"
+        "sendMessage failed"
+    ]
+    out = redact_error_list(errors)
+    assert "123456789:ABCdefGhIJKlmNoPQRsTuVwxYZ" not in out[0]
+    assert "***REDACTED***" in out[0]
+
+
+def test_redact_error_list_returns_empty_list_unchanged():
+    assert redact_error_list([]) == []
 
 
 def test_log_event_never_emits_raw_secret(caplog):
