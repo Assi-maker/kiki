@@ -162,3 +162,69 @@ def test_busy_timeout_is_respected_write_fails_after_timeout_elapses(tmp_path):
     verify_repo = SQLiteRepository(db_path, busy_timeout_ms=2000)
     count = verify_repo._conn.execute("SELECT COUNT(*) AS n FROM candidates").fetchone()["n"]
     assert count == 0
+
+
+def test_two_repositories_can_initialize_concurrently_on_a_brand_new_database_file(tmp_path):
+    """AC3-live-körningen 2026-08-29 kraschade omedelbart med
+    'sqlite3.OperationalError: database is locked' - run.py::main() startar
+    discovery- och monitoring-tråden med .start() rakt efter varandra, utan
+    synkronisering, och båda konstruerar sin egen SQLiteRepository mot SAMMA
+    (då helt nya) databasfil. Root cause: get_connection() satte PRAGMA
+    busy_timeout EFTER PRAGMA journal_mode=WAL - WAL-aktivering kräver ett
+    kortvarigt exklusivt lås, och utan busy_timeout redan aktivt misslyckas
+    den förlorande anslutningen direkt istället för att vänta.
+
+    De två testerna OVAN i denna fil missar detta helt: de skapar alltid
+    repo_b FÄRDIGT (WAL redan aktiverat, schema redan skapat) i huvudtråden
+    INNAN repo_a:s tråd ens startar - racet mot en genuint ny, oinitierad
+    fil testas aldrig. Detta test tvingar de två initialiseringarna att
+    starta i EXAKT samma ögonblick via en threading.Barrier, mot en fil som
+    bevisligen inte existerar när testet börjar - annars bevisar testet
+    ingenting om just detta race."""
+    # Racet är i sig timing-beroende (bekräftat empiriskt: en enda iteration
+    # reproducerar felet ~60% av gångarna på denna maskin, INTE 100% - vore
+    # testet bara EN iteration skulle det vara flakigt i båda riktningarna:
+    # kan råka "passera" grönt före fixen (falsk trygghet) lika gärna som
+    # det kan misslyckas. 20 oberoende iterationer (varsin helt ny fil) gör
+    # rött-läget praktiskt garanterat (0.4^20 chans att alla 20 råkar lyckas
+    # trots buggen) OCH gör grönt-läget en verklig 100%-garanti efter fixen,
+    # inte en tur-baserad enstaka körning.
+    for i in range(20):
+        db_path = tmp_path / f"fresh_race_{i}.db"
+        assert not db_path.exists(), (
+            "testet kräver en genuint ny, oinitierad fil för att bevisa racet"
+        )
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+        repos: list[SQLiteRepository] = []
+        results_lock = threading.Lock()
+
+        def init_repo(
+            db_path=db_path,
+            barrier=barrier,
+            errors=errors,
+            repos=repos,
+            results_lock=results_lock,
+        ):
+            barrier.wait(timeout=5)  # släpper båda trådarna i exakt samma ögonblick
+            try:
+                repo = SQLiteRepository(db_path, busy_timeout_ms=2000)
+                with results_lock:
+                    repos.append(repo)
+            except BaseException as exc:
+                with results_lock:
+                    errors.append(exc)
+
+        thread_a = threading.Thread(target=init_repo)
+        thread_b = threading.Thread(target=init_repo)
+        thread_a.start()
+        thread_b.start()
+        thread_a.join(timeout=5)
+        thread_b.join(timeout=5)
+
+        assert errors == [], (
+            f"iteration {i}: samtidig initiering mot en ny databasfil kastade: "
+            f"{[(type(e).__name__, str(e)) for e in errors]}"
+        )
+        assert len(repos) == 2

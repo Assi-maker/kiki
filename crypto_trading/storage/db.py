@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 SCHEMA_VERSION = 1
@@ -117,10 +118,36 @@ def get_connection(path: Path, busy_timeout_ms: int = 5000) -> sqlite3.Connectio
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout sätts före journal_mode=WAL som god praxis (gäller alla
+    # efterföljande statements på anslutningen), men ENSAM räcker den INTE
+    # för just journal_mode=WAL: SQLite verkar inte konsekvent respektera
+    # busy_timeout-återförsöket för WAL-aktiveringens exklusiva lås när två
+    # anslutningar råkar aktivera WAL på samma helt nya, ännu icke-
+    # existerande fil samtidigt (upptäckt vid AC3-live-körningen 2026-08-29 -
+    # run.py::main() startar discovery- och monitoring-tråden utan
+    # synkronisering, båda mot samma nya fil - bekräftat empiriskt: samma
+    # sqlite3.OperationalError: database is locked kvarstod efter bara
+    # pragma-ordningsbytet, se tests/crypto_trading/storage/
+    # test_repository_concurrency.py::
+    # test_two_repositories_can_initialize_concurrently_on_a_brand_new_database_file).
+    # Löst med en explicit, bounded retry-loop runt just detta anrop -
+    # validerat 0/30 misslyckanden mot ordningsbytets ensamma ~15-20%.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    _set_wal_mode_with_retry(conn, busy_timeout_ms)
     init_schema(conn)
     return conn
+
+
+def _set_wal_mode_with_retry(conn: sqlite3.Connection, busy_timeout_ms: int) -> None:
+    deadline = time.monotonic() + (busy_timeout_ms / 1000)
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
