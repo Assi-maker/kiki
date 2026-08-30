@@ -100,6 +100,12 @@ class Repository(Protocol):
         self,
     ) -> list[tuple[Candidate, list[str]]]: ...
     def find_error_runs_pending_notification(self) -> list[dict]: ...
+    def find_all_candidates(self, limit: int, offset: int = 0) -> list[Candidate]: ...
+    def find_all_positions(self, limit: int, offset: int = 0) -> list[Position]: ...
+    def get_gate_decision(self, candidate_id: str) -> dict | None: ...
+    def find_latest_run(self, run_type: str) -> dict | None: ...
+    def find_recent_runs(self, limit: int, offset: int = 0) -> list[dict]: ...
+    def find_all_forecasts(self, limit: int, offset: int = 0) -> list[ForecastRecord]: ...
 
 
 class SQLiteRepository:
@@ -627,4 +633,84 @@ class SQLiteRepository:
                 continue
             if candidate is not None:
                 result.append(candidate)
+        return result
+
+    def find_all_candidates(self, limit: int, offset: int = 0) -> list[Candidate]:
+        """Fas 7 (dashboard TRADE HISTORY): read-only, paginerad, samma
+        korrupt-rad-hoppa-över-princip som find_candidates_by_status() - ett
+        trasigt objekt får aldrig blockera resten av listan."""
+        rows = self._conn.execute(
+            "SELECT candidate_id FROM candidates ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                candidate = self.get_candidate(row["candidate_id"])
+            except CorruptCandidateStateError:
+                continue
+            if candidate is not None:
+                result.append(candidate)
+        return result
+
+    def find_all_positions(self, limit: int, offset: int = 0) -> list[Position]:
+        """Fas 7 (dashboard TRADE HISTORY): till skillnad från
+        find_open_positions() inkluderar denna CLOSED-positioner - all
+        historik, paginerad."""
+        rows = self._conn.execute(
+            "SELECT * FROM positions ORDER BY opened_at DESC LIMIT ? OFFSET ?", (limit, offset)
+        ).fetchall()
+        return [self._row_to_position(row) for row in rows]
+
+    def get_gate_decision(self, candidate_id: str) -> dict | None:
+        """Fas 7 (dashboard LIVE/TRADE HISTORY): den enda redan persisterade
+        gate-utfallsraden per candidate, oformaterad."""
+        row = self._conn.execute(
+            "SELECT decision, reasons, evaluated_at FROM gate_decisions WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "decision": row["decision"],
+            "reasons": json.loads(row["reasons"]),
+            "evaluated_at": row["evaluated_at"],
+        }
+
+    def find_latest_run(self, run_type: str) -> dict | None:
+        """Fas 7 (dashboard LIVE): senaste run av given typ, oformaterad."""
+        row = self._conn.execute(
+            "SELECT * FROM runs WHERE run_type = ? ORDER BY started_at DESC LIMIT 1", (run_type,)
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def find_recent_runs(self, limit: int, offset: int = 0) -> list[dict]:
+        """Fas 7 (dashboard SYSTEM HEALTH): senaste runs oavsett typ,
+        paginerad, oformaterad."""
+        rows = self._conn.execute(
+            "SELECT * FROM runs ORDER BY started_at DESC LIMIT ? OFFSET ?", (limit, offset)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_all_forecasts(self, limit: int, offset: int = 0) -> list[ForecastRecord]:
+        """Fas 7 (dashboard FORECAST): all forecast-historik, paginerad,
+        samma deserialisering som get_forecast_record()."""
+        rows = self._conn.execute(
+            "SELECT * FROM forecasts ORDER BY forecast_timestamp DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["scenario_probabilities"] = json.loads(data["scenario_probabilities"])
+            data["market_state_metadata"] = json.loads(data["market_state_metadata"])
+            data["forecast_timestamp"] = datetime.fromisoformat(data["forecast_timestamp"])
+            data["outcome_timestamp"] = (
+                datetime.fromisoformat(data["outcome_timestamp"])
+                if data["outcome_timestamp"] is not None
+                else None
+            )
+            result.append(ForecastRecord(**data))
         return result

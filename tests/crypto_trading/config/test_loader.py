@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from crypto_trading.config.exceptions import ConfigError
 from crypto_trading.config.loader import (
     BudgetLimitsConfig,
+    DashboardConfig,
     NotifyConfig,
     PipelineConfig,
     RiskLimitsConfig,
@@ -205,6 +206,22 @@ def test_notify_config_rejects_invalid_notification_level():
 def test_notify_config_rejects_zero_notify_interval_seconds():
     with pytest.raises(ValidationError):
         NotifyConfig(notification_level="important", notify_interval_seconds=0)
+
+
+def test_get_settings_loads_dashboard_config_with_localhost_default():
+    settings = get_settings()
+    assert settings.dashboard.host == "127.0.0.1"
+    assert settings.dashboard.port > 0
+
+
+def test_dashboard_config_rejects_invalid_port():
+    with pytest.raises(ValidationError):
+        DashboardConfig(host="127.0.0.1", port=0)
+
+
+def test_dashboard_config_rejects_port_above_65535():
+    with pytest.raises(ValidationError):
+        DashboardConfig(host="127.0.0.1", port=70000)
 
 
 def test_missing_config_file_raises_config_error(tmp_path, monkeypatch):

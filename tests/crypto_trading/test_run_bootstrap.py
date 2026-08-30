@@ -1,9 +1,15 @@
 import pytest
+from fastapi import FastAPI
 
 from crypto_trading.agents.runner import RealClaudeRunner
 from crypto_trading.config.exceptions import ConfigError
+from crypto_trading.config.loader import get_settings
 from crypto_trading.notify.telegram import TelegramNotifier
-from crypto_trading.run import build_notifier_from_env, build_runner_from_env
+from crypto_trading.run import (
+    build_dashboard_app_from_env,
+    build_notifier_from_env,
+    build_runner_from_env,
+)
 
 
 def test_build_runner_from_env_raises_config_error_when_api_key_missing(monkeypatch):
@@ -35,3 +41,16 @@ def test_build_notifier_from_env_returns_notifier_when_both_present(monkeypatch)
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
     notifier = build_notifier_from_env()
     assert isinstance(notifier, TelegramNotifier)
+
+
+def test_build_dashboard_app_from_env_returns_none_without_flag(monkeypatch, tmp_path):
+    monkeypatch.delenv("CRYPTO_TRADING_DASHBOARD_ENABLED", raising=False)
+    settings = get_settings()
+    assert build_dashboard_app_from_env(lambda: None, settings) is None
+
+
+def test_build_dashboard_app_from_env_returns_app_when_enabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("CRYPTO_TRADING_DASHBOARD_ENABLED", "1")
+    settings = get_settings()
+    app = build_dashboard_app_from_env(lambda: None, settings)
+    assert isinstance(app, FastAPI)

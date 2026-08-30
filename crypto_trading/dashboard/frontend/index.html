@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>crypto_trading dashboard</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0b0d12; color: #e6e6e6; }
+  header { padding: 12px 20px; border-bottom: 1px solid #2a2f3a; }
+  header .banner { color: #f2b90c; font-weight: 600; }
+  nav { display: flex; gap: 4px; padding: 8px 16px; border-bottom: 1px solid #2a2f3a; }
+  nav button {
+    background: #171a21; color: #cfd3da; border: 1px solid #2a2f3a; border-radius: 6px 6px 0 0;
+    padding: 8px 14px; cursor: pointer; font-size: 13px;
+  }
+  nav button.active { background: #20242e; color: #fff; border-bottom-color: #20242e; }
+  main { padding: 16px 20px; }
+  pre { background: #12141a; border: 1px solid #2a2f3a; border-radius: 6px; padding: 12px;
+        overflow-x: auto; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .view { display: none; }
+  .view.active { display: block; }
+  .unavailable { color: #f2b90c; }
+</style>
+</head>
+<body>
+<header>
+  <div class="banner">Simulerad handel — inga verkliga trades, inga verkliga pengar.</div>
+  <div>crypto_trading dashboard (read-only)</div>
+</header>
+<nav id="tabs">
+  <button data-view="live" class="active">LIVE</button>
+  <button data-view="trade-history">TRADE HISTORY</button>
+  <button data-view="performance">PERFORMANCE</button>
+  <button data-view="forecast">FORECAST</button>
+  <button data-view="system-health">SYSTEM HEALTH</button>
+</nav>
+<main>
+  <section class="view active" id="view-live"><pre id="data-live">Loading…</pre></section>
+  <section class="view" id="view-trade-history"><pre id="data-trade-history">Loading…</pre></section>
+  <section class="view" id="view-performance"><pre id="data-performance">Loading…</pre></section>
+  <section class="view" id="view-forecast"><pre id="data-forecast">Loading…</pre></section>
+  <section class="view" id="view-system-health"><pre id="data-system-health">Loading…</pre></section>
+</main>
+<script>
+  const endpoints = {
+    "live": "/api/live",
+    "trade-history": "/api/trade-history",
+    "performance": "/api/performance",
+    "forecast": "/api/forecast",
+    "system-health": "/api/system-health",
+  };
+
+  async function loadView(name) {
+    const el = document.getElementById("data-" + name);
+    try {
+      const response = await fetch(endpoints[name]);
+      const body = await response.json();
+      el.textContent = JSON.stringify(body, null, 2);
+    } catch (err) {
+      el.textContent = "Failed to load " + name + ": " + err;
+    }
+  }
+
+  document.getElementById("tabs").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-view]");
+    if (!button) return;
+    const name = button.dataset.view;
+    document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
+    button.classList.add("active");
+    document.getElementById("view-" + name).classList.add("active");
+    loadView(name);
+  });
+
+  Object.keys(endpoints).forEach(loadView);
+</script>
+</body>
+</html>

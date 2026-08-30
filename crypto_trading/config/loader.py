@@ -86,12 +86,18 @@ class NotifyConfig(BaseModel):
     notify_interval_seconds: int = Field(gt=0)
 
 
+class DashboardConfig(BaseModel):
+    host: str
+    port: int = Field(gt=0, le=65535)
+
+
 class Settings(BaseModel):
     db_path: Path
     pipeline: PipelineConfig
     risk_limits: RiskLimitsConfig
     budget_limits: BudgetLimitsConfig
     notify: NotifyConfig
+    dashboard: DashboardConfig
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -117,4 +123,5 @@ def get_settings() -> Settings:
         risk_limits=_load_yaml_model(_CONFIG_DIR / "risk_limits.yaml", RiskLimitsConfig),
         budget_limits=_load_yaml_model(_CONFIG_DIR / "budget_limits.yaml", BudgetLimitsConfig),
         notify=_load_yaml_model(_CONFIG_DIR / "notify.yaml", NotifyConfig),
+        dashboard=_load_yaml_model(_CONFIG_DIR / "dashboard.yaml", DashboardConfig),
     )

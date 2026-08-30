@@ -4,6 +4,7 @@ from decimal import Decimal
 from crypto_trading.agents.runner import MockAgentRunner
 from crypto_trading.config.loader import (
     BudgetLimitsConfig,
+    DashboardConfig,
     NotifyConfig,
     PipelineConfig,
     RiskLimitsConfig,
@@ -96,6 +97,7 @@ def _settings(
             warning_threshold_pct=Decimal("0.8"),
         ),
         notify=NotifyConfig(notification_level="important", notify_interval_seconds=60),
+        dashboard=DashboardConfig(host="127.0.0.1", port=8000),
     )
 
 

@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 import threading
 
+import uvicorn
+from fastapi import FastAPI
+
 from crypto_trading import discovery_loop, monitoring_loop, notify_loop
 from crypto_trading.agents.runner import AgentRunner, RealClaudeRunner
 from crypto_trading.config.exceptions import ConfigError
@@ -10,7 +13,8 @@ from crypto_trading.config.loader import Settings, get_settings
 from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.connectors.external_data import ExternalDataConnector
 from crypto_trading.connectors.news_rss import NewsRSSConnector
-from crypto_trading.logging import log_event
+from crypto_trading.dashboard.api import RepositoryFactory, create_app
+from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.notify.telegram import TelegramNotifier
 from crypto_trading.storage.repository import SQLiteRepository
 
@@ -43,6 +47,19 @@ def build_notifier_from_env() -> TelegramNotifier | None:
     if not bot_token or not chat_id:
         return None
     return TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
+
+
+def build_dashboard_app_from_env(
+    repo_factory: RepositoryFactory, settings: Settings
+) -> FastAPI | None:
+    """Fas 7: dashboarden är valfri, samma opt-in-princip som Telegram
+    (build_notifier_from_env() ovan) - systemet fungerar helt utan den (bara
+    dashboard-tråden uteblir), aldrig ett krav för discovery/monitoring/
+    notify. Ingen secret att gate:a på (till skillnad från Telegram), så en
+    explicit boolesk env-flagga används istället."""
+    if not os.environ.get("CRYPTO_TRADING_DASHBOARD_ENABLED"):
+        return None
+    return create_app(repo_factory, settings)
 
 
 def _run_discovery_forever(
@@ -83,6 +100,50 @@ def _run_notify_forever(notifier: TelegramNotifier, settings: Settings) -> None:
     _run_monitoring_forever() ovan - Fas 6:s tredje, oberoende loop."""
     repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
     notify_loop.run_forever(notifier, repo, settings)
+
+
+def _run_dashboard_forever(app: FastAPI, settings: Settings) -> None:
+    """Fas 7:s fjärde, oberoende tråd. Till skillnad från de tre ovan
+    konstruerar denna INTE en delad Repository här - `app` byggdes redan i
+    build_dashboard_app_from_env() med en `repo_factory` som `dashboard/
+    api.py` anropar EN gång per HTTP-request (se dess docstring för varför:
+    en delad sqlite3-anslutning skulle krascha när FastAPI kör synkrona
+    route-funktioner i sin egen threadpool). `uvicorn.run()` blockerar denna
+    tråd, exakt som `discovery_loop.run_forever()`/`monitoring_loop.
+    run_forever()`/`notify_loop.run_forever()` gör i sina respektive
+    trådar.
+
+    Code-review-fynd (2026-08-30): `uvicorn.run()` kan misslyckas direkt vid
+    start (t.ex. porten redan upptagen) - utan denna try/except dog felet
+    tyst för projektets egen loggning (syntes bara i uvicorns egen stderr,
+    aldrig via `log_event()`), samma disciplin som redan gäller
+    `run_discovery_tick()`/`run_monitoring_tick()`/`run_notify_tick()`.
+    Processen/övriga trådar kraschar aldrig av detta oavsett (ett undantag i
+    en icke-huvudtråd stoppar bara den tråden) - men nu syns felet även i
+    den strukturerade loggen.
+
+    `except (Exception, SystemExit)`, INTE bara `Exception` - empiriskt
+    verifierat (manuell körning mot en redan upptagen port) att uvicorns
+    egen `Server.run()` vid ett bindningsfel INTE kastar ett vanligt
+    Python-undantag utan `SystemExit(3)` (via dess interna felhantering,
+    loggat till uvicorns EGEN logger innan den avslutar). `SystemExit` ärver
+    `BaseException`, inte `Exception` - ett rent `except Exception` hade
+    sett ut att fånga felet (testat med en OSError-mock) men aldrig
+    fångat/loggat det VERKLIGA felet. Fångar medvetet inte bredare
+    `BaseException` (skulle även svälja `KeyboardInterrupt`)."""
+    run_id = new_run_id()
+    try:
+        uvicorn.run(
+            app, host=settings.dashboard.host, port=settings.dashboard.port, log_level="warning"
+        )
+    except (Exception, SystemExit) as exc:
+        error_detail = str(exc.code) if isinstance(exc, SystemExit) else str(exc)
+        log_event(
+            run_id,
+            event="dashboard_server_failed",
+            error_type=type(exc).__name__,
+            error=error_detail,
+        )
 
 
 def main() -> None:
@@ -137,6 +198,23 @@ def main() -> None:
             "startup",
             event="telegram_notify_disabled",
             reason="TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing",
+        )
+
+    def _dashboard_repo_factory() -> SQLiteRepository:
+        return SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+
+    dashboard_app = build_dashboard_app_from_env(_dashboard_repo_factory, settings)
+    if dashboard_app is not None:
+        threads.append(
+            threading.Thread(
+                target=_run_dashboard_forever, args=(dashboard_app, settings), daemon=True
+            )
+        )
+    else:
+        log_event(
+            "startup",
+            event="dashboard_disabled",
+            reason="CRYPTO_TRADING_DASHBOARD_ENABLED not set",
         )
 
     for thread in threads:
