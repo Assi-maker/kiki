@@ -3,13 +3,32 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse
 
+from crypto_trading.calibration.brier_score import compute_brier_score
+from crypto_trading.calibration.calibration_curve import (
+    compute_calibration_breakdown_by_horizon,
+    compute_calibration_breakdown_by_scenario,
+    compute_calibration_curve,
+    compute_calibration_status,
+)
 from crypto_trading.config.loader import Settings
 from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.performance.metrics import (
+    compute_breakdown_by_direction,
+    compute_breakdown_by_instrument,
+    compute_cumulative_pnl,
+    compute_drawdown,
+    compute_equity_curve,
+    compute_expectancy,
+    compute_profit_factor,
+    compute_win_rate,
+    trade_pnls,
+)
 from crypto_trading.schemas.assessments import AssessmentBase
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.forecast import ForecastRecord
@@ -24,16 +43,6 @@ _MFE_MAE_STATUS = "not yet tracked"
 _DEFAULT_PAGE_LIMIT = 50
 _MAX_PAGE_LIMIT = 500
 _RATE_LIMIT_EVENTS_UNAVAILABLE = "unavailable — throttle decisions not persisted (known gap)"
-_CALIBRATION_NOT_AVAILABLE_YET = (
-    "not_available_yet — Phase 8 (Brier score / calibration curve require "
-    "accumulated ForecastRecord history and a central calibration module)"
-)
-_PERFORMANCE_NOT_AVAILABLE_REASON = (
-    "Win rate, expectancy, drawdown, profit factor and cumulative PnL require a "
-    "central calculation source, deliberately deferred to Phase 8 to avoid "
-    "duplicated business logic."
-)
-
 _ASSESSMENT_FIELD_NAMES = (
     "news_sentiment",
     "technical",
@@ -135,11 +144,24 @@ def create_app(repo_factory: RepositoryFactory, settings: Settings) -> FastAPI:
     ) -> dict:
         repo = repo_factory()
         forecasts = [_forecast_summary(f) for f in repo.find_all_forecasts(limit, offset)]
-        return {"forecasts": forecasts, "calibration": _CALIBRATION_NOT_AVAILABLE_YET}
+        return {"forecasts": forecasts, "calibration": _calibration_summary(repo, settings)}
 
     @app.get("/api/performance")
     def performance() -> dict:
-        return {"status": "not_available_yet", "reason": _PERFORMANCE_NOT_AVAILABLE_REASON}
+        repo = repo_factory()
+        positions = repo.find_closed_positions()
+        pnls = trade_pnls(positions)
+        return {
+            "trade_count": len(pnls),
+            "cumulative_pnl": str(compute_cumulative_pnl(pnls)),
+            "win_rate": _optional_str(compute_win_rate(pnls)),
+            "expectancy": _optional_str(compute_expectancy(pnls)),
+            "profit_factor": _optional_str(compute_profit_factor(pnls)),
+            "max_drawdown": _optional_str(compute_drawdown(positions)),
+            "equity_curve": compute_equity_curve(positions),
+            "by_instrument": compute_breakdown_by_instrument(positions),
+            "by_direction": compute_breakdown_by_direction(positions),
+        }
 
     return app
 
@@ -162,6 +184,12 @@ def _candidate_summary(repo: Repository, candidate: Candidate) -> dict:
 
 def _assessment_status(assessment: AssessmentBase | None) -> str | None:
     return assessment.status if assessment is not None else None
+
+
+def _optional_str(value: Decimal | None) -> str | None:
+    """Fas 8: Decimal -> str för JSON, None förblir None (odefinierat mått,
+    aldrig fabricerat till ett tal)."""
+    return str(value) if value is not None else None
 
 
 def _position_summary(position: Position) -> dict:
@@ -236,6 +264,27 @@ def _forecast_summary(forecast: ForecastRecord) -> dict:
         "horizon": forecast.horizon,
         "forecast_version": forecast.forecast_version,
         "actual_outcome": forecast.actual_outcome,
+    }
+
+
+def _calibration_summary(repo: Repository, settings: Settings) -> dict:
+    """Fas 8: läser ALLTID via find_forecasts_with_outcome() (obegränsat,
+    hela historiken, oberoende av den paginerade forecasts-listan ovan) -
+    kalibrering ska aldrig bero på vilken sida av forecast-listan klienten
+    råkar visa. Konsumerar uteslutande forecasts där actual_outcome redan
+    är persisterat - ingen ifyllning här (PLAN_CRYPTO_PHASE8.md §0)."""
+    scored = repo.find_forecasts_with_outcome()
+    min_n = settings.pipeline.min_sample_size_for_calibration
+    prelim_n = settings.pipeline.calibration_preliminary_sample_size
+    brier = compute_brier_score(scored)
+    return {
+        "brier_score": {
+            **brier,
+            "calibration_status": compute_calibration_status(brier["sample_size"], min_n, prelim_n),
+        },
+        "calibration_curve": compute_calibration_curve(scored, min_n, prelim_n),
+        "breakdown_by_horizon": compute_calibration_breakdown_by_horizon(scored, min_n, prelim_n),
+        "breakdown_by_scenario": compute_calibration_breakdown_by_scenario(scored, min_n, prelim_n),
     }
 
 

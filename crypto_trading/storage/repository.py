@@ -106,6 +106,8 @@ class Repository(Protocol):
     def find_latest_run(self, run_type: str) -> dict | None: ...
     def find_recent_runs(self, limit: int, offset: int = 0) -> list[dict]: ...
     def find_all_forecasts(self, limit: int, offset: int = 0) -> list[ForecastRecord]: ...
+    def find_closed_positions(self) -> list[Position]: ...
+    def find_forecasts_with_outcome(self) -> list[ForecastRecord]: ...
 
 
 class SQLiteRepository:
@@ -700,6 +702,40 @@ class SQLiteRepository:
         rows = self._conn.execute(
             "SELECT * FROM forecasts ORDER BY forecast_timestamp DESC LIMIT ? OFFSET ?",
             (limit, offset),
+        ).fetchall()
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["scenario_probabilities"] = json.loads(data["scenario_probabilities"])
+            data["market_state_metadata"] = json.loads(data["market_state_metadata"])
+            data["forecast_timestamp"] = datetime.fromisoformat(data["forecast_timestamp"])
+            data["outcome_timestamp"] = (
+                datetime.fromisoformat(data["outcome_timestamp"])
+                if data["outcome_timestamp"] is not None
+                else None
+            )
+            result.append(ForecastRecord(**data))
+        return result
+
+    def find_closed_positions(self) -> list[Position]:
+        """Fas 8 (performance-mått): till skillnad från Fas 7:s paginerade
+        find_all_positions() (le=500) är denna medvetet OBEGRÄNSAD - en
+        aggregatberäkning över hela handelshistoriken (cumulative PnL,
+        drawdown, win rate, ...) behöver alla rader, inte en sida. Ingen
+        ORDER BY garanteras - performance/metrics.py sorterar själv internt
+        på closed_at, litar aldrig på radordningen här."""
+        rows = self._conn.execute("SELECT * FROM positions WHERE status = 'CLOSED'").fetchall()
+        return [self._row_to_position(row) for row in rows]
+
+    def find_forecasts_with_outcome(self) -> list[ForecastRecord]:
+        """Fas 8 (kalibrering): samma medvetet obegränsade princip som
+        find_closed_positions() ovan. actual_outcome IS NOT NULL - endast
+        forecasts där ett utfall redan persisterats (av vilken mekanism som
+        helst; ingen sådan mekanism finns ännu i denna fas, se
+        PLAN_CRYPTO_PHASE8.md §0 - det garanterade default-resultatet är
+        alltså en tom lista)."""
+        rows = self._conn.execute(
+            "SELECT * FROM forecasts WHERE actual_outcome IS NOT NULL"
         ).fetchall()
         result = []
         for row in rows:
