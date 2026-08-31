@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from typing import Protocol
 
@@ -32,7 +33,10 @@ class LiveMarketDataSource(Protocol):
 
 
 def build_live_snapshot(
-    connector: LiveMarketDataSource, settings: Settings, now: datetime
+    connector: LiveMarketDataSource,
+    settings: Settings,
+    now: datetime,
+    clock: Callable[[], datetime] | None = None,
 ) -> MarketSnapshot:
     """Bygger en `MarketSnapshot` (Fas 4:s schema) från riktiga BingX-anrop
     och kör SPEC §8.1:s data-quality-klassificering på riktig, flerfälts
@@ -53,7 +57,30 @@ def build_live_snapshot(
     post via instrument-universumet från `get_contracts()` (alltid
     tillgängligt oavsett om tickern kunde parsas) - inte via `tickers`,
     som annars skulle sakna just den symbolen.
-    """
+
+    `clock` (bugfix 2026-08-31, bekräftad mot en riktig live-körning):
+    staleness för VARJE hämtad post (ticker/kline/funding/open interest)
+    bedöms mot ett FÄRSKT `clock()`-anrop taget direkt efter just den
+    postens nätverksanrop - aldrig mot det delade `now` som gäller för hela
+    snapshoten. En sekventiell hämtning över hela instrumentuniversumet tar
+    på riktig BingX-data ~19 minuter (1132 instrument, ~1 request/s verklig
+    svarslatens) - långt mer än `max_data_age_seconds["ticker"]` (30s).
+    Med staleness bedömd mot ETT `now` fångat FÖRE hela loopen blev VARJE
+    ticker som hämtades mer än några sekunder in i loopen felaktigt
+    klassad `invalid`: inte för att datan var gammal, utan för att dess
+    `closeTime` (som korrekt speglar tiden den faktiskt hämtades) hamnade
+    bortom `_FUTURE_TIMESTAMP_GRACE_SECONDS` (5s) relativt det redan
+    inaktuella batch-start-`now`:t. Resultatet var strukturellt `eligible=0`
+    oavsett marknadsläge eller screener-trösklar - inte ett tröskel- eller
+    marknadsvillkor. `now`/`simulated_now` fortsätter oförändrat styra allt
+    annat (look-ahead-bias-filtrering, `InstrumentMetadata.from_raw`,
+    returnerad `simulated_now`) - bara staleness-jämförelsen bytte
+    referenspunkt. `clock=None` (default) bevarar EXAKT tidigare beteende
+    (`now` används som förr) - bakåtkompatibelt för alla anropare som inte
+    uttryckligen skickar in en egen klocka; produktionsanropet i
+    `discovery_loop.py` skickar `clock=lambda: datetime.now(UTC)`."""
+    fetch_clock: Callable[[], datetime] = clock if clock is not None else (lambda: now)
+
     contracts_raw = connector.get_contracts()
     instruments = {c["symbol"]: InstrumentMetadata.from_raw(c, now) for c in contracts_raw}
 
@@ -70,13 +97,14 @@ def build_live_snapshot(
             # obehindrat, samma princip som redan gäller monitoring_loop.py.
             ticker_dq[symbol] = "invalid"
             continue
+        ticker_fetch_time = fetch_clock()
         completeness = check_completeness(raw_ticker, settings.pipeline.required_fields["ticker"])
         if completeness == "invalid":
             ticker_dq[symbol] = "invalid"
             continue
         ticker = Ticker.from_raw(raw_ticker)
         staleness = check_staleness(
-            ticker.observed_at, now, settings.pipeline.max_data_age_seconds["ticker"]
+            ticker.observed_at, ticker_fetch_time, settings.pipeline.max_data_age_seconds["ticker"]
         )
         ticker_dq[symbol] = classify(completeness, staleness)
         tickers[symbol] = ticker
@@ -111,6 +139,7 @@ def build_live_snapshot(
             raw_klines = connector.get_klines(
                 symbol, interval, limit=settings.pipeline.screener_lookback_periods + 5
             )
+            kline_fetch_time = fetch_clock()
             kline_completeness = (
                 classify(
                     *(
@@ -130,7 +159,7 @@ def build_live_snapshot(
             kline_staleness = (
                 check_staleness(
                     parsed_klines[-1].observed_at,
-                    now,
+                    kline_fetch_time,
                     settings.pipeline.max_data_age_seconds["kline"],
                 )
                 if parsed_klines
@@ -147,6 +176,7 @@ def build_live_snapshot(
             raw_funding = connector.get_funding_rate(
                 symbol, limit=settings.pipeline.screener_funding_history_limit
             )
+            funding_fetch_time = fetch_clock()
             funding_completeness = (
                 classify(
                     *(
@@ -166,7 +196,7 @@ def build_live_snapshot(
             funding_staleness = (
                 check_staleness(
                     parsed_funding[-1].observed_at,
-                    now,
+                    funding_fetch_time,
                     settings.pipeline.max_data_age_seconds["funding_rate"],
                 )
                 if parsed_funding
@@ -174,13 +204,16 @@ def build_live_snapshot(
             )
 
             raw_oi = connector.get_open_interest(symbol)
+            oi_fetch_time = fetch_clock()
             oi_completeness = check_completeness(
                 raw_oi, settings.pipeline.required_fields["open_interest"]
             )
             if oi_completeness == "ok":
                 oi = OpenInterest.from_raw(raw_oi)
                 oi_staleness = check_staleness(
-                    oi.observed_at, now, settings.pipeline.max_data_age_seconds["open_interest"]
+                    oi.observed_at,
+                    oi_fetch_time,
+                    settings.pipeline.max_data_age_seconds["open_interest"],
                 )
             else:
                 oi_staleness = "invalid"

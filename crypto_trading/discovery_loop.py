@@ -35,12 +35,21 @@ def run_discovery_tick(
     hann bli `UNDER_AI_ANALYSIS` innan kraschen läks av nästa ticks
     `sweep_interrupted_analyses` + återupptagningspolicy (Task 4) - ingen ny
     recovery-mekanism behövs här, den är redan komponerad av de tidigare
-    tasken."""
+    tasken.
+
+    `clock=lambda: datetime.now(UTC)` (bugfix 2026-08-31, bekräftad mot en
+    riktig live-körning): `build_live_snapshot()`s staleness-kontroll för
+    varje hämtad post bedöms mot en färsk tidpunkt tagen direkt efter just
+    den postens nätverksanrop, inte mot detta `now` (fånget här, före hela
+    den sekventiella hämtningsloopen). Utan detta blev varje instrument som
+    hämtades mer än några sekunder in i en flera-minuter-lång live-hämtning
+    felaktigt `data_quality_invalid` - se market_snapshot.py::
+    build_live_snapshot() för full förklaring."""
     run_id = new_run_id()
     now = datetime.now(UTC)
     repo.start_run(run_id, "discovery", now)
     try:
-        snapshot = build_live_snapshot(connector, settings, now)
+        snapshot = build_live_snapshot(connector, settings, now, clock=lambda: datetime.now(UTC))
         positions = run_single_cycle(
             snapshot,
             repo,

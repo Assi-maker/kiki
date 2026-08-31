@@ -279,6 +279,91 @@ def test_build_live_snapshot_marks_invalid_for_stale_kline():
     assert snapshot.data_quality_status["BTCUSDT"] == "invalid"
 
 
+def test_build_live_snapshot_ticker_staleness_uses_a_fresh_per_item_clock_not_the_batch_start_now():
+    """Bug reproducerad 2026-08-31 (riktig live-körning mot BingX): en
+    sekventiell hämtningsloop över hela instrumentuniversumet (1132
+    instrument) tog ~1152s att slutföra, långt mer än
+    max_data_age_seconds["ticker"] (30s). Med staleness bedömd mot ETT
+    `now` fångat FÖRE hela loopen blev en ticker vars closeTime korrekt
+    speglar tiden DEN FAKTISKT HÄMTADES (klart senare än batch-start-`now`)
+    felaktigt klassad 'invalid' - inte för att datan är gammal, utan för
+    att den är "för färsk" relativt en klocka som redan hunnit bli
+    inaktuell (overskrider _FUTURE_TIMESTAMP_GRACE_SECONDS=5s redan efter
+    några sekunders loop-drift). Fixen: staleness bedöms mot ett eget,
+    färskt timestamp per ticker (injicerat via `clock`), inte mot
+    batch-start-`now`."""
+    contracts = [_raw_contract("BTCUSDT")]
+    # Simulerar: loopen har redan pågått 600s när just den här tickern
+    # faktiskt hämtas - closeTime speglar den verkliga hämtningstidpunkten.
+    late_fetch_instant = _NOW + timedelta(seconds=600)
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(late_fetch_instant))}
+    klines = {
+        "BTCUSDT": [
+            _raw_kline("50000", _ms(late_fetch_instant - timedelta(hours=1))),
+            _raw_kline("50100", _ms(late_fetch_instant)),
+        ]
+    }
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(late_fetch_instant))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(late_fetch_instant))}
+    connector = _StubConnector(contracts, tickers, klines, funding_rates, open_interest)
+
+    snapshot = build_live_snapshot(
+        connector, _settings(top_n=1), _NOW, clock=lambda: late_fetch_instant
+    )
+
+    assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+    assert "BTCUSDT" in snapshot.tickers
+
+
+def test_build_live_snapshot_kline_funding_oi_staleness_uses_a_fresh_per_item_clock():
+    """Samma buggklass som ticker-testet ovan, i top_n-loopen (kline/
+    funding/open interest) - en sen top_n-symbols hämtning ska inte
+    straffas mot batch-start-`now`, precis som ticker-fallet."""
+    contracts = [_raw_contract("BTCUSDT")]
+    late_fetch_instant = _NOW + timedelta(seconds=600)
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(late_fetch_instant))}
+    klines = {
+        "BTCUSDT": [
+            _raw_kline("50000", _ms(late_fetch_instant - timedelta(hours=1))),
+            _raw_kline("50100", _ms(late_fetch_instant)),
+        ]
+    }
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(late_fetch_instant))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(late_fetch_instant))}
+    connector = _StubConnector(contracts, tickers, klines, funding_rates, open_interest)
+
+    snapshot = build_live_snapshot(
+        connector, _settings(top_n=1), _NOW, clock=lambda: late_fetch_instant
+    )
+
+    assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+    assert len(snapshot.klines["BTCUSDT"]) > 0
+
+
+def test_build_live_snapshot_default_clock_preserves_old_behavior_when_not_overridden():
+    """Bakåtkompatibilitet: anropare som inte skickar `clock` (alla
+    existerande anropsplatser/tester innan denna fix) ska få EXAKT samma
+    beteende som innan - staleness bedöms mot det redan passerade `now`,
+    aldrig mot den verkliga systemklockan (som skulle göra varje test med
+    ett fast historiskt `_NOW` trasigt)."""
+    contracts = [_raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    klines = {
+        "BTCUSDT": [
+            _raw_kline("50000", _ms(_NOW - timedelta(hours=2))),
+            _raw_kline("50100", _ms(_NOW - timedelta(hours=1))),
+            _raw_kline("50200", _ms(_NOW)),
+        ]
+    }
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _StubConnector(contracts, tickers, klines, funding_rates, open_interest)
+
+    snapshot = build_live_snapshot(connector, _settings(top_n=1), _NOW)
+
+    assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+
+
 def test_build_live_snapshot_only_fetches_klines_funding_oi_for_top_n_symbols():
     """Prestandagaranti: instrument som inte klarar eligibility (låg
     quote_volume) ska aldrig trigga ett get_klines/get_funding_rate/
