@@ -122,6 +122,18 @@ def format_no_trade_message(candidate: Candidate, reasons: list[str]) -> str:
     )
 
 
+def _format_pnl_value(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.01")))
+
+
+def _format_optional_pnl_value(value: Decimal | None) -> str:
+    return "n/a" if value is None else _format_pnl_value(value)
+
+
+def _format_optional_win_rate(value: Decimal | None) -> str:
+    return "n/a" if value is None else f"{value:.0%}"
+
+
 def format_daily_report_message(
     report_date: date,
     instruments_scanned: int,
@@ -132,11 +144,21 @@ def format_daily_report_message(
     rejected: int,
     open_positions: int,
     system_errors: int,
+    cumulative_pnl: Decimal,
+    win_rate: Decimal | None,
+    expectancy: Decimal | None,
+    drawdown: Decimal | None,
 ) -> str:
-    """Fas 6 daily report (2026-08-29 beslut: minimal version - endast
-    entydiga operativa räknetal, INGA performance-mått som win rate/
-    expectancy/cumulative PnL/drawdown - de hör hemma i Fas 8:s
-    kalibreringsmodul, för att undvika duplicerad beräkningslogik)."""
+    """Fas 6/9 daily report (SPEC §12). Operativa räknetal plus de fyra
+    performance-mått §12 kräver (cumulative PnL, win rate, expectancy,
+    drawdown) - beräknade av anroparen via performance/metrics.py
+    (2026-08-31 beslut: ingen duplicerad beräkningslogik här, samma
+    princip som candidate/position redan följer i denna fil).
+    win_rate/expectancy/drawdown är None för en tom handelshistorik
+    (odefinierat, se metrics.py) och visas då som "n/a" - aldrig 0, som
+    skulle påstå en känd nollprestanda. cumulative_pnl är däremot alltid
+    ett giltigt tal (0 för tom historik är ett faktiskt värde, inte en
+    gap-markering, se performance/metrics.py::compute_cumulative_pnl)."""
     return "\n".join(
         [
             f"📊 Daily report — {report_date.isoformat()}",
@@ -148,6 +170,10 @@ def format_daily_report_message(
             f"Rejected: {rejected}",
             f"Open positions: {open_positions}",
             f"System errors: {system_errors}",
+            f"Cumulative PnL: {_format_pnl_value(cumulative_pnl)}",
+            f"Win rate: {_format_optional_win_rate(win_rate)}",
+            f"Expectancy: {_format_optional_pnl_value(expectancy)}",
+            f"Max drawdown: {_format_optional_pnl_value(drawdown)}",
         ]
     )
 

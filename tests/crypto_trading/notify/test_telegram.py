@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -232,6 +233,10 @@ def test_format_daily_report_message_includes_all_minimal_counts():
         rejected=1,
         open_positions=4,
         system_errors=0,
+        cumulative_pnl=Decimal("192.40"),
+        win_rate=Decimal("0.67"),
+        expectancy=Decimal("48.10"),
+        drawdown=Decimal("15.20"),
     )
     assert "2026-08-29" in text
     assert "1119" in text
@@ -242,6 +247,63 @@ def test_format_daily_report_message_includes_all_minimal_counts():
     assert "4" in text
     # system_errors=0 ska visas explicit, inte utelämnas
     assert "0" in text
+
+
+def test_format_daily_report_message_includes_performance_metrics_spec_section_12():
+    """SPEC §12 (2026-08-31 beslut): daily report ska innehålla EXAKT dessa
+    fyra performance-mått, beräknade av crypto_trading/performance/metrics.py
+    - inte profit factor/trade count (de hör till dashboardens §13, inte
+    Telegrams §12)."""
+    from datetime import date
+
+    text = format_daily_report_message(
+        report_date=date(2026, 8, 29),
+        instruments_scanned=1119,
+        candidates_created=7,
+        ai_analyses=21,
+        confirmed=2,
+        no_trade=3,
+        rejected=1,
+        open_positions=4,
+        system_errors=0,
+        cumulative_pnl=Decimal("192.40"),
+        win_rate=Decimal("0.67"),
+        expectancy=Decimal("48.10"),
+        drawdown=Decimal("15.20"),
+    )
+    assert "192.40" in text
+    assert "67%" in text
+    assert "48.10" in text
+    assert "15.20" in text
+    assert "profit factor" not in text.lower()
+
+
+def test_format_daily_report_message_shows_n_a_for_undefined_metrics_on_empty_history():
+    """Tom handelshistorik: win_rate/expectancy/drawdown är odefinierade
+    (metrics.py returnerar None), ska visas som "n/a" - ALDRIG 0, som skulle
+    påstå att en känd nollprestanda existerar (2026-08-31 beslut).
+    cumulative_pnl=0 är däremot ett giltigt, faktiskt värde (metrics.py:
+    "en tom historik har verkligen noll kumulativ PnL") och ska visas som
+    ett tal, inte "n/a"."""
+    from datetime import date
+
+    text = format_daily_report_message(
+        report_date=date(2026, 8, 29),
+        instruments_scanned=0,
+        candidates_created=0,
+        ai_analyses=0,
+        confirmed=0,
+        no_trade=0,
+        rejected=0,
+        open_positions=0,
+        system_errors=0,
+        cumulative_pnl=Decimal("0"),
+        win_rate=None,
+        expectancy=None,
+        drawdown=None,
+    )
+    assert "0.00" in text  # cumulative_pnl, ett giltigt tal, inte n/a
+    assert text.count("n/a") == 3  # win_rate, expectancy, drawdown
 
 
 def test_format_debug_error_message_includes_run_details():

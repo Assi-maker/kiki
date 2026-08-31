@@ -14,6 +14,13 @@ from crypto_trading.notify.telegram import (
     format_debug_error_message,
     format_no_trade_message,
 )
+from crypto_trading.performance.metrics import (
+    compute_cumulative_pnl,
+    compute_drawdown,
+    compute_expectancy,
+    compute_win_rate,
+    trade_pnls,
+)
 from crypto_trading.storage.repository import Repository
 
 _LEVEL_ORDER = {"important": 0, "decisions": 1, "debug": 2}
@@ -55,11 +62,13 @@ def run_notify_tick(notifier: NotifierProtocol, repo: Repository, settings: Sett
     ändå). `debug` lägger till alla ÖVRIGA NO_TRADE (Beslut 7) samt
     `runs.status='error'`-rader. Daily report är INTE nivå-styrd - den
     skickas oavsett konfigurerad nivå, som bas-`important`-innehåll.
-    Daily report i denna version innehåller ENDAST entydiga operativa
-    räknetal (instrument scannade, candidates, AI-analyser, CONFIRMED,
-    NO_TRADE, REJECTED, öppna positioner, systemfel) - INGA performance-mått
-    (win rate/expectancy/cumulative PnL/drawdown), medvetet uppskjutet till
-    Fas 8:s kalibreringsmodul för att undvika duplicerad beräkningslogik.
+    Daily report innehåller entydiga operativa räknetal (instrument
+    scannade, candidates, AI-analyser, CONFIRMED, NO_TRADE, REJECTED,
+    öppna positioner, systemfel) plus de fyra performance-mått SPEC §12
+    kräver (cumulative PnL, win rate, expectancy, drawdown) - beräknade via
+    `repo.find_closed_positions()` + `performance/metrics.py`
+    (2026-08-31 beslut), samma återanvända beräkningslogik som
+    dashboardens `/api/performance` (Fas 8), aldrig en egen formel här.
 
     Två fail-safe-lager, samma mönster som discovery_loop.py/
     monitoring_loop.py: ett enskilt sändningsfel (TelegramSendError) hoppar
@@ -98,6 +107,8 @@ def run_notify_tick(notifier: NotifierProtocol, repo: Repository, settings: Sett
         daily_report_id = f"daily_report:{today.isoformat()}"
         if not repo.has_telegram_event_been_sent(daily_report_id):
             day_start = _utc_day_start(now)
+            closed_positions = repo.find_closed_positions()
+            pnls = trade_pnls(closed_positions)
             message = format_daily_report_message(
                 report_date=today,
                 instruments_scanned=repo.sum_instruments_scanned_since(day_start),
@@ -108,6 +119,10 @@ def run_notify_tick(notifier: NotifierProtocol, repo: Repository, settings: Sett
                 rejected=repo.count_candidates_by_status_since("REJECTED", day_start),
                 open_positions=repo.count_open_positions(),
                 system_errors=repo.count_runs_by_status_since("error", day_start),
+                cumulative_pnl=compute_cumulative_pnl(pnls),
+                win_rate=compute_win_rate(pnls),
+                expectancy=compute_expectancy(pnls),
+                drawdown=compute_drawdown(closed_positions),
             )
             try:
                 notifier.send(message)

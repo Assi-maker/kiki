@@ -377,6 +377,30 @@ def test_run_notify_tick_sends_daily_report_once_and_is_idempotent_same_day(tmp_
     assert second == 0  # redan skickad idag
     assert len(notifier.sent) == 1
     assert notifier.sent[0].startswith("📊 Daily report")
+    # tom handelshistorik: win rate/expectancy/drawdown odefinierade (n/a),
+    # cumulative PnL ett giltigt 0 - aldrig 0 som fallback för de förra
+    assert "Cumulative PnL: 0.00" in notifier.sent[0]
+    assert notifier.sent[0].count("n/a") == 3
+
+
+def test_run_notify_tick_daily_report_includes_performance_metrics_from_closed_positions(
+    tmp_path,
+):
+    """SPEC §12 (2026-08-31 beslut): daily report-metrics kommer från
+    repo.find_closed_positions() via performance/metrics.py - samma
+    beräkning som dashboardens /api/performance, ingen egen formel här."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_closed_position(repo, "pos-1")
+    notifier = _StubNotifier()
+
+    sent = run_notify_tick(notifier, repo, _settings())
+
+    assert sent == 2  # 1 CLOSED + 1 daily report
+    report = next(msg for msg in notifier.sent if msg.startswith("📊 Daily report"))
+    assert "Cumulative PnL: 192.40" in report
+    assert "Win rate: 100%" in report
+    assert "Expectancy: 192.40" in report
+    assert "Max drawdown: 0.00" in report
 
 
 def test_run_notify_tick_important_level_never_sends_no_trade(tmp_path):
