@@ -4,8 +4,8 @@ top_n: 30
 cooldown_minutes: 60
 max_data_age_seconds:
   ticker: 30
-  kline: 120
-  funding_rate: 3600
+  kline: 3900
+  funding_rate: 29400
   open_interest: 300
   contracts: 86400
 min_sample_size_for_calibration: 30

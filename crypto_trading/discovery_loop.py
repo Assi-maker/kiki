@@ -49,7 +49,9 @@ def run_discovery_tick(
     now = datetime.now(UTC)
     repo.start_run(run_id, "discovery", now)
     try:
-        snapshot = build_live_snapshot(connector, settings, now, clock=lambda: datetime.now(UTC))
+        snapshot = build_live_snapshot(
+            connector, settings, now, clock=lambda: datetime.now(UTC), run_id=run_id
+        )
         positions = run_single_cycle(
             snapshot,
             repo,

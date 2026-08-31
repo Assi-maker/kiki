@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from datetime import datetime
 from typing import Protocol
@@ -13,6 +14,7 @@ from crypto_trading.connectors.data_quality import (
     classify,
 )
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
+from crypto_trading.logging import log_event
 from crypto_trading.paper_trading.replay import MarketSnapshot
 from crypto_trading.schemas.market import (
     FundingRate,
@@ -32,11 +34,118 @@ class LiveMarketDataSource(Protocol):
     def get_open_interest(self, symbol: str) -> dict: ...
 
 
+def _fetch_klines_with_retry(
+    connector: LiveMarketDataSource,
+    symbol: str,
+    interval: str,
+    limit: int,
+    required_fields: list[str],
+    max_age_seconds: float,
+    fetch_clock: Callable[[], datetime],
+    max_retries: int,
+    sleep_fn: Callable[[float], None],
+    run_id: str,
+) -> tuple[DataQualityResult, list[Kline], DataQualityResult]:
+    """Begränsad retry (bugfix 2026-08-31, del 2): `get_klines()` kan
+    intermittent returnera genuint gammal data för en enskild symbol -
+    bekräftat mot riktig BingX-data (BTC-USDT, identiska parametrar, 2
+    minuters mellanrum: en gång 24h gammal, en gång 20 minuter gammal).
+    Ticker/open interest via samma connector visar aldrig detta - trolig
+    orsak är inkonsekvent cache mellan BingX:s backend-noder, eftersom
+    varje anrop öppnar en ny anslutning (ingen keep-alive, se
+    connectors/base.py::_get_with_retry). VARJE försök gör ett NYTT,
+    riktigt `get_klines()`-anrop - aldrig en omtolkning av samma svar -
+    så chansen att träffa en färskare nod ökar med varje försök. Samma
+    backoff-form som `_get_with_retry()`: 0.5 * 2^försök, tak 5s. Ger upp
+    efter `max_retries` försök (aldrig oändligt) och loggar explicit -
+    den redan fail-closed staleness-kontrollen (SPEC §8.3) fångar då
+    korrekt upp den kvarvarande, verkligen gamla datan som `invalid`."""
+    completeness: DataQualityResult = "invalid"
+    parsed_klines: list[Kline] = []
+    staleness: DataQualityResult = "invalid"
+    for attempt in range(max_retries):
+        raw_klines = connector.get_klines(symbol, interval, limit=limit)
+        fetch_time = fetch_clock()
+        completeness = (
+            classify(*(check_completeness(raw, required_fields) for raw in raw_klines))
+            if raw_klines
+            else "invalid"
+        )
+        parsed_klines = (
+            [Kline.from_raw(k, symbol, interval) for k in raw_klines]
+            if completeness == "ok"
+            else []
+        )
+        staleness = (
+            check_staleness(parsed_klines[-1].observed_at, fetch_time, max_age_seconds)
+            if parsed_klines
+            else "invalid"
+        )
+        if staleness == "ok":
+            return completeness, parsed_klines, staleness
+        if attempt < max_retries - 1:
+            sleep_fn(min(0.5 * (2**attempt), 5))
+    log_event(
+        run_id,
+        event="kline_staleness_retries_exhausted",
+        symbol=symbol,
+        attempts=max_retries,
+    )
+    return completeness, parsed_klines, staleness
+
+
+def _fetch_funding_with_retry(
+    connector: LiveMarketDataSource,
+    symbol: str,
+    limit: int,
+    required_fields: list[str],
+    max_age_seconds: float,
+    fetch_clock: Callable[[], datetime],
+    max_retries: int,
+    sleep_fn: Callable[[float], None],
+    run_id: str,
+) -> tuple[DataQualityResult, list[FundingRate], DataQualityResult]:
+    """Samma reproducerade fel och samma begränsade retry-princip som
+    `_fetch_klines_with_retry()` ovan, för `get_funding_rate()`."""
+    completeness: DataQualityResult = "invalid"
+    parsed_funding: list[FundingRate] = []
+    staleness: DataQualityResult = "invalid"
+    for attempt in range(max_retries):
+        raw_funding = connector.get_funding_rate(symbol, limit=limit)
+        fetch_time = fetch_clock()
+        completeness = (
+            classify(*(check_completeness(raw, required_fields) for raw in raw_funding))
+            if raw_funding
+            else "invalid"
+        )
+        parsed_funding = (
+            [FundingRate.from_raw(f) for f in raw_funding] if completeness == "ok" else []
+        )
+        staleness = (
+            check_staleness(parsed_funding[-1].observed_at, fetch_time, max_age_seconds)
+            if parsed_funding
+            else "invalid"
+        )
+        if staleness == "ok":
+            return completeness, parsed_funding, staleness
+        if attempt < max_retries - 1:
+            sleep_fn(min(0.5 * (2**attempt), 5))
+    log_event(
+        run_id,
+        event="funding_staleness_retries_exhausted",
+        symbol=symbol,
+        attempts=max_retries,
+    )
+    return completeness, parsed_funding, staleness
+
+
 def build_live_snapshot(
     connector: LiveMarketDataSource,
     settings: Settings,
     now: datetime,
     clock: Callable[[], datetime] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    run_id: str = "market_snapshot",
 ) -> MarketSnapshot:
     """Bygger en `MarketSnapshot` (Fas 4:s schema) från riktiga BingX-anrop
     och kör SPEC §8.1:s data-quality-klassificering på riktig, flerfälts
@@ -78,7 +187,17 @@ def build_live_snapshot(
     referenspunkt. `clock=None` (default) bevarar EXAKT tidigare beteende
     (`now` används som förr) - bakåtkompatibelt för alla anropare som inte
     uttryckligen skickar in en egen klocka; produktionsanropet i
-    `discovery_loop.py` skickar `clock=lambda: datetime.now(UTC)`."""
+    `discovery_loop.py` skickar `clock=lambda: datetime.now(UTC)`.
+
+    `sleep_fn`/`run_id` (bugfix 2026-08-31, del 2): kline-/funding-
+    hämtningen för top-N-symbolerna görs om (begränsat, se
+    `_fetch_klines_with_retry()`/`_fetch_funding_with_retry()` ovan) om
+    ett färskt anrop fortfarande faller på staleness - bekräftat mot
+    riktig BingX-data att detta intermittent förekommer även när ticker/
+    open interest är helt färska. `sleep_fn` styr backoff-fördröjningen
+    (default riktig `time.sleep`, injicerbar i tester). `run_id` används
+    bara för `log_event()` när retries förbrukas utan att datan blev
+    färsk - `discovery_loop.py` skickar sitt riktiga run_id."""
     fetch_clock: Callable[[], datetime] = clock if clock is not None else (lambda: now)
 
     contracts_raw = connector.get_contracts()
@@ -136,35 +255,19 @@ def build_live_snapshot(
 
     for symbol in top_n_symbols:
         try:
-            raw_klines = connector.get_klines(
-                symbol, interval, limit=settings.pipeline.screener_lookback_periods + 5
-            )
-            kline_fetch_time = fetch_clock()
-            kline_completeness = (
-                classify(
-                    *(
-                        check_completeness(raw, settings.pipeline.required_fields["kline"])
-                        for raw in raw_klines
-                    )
-                )
-                if raw_klines
-                else "invalid"
-            )
-            parsed_klines = (
-                [Kline.from_raw(k, symbol, interval) for k in raw_klines]
-                if kline_completeness == "ok"
-                else []
+            kline_completeness, parsed_klines, kline_staleness = _fetch_klines_with_retry(
+                connector,
+                symbol,
+                interval,
+                settings.pipeline.screener_lookback_periods + 5,
+                settings.pipeline.required_fields["kline"],
+                settings.pipeline.max_data_age_seconds["kline"],
+                fetch_clock,
+                settings.pipeline.bingx_max_retries,
+                sleep_fn,
+                run_id,
             )
             klines[symbol] = parsed_klines
-            kline_staleness = (
-                check_staleness(
-                    parsed_klines[-1].observed_at,
-                    kline_fetch_time,
-                    settings.pipeline.max_data_age_seconds["kline"],
-                )
-                if parsed_klines
-                else "invalid"
-            )
             kline_consistency = (
                 check_kline_consistency(
                     parsed_klines, settings.pipeline.kline_consistency_tolerance_pct
@@ -173,35 +276,18 @@ def build_live_snapshot(
                 else "invalid"
             )
 
-            raw_funding = connector.get_funding_rate(
-                symbol, limit=settings.pipeline.screener_funding_history_limit
-            )
-            funding_fetch_time = fetch_clock()
-            funding_completeness = (
-                classify(
-                    *(
-                        check_completeness(raw, settings.pipeline.required_fields["funding_rate"])
-                        for raw in raw_funding
-                    )
-                )
-                if raw_funding
-                else "invalid"
-            )
-            parsed_funding = (
-                [FundingRate.from_raw(f) for f in raw_funding]
-                if funding_completeness == "ok"
-                else []
+            funding_completeness, parsed_funding, funding_staleness = _fetch_funding_with_retry(
+                connector,
+                symbol,
+                settings.pipeline.screener_funding_history_limit,
+                settings.pipeline.required_fields["funding_rate"],
+                settings.pipeline.max_data_age_seconds["funding_rate"],
+                fetch_clock,
+                settings.pipeline.bingx_max_retries,
+                sleep_fn,
+                run_id,
             )
             funding_rates[symbol] = parsed_funding
-            funding_staleness = (
-                check_staleness(
-                    parsed_funding[-1].observed_at,
-                    funding_fetch_time,
-                    settings.pipeline.max_data_age_seconds["funding_rate"],
-                )
-                if parsed_funding
-                else "invalid"
-            )
 
             raw_oi = connector.get_open_interest(symbol)
             oi_fetch_time = fetch_clock()

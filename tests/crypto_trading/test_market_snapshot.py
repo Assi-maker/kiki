@@ -221,6 +221,57 @@ class _SecondaryIntervalFailingConnector(_StubConnector):
         return super().get_klines(symbol, interval, limit)
 
 
+class _StaleThenFreshKlinesConnector(_StubConnector):
+    """Reproducerar 2026-08-31-fyndet (del 2): get_klines() kan returnera
+    genuint gammal data för en enskild symbol vid ETT anrop, sedan färsk
+    data vid nästa - bekräftat mot riktig BingX-data (BTC-USDT, samma
+    parametrar, 2 minuters mellanrum: en gång 24h gammal, en gång 20
+    minuter gammal). `stale_call_count` styr hur MÅNGA av de FAKTISKA
+    anropen som ger den gamla datan innan den friska datan returneras -
+    varje anrop är genuint separat (klines_call_count räknar), aldrig en
+    omtolkning av samma svar."""
+
+    def __init__(self, *args, stale_klines_raw, fresh_klines_raw, stale_call_count, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stale_klines_raw = stale_klines_raw
+        self._fresh_klines_raw = fresh_klines_raw
+        self._stale_call_count = stale_call_count
+        self.klines_call_count = 0
+
+    def get_klines(self, symbol, interval, limit=100):
+        self.klines_call_count += 1
+        self.klines_calls.append(symbol)
+        self.klines_interval_used = interval
+        self.klines_calls_by_interval.setdefault(interval, []).append(symbol)
+        source = (
+            self._stale_klines_raw
+            if self.klines_call_count <= self._stale_call_count
+            else self._fresh_klines_raw
+        )
+        return source[-limit:]
+
+
+class _StaleThenFreshFundingConnector(_StubConnector):
+    """Samma reproduktion som _StaleThenFreshKlinesConnector ovan, för
+    get_funding_rate()."""
+
+    def __init__(self, *args, stale_funding_raw, fresh_funding_raw, stale_call_count, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stale_funding_raw = stale_funding_raw
+        self._fresh_funding_raw = fresh_funding_raw
+        self._stale_call_count = stale_call_count
+        self.funding_call_count = 0
+
+    def get_funding_rate(self, symbol, limit=1):
+        self.funding_call_count += 1
+        source = (
+            self._stale_funding_raw
+            if self.funding_call_count <= self._stale_call_count
+            else self._fresh_funding_raw
+        )
+        return source[-limit:]
+
+
 def test_build_live_snapshot_produces_ok_quality_for_complete_fresh_data():
     contracts = [_raw_contract("BTCUSDT")]
     tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
@@ -362,6 +413,123 @@ def test_build_live_snapshot_default_clock_preserves_old_behavior_when_not_overr
     snapshot = build_live_snapshot(connector, _settings(top_n=1), _NOW)
 
     assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+
+
+def test_build_live_snapshot_retries_stale_klines_and_succeeds_on_a_fresher_attempt():
+    """Bug reproducerad 2026-08-31 (del 2, riktig live-körning mot BingX):
+    get_klines() kan intermittent returnera genuint gammal data - bekräftat
+    med BTC-USDT, samma parametrar, 2 minuters mellanrum: en gång 24h
+    gammal, en gång 20 minuter gammal. Ticker/open interest visar aldrig
+    detta. Fixen: ett nytt, RIKTIGT get_klines()-anrop (aldrig omtolkning
+    av samma svar) görs om staleness misslyckas, upp till
+    `bingx_max_retries` gånger."""
+    contracts = [_raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    stale_klines_raw = [_raw_kline("50000", _ms(_NOW - timedelta(hours=30)))]
+    fresh_klines_raw = [
+        _raw_kline("50000", _ms(_NOW - timedelta(hours=1))),
+        _raw_kline("50100", _ms(_NOW)),
+    ]
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _StaleThenFreshKlinesConnector(
+        contracts,
+        tickers,
+        funding_rates=funding_rates,
+        open_interest=open_interest,
+        stale_klines_raw=stale_klines_raw,
+        fresh_klines_raw=fresh_klines_raw,
+        stale_call_count=1,
+    )
+
+    snapshot = build_live_snapshot(
+        connector, _settings(top_n=1), _NOW, clock=lambda: _NOW, sleep_fn=lambda seconds: None
+    )
+
+    # Bevisar att retry gjorde ett NYTT faktiskt anrop, inte en omtolkning
+    # av samma stale svar - exakt 2 anrop: första (stale) + andra (fresh).
+    assert connector.klines_call_count == 2
+    assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+    assert len(snapshot.klines["BTCUSDT"]) == 2  # den friska datan, inte den gamla
+
+
+def test_build_live_snapshot_marks_invalid_and_logs_when_klines_stay_stale_after_all_retries(
+    monkeypatch,
+):
+    """Retries är begränsade (aldrig oändliga) och ger tydligt besked när
+    de förbrukas: symbolen förblir korrekt `invalid` (fail-closed, SPEC
+    §8.3) och en explicit händelse loggas."""
+    contracts = [_raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    always_stale_klines_raw = [_raw_kline("50000", _ms(_NOW - timedelta(hours=30)))]
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _StaleThenFreshKlinesConnector(
+        contracts,
+        tickers,
+        funding_rates=funding_rates,
+        open_interest=open_interest,
+        stale_klines_raw=always_stale_klines_raw,
+        fresh_klines_raw=always_stale_klines_raw,  # blir aldrig fräsch
+        stale_call_count=999,
+    )
+    logged_events: list[dict] = []
+    monkeypatch.setattr(
+        "crypto_trading.market_snapshot.log_event",
+        lambda run_id, **fields: logged_events.append({"run_id": run_id, **fields}),
+    )
+
+    snapshot = build_live_snapshot(
+        connector,
+        _settings(top_n=1),
+        _NOW,
+        clock=lambda: _NOW,
+        sleep_fn=lambda seconds: None,
+        run_id="test-run-1",
+    )
+
+    # Begränsat, aldrig oändligt - exakt settings.pipeline.bingx_max_retries (3) anrop.
+    assert connector.klines_call_count == 3
+    assert snapshot.data_quality_status["BTCUSDT"] == "invalid"
+    exhausted_events = [
+        e for e in logged_events if e["event"] == "kline_staleness_retries_exhausted"
+    ]
+    assert len(exhausted_events) == 1
+    assert exhausted_events[0]["run_id"] == "test-run-1"
+    assert exhausted_events[0]["symbol"] == "BTCUSDT"
+
+
+def test_build_live_snapshot_retries_stale_funding_and_succeeds_on_a_fresher_attempt():
+    """Samma reproduktion som klines-testet ovan, för get_funding_rate()."""
+    contracts = [_raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    klines = {
+        "BTCUSDT": [
+            _raw_kline("50000", _ms(_NOW - timedelta(hours=1))),
+            _raw_kline("50100", _ms(_NOW)),
+        ]
+    }
+    stale_funding_raw = [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW - timedelta(days=3)))]
+    fresh_funding_raw = [_raw_funding("BTCUSDT", "0.0002", _ms(_NOW))]
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _StaleThenFreshFundingConnector(
+        contracts,
+        tickers,
+        klines=klines,
+        open_interest=open_interest,
+        stale_funding_raw=stale_funding_raw,
+        fresh_funding_raw=fresh_funding_raw,
+        stale_call_count=1,
+    )
+
+    snapshot = build_live_snapshot(
+        connector, _settings(top_n=1), _NOW, clock=lambda: _NOW, sleep_fn=lambda seconds: None
+    )
+
+    assert connector.funding_call_count == 2
+    assert snapshot.data_quality_status["BTCUSDT"] == "ok"
+    assert len(snapshot.funding_rates["BTCUSDT"]) == 1
+    assert snapshot.funding_rates["BTCUSDT"][0].funding_rate == Decimal("0.0002")
 
 
 def test_build_live_snapshot_only_fetches_klines_funding_oi_for_top_n_symbols():
