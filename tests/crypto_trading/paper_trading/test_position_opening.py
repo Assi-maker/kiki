@@ -155,6 +155,33 @@ def test_returns_none_when_candidate_not_confirmed(tmp_path):
     assert result is None
 
 
+def test_returns_none_and_never_crashes_when_risk_suggestion_is_not_numeric(tmp_path):
+    """Bugfix 2026-09-01: crypto-risk-agent kan legitimt svara med en
+    kvalitativ/relativ beskrivning i stället för ett rent tal när dess
+    kontext (orchestrator.py::_build_context()) saknar ett absolut
+    referenspris - t.ex. "ca 3-4% under senaste pris" (verifierat mot en
+    riktig CONFIRMED-candidate, FIL-USDT, 2026-09-01). Ett Decimal()-anrop
+    på en sådan sträng får aldrig krascha hela discovery-ticken och
+    därmed förlora alla andra candidaters redan färdiga resultat i samma
+    tick - samma "en candidates dåliga data kraschar aldrig batchen"-
+    princip som redan gäller överallt annars i kodbasen."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _confirmed_candidate()
+    candidate.risk.suggested_stop_loss = "ca 3-4% under senaste pris, inget absolut tal i underlaget"
+
+    position = open_position_for_candidate(
+        candidate,
+        repo,
+        _risk_limits(),
+        reference_price=Decimal("50000"),
+        opened_at=_NOW,
+        run_id="run-1",
+    )
+
+    assert position is None
+    assert repo.get_position(candidate.candidate_id) is None
+
+
 def test_direction_is_always_long(tmp_path):
     """Dokumenterar PLAN_CRYPTO_PHASE4.md beslut 1 som ett levande test."""
     repo = SQLiteRepository(tmp_path / "t.db")
