@@ -101,6 +101,9 @@ class _StubConnector:
     def get_ticker(self, symbol):
         return self._tickers[symbol]
 
+    def get_all_tickers(self):
+        return list(self._tickers.values())
+
     def get_klines(self, symbol, interval, limit=100):
         self.klines_calls.append(symbol)
         self.klines_interval_used = interval
@@ -630,15 +633,21 @@ def test_build_live_snapshot_does_not_mask_unexpected_non_connector_errors():
     genuint oväntat fel (programmeringsbugg, inte ett känt connector-fel)
     ska fortfarande propagera okontrollerat, precis som tidigare, så att
     discovery_loop.run_discovery_tick()s befintliga fail-safe (Global
-    Constraints, SPEC §8.3) kan fånga och logga det på tick-nivå."""
+    Constraints, SPEC §8.3) kan fånga och logga det på tick-nivå.
+
+    Bulk-ticker-fixen (2026-09-01): get_all_tickers() är EN gemensam
+    hämtning för hela universumet, inte längre en per-symbol-loop - ett fel
+    här är strukturellt samma "hela endpointen"-kategori som ett
+    get_contracts()-fel (medvetet ofångat, se build_live_snapshot()), inte
+    ett enskilt instruments fel. Testet flyttas därför till get_all_tickers()
+    i stället för det gamla, nu obefintliga per-symbol get_ticker()-anropet."""
     contracts = [_raw_contract("BADUSDT"), _raw_contract("BTCUSDT")]
-    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
-    connector = _TickerFailingConnector(
-        contracts,
-        tickers,
-        fail_symbol="BADUSDT",
-        exc=RuntimeError("genuint oväntad programmeringsbugg"),
-    )
+
+    class _AllTickersFailingConnector(_StubConnector):
+        def get_all_tickers(self):
+            raise RuntimeError("genuint oväntad programmeringsbugg")
+
+    connector = _AllTickersFailingConnector(contracts, tickers={})
 
     with pytest.raises(RuntimeError):
         build_live_snapshot(connector, _settings(top_n=2), _NOW)

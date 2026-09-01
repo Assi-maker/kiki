@@ -29,6 +29,7 @@ from crypto_trading.screening.eligibility_filter import check_eligibility, selec
 class LiveMarketDataSource(Protocol):
     def get_contracts(self) -> list[dict]: ...
     def get_ticker(self, symbol: str) -> dict: ...
+    def get_all_tickers(self) -> list[dict]: ...
     def get_klines(self, symbol: str, interval: str, limit: int = 100) -> list[dict]: ...
     def get_funding_rate(self, symbol: str, limit: int = 1) -> list[dict]: ...
     def get_open_interest(self, symbol: str) -> dict: ...
@@ -46,20 +47,21 @@ def _fetch_klines_with_retry(
     sleep_fn: Callable[[float], None],
     run_id: str,
 ) -> tuple[DataQualityResult, list[Kline], DataQualityResult]:
-    """Begränsad retry (bugfix 2026-08-31, del 2): `get_klines()` kan
-    intermittent returnera genuint gammal data för en enskild symbol -
-    bekräftat mot riktig BingX-data (BTC-USDT, identiska parametrar, 2
-    minuters mellanrum: en gång 24h gammal, en gång 20 minuter gammal).
-    Ticker/open interest via samma connector visar aldrig detta - trolig
-    orsak är inkonsekvent cache mellan BingX:s backend-noder, eftersom
-    varje anrop öppnar en ny anslutning (ingen keep-alive, se
-    connectors/base.py::_get_with_retry). VARJE försök gör ett NYTT,
-    riktigt `get_klines()`-anrop - aldrig en omtolkning av samma svar -
-    så chansen att träffa en färskare nod ökar med varje försök. Samma
-    backoff-form som `_get_with_retry()`: 0.5 * 2^försök, tak 5s. Ger upp
-    efter `max_retries` försök (aldrig oändligt) och loggar explicit -
-    den redan fail-closed staleness-kontrollen (SPEC §8.3) fångar då
-    korrekt upp den kvarvarande, verkligen gamla datan som `invalid`."""
+    """Begränsad retry (bugfix 2026-08-31, del 2): `get_klines()` kunde
+    tidigare uppfattas ge intermittent gammal data. **Rotorsaken
+    korrigerad 2026-09-01**: BingX:s /quote/klines returnerar konsekvent
+    nyast-först (verifierat: 6 upprepade anrop, identisk ordning varje
+    gång) - `parsed_klines[-1]` utan sortering plockade den ÄLDSTA candlen
+    i batchen (t.ex. äkta 24h gammal vid limit=25/1h), inte den senaste.
+    2026-08-31-hypotesen ("inkonsekvent cache mellan BingX:s backend-
+    noder") var en felaktig förklaring av samma symptom - se
+    sorteringen nedan för den faktiska fixen. Retry-loopen behålls som ett
+    fail-safe-lager för genuint förekommande gles/temporärt gammal data
+    (samma backoff-form som `_get_with_retry()`: 0.5 * 2^försök, tak 5s).
+    Ger upp efter `max_retries` försök (aldrig oändligt) och loggar
+    explicit - den redan fail-closed staleness-kontrollen (SPEC §8.3)
+    fångar då korrekt upp kvarvarande, verkligen gammal data som
+    `invalid`."""
     completeness: DataQualityResult = "invalid"
     parsed_klines: list[Kline] = []
     staleness: DataQualityResult = "invalid"
@@ -72,7 +74,19 @@ def _fetch_klines_with_retry(
             else "invalid"
         )
         parsed_klines = (
-            [Kline.from_raw(k, symbol, interval) for k in raw_klines]
+            # BingX's /quote/klines (verifierat live 2026-09-01, v3-
+            # endpointen, konsekvent över upprepade anrop) returnerar
+            # NYAST-FÖRST, inte kronologisk ordning - `[-1]` utan denna sort
+            # plockade tidigare den ÄLDSTA candlen i batchen (t.ex. 24h
+            # gammal vid limit=25/1h), inte den senaste. Detta var den
+            # faktiska rotorsaken bakom stalenessfelen som 2026-08-31-fixen
+            # (se docstring ovan) felaktigt tillskrev "inkonsekvent cache
+            # mellan BingX:s backend-noder" - samma reproducerbara fel varje
+            # gång, inte intermittent.
+            sorted(
+                (Kline.from_raw(k, symbol, interval) for k in raw_klines),
+                key=lambda k: k.observed_at,
+            )
             if completeness == "ok"
             else []
         )
@@ -119,7 +133,13 @@ def _fetch_funding_with_retry(
             else "invalid"
         )
         parsed_funding = (
-            [FundingRate.from_raw(f) for f in raw_funding] if completeness == "ok" else []
+            # Samma verkliga rotorsak/fix som klines ovan - BingX:s
+            # /quote/fundingRate returnerar också nyast-först.
+            sorted(
+                (FundingRate.from_raw(f) for f in raw_funding), key=lambda f: f.observed_at
+            )
+            if completeness == "ok"
+            else []
         )
         staleness = (
             check_staleness(parsed_funding[-1].observed_at, fetch_time, max_age_seconds)
@@ -203,20 +223,34 @@ def build_live_snapshot(
     contracts_raw = connector.get_contracts()
     instruments = {c["symbol"]: InstrumentMetadata.from_raw(c, now) for c in contracts_raw}
 
+    # Bulk-hämtning (bugfix 2026-09-01, empiriskt verifierad mot riktig
+    # BingX: samma /ticker-endpoint utan `symbol` returnerar samtliga
+    # instrument i ETT anrop, ~1-2s, i stället för en sekventiell
+    # per-instrument-loop som på riktig data dominerade hela discovery-
+    # cykelns körtid (15-23 min för ~1119 instrument) - se
+    # BingXMarketDataConnector.get_all_tickers(). Ett totalt fel på detta
+    # anropet (hela endpointen nere) fångas medvetet INTE här - propagerar
+    # precis som ett get_contracts()-fel ovan, samma "hela endpointen är
+    # nere" felkategori (extern blockerare, hela discovery_tick markeras
+    # 'error' och försöks igen nästa cykel, se discovery_loop.py). `now`/
+    # fetch_clock() tas EN gång direkt efter anropet - korrekt igen sedan
+    # hela batchen anländer i ett enda svar, till skillnad från den gamla
+    # loopen där sena instrument kunde vara flera minuter "efter" en tidig
+    # gemensam tidsstämpel (se docstring ovan, 2026-08-31-buggen).
+    raw_tickers_by_symbol = {t["symbol"]: t for t in connector.get_all_tickers()}
+    ticker_fetch_time = fetch_clock()
+
     tickers: dict[str, Ticker] = {}
     ticker_dq: dict[str, DataQualityResult] = {}
     for symbol in instruments:
-        try:
-            raw_ticker = connector.get_ticker(symbol)
-        except ConnectorUnavailableError:
-            # SPEC §8.2/ConnectorUnavailableError-kontraktet: ett enskilt
-            # instruments fel (t.ex. en pausad symbol på BingX, AC3
-            # 2026-08-28) klassas som DATA_INVALID för det instrumentet,
-            # aldrig en krasch av hela ticken - övriga instrument fortsätter
-            # obehindrat, samma princip som redan gäller monitoring_loop.py.
+        raw_ticker = raw_tickers_by_symbol.get(symbol)
+        if raw_ticker is None:
+            # Symbolen fanns i get_contracts() men inte i bulk-ticker-svaret
+            # (t.ex. en pausad symbol på BingX, AC3 2026-08-28) - klassas
+            # som DATA_INVALID för det instrumentet, aldrig en krasch av
+            # hela ticken, samma princip som redan gäller monitoring_loop.py.
             ticker_dq[symbol] = "invalid"
             continue
-        ticker_fetch_time = fetch_clock()
         completeness = check_completeness(raw_ticker, settings.pipeline.required_fields["ticker"])
         if completeness == "invalid":
             ticker_dq[symbol] = "invalid"

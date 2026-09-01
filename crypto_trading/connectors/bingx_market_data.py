@@ -38,6 +38,15 @@ class BingXMarketDataConnector(BaseMarketDataConnector):
     def get_ticker(self, symbol: str) -> dict:
         return self._get(_TICKER_PATH, {"symbol": symbol, "timestamp": self._timestamp_ms()})
 
+    def get_all_tickers(self) -> list[dict]:
+        """Samma endpoint som get_ticker(), utan `symbol` - BingX svarar då
+        med samtliga instruments tickers i ETT anrop (~1119 st, ~1-2s) i
+        stället för en sekventiell per-instrument-loop (som på riktig BingX-
+        data tidigare dominerade hela discovery-cykelns körtid, 15-23 min -
+        se market_snapshot.py::build_live_snapshot()). Verifierat live
+        2026-09-01: samma svarsschema per element som get_ticker()."""
+        return self._get(_TICKER_PATH, {"timestamp": self._timestamp_ms()})
+
     def get_klines(self, symbol: str, interval: str, limit: int = 100) -> list[dict]:
         return self._get(
             _KLINES_PATH,
