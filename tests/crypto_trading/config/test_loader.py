@@ -78,7 +78,7 @@ def test_pipeline_config_rejects_zero_top_n():
 
 def test_get_settings_loads_phase1_fields():
     settings = get_settings()
-    assert settings.pipeline.screener_timeframes == ["1h", "4h"]
+    assert settings.pipeline.screener_timeframes == ["30m", "1h"]
     assert settings.pipeline.bingx_base_url == "https://open-api.bingx.com"
     assert settings.pipeline.bingx_requests_per_second > 0
     assert set(settings.pipeline.required_fields.keys()) >= {

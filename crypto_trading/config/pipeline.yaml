@@ -1,10 +1,14 @@
 discovery_interval_minutes: 15
 monitoring_interval_seconds: 30
-top_n: 30
+top_n: 80
 cooldown_minutes: 60
+# kline: primary candle's open-time span (30m=1800s) + 300s grace, same
+# calibration formula as the 2026-08-31 1h fix - recalibrated together with
+# screener_timeframes below (primary 1h -> 30m). Never applied to the
+# secondary timeframe (market_snapshot.py never staleness-checks it).
 max_data_age_seconds:
   ticker: 30
-  kline: 3900
+  kline: 2100
   funding_rate: 29400
   open_interest: 300
   contracts: 86400
@@ -17,7 +21,7 @@ required_fields:
   funding_rate: [fundingRate, fundingTime, markPrice]
   open_interest: [openInterest, time]
   contracts: [symbol, status]
-screener_timeframes: ["1h", "4h"]
+screener_timeframes: ["30m", "1h"]
 bingx_base_url: "https://open-api.bingx.com"
 bingx_requests_per_second: 10
 bingx_cache_ttl_seconds: 5
