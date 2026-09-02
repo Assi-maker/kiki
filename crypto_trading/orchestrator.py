@@ -155,6 +155,18 @@ class Orchestrator:
                     )
                 except ConnectorUnavailableError:
                     pass
+        # Root-cause-fix (2026-09-02): utan ett faktiskt referenspris kan
+        # Risk Agent aldrig svara med ett absolut, Decimal-parsbart
+        # suggested_stop_loss/suggested_target (paper_trading/
+        # position_opening.py) - bara en kvalitativ beskrivning, som alltid
+        # misslyckade parsningen (0/10 CONFIRMED öppnade någonsin en
+        # position). Skopat strikt till risk-rollen - de andra sex
+        # rollernas kontext/prompt/beteende är helt oförändrat. `None`
+        # (t.ex. äldre candidates persisterade före denna fix) utelämnar
+        # nyckeln helt, samma icke-gissnings-princip som news/fear_greed
+        # ovan.
+        if role == "risk" and candidate.reference_price is not None:
+            context["reference_price"] = str(candidate.reference_price)
         return context
 
 

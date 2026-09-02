@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol
 
@@ -119,7 +119,8 @@ class SQLiteRepository:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO candidates "
                 "(candidate_id, idempotency_key, instrument, discovery_run_id, evidence_hash, "
-                "status, evidence_record, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                "status, evidence_record, created_at, updated_at, reference_price) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     candidate.candidate_id,
                     candidate.idempotency_key,
@@ -130,6 +131,7 @@ class SQLiteRepository:
                     candidate.evidence_record.model_dump_json(),
                     candidate.created_at.isoformat(),
                     candidate.updated_at.isoformat(),
+                    str(candidate.reference_price) if candidate.reference_price is not None else None,
                 ),
             )
             created = cur.rowcount > 0
@@ -213,6 +215,14 @@ class SQLiteRepository:
         except ValueError as exc:
             self._insert_corrupt_state_event(candidate_id, raw_status, "timestamp")
             raise CorruptCandidateStateError(candidate_id, raw_status, "timestamp") from exc
+
+        try:
+            data["reference_price"] = (
+                Decimal(data["reference_price"]) if data["reference_price"] is not None else None
+            )
+        except InvalidOperation as exc:
+            self._insert_corrupt_state_event(candidate_id, raw_status, "reference_price")
+            raise CorruptCandidateStateError(candidate_id, raw_status, "reference_price") from exc
 
         assessment_rows = self._conn.execute(
             "SELECT field_name, payload FROM assessments WHERE candidate_id = ?", (candidate_id,)

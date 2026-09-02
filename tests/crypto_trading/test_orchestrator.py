@@ -330,6 +330,48 @@ def test_build_context_includes_news_and_fear_greed_only_for_news_sentiment_role
     assert "evidence_record" in other_context
 
 
+def test_build_context_includes_reference_price_only_for_risk_role_when_present(tmp_path):
+    """Root-cause-fix (2026-09-02): utan ett faktiskt referenspris i sin
+    kontext kan Risk Agent aldrig svara med ett absolut, Decimal-parsbart
+    suggested_stop_loss/suggested_target - bara en kvalitativ beskrivning
+    som alltid misslyckas parsningen i position_opening.py (0/10 CONFIRMED
+    öppnade någonsin en position). Skopat strikt till risk-rollen - de
+    andra sex rollernas kontext/beteende ska vara helt opåverkat."""
+    from decimal import Decimal
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo).model_copy(
+        update={"reference_price": Decimal("42150.5")}
+    )
+    spy = _SpyRunner(_happy_fixtures())
+
+    orch = Orchestrator(repo=repo, runner=spy, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    risk_context = spy.captured_contexts["crypto-risk-agent"]
+    assert risk_context["reference_price"] == "42150.5"
+
+    for role_name in (
+        "crypto-news-sentiment",
+        "crypto-technical-analyst",
+        "crypto-bull-thesis",
+        "crypto-forecast-agent",
+        "crypto-bear-adversarial",
+    ):
+        assert "reference_price" not in spy.captured_contexts[role_name]
+
+
+def test_build_context_omits_reference_price_for_risk_role_when_absent(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)  # reference_price=None (default)
+    spy = _SpyRunner(_happy_fixtures())
+
+    orch = Orchestrator(repo=repo, runner=spy, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    assert "reference_price" not in spy.captured_contexts["crypto-risk-agent"]
+
+
 def test_build_context_omits_news_keys_when_connectors_are_none(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     candidate = _persisted_candidate_in_under_ai_analysis(repo)

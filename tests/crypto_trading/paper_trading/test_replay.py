@@ -371,6 +371,26 @@ def test_run_single_cycle_wires_secondary_timeframe_evidence_into_candidate(tmp_
     assert secondary_evidence.timeframe == "4h"
 
 
+def test_run_single_cycle_wires_ticker_last_price_into_candidate_reference_price(tmp_path):
+    """Root-cause-fix (2026-09-02): candidate.reference_price ska sättas
+    till tickerns senaste pris vid evidens-tillfället - annars kan Risk
+    Agent aldrig få ett faktiskt pris att förankra suggested_stop_loss/
+    suggested_target mot (position_opening.py kunde tidigare aldrig
+    Decimal-parsa dess svar, så 0/10 CONFIRMED öppnade någonsin en
+    position)."""
+    from decimal import Decimal
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    spike_snapshot = _build_snapshots()[1]
+
+    run_single_cycle(spike_snapshot, repo, runner, _settings(), run_id="run-1")
+
+    candidates = repo.find_candidates_by_status("CONFIRMED")
+    assert len(candidates) == 1
+    assert candidates[0].reference_price == Decimal("55000")
+
+
 def test_run_single_cycle_can_be_called_directly_with_one_snapshot(tmp_path):
     """Låser run_single_cycle()s fristående kontrakt (Task 5): discovery_loop.py
     (Fas 5) ska kunna anropa den en gång per tick, utan run_replay()s loop."""

@@ -159,6 +159,7 @@ def _set_wal_mode_with_retry(conn: sqlite3.Connection, busy_timeout_ms: int) -> 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     _migrate_runs_add_instruments_scanned(conn)
+    _migrate_candidates_add_reference_price(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -182,3 +183,18 @@ def _migrate_runs_add_instruments_scanned(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
     if "instruments_scanned" not in columns:
         conn.execute("ALTER TABLE runs ADD COLUMN instruments_scanned INTEGER")
+
+
+def _migrate_candidates_add_reference_price(conn: sqlite3.Connection) -> None:
+    """Root-cause-fix (2026-09-02): candidates.reference_price - det
+    faktiska referenspris (senaste ticker-pris vid evidens-tillfället) som
+    Risk Agent behöver för att kunna svara med ett absolut, Decimal-
+    parsbart suggested_stop_loss/suggested_target istället för en
+    kvalitativ beskrivning (som alltid misslyckades parsningen i
+    paper_trading/position_opening.py - 0/10 CONFIRMED-kandidater öppnade
+    någonsin en position). Samma migreringsmönster och samma motivering
+    som _migrate_runs_add_instruments_scanned() ovan - lades till EFTER att
+    riktiga produktionsdatabaser redan existerade utan kolumnen."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)").fetchall()}
+    if "reference_price" not in columns:
+        conn.execute("ALTER TABLE candidates ADD COLUMN reference_price TEXT")

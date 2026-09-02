@@ -105,6 +105,36 @@ def test_create_candidate_with_event_persists_both(tmp_path):
     assert row["event_type"] == "CANDIDATE_CREATED"
 
 
+def test_reference_price_roundtrips_exactly_through_create_and_get(tmp_path):
+    """Root-cause-fix (2026-09-02): reference_price måste överleva
+    persistering exakt (Decimal, aldrig via float) - det är precis det
+    värde Risk Agent behöver kunna anchor:a suggested_stop_loss/target mot
+    för att position_opening.py:s Decimal-parsning ska lyckas."""
+    from decimal import Decimal
+
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate().model_copy(
+        update={"reference_price": Decimal("54321.123456789")}
+    )
+    event = _make_event(candidate, "CANDIDATE_CREATED")
+
+    repo.create_candidate_with_event(candidate, event)
+    reloaded = repo.get_candidate(candidate.candidate_id)
+
+    assert reloaded.reference_price == Decimal("54321.123456789")
+
+
+def test_reference_price_defaults_to_none_when_not_provided(tmp_path):
+    repo = SQLiteRepository(tmp_path / "test.db")
+    candidate = _make_candidate()
+    event = _make_event(candidate, "CANDIDATE_CREATED")
+
+    repo.create_candidate_with_event(candidate, event)
+    reloaded = repo.get_candidate(candidate.candidate_id)
+
+    assert reloaded.reference_price is None
+
+
 def test_create_candidate_with_event_is_idempotent_on_retry(tmp_path):
     repo = SQLiteRepository(tmp_path / "test.db")
     candidate = _make_candidate()

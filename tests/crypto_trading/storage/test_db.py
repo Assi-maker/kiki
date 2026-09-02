@@ -85,6 +85,52 @@ def test_migration_adds_instruments_scanned_column_to_a_pre_existing_database_wi
     assert row["instruments_scanned"] is None
 
 
+def test_candidates_table_has_reference_price_column_on_a_fresh_database(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)").fetchall()}
+    assert "reference_price" in columns
+
+
+def test_migration_adds_reference_price_column_to_a_pre_existing_database_without_it(tmp_path):
+    """Root-cause-fix (2026-09-02): CONFIRMED-kandidater kunde aldrig öppna
+    en paper-position eftersom Risk Agent aldrig fick ett faktiskt
+    referenspris i sin kontext (Orchestrator._build_context()) och därför
+    korrekt (per sina egna instruktioner) skrev en kvalitativ beskrivning
+    istället för ett absolut tal - som sedan alltid misslyckades Decimal-
+    parsningen i position_opening.py (0/10 CONFIRMED öppnade någonsin en
+    position). candidates.reference_price lades till EFTER att riktiga
+    produktionsdatabaser redan existerade - samma migreringsmönster som
+    runs.instruments_scanned ovan, samma verifiering: en gammal databas
+    utan kolumnen öppnas igen och migreringen lägger till den utan att
+    förstöra befintliga rader."""
+    db_path = tmp_path / "pre_existing.db"
+
+    old_conn = sqlite3.connect(db_path)
+    old_conn.execute(
+        "CREATE TABLE candidates (candidate_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL "
+        "UNIQUE, instrument TEXT NOT NULL, discovery_run_id TEXT NOT NULL, evidence_hash TEXT "
+        "NOT NULL, status TEXT NOT NULL, evidence_record TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL)"
+    )
+    old_conn.execute(
+        "INSERT INTO candidates (candidate_id, idempotency_key, instrument, discovery_run_id, "
+        "evidence_hash, status, evidence_record, created_at, updated_at) VALUES "
+        "('c1', 'k1', 'BTCUSDT', 'run-1', 'hash-1', 'CANDIDATE', '{}', '2026-01-01', '2026-01-01')"
+    )
+    old_conn.commit()
+    old_conn.close()
+
+    conn = get_connection(db_path)
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)").fetchall()}
+    assert "reference_price" in columns
+
+    row = conn.execute("SELECT * FROM candidates WHERE candidate_id = 'c1'").fetchone()
+    assert row is not None
+    assert row["status"] == "CANDIDATE"
+    assert row["reference_price"] is None
+
+
 def test_migration_is_idempotent_across_repeated_connections(tmp_path):
     db_path = tmp_path / "test.db"
     get_connection(db_path)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from pydantic import BaseModel
 
@@ -27,6 +28,15 @@ class Candidate(BaseModel):
     evidence_record: CandidateEvidenceRecord
     created_at: datetime
     updated_at: datetime
+    # Root-cause-fix (2026-09-02): senaste ticker-pris vid evidens-
+    # tillfället, INTE en del av evidence_record (och därmed aldrig en del
+    # av compute_evidence_hash()/cooldown-/re-analys-jämförelsen - ett pris
+    # som rör sig ska inte i sig trigga om-analys). Enda syftet: ge Risk
+    # Agent något att förankra suggested_stop_loss/suggested_target mot
+    # (se orchestrator.py::_build_context()) - utan det kan agenten aldrig
+    # svara med ett absolut, Decimal-parsbart tal (position_opening.py),
+    # bara en kvalitativ beskrivning som alltid misslyckas parsningen.
+    reference_price: Decimal | None = None
 
     news_sentiment: NewsSentimentAssessment | None = None
     technical: TechnicalAssessment | None = None

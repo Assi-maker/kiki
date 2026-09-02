@@ -67,6 +67,35 @@ def test_process_evidence_creates_candidate_when_signal_triggered(tmp_path):
     assert reloaded.status == "CANDIDATE"
 
 
+def test_process_evidence_stores_reference_price_on_the_candidate(tmp_path):
+    """Root-cause-fix (2026-09-02): reference_price måste hamna på den
+    persisterade candidaten så Risk Agent senare kan förankra ett absolut
+    suggested_stop_loss/suggested_target mot det."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    evidence = _evidence(trigger_reasons=["price_volatility"])
+
+    candidate = process_evidence(
+        repo,
+        evidence,
+        discovery_run_id="run-1",
+        created_at=_NOW,
+        reference_price=Decimal("42150.5"),
+    )
+
+    assert candidate.reference_price == Decimal("42150.5")
+    reloaded = repo.get_candidate(candidate.candidate_id)
+    assert reloaded.reference_price == Decimal("42150.5")
+
+
+def test_process_evidence_reference_price_defaults_to_none(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    evidence = _evidence(trigger_reasons=["price_volatility"])
+
+    candidate = process_evidence(repo, evidence, discovery_run_id="run-1", created_at=_NOW)
+
+    assert candidate.reference_price is None
+
+
 def test_process_evidence_returns_none_and_persists_nothing_when_not_a_candidate(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     evidence = _evidence(outcome="not_a_candidate", trigger_reasons=[])

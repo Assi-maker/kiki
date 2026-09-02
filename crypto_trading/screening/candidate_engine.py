@@ -19,7 +19,10 @@ from crypto_trading.storage.repository import Repository
 
 
 def _build_candidate(
-    evidence: CandidateEvidenceRecord, discovery_run_id: str, created_at: datetime
+    evidence: CandidateEvidenceRecord,
+    discovery_run_id: str,
+    created_at: datetime,
+    reference_price: Decimal | None = None,
 ) -> Candidate:
     evidence_hash = compute_evidence_hash(evidence)
     # idempotency_key används direkt som candidate_id - garanterat stabil och
@@ -39,6 +42,7 @@ def _build_candidate(
         evidence_record=evidence,
         created_at=created_at,
         updated_at=created_at,
+        reference_price=reference_price,
     )
 
 
@@ -47,8 +51,9 @@ def _persist_new_candidate(
     evidence: CandidateEvidenceRecord,
     discovery_run_id: str,
     created_at: datetime,
+    reference_price: Decimal | None = None,
 ) -> Candidate:
-    candidate = _build_candidate(evidence, discovery_run_id, created_at)
+    candidate = _build_candidate(evidence, discovery_run_id, created_at, reference_price)
     creation_event = Event(
         event_id=f"CANDIDATE_CREATED:{candidate.candidate_id}",
         event_type="CANDIDATE_CREATED",
@@ -109,6 +114,7 @@ def process_evidence(
     created_at: datetime,
     cooldown_minutes: int = 60,
     evidence_change_threshold: float = 0.15,
+    reference_price: Decimal | None = None,
 ) -> Candidate | None:
     """SPEC §5/§7: skapar en Candidate-rad bara när det finns anledning.
 
@@ -117,9 +123,15 @@ def process_evidence(
     - outcome == "not_a_candidate" (och data ok) -> ingen rad alls, None.
     - outcome == "worth_deeper_analysis" -> dedup/cooldown-kontroll (AC3),
       sedan en ny CANDIDATE-rad om den klarar kontrollen.
-    """
+
+    `reference_price` (root-cause-fix 2026-09-02): tickerns senaste pris
+    vid evidens-tillfället, om känt - se Candidate.reference_price. Ingår
+    INTE i evidence_hash/cooldown-jämförelsen ovan (som uteslutande läser
+    `evidence`), så den ändrar aldrig dedup-/re-analys-beteendet."""
     if evidence.data_quality_status == "invalid":
-        candidate = _persist_new_candidate(repo, evidence, discovery_run_id, created_at)
+        candidate = _persist_new_candidate(
+            repo, evidence, discovery_run_id, created_at, reference_price
+        )
         return _transition_to_terminal(
             repo, candidate, "DATA_INVALID", created_at, discovery_run_id
         )
@@ -132,7 +144,7 @@ def process_evidence(
     ):
         return None
 
-    return _persist_new_candidate(repo, evidence, discovery_run_id, created_at)
+    return _persist_new_candidate(repo, evidence, discovery_run_id, created_at, reference_price)
 
 
 def prioritize_and_apply_budget(

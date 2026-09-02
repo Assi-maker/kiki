@@ -129,6 +129,12 @@ def run_single_cycle(
             evidence_change_threshold=float(
                 settings.pipeline.evidence_change_threshold_for_reanalysis
             ),
+            # Root-cause-fix (2026-09-02): utan detta referenspris hade Risk
+            # Agent aldrig kunnat svara med ett absolut, Decimal-parsbart
+            # suggested_stop_loss/suggested_target (position_opening.py) -
+            # bara en kvalitativ beskrivning som alltid misslyckades
+            # parsningen (0/10 CONFIRMED öppnade någonsin en position).
+            reference_price=snapshot.tickers[symbol].last_price,
         )
         if candidate is not None:
             new_candidates.append(candidate)
