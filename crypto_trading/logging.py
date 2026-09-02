@@ -31,10 +31,23 @@ def _redact_string(value: str) -> str:
     return _TELEGRAM_BOT_URL_PATTERN.sub("/bot***REDACTED***", masked)
 
 
+def _key_matches_secret_marker(key: str) -> bool:
+    # Bugfix (kostnadsoptimering 2026-09-02): en ren substrängsmatchning på
+    # "token" träffade även legitima tokenRÄKNINGAR som input_tokens/
+    # output_tokens (int, inte hemligheter) och tystade bort den nya
+    # agent_call_usage-kostnadsloggningen. Underscore-inramning ("_x_" i
+    # "_nyckel_") kräver att markören står som ett eget ord/segment i
+    # nyckeln - "_token_" matchar "bot_token" och "access_token_value" men
+    # inte "input_tokens" (som bara innehåller "_tokens_", aldrig "_token_")
+    # - en riktig hemlighetsnyckel heter alltid singular, en räkning plural.
+    padded_key = f"_{key.lower()}_"
+    return any(f"_{marker}_" in padded_key for marker in _SECRET_KEY_MARKERS)
+
+
 def redact(data: dict) -> dict:
     out = {}
     for key, value in data.items():
-        if any(marker in key.lower() for marker in _SECRET_KEY_MARKERS):
+        if _key_matches_secret_marker(key):
             out[key] = "***REDACTED***"
         elif isinstance(value, str):
             out[key] = _redact_string(value)

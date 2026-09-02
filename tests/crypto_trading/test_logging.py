@@ -17,6 +17,31 @@ def test_redact_masks_keys_matching_secret_markers():
     assert out["instrument"] == "BTCUSDT"
 
 
+def test_redact_does_not_mask_token_count_fields():
+    """Bugfix (kostnadsoptimering 2026-09-02): redact()s tidigare rena
+    substrängsmatchning på "token" råkade även träffa input_tokens/
+    output_tokens/cache_read_input_tokens/cache_creation_input_tokens -
+    legitima tokenRÄKNINGAR (int), inte hemligheter - och tystade bort hela
+    poängen med den nya agent_call_usage-kostnadsloggningen. En riktig
+    hemlighetsnyckel heter alltid singular "...token" (bot_token,
+    access_token); en räkning heter plural "...tokens" - det skiljer dem åt
+    utan att öppna ett kryphål för riktiga secrets."""
+    data = {
+        "input_tokens": 970,
+        "output_tokens": 1576,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+    out = redact(data)
+    assert out == data
+
+
+def test_redact_still_masks_a_token_field_embedded_among_other_words():
+    data = {"access_token_value": "abc123"}
+    out = redact(data)
+    assert out["access_token_value"] == "***REDACTED***"
+
+
 def test_redact_masks_embedded_token_in_string_value():
     data = {"error_message": "request failed: token=abc123&other=1"}
     out = redact(data)
