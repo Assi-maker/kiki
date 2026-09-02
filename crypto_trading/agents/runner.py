@@ -136,19 +136,38 @@ class RealClaudeRunner(AgentRunner):
     def _failed_assessment(
         self, agent_def: AgentDefinition, output_schema: type[T], run_id: str
     ) -> T:
+        # Bugfix (reproducerad live 2026-09-02, run_id 19239634...): en
+        # ForecastAssessment vars retries tömdes kraschade hela
+        # discovery-ticken (okontrollerat, aldrig fångat av run()s egen
+        # try/except - se det try-blocket ovan) istället för att, som
+        # designat, bara ge DENNA roll status="failed" och låta candidaten
+        # gå vidare till Gaten som missing_or_failed_assessment. Två
+        # samverkande orsaker: (1) _blank_value() kände bara igen bar
+        # `dict`, inte en parametriserad `dict[str, float]` - föll igenom
+        # till "" för scenario_probabilities. (2) även med rätt tom {}
+        # hade model_validate() ändå kraschat, eftersom
+        # ForecastAssessment.probabilities_sum_to_one() (en
+        # affärsregel-validator för RIKTIGA modellsvar) aldrig kan vara
+        # nöjd av en tom platshållare - summan av en tom dict är 0, aldrig
+        # 1.0. En "failed"-platshållare representerar per definition inget
+        # verkligt analysresultat (Gaten/downstream behandlar alltid
+        # status!="ok" som missing_or_failed_assessment, oavsett
+        # fältinnehåll) - model_construct() (skippar all fältvalidering,
+        # till skillnad från model_validate()) är därför rätt verktyg här:
+        # det försvagar INTE valideringen av riktiga modellsvar, som
+        # fortfarande går genom model_validate() ovan i run() och
+        # underkastas exakt samma scheman/validators som förut.
         required_fields = {
             name: self._blank_value(field.annotation)
             for name, field in output_schema.model_fields.items()
             if name not in {"agent_name", "run_id", "created_at", "status"}
         }
-        return output_schema.model_validate(
-            {
-                "agent_name": agent_def.name,
-                "run_id": run_id,
-                "created_at": datetime.now(UTC),
-                "status": "failed",
-                **required_fields,
-            }
+        return output_schema.model_construct(
+            agent_name=agent_def.name,
+            run_id=run_id,
+            created_at=datetime.now(UTC),
+            status="failed",
+            **required_fields,
         )
 
     @staticmethod
@@ -156,10 +175,10 @@ class RealClaudeRunner(AgentRunner):
         origin = getattr(annotation, "__origin__", None)
         if origin is list:
             return []
+        if origin is dict or annotation is dict:
+            return {}
         if annotation is float:
             return 0.0
         if annotation is bool:
             return False
-        if annotation is dict:
-            return {}
         return ""

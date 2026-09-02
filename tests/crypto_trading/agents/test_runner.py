@@ -178,6 +178,39 @@ def test_real_claude_runner_fails_closed_on_invalid_json():
     assert result.status == "failed"
 
 
+def test_real_claude_runner_falls_back_to_failed_status_for_forecast_without_crashing():
+    """Reproducerar en live-produktionskrasch (2026-09-02, run_id
+    19239634...): när ForecastAssessment (unikt fält
+    scenario_probabilities: dict[str, float], plus en
+    probabilities_sum_to_one-validator) tömmer sin retry-budget kraschade
+    hela discovery-ticken okontrollerat istället för att ge denna roll
+    status="failed" som designat. _blank_value() kände inte igen den
+    parametriserade dict[str, float]-annoteringen (bara bar `dict`) och
+    föll igenom till "" - och även med en korrekt tom {} hade
+    model_validate() ändå kraschat på probabilities_sum_to_one (en tom
+    dict summerar till 0, aldrig 1.0)."""
+    from anthropic import APIError
+
+    from crypto_trading.agents.runner import RealClaudeRunner
+    from crypto_trading.schemas.assessments import ForecastAssessment
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.side_effect = APIError(
+            "boom", request=MagicMock(), body=None
+        )
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=2
+        )
+        result = runner.run(
+            _agent_def(name="crypto-forecast-agent"),
+            context={"run_id": "run-1"},
+            output_schema=ForecastAssessment,
+        )
+
+    assert result.status == "failed"
+    assert result.scenario_probabilities == {}
+
+
 def test_real_claude_runner_does_not_extract_json_from_surrounding_prose():
     """Valideringen får inte försvagas till en fritextsökning efter JSON -
     om svaret inte ÄR (eventuellt kodblocksinlindad) ren JSON ska det
