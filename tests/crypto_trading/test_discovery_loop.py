@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 from crypto_trading.agents.runner import MockAgentRunner
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
@@ -102,6 +103,26 @@ def test_run_discovery_tick_persists_a_runs_row_on_success(tmp_path):
     row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'discovery'").fetchone()
     assert row["status"] == "ok"
     assert row["completed_at"] is not None
+
+
+def test_run_discovery_tick_forwards_screener_runner_to_run_single_cycle(tmp_path):
+    """Ren ledningskontroll (kostnadsoptimering 2026-09-02): run_discovery_
+    tick() ska vidarebefordra screener_runner oförändrat till run_single_
+    cycle() - annars skulle produktionens Haiku-förscreening tyst aldrig
+    köras trots att den är korrekt konfigurerad i run.py."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    connector = _stub_connector_with_one_healthy_symbol()
+    runner = MockAgentRunner(_happy_fixtures())
+    screener_runner = MockAgentRunner({})
+
+    with patch(
+        "crypto_trading.discovery_loop.run_single_cycle", return_value=[]
+    ) as mock_run_single_cycle:
+        run_discovery_tick(
+            connector, repo, runner, _settings(top_n=1), screener_runner=screener_runner
+        )
+
+    assert mock_run_single_cycle.call_args.kwargs["screener_runner"] is screener_runner
 
 
 def test_run_discovery_tick_persists_instruments_scanned_count_on_success(tmp_path):

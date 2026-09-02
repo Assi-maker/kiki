@@ -75,6 +75,81 @@ def test_real_claude_runner_parses_valid_json_response():
     assert result.downside == "d"
 
 
+def test_real_claude_runner_logs_token_usage_and_estimated_cost_on_success():
+    """Kostnadsoptimering (2026-09-02, item 5/6): varje lyckat anrop ska
+    logga in/output-tokens + en uppskattad $-kostnad, så att kostnad per
+    kandidat/CONFIRMED/paper-trade blir mätbar per discovery-cykel."""
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    fake_message = MagicMock()
+    fake_block = MagicMock(
+        type="text",
+        text=(
+            '{"run_id": "run-1", "downside": "d", "liquidity_risk": "l", '
+            '"model_risk": "m", "timing_risk": "t", "suggested_stop_loss": "1", '
+            '"suggested_target": "2"}'
+        ),
+    )
+    fake_message.content = [fake_block]
+    fake_message.usage = MagicMock(
+        input_tokens=1000, output_tokens=500, cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+
+    with (
+        patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic,
+        patch("crypto_trading.agents.runner.log_event") as mock_log_event,
+    ):
+        mock_anthropic.return_value.messages.create.return_value = fake_message
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=1
+        )
+        runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    usage_calls = [
+        c for c in mock_log_event.call_args_list if c.kwargs.get("event") == "agent_call_usage"
+    ]
+    assert len(usage_calls) == 1
+    kwargs = usage_calls[0].kwargs
+    assert kwargs["input_tokens"] == 1000
+    assert kwargs["output_tokens"] == 500
+    assert kwargs["model"] == "claude-sonnet-5"
+    assert kwargs["estimated_cost_usd"] > 0
+
+
+def test_real_claude_runner_logs_usage_even_when_response_fails_to_parse():
+    """En trasig/kodblocksinlindad respons som ändå genererades av modellen
+    kostade riktiga tokens - den kostnaden ska synas i loggen även om
+    svaret sedan misslyckas parsas/valideras (annars underskattar
+    kostnadsmätningen exakt de spillanrop kostnadsoptimeringen ska
+    upptäcka)."""
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    fake_message = MagicMock()
+    fake_block = MagicMock(type="text", text="not valid json at all {{{")
+    fake_message.content = [fake_block]
+    fake_message.usage = MagicMock(
+        input_tokens=800, output_tokens=200, cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+
+    with (
+        patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic,
+        patch("crypto_trading.agents.runner.log_event") as mock_log_event,
+    ):
+        mock_anthropic.return_value.messages.create.return_value = fake_message
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=1
+        )
+        runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    usage_calls = [
+        c for c in mock_log_event.call_args_list if c.kwargs.get("event") == "agent_call_usage"
+    ]
+    assert len(usage_calls) == 1
+    assert usage_calls[0].kwargs["output_tokens"] == 200
+
+
 def test_real_claude_runner_falls_back_to_failed_status_after_retries_exhausted():
     from anthropic import APIError
 

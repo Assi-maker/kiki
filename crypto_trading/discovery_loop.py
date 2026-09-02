@@ -19,6 +19,7 @@ def run_discovery_tick(
     settings: Settings,
     news_connector: object | None = None,
     external_data_connector: object | None = None,
+    screener_runner: AgentRunner | None = None,
 ) -> list[Position]:
     """En periodisk discovery-tick (SPEC §7, PLAN_CRYPTO_PHASE5.md Task 7):
     bygger en live `MarketSnapshot` (Task 6) och kör den genom exakt samma
@@ -60,6 +61,7 @@ def run_discovery_tick(
             run_id,
             news_connector=news_connector,
             external_data_connector=external_data_connector,
+            screener_runner=screener_runner,
         )
         repo.complete_run(
             run_id, datetime.now(UTC), "ok", [], instruments_scanned=len(snapshot.instruments)
@@ -80,6 +82,7 @@ def run_forever(
     settings: Settings,
     news_connector: object | None = None,
     external_data_connector: object | None = None,
+    screener_runner: AgentRunner | None = None,
 ) -> None:
     while True:
         run_discovery_tick(
@@ -89,5 +92,6 @@ def run_forever(
             settings,
             news_connector=news_connector,
             external_data_connector=external_data_connector,
+            screener_runner=screener_runner,
         )
         time.sleep(settings.pipeline.discovery_interval_minutes * 60)

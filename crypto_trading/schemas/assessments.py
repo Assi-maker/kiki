@@ -63,3 +63,13 @@ class BearAdversarialAssessment(AssessmentBase):
 class QAAssessment(AssessmentBase):
     passed: bool
     violations: list[str]
+
+
+class OpportunityScreenAssessment(AssessmentBase):
+    """Billig förscreening (kostnadsoptimering 2026-09-02) - körs INNAN den
+    fulla 7-rollskedjan, på en separat, billigare modell (t.ex. Haiku 4.5).
+    Avgör aldrig CONFIRMED/NO_TRADE själv - bara vilka kandidater som är
+    värda den dyra fulla analysen. Aldrig en handelsrekommendation."""
+
+    opportunity_score: float
+    reasoning: str

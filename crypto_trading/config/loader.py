@@ -79,6 +79,17 @@ class BudgetLimitsConfig(BaseModel):
     max_ai_calls_per_discovery_run: int = Field(gt=0)
     max_ai_calls_per_day: int = Field(gt=0)
     warning_threshold_pct: Decimal = Field(gt=0, le=1)
+    # Kostnadsoptimering (2026-09-02): billig förscreening (t.ex. Haiku 4.5)
+    # på ett urval av den redan budget-godkända, redan rankade kandidat-
+    # poolen, INNAN den dyra fulla 7-rollskedjan (Sonnet 5). Se
+    # screening/candidate_engine.py::apply_opportunity_screening().
+    # opportunity_screening_enforce=False (default): screeningen körs och
+    # loggas för utvärdering men ändrar INTE vilka kandidater som går
+    # vidare - måste sättas till True manuellt, med verklig evidens, innan
+    # den faktiskt filtrerar bort kandidater.
+    max_candidates_for_ai_prescreen: int = Field(gt=0, default=5)
+    max_candidates_for_full_analysis: int = Field(gt=0, default=2)
+    opportunity_screening_enforce: bool = False
 
 
 class NotifyConfig(BaseModel):

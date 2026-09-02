@@ -3,6 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
+from crypto_trading.agents.loader import AgentDefinition
+from crypto_trading.agents.runner import AgentRunner
+from crypto_trading.logging import log_event
+from crypto_trading.schemas.assessments import OpportunityScreenAssessment
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import (
@@ -161,3 +165,101 @@ def prioritize_and_apply_budget(
             _transition_to_terminal(repo, candidate, "BUDGET_LIMITED", evaluated_at, run_id)
         )
     return within_budget, limited
+
+
+def apply_opportunity_screening(
+    repo: Repository,
+    candidates: list[Candidate],
+    screener_agent_def: AgentDefinition,
+    screener_runner: AgentRunner,
+    max_candidates_for_ai_prescreen: int,
+    max_candidates_for_full_analysis: int,
+    enforce: bool,
+    evaluated_at: datetime,
+    run_id: str,
+) -> list[Candidate]:
+    """Kostnadsoptimering (2026-09-02): billig förscreening på en separat,
+    billigare modell (t.ex. Haiku 4.5 via `screener_runner`), INNAN den dyra
+    fulla 7-rollskedjan. `candidates` är redan `prioritize_and_apply_budget`s
+    `within_budget`-lista (redan rankad candidate_score->likviditet->
+    färskhet) - denna funktion ändrar ALDRIG den rankningen, den lägger bara
+    till ett andra, billigare urvalssteg ovanpå den.
+
+    Bara de `max_candidates_for_ai_prescreen` högst rankade får ett
+    screening-anrop alls - resten ("remainder") kostar noll extra AI-anrop
+    oavsett `enforce`, eftersom de redan rankats lägre av det befintliga
+    gratis steget.
+
+    `enforce=False` (skuggläge): screeningen körs och persisteras för
+    utvärdering, men påverkar INTE vilka kandidater som går vidare - alla
+    `candidates` returneras oförändrat, exakt som innan denna funktion
+    fanns. Ingen befintlig tradinglogik, Gate eller PAPER-exekvering rörs.
+
+    `enforce=True`: bara de `max_candidates_for_full_analysis` högst
+    poängsatta (av dem som faktiskt screenades OK) går vidare; resten -
+    lägre poängsatta screenade kandidater OCH hela remainder-poolen -
+    transitionas till BUDGET_LIMITED (samma terminal-status och princip som
+    `prioritize_and_apply_budget` redan använder för resursbrist, aldrig
+    REJECTED/NO_TRADE, som förutsätter att en faktisk bedömning gjordes).
+
+    Fail-closed: ett screening-anrop som misslyckas (status != "ok") kan
+    ALDRIG befordra en kandidat till full analys - även om alla andra
+    kandidater också ser svaga ut. Ett osäkert billigt anrop öppnar aldrig
+    en dörr; det stänger den bara för just den kandidaten den tick."""
+    prescreen_pool = candidates[:max_candidates_for_ai_prescreen]
+    remainder = candidates[max_candidates_for_ai_prescreen:]
+
+    scored: list[tuple[Candidate, OpportunityScreenAssessment]] = []
+    for candidate in prescreen_pool:
+        context = {
+            "candidate_id": candidate.candidate_id,
+            "instrument": candidate.instrument,
+            "evidence_record": candidate.evidence_record.model_dump(mode="json"),
+            "run_id": run_id,
+        }
+        assessment = screener_runner.run(
+            screener_agent_def, context, OpportunityScreenAssessment
+        )
+        repo.save_assessment(candidate.candidate_id, "opportunity_screen", assessment)
+        log_event(
+            run_id,
+            event="opportunity_screen_completed",
+            candidate_id=candidate.candidate_id,
+            instrument=candidate.instrument,
+            status=assessment.status,
+            opportunity_score=assessment.opportunity_score if assessment.status == "ok" else None,
+            enforce=enforce,
+        )
+        scored.append((candidate, assessment))
+
+    ranked = sorted(
+        scored,
+        key=lambda pair: pair[1].opportunity_score if pair[1].status == "ok" else float("-inf"),
+        reverse=True,
+    )
+
+    if not enforce:
+        log_event(
+            run_id,
+            event="opportunity_screening_shadow_mode",
+            prescreened=len(prescreen_pool),
+            would_select=[
+                c.candidate_id
+                for c, a in ranked[:max_candidates_for_full_analysis]
+                if a.status == "ok"
+            ],
+        )
+        return candidates
+
+    selected_ids = {
+        c.candidate_id
+        for c, a in ranked[:max_candidates_for_full_analysis]
+        if a.status == "ok"
+    }
+    selected = [c for c in prescreen_pool if c.candidate_id in selected_ids]
+    not_selected = [c for c in prescreen_pool if c.candidate_id not in selected_ids] + remainder
+
+    for candidate in not_selected:
+        _transition_to_terminal(repo, candidate, "BUDGET_LIMITED", evaluated_at, run_id)
+
+    return selected

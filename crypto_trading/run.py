@@ -37,6 +37,25 @@ def build_runner_from_env() -> AgentRunner:
     )
 
 
+def build_screener_runner_from_env() -> AgentRunner:
+    """Kostnadsoptimering (2026-09-02): separat, billigare/snabbare
+    RealClaudeRunner för Opportunity Screener-etappen (screening/
+    candidate_engine.py::apply_opportunity_screening) - samma
+    ANTHROPIC_API_KEY (ett Anthropic-konto täcker alla modeller), samma
+    fail-fast-princip som build_runner_from_env() ovan, men en egen
+    modell-env-variabel så screeningens modell kan bytas oberoende av den
+    fulla 7-rollskedjans (CRYPTO_TRADING_CLAUDE_MODEL, orörd)."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ConfigError("ANTHROPIC_API_KEY saknas - kan inte starta med RealClaudeRunner")
+    return RealClaudeRunner(
+        api_key=api_key,
+        model=os.environ.get("CRYPTO_TRADING_SCREENER_MODEL", "claude-haiku-4-5"),
+        timeout_seconds=float(os.environ.get("CRYPTO_TRADING_AGENT_TIMEOUT_SECONDS", "60")),
+        max_retries=int(os.environ.get("CRYPTO_TRADING_AGENT_MAX_RETRIES", "3")),
+    )
+
+
 def build_notifier_from_env() -> TelegramNotifier | None:
     """Fas 6 Beslut 2: Telegram är valfritt, INTE fail-fast som
     ANTHROPIC_API_KEY - systemet fungerar helt utan den (bara notify-tråden
@@ -68,6 +87,7 @@ def _run_discovery_forever(
     settings: Settings,
     news_connector: NewsRSSConnector | None,
     external_data_connector: ExternalDataConnector | None,
+    screener_runner: AgentRunner | None = None,
 ) -> None:
     """Konstruerar sin egen Repository (och därmed sqlite3-anslutning) HÄR,
     inne i den tråd som faktiskt kör discovery-loopen. En sqlite3-anslutning
@@ -85,6 +105,7 @@ def _run_discovery_forever(
         settings,
         news_connector=news_connector,
         external_data_connector=external_data_connector,
+        screener_runner=screener_runner,
     )
 
 
@@ -149,6 +170,7 @@ def _run_dashboard_forever(app: FastAPI, settings: Settings) -> None:
 def main() -> None:
     settings = get_settings()
     runner = build_runner_from_env()
+    screener_runner = build_screener_runner_from_env()
     connector = BingXMarketDataConnector(
         base_url=settings.pipeline.bingx_base_url,
         timeout_seconds=10.0,
@@ -178,7 +200,7 @@ def main() -> None:
 
     discovery_thread = threading.Thread(
         target=_run_discovery_forever,
-        args=(connector, runner, settings, news_connector, external_data_connector),
+        args=(connector, runner, settings, news_connector, external_data_connector, screener_runner),
         daemon=True,
     )
     monitoring_thread = threading.Thread(

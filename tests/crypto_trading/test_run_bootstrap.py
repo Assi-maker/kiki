@@ -9,6 +9,7 @@ from crypto_trading.run import (
     build_dashboard_app_from_env,
     build_notifier_from_env,
     build_runner_from_env,
+    build_screener_runner_from_env,
 )
 
 
@@ -22,6 +23,27 @@ def test_build_runner_from_env_returns_real_claude_runner_when_api_key_present(m
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
     runner = build_runner_from_env()
     assert isinstance(runner, RealClaudeRunner)
+
+
+def test_build_screener_runner_from_env_raises_config_error_when_api_key_missing(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(ConfigError):
+        build_screener_runner_from_env()
+
+
+def test_build_screener_runner_from_env_defaults_to_haiku(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    monkeypatch.delenv("CRYPTO_TRADING_SCREENER_MODEL", raising=False)
+    runner = build_screener_runner_from_env()
+    assert isinstance(runner, RealClaudeRunner)
+    assert runner._model == "claude-haiku-4-5"
+
+
+def test_build_screener_runner_from_env_honors_model_override(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("CRYPTO_TRADING_SCREENER_MODEL", "claude-sonnet-5")
+    runner = build_screener_runner_from_env()
+    assert runner._model == "claude-sonnet-5"
 
 
 def test_build_notifier_from_env_returns_none_when_bot_token_missing(monkeypatch):

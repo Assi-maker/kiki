@@ -385,6 +385,108 @@ def test_run_single_cycle_can_be_called_directly_with_one_snapshot(tmp_path):
     assert positions[0].status == "OPEN_POSITION"
 
 
+def test_run_single_cycle_without_screener_runner_is_unaffected(tmp_path):
+    """Bakåtkompatibilitet: screener_runner=None (default) -> ingen
+    opportunity-screening alls, exakt samma beteende som innan
+    kostnadsoptimeringen lades till (2026-09-02)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    spike_snapshot = _build_snapshots()[1]
+
+    positions = run_single_cycle(spike_snapshot, repo, runner, _settings(), run_id="run-1")
+
+    assert len(positions) == 1
+    candidates = repo.find_candidates_by_status("CONFIRMED")
+    row = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM assessments WHERE field_name = 'opportunity_screen'"
+    ).fetchone()
+    assert row["n"] == 0
+    assert len(candidates) == 1
+
+
+def test_run_single_cycle_shadow_mode_screens_but_does_not_change_outcome(tmp_path):
+    """opportunity_screening_enforce=False (default): screeningen körs och
+    persisteras för utvärdering, men candidaten går fortfarande hela vägen
+    till CONFIRMED/OPEN_POSITION precis som innan - noll beteendeändring."""
+    from crypto_trading.schemas.assessments import OpportunityScreenAssessment
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    screener_runner = MockAgentRunner(
+        fixtures={
+            "crypto-opportunity-screener": OpportunityScreenAssessment(
+                agent_name="crypto-opportunity-screener",
+                run_id="run-1",
+                created_at=_T0,
+                status="ok",
+                opportunity_score=8.0,
+                reasoning="stark signal",
+            )
+        }
+    )
+    spike_snapshot = _build_snapshots()[1]
+
+    positions = run_single_cycle(
+        spike_snapshot, repo, runner, _settings(), run_id="run-1", screener_runner=screener_runner
+    )
+
+    assert len(positions) == 1
+    candidates = repo.find_candidates_by_status("CONFIRMED")
+    assert len(candidates) == 1
+    row = repo._conn.execute(
+        "SELECT payload FROM assessments WHERE field_name = 'opportunity_screen'"
+    ).fetchone()
+    assert row is not None
+    import json
+
+    assert json.loads(row["payload"])["opportunity_score"] == 8.0
+
+
+def test_run_single_cycle_enforce_mode_blocks_full_analysis_when_screen_scores_low(tmp_path):
+    """opportunity_screening_enforce=True + en låg opportunity_score ->
+    kandidaten ska INTE nå full analys/CONFIRMED, utan hamna i
+    BUDGET_LIMITED (Gate/QA/PAPER-öppning rörs aldrig - candidaten blockeras
+    innan den fulla 7-rollskedjan ens startar)."""
+    from crypto_trading.schemas.assessments import OpportunityScreenAssessment
+
+    settings = _settings().model_copy(
+        update={
+            "budget_limits": _settings().budget_limits.model_copy(
+                update={
+                    "opportunity_screening_enforce": True,
+                    "max_candidates_for_ai_prescreen": 5,
+                    "max_candidates_for_full_analysis": 1,
+                }
+            )
+        }
+    )
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    screener_runner = MockAgentRunner(
+        fixtures={
+            "crypto-opportunity-screener": OpportunityScreenAssessment(
+                agent_name="crypto-opportunity-screener",
+                run_id="run-1",
+                created_at=_T0,
+                status="failed",
+                opportunity_score=0.0,
+                reasoning="",
+            )
+        },
+        fail_agents={"crypto-opportunity-screener"},
+    )
+    spike_snapshot = _build_snapshots()[1]
+
+    positions = run_single_cycle(
+        spike_snapshot, repo, runner, settings, run_id="run-1", screener_runner=screener_runner
+    )
+
+    assert positions == []
+    candidates = repo.find_candidates_by_status("BUDGET_LIMITED")
+    assert len(candidates) == 1
+    assert repo.find_candidates_by_status("CONFIRMED") == []
+
+
 def test_replay_is_deterministic_on_repeated_runs(tmp_path):
     """AC1: samma indata -> samma trades, vid upprepad körning mot separata,
     färska repo-instanser."""

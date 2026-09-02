@@ -2,3 +2,10 @@ max_candidates_per_discovery_run: 10
 max_ai_calls_per_discovery_run: 70
 max_ai_calls_per_day: 500
 warning_threshold_pct: "0.8"
+# Kostnadsoptimering (2026-09-02): billig Haiku-4.5-förscreening av de
+# topp max_candidates_for_ai_prescreen budget-godkända kandidaterna;
+# enforce=false = skuggläge (loggar beslut, ändrar inget) tills vi har
+# verklig evidens att flippa till true.
+max_candidates_for_ai_prescreen: 5
+max_candidates_for_full_analysis: 2
+opportunity_screening_enforce: false

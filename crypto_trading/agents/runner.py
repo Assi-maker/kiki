@@ -38,6 +38,22 @@ def _strip_code_fence(text: str) -> str:
     return stripped
 
 
+# Kostnadsoptimering (2026-09-02): grova, hårdkodade $/MTok-priser för
+# INTERN kostnadsloggning (agent_call_usage) - inte en faktureringskälla.
+# Priser ändras över tid; uppdatera denna tabell vid modellbyte eller
+# prisändring hos Anthropic. Okänd modell -> 0.0 (loggar tokens utan att
+# gissa en kostnad, hellre än att tysta fel-uppskatta).
+_MODEL_PRICE_PER_MTOK_USD: dict[str, tuple[float, float]] = {
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-haiku-4-5": (1.00, 5.00),
+}
+
+
+def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    input_price, output_price = _MODEL_PRICE_PER_MTOK_USD.get(model, (0.0, 0.0))
+    return (input_tokens / 1_000_000) * input_price + (output_tokens / 1_000_000) * output_price
+
+
 class AgentRunner(ABC):
     @abstractmethod
     def run(self, agent_def: AgentDefinition, context: dict, output_schema: type[T]) -> T: ...
@@ -105,6 +121,24 @@ class RealClaudeRunner(AgentRunner):
                     system=agent_def.system_prompt,
                     messages=[{"role": "user", "content": user_message}],
                     timeout=timeout_seconds,
+                )
+                usage = message.usage
+                input_tokens = usage.input_tokens
+                output_tokens = usage.output_tokens
+                log_event(
+                    run_id,
+                    event="agent_call_usage",
+                    agent_name=agent_def.name,
+                    model=self._model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+                    cache_creation_input_tokens=(
+                        getattr(usage, "cache_creation_input_tokens", 0) or 0
+                    ),
+                    estimated_cost_usd=_estimate_cost_usd(
+                        self._model, input_tokens, output_tokens
+                    ),
                 )
                 text = "".join(b.text for b in message.content if b.type == "text")
                 data = json.loads(_strip_code_fence(text))

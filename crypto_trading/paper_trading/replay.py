@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
 from crypto_trading.orchestrator import run_discovery_cycle
@@ -13,10 +14,16 @@ from crypto_trading.paper_trading.position_closing import close_triggered_positi
 from crypto_trading.paper_trading.position_opening import open_position_for_candidate
 from crypto_trading.schemas.market import FundingRate, InstrumentMetadata, Kline, Ticker
 from crypto_trading.schemas.trade import Position
-from crypto_trading.screening.candidate_engine import prioritize_and_apply_budget, process_evidence
+from crypto_trading.screening.candidate_engine import (
+    apply_opportunity_screening,
+    prioritize_and_apply_budget,
+    process_evidence,
+)
 from crypto_trading.screening.eligibility_filter import check_eligibility, select_top_n
 from crypto_trading.screening.quant_screener import evaluate_candidate
 from crypto_trading.storage.repository import Repository
+
+_OPPORTUNITY_SCREENER_AGENT_FILE = "crypto-opportunity-screener.md"
 
 
 class MarketSnapshot(BaseModel):
@@ -68,6 +75,7 @@ def run_single_cycle(
     run_id: str,
     news_connector: object | None = None,
     external_data_connector: object | None = None,
+    screener_runner: AgentRunner | None = None,
 ) -> list[Position]:
     """En enda discovery->gate->paper-trading-cykel mot EN snapshot (Fas 5,
     PLAN_CRYPTO_PHASE5.md Task 5/Beslut 1) - faktoriserad ut ur run_replay()
@@ -76,7 +84,14 @@ def run_single_cycle(
     `external_data_connector` (Fas 5.5 Task 3) är valfria passthrough-
     parametrar till run_discovery_cycle - run_replay() skickar aldrig in
     dem, så replay-vägens determinism/look-ahead-bias-garantier är
-    mekaniskt opåverkade."""
+    mekaniskt opåverkade.
+
+    `screener_runner` (kostnadsoptimering 2026-09-02): valfri, separat
+    AgentRunner för den billiga Opportunity Screener-etappen (t.ex. Haiku
+    4.5). `None` (default) = exakt samma beteende som innan denna etapp
+    fanns - varje befintligt anrop utan denna parameter är opåverkat.
+    replay.py:s egen `run_replay()` skickar aldrig in den (samma
+    determinism-skäl som news_connector ovan)."""
     eligible_tickers = _select_eligible_tickers(snapshot, settings)
     top_n_symbols = select_top_n(eligible_tickers, settings.pipeline.top_n)
 
@@ -119,7 +134,7 @@ def run_single_cycle(
             new_candidates.append(candidate)
 
     liquidity_by_instrument = {t.instrument: t.quote_volume for t in eligible_tickers}
-    prioritize_and_apply_budget(
+    within_budget, _over_budget = prioritize_and_apply_budget(
         repo,
         new_candidates,
         liquidity_by_instrument,
@@ -127,6 +142,20 @@ def run_single_cycle(
         snapshot.simulated_now,
         run_id,
     )
+
+    if screener_runner is not None:
+        screener_agent_def = load_agent_definition(_OPPORTUNITY_SCREENER_AGENT_FILE)
+        apply_opportunity_screening(
+            repo,
+            within_budget,
+            screener_agent_def,
+            screener_runner,
+            settings.budget_limits.max_candidates_for_ai_prescreen,
+            settings.budget_limits.max_candidates_for_full_analysis,
+            settings.budget_limits.opportunity_screening_enforce,
+            snapshot.simulated_now,
+            run_id,
+        )
 
     processed = run_discovery_cycle(
         repo,
