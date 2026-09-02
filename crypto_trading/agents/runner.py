@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from typing import TypeVar
@@ -12,6 +13,29 @@ from crypto_trading.logging import log_event
 from crypto_trading.schemas.assessments import AssessmentBase
 
 T = TypeVar("T", bound=AssessmentBase)
+
+# Modellen svarar ibland (icke-deterministiskt - samma prompt kan ge både
+# rå JSON och kodblocksinlindad JSON från anrop till anrop, verifierat
+# empiriskt: se root-cause-analysen för bear_adversarial-buggen) med JSON
+# inlindat i ett markdown-kodblock (```json ... ``` eller ``` ... ```)
+# trots instruktionen att svara ENDAST med JSON. json.loads() förstår inte
+# kodblocksmarkörerna och kastar JSONDecodeError på hela svaret, vilket
+# tömmer retry-budgeten och ger status="failed" (fail-closed, se
+# _failed_assessment) även när modellen faktiskt producerade ett giltigt
+# JSON-svar. Ankrad helhetsmatchning (^...$) - stryper ENDAST ett svar som
+# är exakt ett kodblock, aldrig en delsträngsextraktion ur fritext - så att
+# valideringen inte försvagas: allt som inte är antingen ren JSON eller
+# exakt ett JSON-kodblock faller fortfarande igenom till json.loads() och
+# misslyckas som tidigare.
+_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?```$", re.DOTALL)
+
+
+def _strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    match = _CODE_FENCE_RE.match(stripped)
+    if match:
+        return match.group(1).strip()
+    return stripped
 
 
 class AgentRunner(ABC):
@@ -67,7 +91,9 @@ class RealClaudeRunner(AgentRunner):
             "kan fylla i fälten på ett rimligt sätt, status=failed bara om "
             "kontexten konkret saknar det du behöver.\n\n"
             f"Context (JSON): {json.dumps(context, default=str)}\n\n"
-            f"Svara ENDAST med giltig JSON som matchar detta schema:\n{json.dumps(schema)}"
+            f"Svara ENDAST med giltig JSON som matchar detta schema:\n{json.dumps(schema)}\n\n"
+            "Svara med ren JSON direkt - inget markdown-kodblock (```), ingen "
+            "förklarande text före eller efter."
         )
         run_id = context.get("run_id", "unknown")
         timeout_seconds = self._timeout_overrides.get(agent_def.name, self._timeout_seconds)
@@ -81,7 +107,7 @@ class RealClaudeRunner(AgentRunner):
                     timeout=timeout_seconds,
                 )
                 text = "".join(b.text for b in message.content if b.type == "text")
-                data = json.loads(text)
+                data = json.loads(_strip_code_fence(text))
                 if not isinstance(data, dict):
                     raise ValueError("model response was not a JSON object")
                 data.setdefault("agent_name", agent_def.name)

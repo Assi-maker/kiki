@@ -91,3 +91,106 @@ def test_real_claude_runner_falls_back_to_failed_status_after_retries_exhausted(
 
     assert result.status == "failed"
     assert result.agent_name == "crypto-risk-agent"
+
+
+def _fake_message_with_text(text: str) -> MagicMock:
+    fake_message = MagicMock()
+    fake_message.content = [MagicMock(type="text", text=text)]
+    return fake_message
+
+
+_VALID_JSON_BODY = (
+    '{"run_id": "run-1", "downside": "d", "liquidity_risk": "l", '
+    '"model_risk": "m", "timing_risk": "t", "suggested_stop_loss": "1", '
+    '"suggested_target": "2"}'
+)
+
+
+def test_real_claude_runner_parses_response_wrapped_in_json_code_fence():
+    """Reproducerar root cause för bear_adversarial-buggen: modellen
+    svarar ibland (icke-deterministiskt, verifierat mot riktiga API-svar)
+    med giltig JSON inlindad i ett ```json ... ```-kodblock trots
+    instruktionen att svara med ren JSON. Innan fixen kastade json.loads()
+    JSONDecodeError på HELA svaret här, tömde retry-budgeten och gav
+    status="failed" trots att modellen levererade ett giltigt svar."""
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = _fake_message_with_text(
+            f"```json\n{_VALID_JSON_BODY}\n```"
+        )
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=1
+        )
+        result = runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    assert result.status == "ok"
+    assert result.downside == "d"
+
+
+def test_real_claude_runner_parses_response_wrapped_in_plain_code_fence():
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = _fake_message_with_text(
+            f"```\n{_VALID_JSON_BODY}\n```"
+        )
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=1
+        )
+        result = runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    assert result.status == "ok"
+    assert result.downside == "d"
+
+
+def test_real_claude_runner_fails_closed_on_empty_response():
+    """Ett tomt svar (t.ex. content-blocket saknar text) ska - precis som
+    innan fixen - tömma retry-budgeten och ge status="failed", ALDRIG
+    godkännas som ok. Kodblocksstrippningen får inte försvaga detta."""
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = _fake_message_with_text("")
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=2
+        )
+        result = runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    assert result.status == "failed"
+
+
+def test_real_claude_runner_fails_closed_on_invalid_json():
+    """Trasig/ogiltig JSON (t.ex. modellen klipper mitt i svaret) ska
+    fortfarande falla igenom till status="failed" efter uttömda försök -
+    fail-closed även efter att kodblocksstrippningen lagts till."""
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = _fake_message_with_text(
+            '{"run_id": "run-1", "downside": "d", '
+        )
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=2
+        )
+        result = runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    assert result.status == "failed"
+
+
+def test_real_claude_runner_does_not_extract_json_from_surrounding_prose():
+    """Valideringen får inte försvagas till en fritextsökning efter JSON -
+    om svaret inte ÄR (eventuellt kodblocksinlindad) ren JSON ska det
+    fortsatt misslyckas, aldrig plockas ut ur omgivande text."""
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = _fake_message_with_text(
+            f"Här är svaret:\n{_VALID_JSON_BODY}\nHoppas det hjälper!"
+        )
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=1
+        )
+        result = runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    assert result.status == "failed"
