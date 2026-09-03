@@ -84,6 +84,7 @@ class Repository(Protocol):
     ) -> None: ...
     def record_ai_call_event(self, event: Event) -> None: ...
     def count_ai_calls_since(self, cutoff: datetime) -> int: ...
+    def sum_ai_cost_since(self, cutoff: datetime) -> Decimal: ...
     def save_forecast_record(self, record: ForecastRecord) -> None: ...
     def get_forecast_record(self, candidate_id: str) -> ForecastRecord | None: ...
     def record_telegram_event(
@@ -471,6 +472,25 @@ class SQLiteRepository:
             (cutoff.isoformat(),),
         ).fetchone()
         return row["n"]
+
+    def sum_ai_cost_since(self, cutoff: datetime) -> Decimal:
+        """Kostnadsbudget (2026-09-03): samma Python-sidans Decimal-säkra
+        aggregeringsmönster som sum_open_positions_notional() - undviker
+        SQLite/float-precisionsproblem för pengar, och kräver ingen
+        JSON1-SQL-funktion. Bara AI_CALL_MADE-rader existerar överhuvudtaget
+        för anrop som faktiskt nådde modellen (Orchestrator skriver aldrig
+        en sådan rad för ett anrop som aldrig fakturerades - se
+        orchestrator.py::process_candidate()), så alla rader denna metod
+        ser är redan giltiga att summera."""
+        rows = self._conn.execute(
+            "SELECT payload FROM events WHERE event_type = 'AI_CALL_MADE' "
+            "AND occurred_at >= ?",
+            (cutoff.isoformat(),),
+        ).fetchall()
+        return sum(
+            (Decimal(json.loads(row["payload"]).get("cost_usd", "0")) for row in rows),
+            Decimal("0"),
+        )
 
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None:
         self._conn.execute(

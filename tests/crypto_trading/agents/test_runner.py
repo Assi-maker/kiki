@@ -63,6 +63,10 @@ def test_real_claude_runner_parses_valid_json_response():
         ),
     )
     fake_message.content = [fake_block]
+    fake_message.usage = MagicMock(
+        input_tokens=100, output_tokens=50, cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
 
     with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
         mock_anthropic.return_value.messages.create.return_value = fake_message
@@ -168,9 +172,96 @@ def test_real_claude_runner_falls_back_to_failed_status_after_retries_exhausted(
     assert result.agent_name == "crypto-risk-agent"
 
 
+def test_real_claude_runner_marks_call_billed_with_real_cost_on_success():
+    """Kostnadsbudget (2026-09-03, krav 2/3): ett lyckat anrop som faktiskt
+    genererade tokens ska rapporteras som fakturerat, med en verklig
+    kostnad > 0 - detta är signalen Orchestrator använder för att avgöra om
+    anropet ska räknas mot dagens call-/dollarbudget."""
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    fake_message = MagicMock()
+    fake_message.content = [MagicMock(type="text", text=_VALID_JSON_BODY)]
+    fake_message.usage = MagicMock(
+        input_tokens=1000, output_tokens=500, cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = fake_message
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=1
+        )
+        runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    assert runner.last_call_billed is True
+    assert runner.last_call_cost_usd > 0
+
+
+def test_real_claude_runner_marks_call_unbilled_with_zero_cost_on_credit_exhaustion():
+    """Root-cause-fix (2026-09-03): ett HTTP 400 credit-exhaustion-fel (eller
+    annat fel INNAN modellen genererade tokens) fakturerade aldrig något
+    hos Anthropic - ett sådant anrop ska rapporteras som ofakturerat med
+    kostnad $0, så Orchestrator inte förbrukar dagens call-/dollarbudget på
+    anrop som aldrig nådde modellen."""
+    from anthropic import APIError
+
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.side_effect = APIError(
+            "credit balance too low", request=MagicMock(), body=None
+        )
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=2
+        )
+        runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    assert runner.last_call_billed is False
+    assert runner.last_call_cost_usd == 0
+
+
+def test_real_claude_runner_marks_call_billed_even_when_response_fails_to_parse():
+    """Ett anrop som fick ett riktigt (om än oparsbart) svar från modellen
+    KOSTADE riktiga tokens - till skillnad från ett anrop som aldrig nådde
+    modellen. last_call_billed måste skilja mellan dessa två fall."""
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    fake_message = MagicMock()
+    fake_message.content = [MagicMock(type="text", text="not valid json at all {{{")]
+    fake_message.usage = MagicMock(
+        input_tokens=800, output_tokens=200, cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.return_value = fake_message
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=1
+        )
+        runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    assert runner.last_call_billed is True
+    assert runner.last_call_cost_usd > 0
+
+
+def test_mock_runner_defaults_to_billed_true_with_zero_cost():
+    """Bakåtkompatibilitet: MockAgentRunner (använd i alla befintliga
+    orchestrator-/discovery-tester) ska defaulta till last_call_billed=True
+    så att existerande call-räkningstester förblir oförändrade."""
+    runner = MockAgentRunner(fixtures={"crypto-risk-agent": _risk_assessment()})
+    runner.run(_agent_def(), context={}, output_schema=RiskAssessment)
+
+    assert runner.last_call_billed is True
+    assert runner.last_call_cost_usd == 0
+
+
 def _fake_message_with_text(text: str) -> MagicMock:
     fake_message = MagicMock()
     fake_message.content = [MagicMock(type="text", text=text)]
+    fake_message.usage = MagicMock(
+        input_tokens=100, output_tokens=50, cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
     return fake_message
 
 

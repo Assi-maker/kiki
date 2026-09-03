@@ -4,6 +4,7 @@ import json
 import re
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import TypeVar
 
 from anthropic import Anthropic, APIError
@@ -55,6 +56,19 @@ def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> flo
 
 
 class AgentRunner(ABC):
+    # Kostnadsbudget (2026-09-03, root cause: ett anrop som aldrig nådde
+    # modellen - t.ex. HTTP 400 credit exhaustion - förbrukade ändå dagens
+    # AI-anropstak/kostnadsbudget, eftersom Orchestrator tidigare räknade
+    # varje run()-anrop lika oavsett utfall. Dessa två attribut är den enda
+    # sanningskällan för "kostade detta anrop riktiga pengar" - Orchestrator
+    # läser dem via getattr(..., default=True/Decimal("0")) direkt efter
+    # run() returnerar, så en runner som inte sätter dem (som
+    # MockAgentRunner) räknas som fakturerad med $0 kostnad - identiskt med
+    # beteendet innan denna ändring, för att inte påverka någon av de
+    # befintliga Mock-baserade testerna.
+    last_call_billed: bool = True
+    last_call_cost_usd: Decimal = Decimal("0")
+
     @abstractmethod
     def run(self, agent_def: AgentDefinition, context: dict, output_schema: type[T]) -> T: ...
 
@@ -113,6 +127,15 @@ class RealClaudeRunner(AgentRunner):
         )
         run_id = context.get("run_id", "unknown")
         timeout_seconds = self._timeout_overrides.get(agent_def.name, self._timeout_seconds)
+        # Kostnadsbudget (2026-09-03): ackumuleras över SAMTLIGA försök inom
+        # detta run()-anrop, inte bara det sista - ett försök kan nå
+        # modellen (och alltså kosta riktiga pengar) och ändå räknas som
+        # misslyckat här om svaret sedan inte går att parsa/validera (se
+        # testet .._marks_call_billed_even_when_response_fails_to_parse).
+        # Ekonomiskt har Anthropic då redan fakturerat det försöket oavsett
+        # vad vår klientkod gör med svaret efteråt.
+        billed_this_call = False
+        cost_this_call = Decimal("0")
         for attempt in range(self._max_retries):
             try:
                 message = self._client.messages.create(
@@ -125,6 +148,9 @@ class RealClaudeRunner(AgentRunner):
                 usage = message.usage
                 input_tokens = usage.input_tokens
                 output_tokens = usage.output_tokens
+                estimated_cost = _estimate_cost_usd(self._model, input_tokens, output_tokens)
+                billed_this_call = True
+                cost_this_call += Decimal(str(estimated_cost))
                 log_event(
                     run_id,
                     event="agent_call_usage",
@@ -136,9 +162,7 @@ class RealClaudeRunner(AgentRunner):
                     cache_creation_input_tokens=(
                         getattr(usage, "cache_creation_input_tokens", 0) or 0
                     ),
-                    estimated_cost_usd=_estimate_cost_usd(
-                        self._model, input_tokens, output_tokens
-                    ),
+                    estimated_cost_usd=estimated_cost,
                 )
                 text = "".join(b.text for b in message.content if b.type == "text")
                 data = json.loads(_strip_code_fence(text))
@@ -147,6 +171,8 @@ class RealClaudeRunner(AgentRunner):
                 data.setdefault("agent_name", agent_def.name)
                 data.setdefault("status", "ok")
                 data.setdefault("created_at", datetime.now(UTC).isoformat())
+                self.last_call_billed = billed_this_call
+                self.last_call_cost_usd = cost_this_call
                 return output_schema.model_validate(data)
             except (json.JSONDecodeError, ValueError, TypeError, APIError) as exc:
                 # SPEC §10: every retry failure must leave a diagnostic trace —
@@ -165,6 +191,8 @@ class RealClaudeRunner(AgentRunner):
                 )
                 continue
 
+        self.last_call_billed = billed_this_call
+        self.last_call_cost_usd = cost_this_call
         return self._failed_assessment(agent_def, output_schema, run_id)
 
     def _failed_assessment(

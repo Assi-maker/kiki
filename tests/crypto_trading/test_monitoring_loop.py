@@ -96,6 +96,39 @@ def test_run_monitoring_tick_closes_a_triggered_position(tmp_path):
     assert closed[0].exit_reason == "stop_loss"
 
 
+def test_run_monitoring_tick_continues_when_daily_ai_budget_is_exhausted(tmp_path):
+    """Krav 4 (budget enforcement): monitoring_loop tar ingen AgentRunner/
+    Settings.budget_limits-parameter alls - denna test bevisar att en helt
+    uttömd daglig AI-budget (både anropstak och dollartak) inte påverkar
+    övervakningen av redan öppna PAPER-positioner, exakt som kravet säger."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    for i in range(500):
+        repo.record_ai_call_event(
+            Event(
+                event_id=f"AI_CALL_MADE:exhaust:{i}",
+                event_type="AI_CALL_MADE",
+                aggregate_type="candidate",
+                aggregate_id="exhaust",
+                occurred_at=datetime.now(UTC),
+                run_id="run-0",
+                schema_version=1,
+                payload={"role": "risk", "status": "ok", "cost_usd": "10.00"},
+            )
+        )
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    closed = run_monitoring_tick(connector, repo, _settings())
+
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "stop_loss"
+
+
 def test_run_monitoring_tick_skips_instrument_on_connector_failure_without_crashing(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))

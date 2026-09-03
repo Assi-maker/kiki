@@ -2,6 +2,11 @@ max_candidates_per_discovery_run: 10
 max_ai_calls_per_discovery_run: 70
 max_ai_calls_per_day: 500
 warning_threshold_pct: "0.8"
+# Kostnadsbudget (2026-09-03): hård dollar-gräns, UTC-dygn, oberoende av
+# max_ai_calls_per_day ovan (se config/loader.py::BudgetLimitsConfig för
+# den fulla motiveringen). Ändra inte utan att uppdatera analysen daterad
+# 2026-09-03.
+max_daily_ai_cost_usd: "10.00"
 # Kostnadsoptimering (2026-09-02): billig Haiku-4.5-förscreening av de
 # topp max_candidates_for_ai_prescreen budget-godkända kandidaterna;
 # enforce=false = skuggläge (loggar beslut, ändrar inget) tills vi har

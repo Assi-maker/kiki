@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.roles import ROLE_MAP
@@ -26,6 +27,22 @@ _ROLE_ORDER = (
     "bear_adversarial",
     "qa",
 )
+
+# Kostnadsbudget (2026-09-03): konservativ worst-case-uppskattning av vad EN
+# kandidats fulla 7-rollskedja skulle kunna kosta, använd i
+# run_discovery_cycle() för att aldrig medvetet starta en rollskedja som
+# riskerar att spränga max_daily_ai_cost_usd. Beräknad från systemets egna,
+# redan satta gränser - inte en gissning: RealClaudeRunner.run() begär
+# max_tokens=16000 per anrop, och den dyraste konfigurerade modellen
+# (claude-sonnet-5) kostar $10/MTok output + $2/MTok input (agents/
+# runner.py::_MODEL_PRICE_PER_MTOK_USD). Med en generös övre gräns på 20 000
+# inputtokens (verkligt observerat max 2026-09-03 var ~9 600) blir
+# värsta-fall-kostnaden per anrop (20000/1e6)*2 + (16000/1e6)*10 = $0.20.
+# Verklig observerad kostnad per fullanalyserad kandidat 2026-09-03 låg på
+# $0.13-0.14 - denna konstant är medvetet ~10x högre för att vara ett äkta
+# säkerhetsnät, inte en gissning på snittkostnad.
+_WORST_CASE_COST_PER_CALL_USD = Decimal("0.20")
+_CONSERVATIVE_COST_PER_CANDIDATE_USD = _WORST_CASE_COST_PER_CALL_USD * len(_ROLE_ORDER)
 
 
 class Orchestrator:
@@ -68,19 +85,39 @@ class Orchestrator:
             else:
                 context = self._build_context(candidate, role, run_id)
                 assessment = self._runner.run(agent_def, context, spec.assessment_type)
-            ai_calls += 1
-            self._repo.record_ai_call_event(
-                Event(
-                    event_id=f"AI_CALL_MADE:{candidate.candidate_id}:{role}:{run_id}",
-                    event_type="AI_CALL_MADE",
-                    aggregate_type="candidate",
-                    aggregate_id=candidate.candidate_id,
-                    occurred_at=datetime.now(UTC),
-                    run_id=run_id,
-                    schema_version=1,
-                    payload={"role": role, "status": assessment.status},
+            # Root-cause-fix (2026-09-03): ett anrop som ALDRIG nådde modellen
+            # (t.ex. HTTP 400 credit exhaustion, auth-/config-fel, en timeout
+            # innan svar) fakturerade aldrig något hos Anthropic, men räknades
+            # tidigare ändå ovillkorligen som 1 AI-anrop här - observerat live
+            # 2026-09-03: 497/500 av dagens anropstak förbrukades på
+            # retry-misslyckanden under ett kreditstopp, utan en enda verklig
+            # analys. `last_call_billed`/`last_call_cost_usd` (agents/
+            # runner.py::AgentRunner) är den enda sanningskällan - default
+            # True/$0 för runners som inte sätter dem (MockAgentRunner) håller
+            # alla befintliga Mock-baserade tester oförändrade. Ett
+            # ofakturerat anrop loggas fortfarande som fel för diagnostik via
+            # RealClaudeRunner.run()s egen agent_retry_failed-loggning
+            # (oförändrad) - det får bara inte förbruka dagens budget.
+            billed = getattr(self._runner, "last_call_billed", True)
+            cost_usd = getattr(self._runner, "last_call_cost_usd", Decimal("0"))
+            if billed:
+                ai_calls += 1
+                self._repo.record_ai_call_event(
+                    Event(
+                        event_id=f"AI_CALL_MADE:{candidate.candidate_id}:{role}:{run_id}",
+                        event_type="AI_CALL_MADE",
+                        aggregate_type="candidate",
+                        aggregate_id=candidate.candidate_id,
+                        occurred_at=datetime.now(UTC),
+                        run_id=run_id,
+                        schema_version=1,
+                        payload={
+                            "role": role,
+                            "status": assessment.status,
+                            "cost_usd": str(cost_usd),
+                        },
+                    )
                 )
-            )
             setattr(candidate, role, assessment)
             self._repo.save_assessment(candidate.candidate_id, role, assessment)
             if role == "forecast" and assessment.status == "ok":
@@ -209,6 +246,7 @@ def run_discovery_cycle(
         external_data_connector=external_data_connector,
     )
     daily_cap = settings.budget_limits.max_ai_calls_per_day
+    daily_cost_cap = settings.budget_limits.max_daily_ai_cost_usd
     day_start = _utc_day_start(datetime.now(UTC))
     planned_calls_for_candidate = min(
         len(_ROLE_ORDER), settings.budget_limits.max_ai_calls_per_discovery_run
@@ -233,9 +271,22 @@ def run_discovery_cycle(
 
     results: list[Candidate] = []
     for candidate in to_analyze:
-        if repo.count_ai_calls_since(day_start) + planned_calls_for_candidate > daily_cap:
+        calls_would_exceed = (
+            repo.count_ai_calls_since(day_start) + planned_calls_for_candidate > daily_cap
+        )
+        # Kostnadsbudget (2026-09-03): oberoende, dollar-baserad andra hälft av
+        # samma budget-gate - se _CONSERVATIVE_COST_PER_CANDIDATE_USD ovan för
+        # varför en konservativ uppskattning används istället för verklig
+        # snittkostnad (skulle annars kunna starta en rollskedja som spränger
+        # taket mitt i sig själv).
+        cost_would_exceed = (
+            repo.sum_ai_cost_since(day_start) + _CONSERVATIVE_COST_PER_CANDIDATE_USD
+            > daily_cost_cap
+        )
+        if calls_would_exceed or cost_would_exceed:
             if candidate.status == "CANDIDATE":
-                results.append(_send_to_budget_limited(repo, candidate, run_id))
+                reason = "daily_ai_cost_cap" if cost_would_exceed else "daily_ai_call_cap"
+                results.append(_send_to_budget_limited(repo, candidate, run_id, reason))
             else:
                 log_event(
                     run_id,
@@ -293,11 +344,13 @@ def _build_forecast_record(
     )
 
 
-def _send_to_budget_limited(repo: Repository, candidate: Candidate, run_id: str) -> Candidate:
+def _send_to_budget_limited(
+    repo: Repository, candidate: Candidate, run_id: str, reason: str = "daily_ai_call_cap"
+) -> Candidate:
     now = datetime.now(UTC)
-    allowed, reason = can_transition(candidate.status, "BUDGET_LIMITED")
+    allowed, transition_reason = can_transition(candidate.status, "BUDGET_LIMITED")
     if not allowed:
-        raise AssertionError(f"illegal transition attempted: {reason}")
+        raise AssertionError(f"illegal transition attempted: {transition_reason}")
     event = Event(
         event_id=f"CANDIDATE_TRANSITIONED:{candidate.candidate_id}:BUDGET_LIMITED",
         event_type="CANDIDATE_TRANSITIONED",
@@ -306,7 +359,7 @@ def _send_to_budget_limited(repo: Repository, candidate: Candidate, run_id: str)
         occurred_at=now,
         run_id=run_id,
         schema_version=1,
-        payload={"from": candidate.status, "to": "BUDGET_LIMITED", "reason": "daily_ai_call_cap"},
+        payload={"from": candidate.status, "to": "BUDGET_LIMITED", "reason": reason},
     )
     repo.transition_candidate_with_event(candidate.candidate_id, "BUDGET_LIMITED", now, event)
     return candidate.model_copy(update={"status": "BUDGET_LIMITED", "updated_at": now})

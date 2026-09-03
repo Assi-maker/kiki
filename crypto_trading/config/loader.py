@@ -79,6 +79,16 @@ class BudgetLimitsConfig(BaseModel):
     max_ai_calls_per_discovery_run: int = Field(gt=0)
     max_ai_calls_per_day: int = Field(gt=0)
     warning_threshold_pct: Decimal = Field(gt=0, le=1)
+    # Kostnadsbudget (2026-09-03): hård dollar-baserad daglig gräns, oberoende
+    # av max_ai_calls_per_day (som räknar ANROP, inte $ - ett prishopp eller
+    # kontexttillväxt per anrop skulle annars inte fångas). UTC-dygn som
+    # budgetperiod, exakt samma _utc_day_start()-mönster som
+    # max_ai_calls_per_day redan använder i orchestrator.py. $10.00/dag
+    # rekommenderat 2026-09-03 utifrån verklig observerad kostnad (~$1/cykel
+    # med 7-10 fullanalyserade kandidater, 500-anropstaket implicerar redan
+    # ett tak på ~$9.30/dag i dagens prismix) - se conversation/incident-
+    # anteckningar samma datum för den fulla analysen.
+    max_daily_ai_cost_usd: Decimal = Field(gt=0, default=Decimal("10.00"))
     # Kostnadsoptimering (2026-09-02): billig förscreening (t.ex. Haiku 4.5)
     # på ett urval av den redan budget-godkända, redan rankade kandidat-
     # poolen, INNAN den dyra fulla 7-rollskedjan (Sonnet 5). Se

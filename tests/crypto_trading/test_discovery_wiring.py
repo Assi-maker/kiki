@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from crypto_trading.agents.runner import MockAgentRunner
 from crypto_trading.orchestrator import run_discovery_cycle
@@ -214,6 +215,86 @@ def test_daily_ai_call_cap_is_respected_across_two_separate_discovery_cycles(tmp
     statuses = {repo.get_candidate("c-1").status, repo.get_candidate("c-2").status}
     assert "BUDGET_LIMITED" in statuses
     assert "CONFIRMED" in statuses or "NO_TRADE" in statuses or "REJECTED" in statuses
+
+
+def test_daily_ai_cost_cap_allows_analysis_when_well_under_budget(tmp_path):
+    """Krav 3/4: en generös dollarbudget ska inte blockera normal analys."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    settings = _settings(max_daily_ai_cost_usd=Decimal("10.00"))
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
+
+    results = run_discovery_cycle(
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+    )
+
+    assert results[0].status == "CONFIRMED"
+
+
+def test_daily_ai_cost_cap_sends_candidate_to_budget_limited_not_rejected(tmp_path):
+    """Krav 4: en redan uppnådd dollarbudget ska ge BUDGET_LIMITED, aldrig
+    REJECTED/NO_TRADE, exakt som det befintliga anropstaket."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    settings = _settings(max_daily_ai_cost_usd=Decimal("0.01"))  # räcker inte till en enda roll
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
+
+    results = run_discovery_cycle(
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "BUDGET_LIMITED"
+    assert results[0].risk is None
+    assert repo.get_candidate("c-1").status == "BUDGET_LIMITED"
+
+
+def test_daily_ai_cost_cap_uses_conservative_projected_cost_not_actual_spend(tmp_path):
+    """Krav 4 (konservativ projected cost): även om dagens FAKTISKA
+    förbrukning ($9.00) fortfarande lämnar utrymme kvar under taket ($10),
+    ska en konservativ per-kandidat-uppskattning (medvetet större än
+    verklig snittkostnad, se orchestrator.py::_CONSERVATIVE_COST_PER_CANDIDATE_USD)
+    hindra en ny kandidat från att starta om den riskerar att spränga taket -
+    aldrig en girig "just precis får plats"-bedömning mot verklig kostnad."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    settings = _settings(max_daily_ai_cost_usd=Decimal("10.00"))
+    repo.record_ai_call_event(
+        Event(
+            event_id="AI_CALL_MADE:other-candidate:risk:run-0",
+            event_type="AI_CALL_MADE",
+            aggregate_type="candidate",
+            aggregate_id="other-candidate",
+            occurred_at=datetime.now(UTC),  # dagens verkliga budgetfönster, inte fixturens _NOW
+            run_id="run-0",
+            schema_version=1,
+            payload={"role": "risk", "status": "ok", "cost_usd": "9.00"},
+        )
+    )
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
+
+    results = run_discovery_cycle(
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+    )
+
+    assert results[0].status == "BUDGET_LIMITED"
+
+
+def test_daily_ai_call_cap_still_applies_to_billed_successful_calls(tmp_path):
+    """Krav 7 (regression): den ursprungliga 500-anropsgränsen (nu korrekt
+    scopead till bara fakturerade anrop, se orchestrator.py::process_candidate)
+    ska fortfarande fungera precis som förut för en runner vars anrop alla
+    faktiskt fakturerades (MockAgentRunner defaultar till last_call_billed=
+    True, se agents/runner.py::AgentRunner)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    settings = _settings(max_ai_calls_per_day=7)  # exakt en candidates fulla analys
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-2")
+
+    run_discovery_cycle(
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+    )
+
+    statuses = {repo.get_candidate("c-1").status, repo.get_candidate("c-2").status}
+    assert "BUDGET_LIMITED" in statuses
+    assert repo.count_ai_calls_since(_NOW) == 7  # taket höll exakt vid en kandidats hela kedja
 
 
 def test_run_discovery_cycle_forwards_news_connector_to_orchestrator(tmp_path):

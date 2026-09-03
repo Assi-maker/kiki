@@ -37,7 +37,9 @@ _NOW = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
 
 
 def _settings(
-    max_ai_calls_per_discovery_run: int = 70, max_ai_calls_per_day: int = 500
+    max_ai_calls_per_discovery_run: int = 70,
+    max_ai_calls_per_day: int = 500,
+    max_daily_ai_cost_usd: Decimal = Decimal("10.00"),
 ) -> Settings:
     return Settings(
         db_path="unused",
@@ -95,6 +97,7 @@ def _settings(
             max_ai_calls_per_discovery_run=max_ai_calls_per_discovery_run,
             max_ai_calls_per_day=max_ai_calls_per_day,
             warning_threshold_pct=Decimal("0.8"),
+            max_daily_ai_cost_usd=max_daily_ai_cost_usd,
         ),
         notify=NotifyConfig(notification_level="important", notify_interval_seconds=60),
         dashboard=DashboardConfig(host="127.0.0.1", port=8000),
@@ -507,6 +510,55 @@ def test_process_candidate_does_not_persist_forecast_record_when_forecast_role_f
     orch.process_candidate(candidate, run_id="run-1")
 
     assert repo.get_forecast_record(candidate.candidate_id) is None
+
+
+class _UnbilledRunner(MockAgentRunner):
+    """Simulerar RealClaudeRunner efter uttömda retries mot en credit-
+    exhaustion-liknande fel: aldrig fakturerad, $0 kostnad - oavsett
+    fixture-status (2026-09-03 root-cause-fix)."""
+
+    def __init__(self, fixtures):
+        super().__init__(fixtures)
+        self.last_call_billed = False
+        self.last_call_cost_usd = Decimal("0")
+
+
+def test_process_candidate_does_not_record_ai_call_event_when_runner_reports_unbilled(tmp_path):
+    """Root-cause-fix (2026-09-03): ett anrop som aldrig nådde modellen (t.ex.
+    HTTP 400 credit exhaustion) fick tidigare ändå ett AI_CALL_MADE-event
+    per roll, vilket tömde hela dagens 500-anropstak på misslyckade försök
+    utan någon verklig analys (observerat live: 497/500 förbrukat på
+    retry-fel under ett kreditstopp). Ett runner-anrop som rapporterar
+    last_call_billed=False ska INTE räknas mot dagens budget."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    runner = _UnbilledRunner(fixtures=_happy_fixtures())
+
+    orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    assert repo.count_ai_calls_since(_NOW) == 0
+
+
+def test_process_candidate_persists_zero_cost_ai_call_event_when_billed(tmp_path):
+    """Krav 3: faktisk kostnad från ett lyckat anrop ska persisteras i DB:n
+    (inte bara i loggfilen), läsbar via sum_ai_cost_since()."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+
+    class _BilledRunner(MockAgentRunner):
+        def __init__(self, fixtures):
+            super().__init__(fixtures)
+            self.last_call_billed = True
+            self.last_call_cost_usd = Decimal("0.05")
+
+    runner = _BilledRunner(fixtures=_happy_fixtures())
+
+    orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1")
+
+    assert repo.count_ai_calls_since(_NOW) == 7
+    assert repo.sum_ai_cost_since(_NOW) == Decimal("0.35")  # 7 roller * $0.05
 
 
 def test_process_candidate_stops_role_loop_at_ai_call_budget(tmp_path):
