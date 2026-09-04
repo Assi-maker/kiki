@@ -63,6 +63,28 @@ class Repository(Protocol):
     def create_position_with_event(self, position: Position, event: Event) -> bool: ...
     def get_position(self, position_id: str) -> Position | None: ...
     def find_open_positions(self) -> list[Position]: ...
+    def claim_demo_execution(self, position_id: str, claimed_at: datetime) -> bool: ...
+    def get_demo_execution(self, position_id: str) -> dict | None: ...
+    def find_positions_pending_demo_execution(self, limit: int) -> list[Position]: ...
+    def find_active_demo_executions(self) -> list[dict]: ...
+    def find_stale_claimed_demo_executions(self, older_than: datetime) -> list[dict]: ...
+    def update_demo_execution_submitted(
+        self,
+        position_id: str,
+        entry_client_order_id: str,
+        entry_exchange_order_id: str,
+        entry_quantity: str,
+        exchange_fill_entry: str,
+        sl_exchange_order_id: str | None,
+        tp_exchange_order_id: str | None,
+        updated_at: datetime,
+    ) -> None: ...
+    def close_demo_execution(
+        self, position_id: str, exit_reason: str, exchange_fill_exit: str, closed_at: datetime
+    ) -> None: ...
+    def mark_demo_execution_failed(
+        self, position_id: str, last_error: str, updated_at: datetime
+    ) -> None: ...
     def close_position_with_event(
         self,
         position_id: str,
@@ -394,6 +416,97 @@ class SQLiteRepository:
             "SELECT * FROM positions WHERE status = 'OPEN_POSITION'"
         ).fetchall()
         return [self._row_to_position(row) for row in rows]
+
+    def claim_demo_execution(self, position_id: str, claimed_at: datetime) -> bool:
+        try:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO demo_executions "
+                "(position_id, phase, claimed_at, updated_at) VALUES (?, 'CLAIMED', ?, ?)",
+                (position_id, claimed_at.isoformat(), claimed_at.isoformat()),
+            )
+            claimed = cur.rowcount > 0
+            self._conn.commit()
+            return claimed
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_demo_execution(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM demo_executions WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_positions_pending_demo_execution(self, limit: int) -> list[Position]:
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE status = 'OPEN_POSITION' "
+            "AND position_id NOT IN (SELECT position_id FROM demo_executions) "
+            "ORDER BY opened_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._row_to_position(row) for row in rows]
+
+    def find_active_demo_executions(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM demo_executions WHERE phase = 'ACTIVE'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_stale_claimed_demo_executions(self, older_than: datetime) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM demo_executions WHERE phase = 'CLAIMED' AND claimed_at < ?",
+            (older_than.isoformat(),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_demo_execution_submitted(
+        self,
+        position_id: str,
+        entry_client_order_id: str,
+        entry_exchange_order_id: str,
+        entry_quantity: str,
+        exchange_fill_entry: str,
+        sl_exchange_order_id: str | None,
+        tp_exchange_order_id: str | None,
+        updated_at: datetime,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE demo_executions SET phase = 'ACTIVE', entry_client_order_id = ?, "
+            "entry_exchange_order_id = ?, entry_quantity = ?, exchange_fill_entry = ?, "
+            "sl_exchange_order_id = ?, tp_exchange_order_id = ?, updated_at = ? "
+            "WHERE position_id = ?",
+            (
+                entry_client_order_id,
+                entry_exchange_order_id,
+                entry_quantity,
+                exchange_fill_entry,
+                sl_exchange_order_id,
+                tp_exchange_order_id,
+                updated_at.isoformat(),
+                position_id,
+            ),
+        )
+        self._conn.commit()
+
+    def close_demo_execution(
+        self, position_id: str, exit_reason: str, exchange_fill_exit: str, closed_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "UPDATE demo_executions SET phase = 'CLOSED', exit_reason = ?, "
+            "exchange_fill_exit = ?, closed_at = ?, updated_at = ? WHERE position_id = ?",
+            (exit_reason, exchange_fill_exit, closed_at.isoformat(), closed_at.isoformat(), position_id),
+        )
+        self._conn.commit()
+
+    def mark_demo_execution_failed(
+        self, position_id: str, last_error: str, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "UPDATE demo_executions SET phase = 'FAILED', last_error = ?, updated_at = ? "
+            "WHERE position_id = ?",
+            (last_error, updated_at.isoformat(), position_id),
+        )
+        self._conn.commit()
 
     def close_position_with_event(
         self,
