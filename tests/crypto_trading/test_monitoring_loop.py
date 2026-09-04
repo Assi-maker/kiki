@@ -175,3 +175,39 @@ def test_run_monitoring_tick_does_not_crash_on_unexpected_malformed_payload(tmp_
     row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
     assert row["status"] == "error"
     assert "KeyError" in row["errors"]
+
+
+def test_run_monitoring_tick_skips_instrument_on_empty_klines_without_blocking_others(tmp_path):
+    """Live incident 2026-09-04: BingX returned an empty klines list for one
+    instrument (`get_klines(...)[-1]` -> IndexError, not caught by the inner
+    ConnectorUnavailableError handler) and aborted the WHOLE tick, silently
+    skipping stop-loss/target checks for every OTHER open position too -
+    not just the affected instrument. An empty response is exactly the same
+    "no usable data available" case as a connector failure, so it's treated
+    the same way: skip only that instrument, keep checking the rest."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"), position_id="pos-1")
+    _seed_open_position(repo, instrument="ETHUSDT", stop_loss=Decimal("3000"), position_id="pos-2")
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={
+            "BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(now)),
+            "ETHUSDT": _raw_ticker("ETHUSDT", "2900", "10000000", _ms(now)),
+        },
+        klines={
+            "BTCUSDT": [],  # empty response for this instrument only
+            "ETHUSDT": [_raw_kline("2900", _ms(now), high="2950", low="2900")],
+        },
+        funding_rates={"ETHUSDT": [_raw_funding("ETHUSDT", "0.0001", _ms(now))]},
+    )
+
+    closed = run_monitoring_tick(connector, repo, _settings())
+
+    assert len(closed) == 1
+    assert closed[0].position_id == "pos-2"
+    assert closed[0].exit_reason == "stop_loss"
+    # BTCUSDT's own position is left open, never crashed the whole tick
+    btc_position = repo.get_position("pos-1")
+    assert btc_position.status == "OPEN_POSITION"
+    row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
+    assert row["status"] == "partial_error"

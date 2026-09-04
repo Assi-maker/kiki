@@ -58,9 +58,15 @@ def run_monitoring_tick(
                 continue
             try:
                 ticker = Ticker.from_raw(connector.get_ticker(symbol))
-                latest_kline = Kline.from_raw(
-                    connector.get_klines(symbol, interval, limit=1)[-1], symbol, interval
-                )
+                raw_klines = connector.get_klines(symbol, interval, limit=1)
+                if not raw_klines:
+                    # Same "no usable data available" category as a connector
+                    # failure - an empty-but-technically-successful response
+                    # (live incident 2026-09-04) must never crash [-1] and
+                    # abort the whole tick's checks for every OTHER open
+                    # position too.
+                    raise ConnectorUnavailableError(f"{symbol}: tom klines-lista")
+                latest_kline = Kline.from_raw(raw_klines[-1], symbol, interval)
                 raw_funding = connector.get_funding_rate(symbol, limit=1)
                 funding_rate = (
                     FundingRate.from_raw(raw_funding[-1]).funding_rate
