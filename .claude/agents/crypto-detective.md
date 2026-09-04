@@ -28,6 +28,12 @@ inget du säger ändrar någonting i systemet automatiskt.
 4. Formulera korta, konkreta observationer - alltid som hypoteser
    ("verkar", "flera fall tyder på"), aldrig som säkra slutsatser eller
    rekommendationer.
+5. Om `guardian_trajectory` finns för en trade: notera - som ytterligare en
+   hypotes, inte en säker slutsats - om Guardians tillståndsövergångar
+   (WATCH/PROTECT/EXIT) verkar ha föregått det faktiska utfallet, eller om
+   de inte gav något förvarningsvärde i just detta fall. Guardian är
+   shadow-mode-only (fattar inga beslut) - detta är ren kalibrering av om
+   dess signal har prediktivt värde, aldrig en bedömning av en åtgärd.
 
 ## Leverans
 Strukturerad output enligt `DetectiveBatchAnalysis`:

@@ -16,7 +16,10 @@ _ASSESSMENT_ROLES = (
 
 
 def build_position_analysis_context(
-    position: Position, candidate: Candidate | None, gate_decision: dict | None
+    position: Position,
+    candidate: Candidate | None,
+    gate_decision: dict | None,
+    guardian_observations: list[dict] | None = None,
 ) -> dict:
     """Ren funktion: bygger EN stängd positions fulla analysunderlag åt
     Detective, uteslutande genom att LÄSA redan persisterad Position/
@@ -62,6 +65,11 @@ def build_position_analysis_context(
                 context[f"{role}_assessment"] = assessment.model_dump(mode="json")
     if gate_decision is not None:
         context["gate_decision"] = gate_decision
+    if guardian_observations:
+        context["guardian_trajectory"] = [
+            {"observed_at": obs["observed_at"], "state": obs["state"], "decay_score": obs["decay_score"]}
+            for obs in guardian_observations
+        ]
     return context
 
 

@@ -131,3 +131,17 @@ def test_signal_type_for_candidate_returns_unknown_for_missing_candidate():
 def test_signal_type_for_candidate_returns_unknown_for_empty_trigger_reasons():
     candidate = _candidate(trigger_reasons=[])
     assert signal_type_for_candidate(candidate) == "unknown"
+
+
+def test_context_omits_guardian_trajectory_when_absent():
+    context = build_position_analysis_context(_closed_position(), None, None)
+    assert "guardian_trajectory" not in context
+
+
+def test_context_includes_guardian_trajectory_when_present():
+    trajectory = [
+        {"observed_at": "2026-09-04T12:00:00+00:00", "state": "HOLD", "decay_score": "0.1"},
+        {"observed_at": "2026-09-04T13:00:00+00:00", "state": "WATCH", "decay_score": "0.4"},
+    ]
+    context = build_position_analysis_context(_closed_position(), None, None, guardian_observations=trajectory)
+    assert context["guardian_trajectory"] == trajectory

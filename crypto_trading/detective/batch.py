@@ -121,6 +121,7 @@ def run_detective_batch(
             position,
             candidates_by_id.get(position.candidate_id),
             gate_decisions_by_position.get(position.position_id),
+            guardian_observations=repo.find_guardian_observations_for_position(position.position_id),
         )
         for position in batch_positions
     ]
