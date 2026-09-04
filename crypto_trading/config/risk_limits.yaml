@@ -2,8 +2,29 @@
 # via ett YAML-flyttal (float-precision skulle då redan ha smugit in vid inläsning).
 starting_capital_usdt: "10000"
 risk_per_trade_pct: "0.01"
-max_concurrent_positions: 5
-max_total_exposure_pct: "0.25"
+# PAPER-kapacitet (2026-09-04, explicit användarkrav): höjd från 5 för att
+# tillåta fler samtidiga PAPER-positioner och samla mer verklig
+# handelshistorik. Rör ALDRIG risk_per_trade_pct eller sizing-formeln
+# (paper_trading/position_sizing.py) - bara hur många samtidiga positioner
+# Gaten (gate/risk_signal_gate.py::evaluate_risk_signal_gate) tillåter.
+max_concurrent_positions: 20
+# PAPER-kapacitet (2026-09-04): höjd från 0.25 till 1.00 - schemats övre
+# gräns (config/loader.py::RiskLimitsConfig.max_total_exposure_pct har redan
+# Field(le=1), oförändrat här). Med risk_per_trade_pct=1% ger den
+# regelbaserade sizing-formeln (paper_trading/position_sizing.py::
+# compute_position_size) ofta ett råstorlek som redan ENSAM överstiger hela
+# den gamla 2500 USDT-poolen (10000*0.25) vid typiska stop-avstånd - så
+# redan ett fåtal samtidiga CONFIRMED-kandidater kunde tömma poolen och
+# tvinga efterföljande kandidaters storlek till 0 ("blocked_by_exposure",
+# se performance/paper_track_report.py), långt under målet 15-20 samtidiga
+# positioner. 1.00 ger en ~4x större pool (10000 USDT) utan att röra
+# risk_per_trade_pct, sizing-formeln eller Risk Agent - bara hur mycket
+# sammanlagd simulerad notional som får vara utestående samtidigt. Detta
+# maximerar möjlig kapacitet inom de givna begränsningarna - det garanterar
+# INTE matematiskt att alla 20 alltid får en icke-nollstorlek (beror även på
+# verkliga stop-avstånd Risk Agent föreslår per trade, som denna ändring
+# inte rör).
+max_total_exposure_pct: "1.00"
 spread_pct: "0.0005"
 slippage_pct: "0.0005"
 fee_pct: "0.0004"

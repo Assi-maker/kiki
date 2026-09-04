@@ -197,3 +197,18 @@ def test_timeout_status_assessment_blocks_confirmed_and_is_not_rejected():
     candidate = _full_candidate(forecast=_forecast(status="timeout"))
     decision = evaluate_risk_signal_gate(candidate, open_positions=0, max_concurrent_positions=5)
     assert decision.outcome == "NO_TRADE"
+
+
+def test_gate_confirms_up_to_new_higher_concurrent_position_cap():
+    """2026-09-04: PAPER-kapacitetsökning - Gaten ska tillåta CONFIRMED hela
+    vägen upp till den nya, högre gränsen (20), inte bara den gamla (5)."""
+    candidate = _full_candidate()
+    decision = evaluate_risk_signal_gate(candidate, open_positions=19, max_concurrent_positions=20)
+    assert decision.outcome == "CONFIRMED"
+
+
+def test_gate_blocks_confirmed_at_new_higher_concurrent_position_cap():
+    candidate = _full_candidate()
+    decision = evaluate_risk_signal_gate(candidate, open_positions=20, max_concurrent_positions=20)
+    assert decision.outcome == "NO_TRADE"
+    assert any("max_concurrent_positions" in r for r in decision.reasons)

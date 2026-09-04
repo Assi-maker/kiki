@@ -230,3 +230,14 @@ def test_missing_config_file_raises_config_error(tmp_path, monkeypatch):
     monkeypatch.setattr(loader_module, "_CONFIG_DIR", tmp_path)
     with pytest.raises(ConfigError):
         get_settings()
+
+
+def test_get_settings_loads_paper_capacity_defaults():
+    """2026-09-04: PAPER-kapacitetsökning, explicit användarkrav - se
+    config/risk_limits.yaml:s kommentar för den fulla motiveringen."""
+    settings = get_settings()
+    assert settings.risk_limits.max_concurrent_positions == 20
+    assert settings.risk_limits.max_total_exposure_pct == Decimal("1.00")
+    # Oförändrat - målet är mer kapacitet, inte mer risk per trade.
+    assert settings.risk_limits.risk_per_trade_pct == Decimal("0.01")
+    assert settings.risk_limits.starting_capital_usdt == Decimal("10000")
