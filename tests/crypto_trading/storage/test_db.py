@@ -255,6 +255,40 @@ def test_demo_executions_table_exists(tmp_path):
     }
 
 
+def test_guardian_observations_table_exists(tmp_path):
+    conn = get_connection(tmp_path / "t.db")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(guardian_observations)").fetchall()}
+    assert columns == {
+        "observation_id", "position_id", "observed_at", "state", "decay_score",
+        "progress_ratio", "unrealized_pnl", "factors", "ai_reasoning",
+        "ai_cost_usd", "run_id",
+    }
+
+
+def test_guardian_observations_rejects_update(tmp_path):
+    conn = get_connection(tmp_path / "t.db")
+    conn.execute(
+        "INSERT INTO guardian_observations (observation_id, position_id, observed_at, "
+        "state, decay_score, progress_ratio, unrealized_pnl, factors, run_id) "
+        "VALUES ('o1','p1','2026-01-01','HOLD','0.1','0.1','0','{}','run-1')"
+    )
+    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("UPDATE guardian_observations SET state = 'EXIT' WHERE observation_id = 'o1'")
+
+
+def test_guardian_observations_rejects_delete(tmp_path):
+    conn = get_connection(tmp_path / "t.db")
+    conn.execute(
+        "INSERT INTO guardian_observations (observation_id, position_id, observed_at, "
+        "state, decay_score, progress_ratio, unrealized_pnl, factors, run_id) "
+        "VALUES ('o2','p1','2026-01-01','HOLD','0.1','0.1','0','{}','run-1')"
+    )
+    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM guardian_observations WHERE observation_id = 'o2'")
+
+
 @pytest.mark.parametrize("value", _DECIMAL_ROUNDTRIP_VALUES)
 def test_decimal_json_roundtrip_is_exact_never_via_float(value):
     """Låser samma konvention för JSON-payloads (t.ex. events.payload):

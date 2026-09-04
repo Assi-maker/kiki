@@ -169,6 +169,40 @@ CREATE TABLE IF NOT EXISTS demo_executions (
     updated_at TEXT NOT NULL,
     closed_at TEXT
 );
+
+-- Position Guardian (2026-09-04): strictly append-only, shadow-mode-only
+-- observer of an already-open PAPER position, see
+-- docs/superpowers/specs/2026-09-04-position-guardian-design.md.
+-- NEVER written from paper_trading/position_opening.py or
+-- position_closing.py - Guardian only reads `positions`, never writes it.
+CREATE TABLE IF NOT EXISTS guardian_observations (
+    observation_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    state TEXT NOT NULL,
+    decay_score TEXT NOT NULL,
+    progress_ratio TEXT NOT NULL,
+    unrealized_pnl TEXT NOT NULL,
+    factors TEXT NOT NULL,
+    ai_reasoning TEXT,
+    ai_cost_usd TEXT,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_guardian_observations_position
+    ON guardian_observations(position_id, observed_at);
+
+CREATE TRIGGER IF NOT EXISTS guardian_observations_no_update
+BEFORE UPDATE ON guardian_observations
+BEGIN
+    SELECT RAISE(ABORT, 'guardian_observations is append-only: UPDATE is not permitted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS guardian_observations_no_delete
+BEFORE DELETE ON guardian_observations
+BEGIN
+    SELECT RAISE(ABORT, 'guardian_observations is append-only: DELETE is not permitted');
+END;
 """
 
 
