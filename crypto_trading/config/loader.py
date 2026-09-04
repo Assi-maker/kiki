@@ -117,6 +117,16 @@ class DetectiveConfig(BaseModel):
     min_history_for_win_loss_comparison: int = Field(gt=0, default=20)
 
 
+class DemoExecutionConfig(BaseModel):
+    # BingX Demo (VST) execution tunables only - whether the thread runs at
+    # all is the CRYPTO_TRADING_DEMO_EXECUTION_ENABLED env-var arm flag
+    # (is_demo_execution_enabled() below), same opt-in pattern already used
+    # for the dashboard/Telegram threads in run.py.
+    check_interval_seconds: int = Field(gt=0, default=30)
+    claim_stale_after_seconds: int = Field(gt=0, default=30)
+    max_retries: int = Field(gt=0, default=3)
+
+
 class NotifyConfig(BaseModel):
     notification_level: Literal["important", "decisions", "debug"]
     notify_interval_seconds: int = Field(gt=0)
@@ -135,6 +145,7 @@ class Settings(BaseModel):
     notify: NotifyConfig
     dashboard: DashboardConfig
     detective: DetectiveConfig = Field(default_factory=DetectiveConfig)
+    demo_execution: DemoExecutionConfig = Field(default_factory=DemoExecutionConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -162,4 +173,15 @@ def get_settings() -> Settings:
         notify=_load_yaml_model(_CONFIG_DIR / "notify.yaml", NotifyConfig),
         dashboard=_load_yaml_model(_CONFIG_DIR / "dashboard.yaml", DashboardConfig),
         detective=_load_yaml_model(_CONFIG_DIR / "detective.yaml", DetectiveConfig),
+        demo_execution=_load_yaml_model(_CONFIG_DIR / "demo_execution.yaml", DemoExecutionConfig),
     )
+
+
+def is_demo_execution_enabled() -> bool:
+    """Opt-in arm flag for the BingX Demo execution thread - same pattern as
+    run.py's existing CRYPTO_TRADING_DASHBOARD_ENABLED check. Deliberately
+    an env var, not a YAML setting: matches how the other optional threads
+    (dashboard, Telegram) are gated in this codebase, and keeps "should this
+    thread run at all" a deploy-time decision, not a checked-in default."""
+    load_dotenv(_PROJECT_ROOT / ".env", override=False)
+    return bool(os.environ.get("CRYPTO_TRADING_DEMO_EXECUTION_ENABLED"))

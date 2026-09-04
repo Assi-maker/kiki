@@ -1,0 +1,8 @@
+# BingX Demo (VST) execution (2026-09-04) - parallel observer of PAPER, see
+# docs/superpowers/specs/2026-09-04-bingx-demo-execution-design.md. Whether
+# the thread runs at all is an env-var arm flag
+# (CRYPTO_TRADING_DEMO_EXECUTION_ENABLED), not this file - these are only
+# tunables for when it does run.
+check_interval_seconds: 30
+claim_stale_after_seconds: 30
+max_retries: 3
