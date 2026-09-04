@@ -6,10 +6,11 @@ import threading
 import uvicorn
 from fastapi import FastAPI
 
-from crypto_trading import detective_loop, discovery_loop, monitoring_loop, notify_loop
+from crypto_trading import demo_execution_loop, detective_loop, discovery_loop, monitoring_loop, notify_loop
 from crypto_trading.agents.runner import AgentRunner, RealClaudeRunner
 from crypto_trading.config.exceptions import ConfigError
-from crypto_trading.config.loader import Settings, get_settings
+from crypto_trading.config.loader import Settings, get_settings, is_demo_execution_enabled
+from crypto_trading.connectors.bingx_demo_trading import BingXDemoTradingConnector
 from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.connectors.external_data import ExternalDataConnector
 from crypto_trading.connectors.news_rss import NewsRSSConnector
@@ -88,6 +89,22 @@ def build_notifier_from_env() -> TelegramNotifier | None:
     return TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
 
 
+def build_demo_trading_connector_from_env() -> BingXDemoTradingConnector | None:
+    """Opt-in, same pattern as build_notifier_from_env(): if the dedicated
+    demo credentials aren't set, the thread simply doesn't start - never a
+    fail-fast requirement like ANTHROPIC_API_KEY, since PAPER trading works
+    completely without it. Deliberately reads ONLY the dedicated
+    CRYPTO_TRADING_BINGX_DEMO_API_KEY/_SECRET names, never the generic
+    BINGX_API_KEY/BINGX_API_SECRET also present in .env (2026-09-04 design
+    decision - a generic name risks accidental reuse by a future live-
+    account integration)."""
+    api_key = os.environ.get("CRYPTO_TRADING_BINGX_DEMO_API_KEY")
+    api_secret = os.environ.get("CRYPTO_TRADING_BINGX_DEMO_API_SECRET")
+    if not api_key or not api_secret:
+        return None
+    return BingXDemoTradingConnector(api_key=api_key, api_secret=api_secret)
+
+
 def build_dashboard_app_from_env(
     repo_factory: RepositoryFactory, settings: Settings
 ) -> FastAPI | None:
@@ -142,6 +159,22 @@ def _run_detective_forever(runner: AgentRunner, settings: Settings) -> None:
     femte, oberoende tråd."""
     repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
     detective_loop.run_forever(repo, runner, settings)
+
+
+def _run_demo_execution_forever(
+    market_data_connector: BingXMarketDataConnector,
+    demo_connector: BingXDemoTradingConnector,
+    settings: Settings,
+) -> None:
+    """Same thread-bound-connection fix as the other _run_*_forever()
+    functions above. quantity_precision_by_symbol is built ONCE here from
+    the existing, read-only get_contracts() - not re-fetched every tick."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    contracts = market_data_connector.get_contracts()
+    quantity_precision_by_symbol = {
+        c["symbol"]: int(c.get("quantityPrecision", 0)) for c in contracts
+    }
+    demo_execution_loop.run_forever(repo, demo_connector, quantity_precision_by_symbol, settings)
 
 
 def _run_notify_forever(notifier: TelegramNotifier, settings: Settings) -> None:
@@ -271,6 +304,29 @@ def main() -> None:
             "startup",
             event="dashboard_disabled",
             reason="CRYPTO_TRADING_DASHBOARD_ENABLED not set",
+        )
+
+    if is_demo_execution_enabled():
+        demo_connector = build_demo_trading_connector_from_env()
+        if demo_connector is not None:
+            threads.append(
+                threading.Thread(
+                    target=_run_demo_execution_forever,
+                    args=(connector, demo_connector, settings),
+                    daemon=True,
+                )
+            )
+        else:
+            log_event(
+                "startup",
+                event="demo_execution_disabled",
+                reason="CRYPTO_TRADING_BINGX_DEMO_API_KEY/_SECRET missing",
+            )
+    else:
+        log_event(
+            "startup",
+            event="demo_execution_disabled",
+            reason="CRYPTO_TRADING_DEMO_EXECUTION_ENABLED not set",
         )
 
     for thread in threads:
