@@ -178,6 +178,36 @@ def test_get_position_returns_matching_open_position():
 
 
 @respx.mock
+def test_get_open_orders_handles_list_shaped_data():
+    respx.get(f"{_VST_BASE}/openApi/swap/v2/trade/openOrders").mock(
+        return_value=Response(
+            200, json={"code": 0, "msg": "", "data": [{"orderId": "sl-1", "type": "STOP_MARKET"}]}
+        )
+    )
+
+    result = _connector().get_open_orders("BTC-USDT")
+
+    assert result == [{"orderId": "sl-1", "type": "STOP_MARKET"}]
+
+
+@respx.mock
+def test_get_open_orders_handles_dict_shaped_data():
+    respx.get(f"{_VST_BASE}/openApi/swap/v2/trade/openOrders").mock(
+        return_value=Response(
+            200,
+            json={
+                "code": 0, "msg": "",
+                "data": {"orders": [{"orderId": "tp-1", "type": "TAKE_PROFIT_MARKET"}]},
+            },
+        )
+    )
+
+    result = _connector().get_open_orders("BTC-USDT")
+
+    assert result == [{"orderId": "tp-1", "type": "TAKE_PROFIT_MARKET"}]
+
+
+@respx.mock
 def test_get_position_returns_none_when_flat_or_absent():
     respx.get(f"{_VST_BASE}/openApi/swap/v2/user/positions").mock(
         return_value=Response(

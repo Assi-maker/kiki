@@ -17,6 +17,7 @@ _ORDER_PATH = "/openApi/swap/v2/trade/order"
 _ALL_OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/allOpenOrders"
 _LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 _POSITIONS_PATH = "/openApi/swap/v2/user/positions"
+_OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 
 
 def _unwrap_order(data: dict | None) -> dict:
@@ -202,6 +203,19 @@ class BingXDemoTradingConnector:
             if position.get("symbol") == symbol and Decimal(str(position.get("positionAmt", "0"))) != 0:
                 return position
         return None
+
+    def get_open_orders(self, symbol: str) -> list[dict]:
+        """Read-only, diagnostic/verification use: independent proof that
+        attached stopLoss/takeProfit legs actually registered as live
+        conditional orders on the exchange (as opposed to the entry order's
+        own echoed-back fields, which can look correct without the
+        attachment having taken effect - see place_entry_order_with_sl_tp's
+        docstring). Not used by the production reconcile loop, which
+        watches position state instead (§12 of the design doc)."""
+        data = self._request("GET", _OPEN_ORDERS_PATH, {"symbol": symbol}) or {}
+        if isinstance(data, list):
+            return data
+        return data.get("orders", [])
 
     def cancel_all_open_orders(self, symbol: str) -> dict:
         return self._request("DELETE", _ALL_OPEN_ORDERS_PATH, {"symbol": symbol}) or {}
