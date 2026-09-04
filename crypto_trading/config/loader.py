@@ -179,9 +179,11 @@ def get_settings() -> Settings:
 
 def is_demo_execution_enabled() -> bool:
     """Opt-in arm flag for the BingX Demo execution thread - same pattern as
-    run.py's existing CRYPTO_TRADING_DASHBOARD_ENABLED check. Deliberately
-    an env var, not a YAML setting: matches how the other optional threads
-    (dashboard, Telegram) are gated in this codebase, and keeps "should this
-    thread run at all" a deploy-time decision, not a checked-in default."""
-    load_dotenv(_PROJECT_ROOT / ".env", override=False)
+    run.py's existing build_dashboard_app_from_env()/build_notifier_from_env()
+    checks (plain os.environ.get(), no load_dotenv() of its own - callers
+    always run this after get_settings() has already loaded .env into
+    os.environ once for the whole process). Deliberately an env var, not a
+    YAML setting: matches how the other optional threads (dashboard,
+    Telegram) are gated in this codebase, and keeps "should this thread run
+    at all" a deploy-time decision, not a checked-in default."""
     return bool(os.environ.get("CRYPTO_TRADING_DEMO_EXECUTION_ENABLED"))

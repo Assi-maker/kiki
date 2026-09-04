@@ -61,6 +61,36 @@ def test_find_positions_pending_demo_execution_excludes_claimed(tmp_path):
     assert [p.position_id for p in pending] == ["pos-2"]
 
 
+def test_find_positions_pending_demo_execution_excludes_zero_size_blocked_positions(tmp_path):
+    """A position whose size was pressed to 0 by the exposure cap
+    (paper_trading/position_sizing.py::compute_position_size) represents
+    zero real market exposure - performance/paper_track_report.py already
+    excludes these from every trading metric for the same reason. Mirroring
+    it to BingX Demo would just fail with "quantity or quoteOrderQty is
+    must" (confirmed live 2026-09-04) - never a real trade, so never worth
+    a demo order attempt at all."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "pos-1")
+    blocked = Position(
+        position_id="pos-blocked", candidate_id="pos-blocked", instrument="BTCUSDT",
+        direction="LONG", status="OPEN_POSITION", theoretical_entry=Decimal("50000"),
+        simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"),
+        target=Decimal("52000"), size=Decimal("0"), fill_model_version="v1", opened_at=_NOW,
+    )
+    repo.create_position_with_event(
+        blocked,
+        Event(
+            event_id="POSITION_OPENED:pos-blocked", event_type="POSITION_OPENED",
+            aggregate_type="position", aggregate_id="pos-blocked", occurred_at=_NOW,
+            run_id="seed", schema_version=1, payload={},
+        ),
+    )
+
+    pending = repo.find_positions_pending_demo_execution(limit=10)
+
+    assert [p.position_id for p in pending] == ["pos-1"]
+
+
 def test_update_demo_execution_submitted_then_close(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)

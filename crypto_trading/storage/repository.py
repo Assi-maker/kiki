@@ -438,8 +438,15 @@ class SQLiteRepository:
         return dict(row) if row is not None else None
 
     def find_positions_pending_demo_execution(self, limit: int) -> list[Position]:
+        # size = '0' excludes positions the exposure cap pressed to zero
+        # (paper_trading/position_sizing.py::compute_position_size) - zero
+        # real market exposure, same convention performance/
+        # paper_track_report.py::_is_blocked_by_exposure() already applies.
+        # Mirroring one to BingX Demo would just fail ("quantity or
+        # quoteOrderQty is must", confirmed live 2026-09-04) - never a real
+        # trade, never worth a demo order attempt.
         rows = self._conn.execute(
-            "SELECT * FROM positions WHERE status = 'OPEN_POSITION' "
+            "SELECT * FROM positions WHERE status = 'OPEN_POSITION' AND size != '0' "
             "AND position_id NOT IN (SELECT position_id FROM demo_executions) "
             "ORDER BY opened_at ASC LIMIT ?",
             (limit,),
