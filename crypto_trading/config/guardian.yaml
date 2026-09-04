@@ -1,0 +1,17 @@
+# Position Guardian (2026-09-04, shadow mode only) - see
+# docs/superpowers/specs/2026-09-04-position-guardian-design.md §5.
+# Thresholds below are EXPLICITLY UNVALIDATED starting points, meant to be
+# re-tuned after Detective calibrates real shadow-mode observations against
+# actual outcomes - never treated as final. factor_weights need not sum to
+# 1.0 (decay_score is a weight-normalized average, see deterministic.py).
+check_interval_seconds: 60
+watch_decay_threshold: "0.35"
+protect_decay_threshold: "0.55"
+exit_decay_threshold: "0.75"
+factor_weights:
+  time_decay: "1"
+  momentum_decay: "1"
+  volume_decay: "1"
+  funding_decay: "1"
+  secondary_confirmation_lost: "1"
+  market_regime: "1"

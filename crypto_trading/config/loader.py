@@ -127,6 +127,29 @@ class DemoExecutionConfig(BaseModel):
     max_retries: int = Field(gt=0, default=3)
 
 
+class GuardianConfig(BaseModel):
+    # Position Guardian (2026-09-04, shadow mode only) - see
+    # docs/superpowers/specs/2026-09-04-position-guardian-design.md.
+    # Thresholds are explicitly unvalidated starting points, meant to be
+    # re-tuned after Detective calibrates real observations against actual
+    # outcomes. factor_weights need not sum to 1.0 - decay_score is a
+    # weight-normalized average (guardian/deterministic.py).
+    check_interval_seconds: int = Field(gt=0, default=60)
+    watch_decay_threshold: Decimal = Field(gt=0, lt=1, default=Decimal("0.35"))
+    protect_decay_threshold: Decimal = Field(gt=0, lt=1, default=Decimal("0.55"))
+    exit_decay_threshold: Decimal = Field(gt=0, lt=1, default=Decimal("0.75"))
+    factor_weights: dict[str, Decimal] = Field(
+        default_factory=lambda: {
+            "time_decay": Decimal("1"),
+            "momentum_decay": Decimal("1"),
+            "volume_decay": Decimal("1"),
+            "funding_decay": Decimal("1"),
+            "secondary_confirmation_lost": Decimal("1"),
+            "market_regime": Decimal("1"),
+        }
+    )
+
+
 class NotifyConfig(BaseModel):
     notification_level: Literal["important", "decisions", "debug"]
     notify_interval_seconds: int = Field(gt=0)
@@ -146,6 +169,7 @@ class Settings(BaseModel):
     dashboard: DashboardConfig
     detective: DetectiveConfig = Field(default_factory=DetectiveConfig)
     demo_execution: DemoExecutionConfig = Field(default_factory=DemoExecutionConfig)
+    guardian: GuardianConfig = Field(default_factory=GuardianConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -174,7 +198,15 @@ def get_settings() -> Settings:
         dashboard=_load_yaml_model(_CONFIG_DIR / "dashboard.yaml", DashboardConfig),
         detective=_load_yaml_model(_CONFIG_DIR / "detective.yaml", DetectiveConfig),
         demo_execution=_load_yaml_model(_CONFIG_DIR / "demo_execution.yaml", DemoExecutionConfig),
+        guardian=_load_yaml_model(_CONFIG_DIR / "guardian.yaml", GuardianConfig),
     )
+
+
+def is_guardian_enabled() -> bool:
+    """Opt-in arm flag for the Guardian thread - same plain os.environ.get()
+    pattern as is_demo_execution_enabled() (no load_dotenv() of its own;
+    callers always run after get_settings() has already loaded .env once)."""
+    return bool(os.environ.get("CRYPTO_TRADING_GUARDIAN_ENABLED"))
 
 
 def is_demo_execution_enabled() -> bool:
