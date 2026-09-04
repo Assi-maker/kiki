@@ -17,15 +17,30 @@ def _optional_str(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
 
 
+def _is_blocked_by_exposure(position: Position) -> bool:
+    """Samma definition/semantik som performance/paper_track_report.py::
+    _is_blocked_by_exposure() - en position vars `size` trycktes till 0 av
+    max_total_exposure_pct-taket (paper_trading/position_sizing.py::
+    compute_position_size()) representerar noll verklig marknadsexponering
+    och ska aldrig räknas som en break-even-trade i Detectives statistik."""
+    return position.size == Decimal("0")
+
+
 def compute_batch_win_loss_counts(positions: list[Position]) -> dict:
     """Samma win/loss/breakeven-definition som performance/paper_track_
     report.py redan använder (p>0/p<0/p==0 på compute_pnl()), återanvänd
-    via trade_pnls() - ingen egen PnL-formel."""
-    pnls = trade_pnls(positions)
+    via trade_pnls() - ingen egen PnL-formel. Nollstorlekspositioner
+    (blockerade av max_total_exposure_pct, se _is_blocked_by_exposure())
+    exkluderas innan pnls/counts beräknas - annars skulle de felaktigt
+    räknas som break-even (2026-09-03, explicit användarkrav)."""
+    closed = [p for p in positions if p.status == "CLOSED"]
+    real_positions = [p for p in closed if not _is_blocked_by_exposure(p)]
+    pnls = trade_pnls(real_positions)
     return {
         "win_count": sum(1 for p in pnls if p > 0),
         "loss_count": sum(1 for p in pnls if p < 0),
         "breakeven_count": sum(1 for p in pnls if p == 0),
+        "blocked_by_exposure_count": len(closed) - len(real_positions),
     }
 
 
@@ -39,8 +54,10 @@ def compute_breakdown_by_signal_type(
     instrument(), bara en annan grupperingsnyckel. En position vars
     candidate saknas i `candidates_by_id` (t.ex. en korrupt rad Detective
     redan filtrerat bort - se detective/batch.py) grupperas som "unknown",
-    aldrig utelämnad tyst."""
-    closed = [p for p in positions if p.status == "CLOSED"]
+    aldrig utelämnad tyst. Nollstorlekspositioner (_is_blocked_by_exposure())
+    exkluderas innan grupperingen, av samma skäl som i
+    compute_batch_win_loss_counts()."""
+    closed = [p for p in positions if p.status == "CLOSED" and not _is_blocked_by_exposure(p)]
     grouped: dict[str, list[Position]] = {}
     for position in closed:
         signal_type = signal_type_for_candidate(candidates_by_id.get(position.candidate_id))

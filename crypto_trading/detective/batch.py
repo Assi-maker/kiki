@@ -71,7 +71,7 @@ def run_detective_batch(
     (restart-säkert: se Repository.save_detective_analysis()s atomiska
     markering av vilka positioner en given analys täckte).
 
-    Delar samma dagliga $-budget som de sju rollerna/Opportunity Screener
+    Delar samma dagliga $-budget som de sju rollerna
     (settings.budget_limits.max_daily_ai_cost_usd/max_ai_calls_per_day) -
     kringgår den ALDRIG (explicit användarkrav): om en konservativ
     worst-case-uppskattning av detta batchanrop skulle spränga taket,
@@ -132,6 +132,7 @@ def run_detective_batch(
         "run_id": run_id,
         "batch_trades": position_contexts,
         "batch_signal_type_breakdown": signal_type_breakdown,
+        "blocked_by_exposure_count_in_batch": counts["blocked_by_exposure_count"],
     }
 
     historical_breakdown = None
@@ -183,6 +184,7 @@ def run_detective_batch(
         stats_snapshot={
             "batch_signal_type_breakdown": signal_type_breakdown,
             "historical_signal_type_breakdown": historical_breakdown,
+            "blocked_by_exposure_count": counts["blocked_by_exposure_count"],
         },
         ai_cost_usd=cost_usd if billed else Decimal("0"),
     )

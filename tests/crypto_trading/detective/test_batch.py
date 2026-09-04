@@ -48,7 +48,7 @@ def _evidence() -> CandidateEvidenceRecord:
     )
 
 
-def _seed_closed_trade(repo, i: int, win: bool) -> None:
+def _seed_closed_trade(repo, i: int, win: bool, size: Decimal = Decimal("1000")) -> None:
     candidate_id = f"cand-{i}"
     candidate = Candidate(
         candidate_id=candidate_id,
@@ -96,7 +96,7 @@ def _seed_closed_trade(repo, i: int, win: bool) -> None:
         simulated_fill_entry=Decimal("50025"),
         stop_loss=Decimal("49000"),
         target=Decimal("52000"),
-        size=Decimal("1000"),
+        size=size,
         fill_model_version="v1",
         opened_at=_NOW,
     )
@@ -114,12 +114,17 @@ def _seed_closed_trade(repo, i: int, win: bool) -> None:
         ),
     )
     exit_price = Decimal("52000") if win else Decimal("49000")
+    # fees/funding beräknas proportionellt mot size i den riktiga pipelinen
+    # (paper_trading/position_closing.py::compute_fees()/compute_funding())
+    # - en äkta nollstorlekstrade (blocked by exposure) har alltid 0 i
+    # båda, inte bara 0 gross_pnl.
+    fees = Decimal("0.4") if size != 0 else Decimal("0")
     repo.close_position_with_event(
         position_id=candidate_id,
         theoretical_exit=exit_price,
         simulated_fill_exit=exit_price,
         exit_reason="target" if win else "stop_loss",
-        fees=Decimal("0.4"),
+        fees=fees,
         funding=Decimal("0"),
         closed_at=_NOW,
         event=Event(
@@ -415,6 +420,60 @@ def test_restart_does_not_reanalyze_already_analyzed_positions(tmp_path):
     assert second_result is not None
     assert set(second_result.position_ids) == {"cand-3", "cand-4", "cand-5"}
     assert repo2.count_closed_positions_pending_detective_analysis() == 0
+
+
+class _ContextCapturingRunner:
+    """Fångar context-dicten Detective bygger åt AI:n - MockAgentRunner
+    sparar den inte, så ett litet eget stub behövs för att verifiera vad
+    modellen faktiskt fick se (2026-09-04, slutgranskningsfynd: nollstorleks-
+    positioner måste synas explicit i kontexten, inte bara tyst försvinna)."""
+
+    last_call_billed = True
+    last_call_cost_usd = Decimal("0")
+
+    def __init__(self, response: DetectiveBatchAnalysis):
+        self._response = response
+        self.captured_context: dict | None = None
+
+    def run(self, agent_def, context, output_schema):
+        self.captured_context = context
+        return self._response
+
+
+def test_zero_size_positions_are_excluded_from_stats_and_surfaced_as_blocked_count(tmp_path):
+    """Slutgranskningsfynd (2026-09-04): den höjda PAPER-kapaciteten (del 1
+    av denna ändring) kan producera fler nollstorlekspositioner
+    ("blocked_by_exposure", se paper_trading/position_sizing.py) i en och
+    samma batch. De ska ALDRIG räknas som break-even-trades i Detectives
+    win/loss-statistik eller signaltyps-nedbrytning, och deras antal ska
+    synas explicit - både i AI-kontexten och i den sparade stats_snapshot -
+    istället för att tyst spädas ut resultatet."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_closed_trade(repo, 0, win=True)
+    _seed_closed_trade(repo, 1, win=False)
+    _seed_closed_trade(repo, 2, win=True, size=Decimal("0"))
+    fixture = DetectiveBatchAnalysis(
+        agent_name="crypto-detective",
+        run_id="run-1",
+        created_at=_NOW,
+        status="ok",
+        observations=["obs"],
+        winning_patterns=["win"],
+        losing_patterns=["loss"],
+    )
+    runner = _ContextCapturingRunner(fixture)
+
+    result = run_detective_batch(repo, runner, _settings_with(), "run-1", _NOW)
+
+    assert result is not None
+    # Nollstorlekstraden (cand-2) räknas inte som vinst, förlust eller
+    # break-even - bara de två riktiga trades gör det.
+    assert result.win_count == 1
+    assert result.loss_count == 1
+    assert result.breakeven_count == 0
+    assert result.stats_snapshot["blocked_by_exposure_count"] == 1
+    assert runner.captured_context is not None
+    assert runner.captured_context["blocked_by_exposure_count_in_batch"] == 1
 
 
 def test_small_history_produces_observations_but_never_touches_config(tmp_path):
