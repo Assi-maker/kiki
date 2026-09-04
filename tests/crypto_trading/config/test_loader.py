@@ -7,6 +7,7 @@ from crypto_trading.config.exceptions import ConfigError
 from crypto_trading.config.loader import (
     BudgetLimitsConfig,
     DashboardConfig,
+    DetectiveConfig,
     NotifyConfig,
     PipelineConfig,
     RiskLimitsConfig,
@@ -241,3 +242,28 @@ def test_get_settings_loads_paper_capacity_defaults():
     # Oförändrat - målet är mer kapacitet, inte mer risk per trade.
     assert settings.risk_limits.risk_per_trade_pct == Decimal("0.01")
     assert settings.risk_limits.starting_capital_usdt == Decimal("10000")
+
+
+def test_get_settings_loads_detective_config_from_real_yaml():
+    settings = get_settings()
+    assert settings.detective.batch_size == 10
+    assert settings.detective.check_interval_seconds == 300
+    assert settings.detective.min_history_for_win_loss_comparison == 20
+
+
+def test_detective_config_rejects_zero_batch_size():
+    with pytest.raises(ValidationError):
+        DetectiveConfig(
+            batch_size=0, check_interval_seconds=300, min_history_for_win_loss_comparison=20
+        )
+
+
+def test_detective_config_defaults_when_omitted():
+    """Settings.detective har ett default (Field(default_factory=...)) -
+    de ~25 befintliga testfilerna som konstruerar Settings(...) utan
+    detective= (t.ex. tests/crypto_trading/test_market_snapshot.py::
+    _settings()) får fortfarande ett giltigt, validerat värde."""
+    config = DetectiveConfig()
+    assert config.batch_size == 10
+    assert config.check_interval_seconds == 300
+    assert config.min_history_for_win_loss_comparison == 20

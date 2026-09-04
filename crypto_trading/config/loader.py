@@ -102,6 +102,21 @@ class BudgetLimitsConfig(BaseModel):
     opportunity_screening_enforce: bool = False
 
 
+class DetectiveConfig(BaseModel):
+    # Detective (Post-Trade Analyst, 2026-09-04): analyserar EFTERHAND redan
+    # stängda PAPER-trades i batchar av `batch_size` - aldrig en per trade
+    # (kostnadskontroll, explicit användarkrav: "inte ett dyrt Sonnet-anrop
+    # efter varje enskild trade"). Se crypto_trading/detective/batch.py.
+    batch_size: int = Field(gt=0, default=10)
+    check_interval_seconds: int = Field(gt=0, default=300)
+    # Minsta totala antal stängda trades innan Detective får inkludera en
+    # WIN-vs-LOSS-jämförelse i sitt underlag (explicit användarkrav: "jag
+    # vill också att den jämför WIN vs LOSS när tillräckligt många trades
+    # finns"). Under denna gräns får den fortfarande observera enskilda
+    # trades, bara utan den historiska jämförelsen.
+    min_history_for_win_loss_comparison: int = Field(gt=0, default=20)
+
+
 class NotifyConfig(BaseModel):
     notification_level: Literal["important", "decisions", "debug"]
     notify_interval_seconds: int = Field(gt=0)
@@ -119,6 +134,7 @@ class Settings(BaseModel):
     budget_limits: BudgetLimitsConfig
     notify: NotifyConfig
     dashboard: DashboardConfig
+    detective: DetectiveConfig = Field(default_factory=DetectiveConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -145,4 +161,5 @@ def get_settings() -> Settings:
         budget_limits=_load_yaml_model(_CONFIG_DIR / "budget_limits.yaml", BudgetLimitsConfig),
         notify=_load_yaml_model(_CONFIG_DIR / "notify.yaml", NotifyConfig),
         dashboard=_load_yaml_model(_CONFIG_DIR / "dashboard.yaml", DashboardConfig),
+        detective=_load_yaml_model(_CONFIG_DIR / "detective.yaml", DetectiveConfig),
     )

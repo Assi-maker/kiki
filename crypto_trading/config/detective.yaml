@@ -1,0 +1,6 @@
+# Detective (Post-Trade Analyst, 2026-09-04): analyserar EFTERHAND redan
+# stängda PAPER-trades, batchvis - deltar aldrig i realtidsbeslut. Se
+# crypto_trading/detective/batch.py och .claude/agents/crypto-detective.md.
+batch_size: 10
+check_interval_seconds: 300
+min_history_for_win_loss_comparison: 20
