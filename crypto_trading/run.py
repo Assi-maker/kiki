@@ -6,10 +6,22 @@ import threading
 import uvicorn
 from fastapi import FastAPI
 
-from crypto_trading import demo_execution_loop, detective_loop, discovery_loop, monitoring_loop, notify_loop
+from crypto_trading import (
+    demo_execution_loop,
+    detective_loop,
+    discovery_loop,
+    guardian_loop,
+    monitoring_loop,
+    notify_loop,
+)
 from crypto_trading.agents.runner import AgentRunner, RealClaudeRunner
 from crypto_trading.config.exceptions import ConfigError
-from crypto_trading.config.loader import Settings, get_settings, is_demo_execution_enabled
+from crypto_trading.config.loader import (
+    Settings,
+    get_settings,
+    is_demo_execution_enabled,
+    is_guardian_enabled,
+)
 from crypto_trading.connectors.bingx_demo_trading import BingXDemoTradingConnector
 from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.connectors.external_data import ExternalDataConnector
@@ -72,6 +84,25 @@ def build_detective_runner_from_env() -> AgentRunner:
     return RealClaudeRunner(
         api_key=api_key,
         model=os.environ.get("CRYPTO_TRADING_DETECTIVE_MODEL", "claude-haiku-4-5"),
+        timeout_seconds=float(os.environ.get("CRYPTO_TRADING_AGENT_TIMEOUT_SECONDS", "60")),
+        max_retries=int(os.environ.get("CRYPTO_TRADING_AGENT_MAX_RETRIES", "3")),
+    )
+
+
+def build_guardian_runner_from_env() -> AgentRunner:
+    """Position Guardian (2026-09-04) - own RealClaudeRunner instance, same
+    reason as build_detective_runner_from_env(): never shared with another
+    thread's runner (mutable last_call_billed/last_call_cost_usd state
+    would race). Same cheap default model as screener/Detective (Haiku
+    4.5, cost-controlled, this is reasoning-only narration of an already-
+    decided state, not a realtime trading decision) - own env var so it
+    can be changed independently."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ConfigError("ANTHROPIC_API_KEY saknas - kan inte starta med RealClaudeRunner")
+    return RealClaudeRunner(
+        api_key=api_key,
+        model=os.environ.get("CRYPTO_TRADING_GUARDIAN_MODEL", "claude-haiku-4-5"),
         timeout_seconds=float(os.environ.get("CRYPTO_TRADING_AGENT_TIMEOUT_SECONDS", "60")),
         max_retries=int(os.environ.get("CRYPTO_TRADING_AGENT_MAX_RETRIES", "3")),
     )
@@ -159,6 +190,15 @@ def _run_detective_forever(runner: AgentRunner, settings: Settings) -> None:
     femte, oberoende tråd."""
     repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
     detective_loop.run_forever(repo, runner, settings)
+
+
+def _run_guardian_forever(
+    market_data_connector: BingXMarketDataConnector, runner: AgentRunner, settings: Settings
+) -> None:
+    """Same thread-bound-connection fix as the other _run_*_forever()
+    functions above."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    guardian_loop.run_forever(repo, market_data_connector, runner, settings)
 
 
 def _run_demo_execution_forever(
@@ -329,6 +369,18 @@ def main() -> None:
             "startup",
             event="demo_execution_disabled",
             reason="CRYPTO_TRADING_DEMO_EXECUTION_ENABLED not set",
+        )
+
+    if is_guardian_enabled():
+        guardian_runner = build_guardian_runner_from_env()
+        threads.append(
+            threading.Thread(
+                target=_run_guardian_forever, args=(connector, guardian_runner, settings), daemon=True
+            )
+        )
+    else:
+        log_event(
+            "startup", event="guardian_disabled", reason="CRYPTO_TRADING_GUARDIAN_ENABLED not set"
         )
 
     for thread in threads:
