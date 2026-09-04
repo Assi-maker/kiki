@@ -117,6 +117,32 @@ CREATE TABLE IF NOT EXISTS runs (
     status TEXT,
     errors TEXT
 );
+
+-- Detective (Post-Trade Analyst, 2026-09-04): analyserar EFTERHAND redan
+-- stängda PAPER-trades, batchvis. Refererar bara till position_ids (ingen
+-- duplicerad trade-/evidensdata - se schemas/detective.py::
+-- DetectiveAnalysisRecord).
+CREATE TABLE IF NOT EXISTS detective_analyses (
+    analysis_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    position_ids TEXT NOT NULL,
+    win_count INTEGER NOT NULL,
+    loss_count INTEGER NOT NULL,
+    breakeven_count INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    observations TEXT NOT NULL,
+    winning_patterns TEXT NOT NULL,
+    losing_patterns TEXT NOT NULL,
+    stats_snapshot TEXT NOT NULL,
+    ai_cost_usd TEXT NOT NULL
+);
+
+-- Restart-säker "redan analyserad"-markering (samma anti-join-mönster som
+-- telegram_events ovan) - ingen separat cursor/pekare som kan hamna fel.
+CREATE TABLE IF NOT EXISTS detective_analyzed_positions (
+    position_id TEXT PRIMARY KEY,
+    analysis_id TEXT NOT NULL
+);
 """
 
 

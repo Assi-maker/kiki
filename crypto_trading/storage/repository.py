@@ -20,6 +20,7 @@ from crypto_trading.schemas.assessments import (
     TechnicalAssessment,
 )
 from crypto_trading.schemas.candidate import Candidate
+from crypto_trading.schemas.detective import DetectiveAnalysisRecord
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import CandidateEvidenceRecord
 from crypto_trading.schemas.forecast import ForecastRecord
@@ -109,6 +110,12 @@ class Repository(Protocol):
     def find_all_forecasts(self, limit: int, offset: int = 0) -> list[ForecastRecord]: ...
     def find_closed_positions(self) -> list[Position]: ...
     def find_forecasts_with_outcome(self) -> list[ForecastRecord]: ...
+    def find_closed_positions_pending_detective_analysis(self, limit: int) -> list[Position]: ...
+    def count_closed_positions_pending_detective_analysis(self) -> int: ...
+    def save_detective_analysis(self, record: DetectiveAnalysisRecord) -> None: ...
+    def find_detective_analyses(
+        self, limit: int, offset: int = 0
+    ) -> list[DetectiveAnalysisRecord]: ...
 
 
 class SQLiteRepository:
@@ -779,4 +786,72 @@ class SQLiteRepository:
                 else None
             )
             result.append(ForecastRecord(**data))
+        return result
+
+    def find_closed_positions_pending_detective_analysis(self, limit: int) -> list[Position]:
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE status = 'CLOSED' "
+            "AND position_id NOT IN (SELECT position_id FROM detective_analyzed_positions) "
+            "ORDER BY closed_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._row_to_position(row) for row in rows]
+
+    def count_closed_positions_pending_detective_analysis(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM positions WHERE status = 'CLOSED' "
+            "AND position_id NOT IN (SELECT position_id FROM detective_analyzed_positions)"
+        ).fetchone()
+        return row["n"]
+
+    def save_detective_analysis(self, record: DetectiveAnalysisRecord) -> None:
+        try:
+            self._conn.execute(
+                "INSERT INTO detective_analyses (analysis_id, created_at, position_ids, "
+                "win_count, loss_count, breakeven_count, status, observations, "
+                "winning_patterns, losing_patterns, stats_snapshot, ai_cost_usd) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    record.analysis_id,
+                    record.created_at.isoformat(),
+                    json.dumps(record.position_ids),
+                    record.win_count,
+                    record.loss_count,
+                    record.breakeven_count,
+                    record.status,
+                    json.dumps(record.observations),
+                    json.dumps(record.winning_patterns),
+                    json.dumps(record.losing_patterns),
+                    json.dumps(record.stats_snapshot, default=str),
+                    str(record.ai_cost_usd),
+                ),
+            )
+            self._conn.executemany(
+                "INSERT OR IGNORE INTO detective_analyzed_positions (position_id, analysis_id) "
+                "VALUES (?, ?)",
+                [(position_id, record.analysis_id) for position_id in record.position_ids],
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def find_detective_analyses(
+        self, limit: int, offset: int = 0
+    ) -> list[DetectiveAnalysisRecord]:
+        rows = self._conn.execute(
+            "SELECT * FROM detective_analyses ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        result = []
+        for row in rows:
+            data = dict(row)
+            data["created_at"] = datetime.fromisoformat(data["created_at"])
+            data["position_ids"] = json.loads(data["position_ids"])
+            data["observations"] = json.loads(data["observations"])
+            data["winning_patterns"] = json.loads(data["winning_patterns"])
+            data["losing_patterns"] = json.loads(data["losing_patterns"])
+            data["stats_snapshot"] = json.loads(data["stats_snapshot"])
+            data["ai_cost_usd"] = Decimal(data["ai_cost_usd"])
+            result.append(DetectiveAnalysisRecord(**data))
         return result
