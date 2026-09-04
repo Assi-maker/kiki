@@ -182,3 +182,36 @@ def test_run_dashboard_forever_also_catches_a_generic_exception(tmp_path, monkey
     assert event["event"] == "dashboard_server_failed"
     assert event["error_type"] == "OSError"
     assert "address already in use" in event["error"]
+
+
+def test_run_detective_forever_constructs_its_own_repository_inside_the_worker_thread(
+    tmp_path, monkeypatch
+):
+    """Samma AC3-regression (se testerna ovan), Detective-sidan av
+    run.py::main() (2026-09-04)."""
+    settings = _settings_with_db(tmp_path)
+    errors: list[BaseException] = []
+    tick_thread_ids: list[int] = []
+
+    def fake_run_forever(repo, runner, settings):
+        try:
+            repo.start_run("run-4", "detective", datetime.now(UTC))
+            tick_thread_ids.append(threading.get_ident())
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(run_module.detective_loop, "run_forever", fake_run_forever)
+
+    worker = threading.Thread(
+        target=run_module._run_detective_forever,
+        args=(object(), settings),
+    )
+    worker.start()
+    worker.join(timeout=5)
+
+    assert errors == [], f"repo built outside the worker thread raised: {errors}"
+    assert tick_thread_ids == [worker.ident]
+
+    conn = sqlite3.connect(settings.db_path)
+    row = conn.execute("SELECT status FROM runs WHERE run_id = 'run-4'").fetchone()
+    assert row is not None, "the tick's write never reached the database"
