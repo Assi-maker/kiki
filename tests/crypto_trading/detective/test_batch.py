@@ -211,12 +211,16 @@ def test_detective_batch_never_touches_gate_decisions(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     for i in range(3):
         _seed_closed_trade(repo, i, win=True)
+    repo.save_gate_decision(
+        "cand-0", decision="CONFIRMED", reasons=["all checks passed"], evaluated_at=_NOW
+    )
     before = repo.get_gate_decision("cand-0")
+    assert before is not None  # ett verkligt gate-beslut finns innan Detective körs
 
     run_detective_batch(repo, _mock_runner(), _settings_with(), "run-1", _NOW)
 
     after = repo.get_gate_decision("cand-0")
-    assert before == after == None  # noqa: E711 - explicit None check for clarity
+    assert before == after
 
 
 def test_detective_batch_never_opens_closes_or_reopens_positions(tmp_path):
@@ -286,6 +290,47 @@ def test_daily_ai_cost_cap_is_respected_batch_is_deferred(tmp_path):
             run_id="run-0",
             schema_version=1,
             payload={"role": "risk", "status": "ok", "cost_usd": "10.00"},
+        )
+    )
+
+    result = run_detective_batch(repo, _mock_runner(), settings, "run-1", _NOW)
+
+    assert result is None
+    # Ingen batch kördes alls - positionerna förblir ej-analyserade, ingen
+    # förlorad historik.
+    assert repo.count_closed_positions_pending_detective_analysis() == 3
+    assert repo.find_detective_analyses(limit=10) == []
+
+
+def test_daily_ai_call_count_cap_is_respected_batch_is_deferred(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(3):
+        _seed_closed_trade(repo, i, win=True)
+    base_settings = _settings_with()
+    # Sätt dagens ANROPS-tak (räknar antal AI-anrop, inte $) så lågt att
+    # Detectives enda batchanrop redan skulle spränga det - oberoende av
+    # $-kostnadstaket (testas separat ovan, med gott om marginal kvar här:
+    # ett tidigare lågt-kostat anrop håller $-summan långt under taket, så
+    # det är verkligen ANROPS-räknaren som fäller batchen, inte $-taket).
+    settings = base_settings.model_copy(
+        update={
+            "budget_limits": base_settings.budget_limits.model_copy(
+                update={"max_ai_calls_per_day": 1}
+            )
+        }
+    )
+    # Ett tidigare anrop idag redan gjort - Detectives batch skulle bli
+    # anrop nr 2, vilket spränger max_ai_calls_per_day=1.
+    repo.record_ai_call_event(
+        Event(
+            event_id="AI_CALL_MADE:earlier:0",
+            event_type="AI_CALL_MADE",
+            aggregate_type="candidate",
+            aggregate_id="earlier",
+            occurred_at=_NOW,
+            run_id="run-0",
+            schema_version=1,
+            payload={"role": "risk", "status": "ok", "cost_usd": "0.01"},
         )
     )
 
