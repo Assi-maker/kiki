@@ -24,6 +24,7 @@ from crypto_trading.schemas.detective import DetectiveAnalysisRecord
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import CandidateEvidenceRecord
 from crypto_trading.schemas.forecast import ForecastRecord
+from crypto_trading.schemas.guardian import GuardianObservation
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.db import get_connection
 from crypto_trading.storage.exceptions import CorruptCandidateStateError
@@ -85,6 +86,9 @@ class Repository(Protocol):
     def mark_demo_execution_failed(
         self, position_id: str, last_error: str, updated_at: datetime
     ) -> None: ...
+    def save_guardian_observation(self, observation: GuardianObservation) -> bool: ...
+    def find_latest_guardian_observation(self, position_id: str) -> dict | None: ...
+    def find_guardian_observations_for_position(self, position_id: str) -> list[dict]: ...
     def close_position_with_event(
         self,
         position_id: str,
@@ -514,6 +518,49 @@ class SQLiteRepository:
             (last_error, updated_at.isoformat(), position_id),
         )
         self._conn.commit()
+
+    def save_guardian_observation(self, observation: GuardianObservation) -> bool:
+        try:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO guardian_observations "
+                "(observation_id, position_id, observed_at, state, decay_score, "
+                "progress_ratio, unrealized_pnl, factors, ai_reasoning, ai_cost_usd, run_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    observation.observation_id,
+                    observation.position_id,
+                    observation.observed_at.isoformat(),
+                    observation.state,
+                    str(observation.decay_score),
+                    str(observation.progress_ratio),
+                    str(observation.unrealized_pnl),
+                    json.dumps(observation.factors),
+                    observation.ai_reasoning,
+                    str(observation.ai_cost_usd) if observation.ai_cost_usd is not None else None,
+                    observation.run_id,
+                ),
+            )
+            created = cur.rowcount > 0
+            self._conn.commit()
+            return created
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def find_latest_guardian_observation(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM guardian_observations WHERE position_id = ? "
+            "ORDER BY observed_at DESC LIMIT 1",
+            (position_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_guardian_observations_for_position(self, position_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_observations WHERE position_id = ? ORDER BY observed_at ASC",
+            (position_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def close_position_with_event(
         self,
