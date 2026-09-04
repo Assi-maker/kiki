@@ -174,7 +174,9 @@ def _run_demo_execution_forever(
     quantity_precision_by_symbol = {
         c["symbol"]: int(c.get("quantityPrecision", 0)) for c in contracts
     }
-    demo_execution_loop.run_forever(repo, demo_connector, quantity_precision_by_symbol, settings)
+    demo_execution_loop.run_forever(
+        repo, demo_connector, market_data_connector, quantity_precision_by_symbol, settings
+    )
 
 
 def _run_notify_forever(notifier: TelegramNotifier, settings: Settings) -> None:

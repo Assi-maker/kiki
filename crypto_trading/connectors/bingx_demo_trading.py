@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import time
+from decimal import Decimal
 from urllib.parse import urlparse
 
 import httpx
@@ -15,6 +16,18 @@ _VST_HOST = "open-api-vst.bingx.com"
 _ORDER_PATH = "/openApi/swap/v2/trade/order"
 _ALL_OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/allOpenOrders"
 _LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
+_POSITIONS_PATH = "/openApi/swap/v2/user/positions"
+
+
+def _unwrap_order(data: dict | None) -> dict:
+    """BingX's /trade/order endpoint (place, GET-by-id, GET-by-clientOrderID)
+    nests the actual order fields one level down under a `data.order` key -
+    confirmed live 2026-09-04, not documented anywhere readable at design
+    time. Centralized here so every caller gets a flat dict, matching what
+    the rest of this codebase already expects."""
+    if not data:
+        return {}
+    return data.get("order", data)
 
 
 class DemoExecutionGuardError(Exception):
@@ -135,7 +148,13 @@ class BingXDemoTradingConnector:
             "stopLoss": json.dumps(
                 {
                     "type": "STOP_MARKET",
+                    # quantity/price are required alongside stopPrice - confirmed live
+                    # 2026-09-04: an entry order filled fine without them, but a
+                    # follow-up query showed the SL/TP had NOT actually been
+                    # registered (silently ignored, not rejected).
+                    "quantity": float(quantity),
                     "stopPrice": float(stop_loss_price),  # numeric, not a string - BingX rejects a quoted stopPrice
+                    "price": float(stop_loss_price),
                     "workingType": "MARK_PRICE",
                 },
                 separators=(",", ":"),
@@ -143,27 +162,46 @@ class BingXDemoTradingConnector:
             "takeProfit": json.dumps(
                 {
                     "type": "TAKE_PROFIT_MARKET",
+                    "quantity": float(quantity),
                     "stopPrice": float(target_price),
+                    "price": float(target_price),
                     "workingType": "MARK_PRICE",
                 },
                 separators=(",", ":"),
             ),
         }
-        return self._request("POST", _ORDER_PATH, params) or {}
+        return _unwrap_order(self._request("POST", _ORDER_PATH, params))
 
     def get_order_by_client_order_id(self, symbol: str, client_order_id: str) -> dict | None:
         try:
-            return self._request(
+            data = self._request(
                 "GET", _ORDER_PATH, {"symbol": symbol, "clientOrderID": client_order_id}
             )
         except ConnectorUnavailableError:
             return None
+        return _unwrap_order(data) or None
 
     def get_order_status(self, symbol: str, order_id: str) -> dict | None:
         try:
-            return self._request("GET", _ORDER_PATH, {"symbol": symbol, "orderId": order_id})
+            data = self._request("GET", _ORDER_PATH, {"symbol": symbol, "orderId": order_id})
         except ConnectorUnavailableError:
             return None
+        return _unwrap_order(data) or None
+
+    def get_position(self, symbol: str) -> dict | None:
+        """Read-only. BingX does not expose a separate, independently
+        queryable order id for the stopLoss/takeProfit legs attached to an
+        entry order (confirmed live 2026-09-04: the entry order's own
+        `get_order_status()` response embeds them as descriptive sub-fields,
+        never as a distinct order id to poll) - so reconciliation
+        (paper_trading/demo_execution.py::reconcile_active_executions)
+        detects an exchange-side close by noticing the position itself has
+        gone flat, not by polling a leg's order id."""
+        positions = self._request("GET", _POSITIONS_PATH, {}) or []
+        for position in positions:
+            if position.get("symbol") == symbol and Decimal(str(position.get("positionAmt", "0"))) != 0:
+                return position
+        return None
 
     def cancel_all_open_orders(self, symbol: str) -> dict:
         return self._request("DELETE", _ALL_OPEN_ORDERS_PATH, {"symbol": symbol}) or {}
@@ -179,7 +217,7 @@ class BingXDemoTradingConnector:
         tracks LONG/SHORT as entirely separate books, selected by
         positionSide, not by net side) - there is no code path here that
         could ever increase or flip the position."""
-        return (
+        return _unwrap_order(
             self._request(
                 "POST",
                 _ORDER_PATH,
@@ -192,5 +230,4 @@ class BingXDemoTradingConnector:
                     "clientOrderID": client_order_id,
                 },
             )
-            or {}
         )

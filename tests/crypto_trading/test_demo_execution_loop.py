@@ -24,14 +24,19 @@ class _SpyConnector:
     def get_order_by_client_order_id(self, symbol, client_order_id):
         return None
 
-    def get_order_status(self, symbol, order_id):
-        return None
+    def get_position(self, symbol):
+        return {"symbol": symbol, "positionAmt": "0.001"}  # still open
 
     def cancel_all_open_orders(self, symbol):
         return {}
 
     def close_position_market(self, symbol, quantity, client_order_id):
         return {"avgPrice": "0"}
+
+
+class _SpyMarketDataConnector:
+    def get_ticker(self, symbol):
+        return {"lastPrice": "50000"}
 
 
 def _seed_open_position(repo, position_id="pos-1"):
@@ -54,7 +59,9 @@ def test_run_demo_execution_tick_processes_pending_positions(tmp_path):
     _seed_open_position(repo)
     connector = _SpyConnector()
 
-    run_demo_execution_tick(repo, connector, {"BTC-USDT": 3}, get_settings(), _NOW)
+    run_demo_execution_tick(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3}, get_settings(), _NOW
+    )
 
     row = repo.get_demo_execution("pos-1")
     assert row["phase"] == "ACTIVE"

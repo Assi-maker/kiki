@@ -33,15 +33,16 @@ def _open_position(repo, position_id="pos-1", opened_at=_NOW) -> Position:
 
 
 class _SpyConnector:
+    """`position_by_symbol` defaults every symbol to "still open" (a non-
+    None dict) unless explicitly set to None - matching a real just-opened
+    position that hasn't been closed by the exchange yet."""
+
     def __init__(self, order_result=None, raise_on_place=None):
         self.calls = []
-        self._order_result = order_result or {
-            "orderId": "ex-1", "avgPrice": "50010",
-            "stopLoss": {"orderId": "sl-1"}, "takeProfit": {"orderId": "tp-1"},
-        }
+        self._order_result = order_result or {"orderId": "ex-1", "avgPrice": "50010"}
         self._raise_on_place = raise_on_place
         self.order_lookup_result = None
-        self.order_status_by_id = {}
+        self.position_by_symbol: dict[str, dict | None] = {}
 
     def set_leverage(self, symbol, leverage=1, side="LONG"):
         self.calls.append(("set_leverage", symbol, leverage))
@@ -57,9 +58,9 @@ class _SpyConnector:
         self.calls.append(("get_order_by_client_order_id", symbol, client_order_id))
         return self.order_lookup_result
 
-    def get_order_status(self, symbol, order_id):
-        self.calls.append(("get_order_status", symbol, order_id))
-        return self.order_status_by_id.get(order_id)
+    def get_position(self, symbol):
+        self.calls.append(("get_position", symbol))
+        return self.position_by_symbol.get(symbol, {"symbol": symbol, "positionAmt": "0.001"})
 
     def cancel_all_open_orders(self, symbol):
         self.calls.append(("cancel_all_open_orders", symbol))
@@ -68,6 +69,14 @@ class _SpyConnector:
     def close_position_market(self, symbol, quantity, client_order_id):
         self.calls.append(("close_position_market", symbol, quantity, client_order_id))
         return {"avgPrice": "49500"}
+
+
+class _SpyMarketDataConnector:
+    def __init__(self, last_price: str = "49000"):
+        self._last_price = last_price
+
+    def get_ticker(self, symbol):
+        return {"lastPrice": self._last_price}
 
 
 def test_process_pending_positions_places_one_order_and_marks_active(tmp_path):
@@ -80,8 +89,8 @@ def test_process_pending_positions_places_one_order_and_marks_active(tmp_path):
     row = repo.get_demo_execution("pos-1")
     assert row["phase"] == "ACTIVE"
     assert row["entry_exchange_order_id"] == "ex-1"
-    assert row["sl_exchange_order_id"] == "sl-1"
-    assert row["tp_exchange_order_id"] == "tp-1"
+    assert row["sl_exchange_order_id"] is None
+    assert row["tp_exchange_order_id"] is None
     place_calls = [c for c in connector.calls if c[0] == "place_entry_order_with_sl_tp"]
     assert len(place_calls) == 1
 
@@ -143,19 +152,51 @@ def test_recover_stale_claims_adopts_existing_order_without_resubmitting(tmp_pat
     assert len(place_calls) == 0  # adopted the existing order, never resubmitted
 
 
-def test_reconcile_active_executions_detects_stop_loss_fill(tmp_path):
+def test_reconcile_active_executions_leaves_row_active_while_position_is_still_open(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector()
     process_pending_positions(repo, connector, {"BTC-USDT": 3}, "run-1", _NOW)
-    connector.order_status_by_id["sl-1"] = {"status": "FILLED", "avgPrice": "49000"}
+    market_data = _SpyMarketDataConnector()
 
-    reconcile_active_executions(repo, connector, "run-1", _NOW + timedelta(minutes=5))
+    reconcile_active_executions(repo, connector, market_data, "run-1", _NOW + timedelta(minutes=5))
+
+    assert repo.get_demo_execution("pos-1")["phase"] == "ACTIVE"
+
+
+def test_reconcile_active_executions_closes_and_classifies_stop_loss_when_position_goes_flat(
+    tmp_path,
+):
+    """BingX exposes no separate order id for the attached SL/TP legs
+    (confirmed live 2026-09-04) - reconciliation instead notices the
+    position itself went flat and classifies the exit by comparing the
+    observed price's distance to our own recorded stop_loss/target."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    position = _open_position(repo)
+    connector = _SpyConnector()
+    process_pending_positions(repo, connector, {"BTC-USDT": 3}, "run-1", _NOW)
+    connector.position_by_symbol["BTC-USDT"] = None  # exchange closed it
+    market_data = _SpyMarketDataConnector(last_price=str(position.stop_loss))
+
+    reconcile_active_executions(repo, connector, market_data, "run-1", _NOW + timedelta(minutes=5))
 
     row = repo.get_demo_execution("pos-1")
     assert row["phase"] == "CLOSED"
     assert row["exit_reason"] == "stop_loss"
-    assert row["exchange_fill_exit"] == "49000"
+    assert row["exchange_fill_exit"] == str(position.stop_loss)
+
+
+def test_reconcile_active_executions_classifies_target_when_price_is_closer_to_target(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    position = _open_position(repo)
+    connector = _SpyConnector()
+    process_pending_positions(repo, connector, {"BTC-USDT": 3}, "run-1", _NOW)
+    connector.position_by_symbol["BTC-USDT"] = None
+    market_data = _SpyMarketDataConnector(last_price=str(position.target))
+
+    reconcile_active_executions(repo, connector, market_data, "run-1", _NOW + timedelta(minutes=5))
+
+    assert repo.get_demo_execution("pos-1")["exit_reason"] == "target"
 
 
 def test_close_time_limit_positions_closes_and_never_touches_positions_table(tmp_path):

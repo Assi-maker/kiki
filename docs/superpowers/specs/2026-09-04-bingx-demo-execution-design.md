@@ -100,7 +100,9 @@ thread is never started, `run.py` logs
 | `phase` | TEXT | `CLAIMED` → `ENTRY_SUBMITTED` → `ACTIVE` → `CLOSED` / `FAILED` |
 | `entry_client_order_id` | TEXT | deterministic, derived from `position_id` |
 | `entry_exchange_order_id` | TEXT NULL | set once BingX confirms |
-| `exit_reason` | TEXT NULL | `stop_loss` / `target` / `TIME_LIMIT` |
+| `entry_quantity` | TEXT NULL | contract quantity actually submitted, reused for the eventual close |
+| `sl_exchange_order_id` / `tp_exchange_order_id` | TEXT NULL | **always NULL in practice** — kept for schema stability, but BingX exposes no separate order id for these attached legs (live-verified 2026-09-04, §9/§12); reconciliation uses position state instead |
+| `exit_reason` | TEXT NULL | `stop_loss` / `target` (best-effort classification, §12) / `TIME_LIMIT` |
 | `exchange_fill_entry` | TEXT NULL | Decimal-as-string, exchange-reported |
 | `exchange_fill_exit` | TEXT NULL | Decimal-as-string |
 | `last_error` | TEXT NULL | most recent failure, if `phase='FAILED'` |
@@ -125,16 +127,15 @@ shared id value, no shared write path.
    first; only if that lookup finds nothing does it retry placement with the
    same deterministic `clientOrderID`. Never a blind retry.
 
-**Open item to verify live during implementation:** BingX's exact
-`clientOrderID` semantics (length/charset limits, whether the exchange
-itself rejects a duplicate `clientOrderID` or silently accepts a second
-order). The official API docs have moved to a JS-rendered site this design
-process couldn't fully read; the repo's own README now just redirects there.
-Treat this as unconfirmed until checked against the live authenticated demo
-endpoint — same "verified live" discipline already used elsewhere in this
-codebase (e.g. `bingx_market_data.py`'s "Verifierad live 2026-08-25" note).
-Our own DB-level claim (step 1) is the primary, self-sufficient safeguard
-regardless of what BingX does with `clientOrderID`.
+**Verified live 2026-09-04 (Task 11 Step 3):** a `clientOrderID` is accepted
+and echoed back correctly by BingX. **Still open, not yet live-verified:**
+whether BingX itself rejects a genuine duplicate `clientOrderID` (the
+verification order used a fresh, timestamp-based id each retry, so this
+specific case never arose) - our own DB-level claim (step 1) remains the
+primary, self-sufficient safeguard regardless of what BingX does here. Also
+not yet live-verified: the production `_client_order_id()` format itself
+(a 32-char `pt<hash-prefix><suffix>` string) - the live test used simple
+ad-hoc ids, not this exact function's output.
 
 ## 9. Order mechanics
 
@@ -150,9 +151,34 @@ regardless of what BingX does with `clientOrderID`.
 - **SL/TP attached to the entry order** as `stopLoss`/`takeProfit` JSON
   parameters on the same order-placement call (BingX's native one-request
   attachment), not three separate calls — eliminates the window where a
-  filled entry temporarily has no exchange-side protection.
-- **`reduceOnly=true`** on the SL/TP legs — they can only close, never flip
-  or add to, the position.
+  filled entry temporarily has no exchange-side protection. **Live-verified
+  2026-09-04 (Task 11 Step 3):** each JSON object must include `quantity`
+  and `price` alongside `type`/`stopPrice`/`workingType` — an entry order
+  submitted without them fills fine and even echoes the SL/TP back in the
+  placement response, but a follow-up query shows the attachment was
+  silently *not* registered (empty/zeroed fields). BingX also exposes no
+  independently queryable order id for these attached legs at all (neither
+  in the placement response nor in a follow-up query of the entry order) —
+  see §12 for how reconciliation adapted to that.
+- **No `reduceOnly` on the closing order** — live-verified 2026-09-04: a
+  hedge-mode account (confirmed to be this user's account type) rejects
+  `reduceOnly` outright ("In the Hedge mode, the 'ReduceOnly' field can not
+  be filled"). `positionSide=LONG` on its own already provides the same
+  guarantee in hedge mode: a `SELL` order pinned to the `LONG` bucket can
+  only reduce/close it, never flip into or increase a `SHORT` position
+  (hedge mode tracks LONG/SHORT as entirely separate books, selected by
+  `positionSide`, not by net side).
+- **Transport, live-verified 2026-09-04:** POST request parameters
+  (including entry+SL/TP) must be sent in the request body
+  (`application/x-www-form-urlencoded`), not the URL query string — a
+  JSON-valued query parameter (literal `{`/`"`/`:`) is silently blocked by
+  a CloudFront-level WAF in front of BingX's API (`X-Cache: Error from
+  cloudfront`, empty-body 400) before ever reaching BingX's application.
+  GET/DELETE still use the URL query string. The HMAC-SHA256 signature
+  itself is computed over a plain, **never percent-encoded**
+  `key=value&...` join (confirmed against BingX's own reference client
+  implementations) — this exact string is both signed and transmitted,
+  never rebuilt or re-encoded by the HTTP client afterwards.
 
 ## 10. Time-limit parity (user-specified)
 
@@ -181,8 +207,21 @@ BingX has no server-side time-based close; PAPER does
 
 1. Read new `POSITION_OPENED` events → claim-before-place (§8) → single
    entry+SL/TP order call (§9).
-2. Poll `ACTIVE` rows' order/position status on BingX → update fill/close/
-   `exit_reason` when the exchange reports an SL/TP trigger.
+2. Reconcile `ACTIVE` rows — **redesigned 2026-09-04 after live
+   verification disproved the original per-leg-order-id design.** BingX
+   does not expose an order id for the attached SL/TP legs (§9), so
+   `reconcile_active_executions()` instead queries the account's current
+   position for the instrument (`GET /openApi/swap/v2/user/positions`, a
+   new read-only connector method, `get_position()`). If the position has
+   gone flat, the exchange closed it independently of this process — that
+   alone is the proof, regardless of which leg triggered it. The exit fill
+   price is then approximated from the already-existing, already-trusted
+   `BingXMarketDataConnector.get_ticker()` (the same "conservative
+   approximation from available data, always honestly labeled" approach
+   PAPER's own `monitoring_loop` already uses), and `exit_reason` is a
+   best-effort classification — `stop_loss` if that price is closer to the
+   position's own recorded `stop_loss`, otherwise `target` — since BingX
+   gives us no direct flag saying which leg fired.
 3. Check `ACTIVE` rows against PAPER's time-limit (§10) → close if reached.
 4. Writes exclusively to `demo_executions`. Never writes to `positions`.
 
@@ -197,10 +236,14 @@ write logic in that file — it stays read-only as designed.
 
 ## 14. Testing strategy
 
-- `FakeBingXDemoConnector` test double — same pattern the test suite already
-  uses for `BingXMarketDataConnector`. Real network calls are forbidden in
-  tests.
-- Targeted tests:
+- Connector-level tests: `respx`-mocked HTTP against the real
+  `BingXDemoTradingConnector` class — the same pattern the test suite
+  already uses for `BingXMarketDataConnector` (not a separate fake class).
+  Real network calls are forbidden in this layer.
+- Orchestration-level tests (`demo_execution.py`, `demo_execution_loop.py`):
+  a plain spy/stub object matching the connector's method signatures — same
+  pattern as `monitoring_loop.py`'s existing `_MonitoringStubConnector`.
+- Targeted tests, all implemented:
   - host guard rejects everything except the exact `open-api-vst.bingx.com`
     host (including near-miss hosts, e.g. a subdomain trick).
   - concurrent/duplicate `POSITION_OPENED` delivery never results in two
@@ -208,6 +251,9 @@ write logic in that file — it stays read-only as designed.
   - a crash between `CLAIMED` and confirmed response recovers correctly via
     lookup-before-retry.
   - time-limit closing never mutates the `positions` table.
+  - reconciliation correctly distinguishes "still open" vs "exchange
+    closed it" via `get_position()`, and classifies `stop_loss`/`target` by
+    price proximity.
 - Before considering this done: a **manual, real verification** against the
   user's actual BingX demo account (a position visibly opens/closes correctly
   in BingX's own UI) — the same live-verification discipline already

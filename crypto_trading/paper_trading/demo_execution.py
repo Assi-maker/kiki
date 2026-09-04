@@ -52,8 +52,13 @@ def _submit_entry_order(
             entry_exchange_order_id=str(result.get("orderId", "")),
             entry_quantity=quantity,
             exchange_fill_entry=str(result.get("avgPrice", "")),
-            sl_exchange_order_id=str(result.get("stopLoss", {}).get("orderId", "")) or None,
-            tp_exchange_order_id=str(result.get("takeProfit", {}).get("orderId", "")) or None,
+            # BingX exposes no independently queryable order id for the
+            # attached stopLoss/takeProfit legs (confirmed live 2026-09-04 -
+            # they come back as a descriptive JSON string/empty sub-object,
+            # never an order id to poll). Reconciliation instead watches the
+            # position itself go flat (see reconcile_active_executions()).
+            sl_exchange_order_id=None,
+            tp_exchange_order_id=None,
             updated_at=now,
         )
         log_event(
@@ -120,33 +125,48 @@ def recover_stale_claims(
         _submit_entry_order(repo, connector, position, quantity_precision_by_symbol, run_id, now)
 
 
+def _classify_exit_reason(position: Position, exit_price: Decimal) -> str:
+    """Best-effort classification, not a fact BingX hands us directly: once
+    the position is confirmed flat (reconcile_active_executions()), we know
+    *that* it closed but not natively *why*. Compares the observed exit
+    price's distance to our own recorded stop_loss/target - the same
+    conservative "approximate from available data, always honestly labeled"
+    approach the rest of this codebase already uses for PAPER (design doc
+    §12/§13)."""
+    distance_to_stop = abs(exit_price - position.stop_loss)
+    distance_to_target = abs(exit_price - position.target)
+    return "stop_loss" if distance_to_stop <= distance_to_target else "target"
+
+
 def reconcile_active_executions(
-    repo: Repository, connector: BingXDemoTradingConnector, run_id: str, now: datetime
+    repo: Repository,
+    connector: BingXDemoTradingConnector,
+    market_data_connector: object,
+    run_id: str,
+    now: datetime,
 ) -> None:
-    """Polls each ACTIVE demo_executions row's attached SL/TP order status.
-    BingX's own matching engine triggers these independent of whether this
-    process is running - this loop only needs to notice and record it
-    afterwards, never to cause the close itself."""
+    """BingX exposes no independently queryable order id for the attached
+    stopLoss/takeProfit legs (confirmed live 2026-09-04), so this cannot
+    poll a leg's order status the way the original design assumed. Instead
+    it watches the position itself: BingX's own matching engine closes it
+    independent of whether this process is running, and once
+    `connector.get_position()` reports it flat, that alone proves the
+    exchange closed it (this loop never causes the close itself - the only
+    other closer is close_time_limit_positions(), and a row already
+    CLOSED/FAILED is filtered out by find_active_demo_executions())."""
     for row in repo.find_active_demo_executions():
         position = repo.get_position(row["position_id"])
         if position is None:
             continue
-        sl_id, tp_id = row.get("sl_exchange_order_id"), row.get("tp_exchange_order_id")
-        sl_status = connector.get_order_status(position.instrument, sl_id) if sl_id else None
-        if sl_status and sl_status.get("status") == "FILLED":
-            repo.close_demo_execution(
-                position.position_id, "stop_loss", str(sl_status.get("avgPrice", "")), now
-            )
-            log_event(run_id, event="demo_position_closed", position_id=position.position_id,
-                       exit_reason="stop_loss")
-            continue
-        tp_status = connector.get_order_status(position.instrument, tp_id) if tp_id else None
-        if tp_status and tp_status.get("status") == "FILLED":
-            repo.close_demo_execution(
-                position.position_id, "target", str(tp_status.get("avgPrice", "")), now
-            )
-            log_event(run_id, event="demo_position_closed", position_id=position.position_id,
-                       exit_reason="target")
+        if connector.get_position(position.instrument) is not None:
+            continue  # still open on the exchange
+        exit_price = Decimal(str(market_data_connector.get_ticker(position.instrument)["lastPrice"]))
+        exit_reason = _classify_exit_reason(position, exit_price)
+        repo.close_demo_execution(position.position_id, exit_reason, str(exit_price), now)
+        log_event(
+            run_id, event="demo_position_closed", position_id=position.position_id,
+            exit_reason=exit_reason,
+        )
 
 
 def close_time_limit_positions(
