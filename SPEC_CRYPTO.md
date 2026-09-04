@@ -17,14 +17,38 @@ Systemet ska kontinuerligt bevaka BingX USDT perpetual futures, deterministiskt 
 
 **Det här är INTE:**
 - Ett system som lovar att förutsäga marknaden. Forecast Agent producerar sannolikhetsscenarier, aldrig säkerheter, och dess kalibrering mäts fortlöpande mot faktiskt utfall (§9).
-- **Ett tradingsystem i verklig mening.** Ingen kod i `crypto_trading/` får:
-  - ansluta till BingX (eller annat) mäklarkonto,
-  - läsa kontosaldo,
-  - hantera broker-credentials eller API-nycklar för orderläggning,
+- **Ett tradingsystem i verklig mening mot ett riktigt (live) konto.** Ingen
+  kod i `crypto_trading/` får:
+  - ansluta till ett riktigt BingX-konto (eller annat riktigt mäklarkonto),
+  - läsa ett riktigt kontosaldo,
+  - hantera broker-credentials/API-nycklar som kan nå ett riktigt konto,
   - placera en riktig order,
-  - flytta pengar.
+  - flytta riktiga pengar.
 
-  Detta är en **hård gräns, inte en konfigurationsflagga** — identisk princip som `intelligence/`s SPEC §1/§14, gäller i alla faser. "Paper trading" betyder uteslutande lokal, simulerad bokföring av hypotetiska positioner mot riktig marknadsdata — aldrig en verklig order.
+  Detta är en **hård gräns, inte en konfigurationsflagga** — identisk princip
+  som `intelligence/`s SPEC §1/§14, gäller i alla faser.
+
+  **Explicit, avsiktligt undantag (2026-09-04, se
+  `docs/superpowers/specs/2026-09-04-bingx-demo-execution-design.md`):**
+  `crypto_trading/connectors/bingx_demo_trading.py` får placera/avbryta
+  ordrar **uteslutande** mot BingX **Demo (VST)**-kontot, aldrig det riktiga
+  kontot. Detta är säkrat på kodnivå, inte bara via konfiguration:
+  - `_base_url` är en hårdkodad modulkonstant (`open-api-vst.bingx.com`),
+    aldrig en constructor-/env-/settings-parameter.
+  - Ett exakt host-guard körs omedelbart före varje order-läggande/ändrande/
+    avbrytande anrop och vägrar allt annat än exakt detta värde.
+  - Credentials läses uteslutande från `CRYPTO_TRADING_BINGX_DEMO_API_KEY`/
+    `_SECRET`, aldrig en generisk `BINGX_API_KEY`-variabel.
+  - Tråden som kör detta är avstängd som standard
+    (`CRYPTO_TRADING_DEMO_EXECUTION_ENABLED`, opt-in).
+  - Denna kod får **aldrig** skapa/ändra/stänga en rad i `positions`-tabellen
+    — PAPER och BingX Demo är oberoende, parallella observatörer av samma
+    redan Gate-godkända trade (se §8.6/§8.7 nedan, oförändrade för
+    `positions`).
+
+  "Paper trading" (den ursprungliga, oförändrade `positions`-tabellen)
+  förblir uteslutande lokal, simulerad bokföring — det nya BingX Demo-lagret
+  är ett separat, additivt observationslager, inte en ersättning.
 - En "magisk AI-agent". Deterministisk kod gör allt som kan vara deterministiskt (eligibility-filtrering, quant screening, position sizing, risk-gate, state transitions). LLM används bara för semantisk analys: teknisk tolkning, hypotesgenerering, prognos, adversarial granskning.
 
 **Kärnprinciper (obligatoriska, kod-nivå-garantier):**
@@ -324,8 +348,8 @@ Varje fas har egna acceptance criteria och automatiska tester; nästa fas påbö
 
 ## 19. Säkerhet
 
-- Ingen kod i `crypto_trading/` ansluter till ett mäklarkonto, hanterar broker-credentials, placerar en riktig order, eller flyttar pengar — i någon fas. Hård gräns, inte konfigurationsflagga (§1).
-- **Paper trading är 100 % lokal simulering.** Ingen del av `paper_trading/` gör ett nätverksanrop mot ett BingX-konto eller någon order-/account-endpoint — all "execution" är en beräkning mot redan hämtad publik marknadsdata, skriven till den lokala databasen (§16). Verifieras explicit i Phase 1 acceptance criterion 3 (PLAN_CRYPTO.md): ingen kod-sökväg i hela `crypto_trading/` refererar ett BingX-konto, orderendpoint eller broker-credential.
+- Ingen kod i `crypto_trading/` ansluter till ett RIKTIGT mäklarkonto, hanterar broker-credentials som kan nå ett riktigt konto, placerar en riktig order, eller flyttar riktiga pengar — i någon fas. Hård gräns, inte konfigurationsflagga (§1). Explicit, avsiktligt undantag: `connectors/bingx_demo_trading.py` mot BingX Demo (VST) uteslutande, se §1 och `docs/superpowers/specs/2026-09-04-bingx-demo-execution-design.md`.
+- **Paper trading (`positions`-tabellen) är fortsatt 100 % lokal simulering, oförändrad.** `paper_trading/position_opening.py`/`position_closing.py` gör inget nätverksanrop mot ett BingX-konto. Ett separat, additivt lager (`paper_trading/demo_execution.py`, tabellen `demo_executions`) mirror:ar Gate-godkända trades som riktiga ordrar mot BingX Demo (VST) — det lagret rör aldrig `positions`.
 - BingX-anrop är uteslutande publika market-data-endpoints.
 - Alla secrets (Telegram) via `.env`, gitignorad, redigeras i loggar.
 - Paper trading-rapporter markeras alltid "Simulerad handel — inga verkliga trades, inga verkliga pengar" i Telegram/dashboard/rapporter.
@@ -340,7 +364,8 @@ Varje fas har egna acceptance criteria och automatiska tester; nästa fas påbö
 | Kan ett krasch mitt i analys skapa ett permanent oklart state? | Nej — `ANALYSIS_INTERRUPTED` + definierad recovery-policy (§8.5). |
 | Kan en restart skapa dubbla positioner/notiser? | Nej — idempotenta state-övergångar och events (§8.6). |
 | Kan Forecast Agent:s sannolikheter presenteras som bevis? | Nej — alltid med sample size, Brier score och calibration curve; låg N flaggas explicit (§9). |
-| Kan riktig handel ske av misstag? | Nej — inga account/order-endpoints existerar i kodbasen, ingen broker-anslutning, ingen kod för det (§1, §19). |
+| Kan riktig (LIVE-konto) handel ske av misstag? | Nej — `connectors/bingx_demo_trading.py` har en hårdkodad `_base_url`-konstant (aldrig en parameter), ett exakt host-guard som körs före varje mutating anrop och vägrar allt utom `open-api-vst.bingx.com`, dedikerade `CRYPTO_TRADING_BINGX_DEMO_API_KEY/_SECRET`-variabler (aldrig en generisk nyckel), och tråden är avstängd som standard (§1, §19, `docs/superpowers/specs/2026-09-04-bingx-demo-execution-design.md`). |
+| Kan BingX Demo-exekveringen ändra en PAPER-position? | Nej — den skriver uteslutande till `demo_executions`, aldrig till `positions`; `position_opening.py`/`position_closing.py` är oförändrade och opåverkade. |
 | Kan budgetbegränsning kringgå risk-/data-quality-regler? | Nej — budget påverkar bara vilka candidates som analyseras, aldrig gate-logiken (§8.3, §10). |
 | Kan framtida data läcka in i ett beslut (live eller replay)? | Nej — generell arkitekturregel (kärnprincip 4, §1), testad explicit i replay och i livevägens datahämtning (§8.4). |
 | Kan `candidate_score` misstas för AI-confidence/forecast-sannolikhet/vinstchans? | Nej — separat tabell i §4 låser vad varje tal betyder; inget kombinerat "confidence"-fält existerar. |
