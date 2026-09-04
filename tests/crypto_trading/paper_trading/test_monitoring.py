@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from crypto_trading.paper_trading.monitoring import check_exit_trigger
+from crypto_trading.paper_trading.monitoring import check_exit_trigger, compute_hold_hours
 from crypto_trading.schemas.trade import Position
 
 _OPENED_AT = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
@@ -141,3 +141,11 @@ def test_stop_loss_checked_before_time_limit_when_both_true():
     )
     exit_reason, _trigger_price = result
     assert exit_reason == "stop_loss"
+
+
+def test_compute_hold_hours_matches_elapsed_time():
+    now = _OPENED_AT + timedelta(hours=2, minutes=30)
+
+    hours = compute_hold_hours(_position(), now)
+
+    assert hours == Decimal("2.5")

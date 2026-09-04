@@ -34,9 +34,15 @@ def check_exit_trigger(
     if candle_high >= position.target:
         return "target", min(candle_high, position.target)
 
-    hold_seconds = Decimal(str((now - position.opened_at).total_seconds()))
-    hold_hours = hold_seconds / _SECONDS_PER_HOUR
-    if hold_hours >= max_position_hold_hours:
+    if compute_hold_hours(position, now) >= max_position_hold_hours:
         return "time_limit", current_price
 
     return None
+
+
+def compute_hold_hours(position: Position, now: datetime) -> Decimal:
+    """Shared with paper_trading/demo_execution.py's time-limit parity logic
+    (2026-09-04 design) so PAPER and BingX Demo never drift on what counts
+    as 'reached max_position_hold_hours' for the same position."""
+    hold_seconds = Decimal(str((now - position.opened_at).total_seconds()))
+    return hold_seconds / _SECONDS_PER_HOUR
