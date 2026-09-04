@@ -143,6 +143,32 @@ CREATE TABLE IF NOT EXISTS detective_analyzed_positions (
     position_id TEXT PRIMARY KEY,
     analysis_id TEXT NOT NULL
 );
+
+-- BingX Demo (VST) execution (2026-09-04): strictly additive parallel
+-- observer of an already-Gate-approved PAPER position, never the other way
+-- around - this table is NEVER joined-into or written-from
+-- position_opening.py/position_closing.py, see
+-- docs/superpowers/specs/2026-09-04-bingx-demo-execution-design.md.
+-- phase: CLAIMED -> ACTIVE -> CLOSED / FAILED. Claim-before-place
+-- idempotency: position_id is the PK, so a duplicate POSITION_OPENED
+-- observation or a restart can never produce two demo orders for the same
+-- position (INSERT OR IGNORE in repository.py::claim_demo_execution()).
+CREATE TABLE IF NOT EXISTS demo_executions (
+    position_id TEXT PRIMARY KEY,
+    phase TEXT NOT NULL,
+    entry_client_order_id TEXT,
+    entry_exchange_order_id TEXT,
+    entry_quantity TEXT,
+    sl_exchange_order_id TEXT,
+    tp_exchange_order_id TEXT,
+    exit_reason TEXT,
+    exchange_fill_entry TEXT,
+    exchange_fill_exit TEXT,
+    last_error TEXT,
+    claimed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT
+);
 """
 
 

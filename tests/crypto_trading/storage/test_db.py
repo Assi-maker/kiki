@@ -244,6 +244,17 @@ def test_decimal_high_precision_value_would_lose_precision_via_float_but_not_via
     assert preserved_via_str == value  # str-vägen (den vi faktiskt använder) tappar ingenting
 
 
+def test_demo_executions_table_exists(tmp_path):
+    conn = get_connection(tmp_path / "t.db")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(demo_executions)").fetchall()}
+    assert columns == {
+        "position_id", "phase", "entry_client_order_id", "entry_exchange_order_id",
+        "entry_quantity", "sl_exchange_order_id", "tp_exchange_order_id", "exit_reason",
+        "exchange_fill_entry", "exchange_fill_exit", "last_error", "claimed_at",
+        "updated_at", "closed_at",
+    }
+
+
 @pytest.mark.parametrize("value", _DECIMAL_ROUNDTRIP_VALUES)
 def test_decimal_json_roundtrip_is_exact_never_via_float(value):
     """Låser samma konvention för JSON-payloads (t.ex. events.payload):
