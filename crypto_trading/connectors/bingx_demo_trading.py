@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 import time
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlparse
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -49,17 +49,29 @@ class BingXDemoTradingConnector:
                 f"only {_VST_HOST!r} is permitted"
             )
 
-    def _sign(self, params: dict) -> dict:
-        query = urlencode(sorted(params.items()))
+    def _sign_query(self, params: dict) -> str:
+        """Builds the exact, raw (never percent-encoded) query string that
+        gets signed AND transmitted - byte-for-byte identical everywhere.
+        Confirmed against BingX's own reference client implementations
+        (2026-09-04, after this connector's first live attempts failed):
+        the signature is HMAC-SHA256 over a plain `key=value` join with NO
+        URL-encoding at all. This only matters for GET/DELETE, which still
+        carry params in the URL query string - POST sends this same string
+        as the request body instead (see _request()), which is what
+        actually avoids a CloudFront-level rejection of literal `{`/`"`/`:`
+        characters from the JSON-valued stopLoss/takeProfit params inside a
+        URL (confirmed live: `X-Cache: Error from cloudfront` on an
+        empty-body 400 when those characters were sent in the URL)."""
+        query = "&".join(f"{key}={value}" for key, value in sorted(params.items()))
         signature = hmac.new(
             self._api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256
         ).hexdigest()
-        return {**params, "signature": signature}
+        return f"{query}&signature={signature}"
 
     def _request(self, method: str, path: str, params: dict) -> dict | None:
         self._guard_host()
         full_params = {**params, "timestamp": int(time.time() * 1000)}
-        signed = self._sign(full_params)
+        query_string = self._sign_query(full_params)
 
         @retry(
             stop=stop_after_attempt(self._max_retries),
@@ -69,18 +81,29 @@ class BingXDemoTradingConnector:
         )
         def _do() -> dict | None:
             self._guard_host()  # re-checked immediately before the network call itself
+            headers = {"X-BX-APIKEY": self._api_key}
             with httpx.Client(timeout=self._timeout_seconds) as client:
-                response = client.request(
-                    method,
-                    f"{self._base_url}{path}",
-                    params=signed,
-                    headers={"X-BX-APIKEY": self._api_key},
-                )
+                if method == "POST":
+                    headers["Content-Type"] = "application/x-www-form-urlencoded"
+                    response = client.request(
+                        method, f"{self._base_url}{path}", content=query_string, headers=headers
+                    )
+                else:
+                    response = client.request(
+                        method, f"{self._base_url}{path}?{query_string}", headers=headers
+                    )
             try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise ConnectorUnavailableError(f"BingX Demo HTTP-fel: {path} ({exc})") from exc
-            body = response.json()
+                body = response.json()
+            except ValueError:
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise ConnectorUnavailableError(
+                        f"BingX Demo HTTP-fel: {path} ({exc})"
+                    ) from exc
+                raise ConnectorUnavailableError(
+                    f"BingX Demo: icke-JSON-svar från {path} (status {response.status_code})"
+                )
             if body.get("code") != 0:
                 raise ConnectorUnavailableError(
                     f"BingX Demo API-fel {body.get('code')}: {body.get('msg')} ({path})"
@@ -110,10 +133,20 @@ class BingXDemoTradingConnector:
             "quantity": quantity,
             "clientOrderID": client_order_id,
             "stopLoss": json.dumps(
-                {"type": "STOP_MARKET", "stopPrice": stop_loss_price, "workingType": "MARK_PRICE"}
+                {
+                    "type": "STOP_MARKET",
+                    "stopPrice": float(stop_loss_price),  # numeric, not a string - BingX rejects a quoted stopPrice
+                    "workingType": "MARK_PRICE",
+                },
+                separators=(",", ":"),
             ),
             "takeProfit": json.dumps(
-                {"type": "TAKE_PROFIT_MARKET", "stopPrice": target_price, "workingType": "MARK_PRICE"}
+                {
+                    "type": "TAKE_PROFIT_MARKET",
+                    "stopPrice": float(target_price),
+                    "workingType": "MARK_PRICE",
+                },
+                separators=(",", ":"),
             ),
         }
         return self._request("POST", _ORDER_PATH, params) or {}
@@ -136,6 +169,16 @@ class BingXDemoTradingConnector:
         return self._request("DELETE", _ALL_OPEN_ORDERS_PATH, {"symbol": symbol}) or {}
 
     def close_position_market(self, symbol: str, quantity: str, client_order_id: str) -> dict:
+        """LONG-only close: side=SELL against positionSide=LONG. No
+        `reduceOnly` - confirmed live (2026-09-04) that BingX rejects it
+        outright on a hedge-mode account ("In the Hedge mode, the
+        'ReduceOnly' field can not be filled"). `positionSide=LONG` already
+        provides the same safety property in hedge mode: a SELL order
+        pinned to the LONG position bucket can only reduce/close that
+        bucket, never flip into or increase a SHORT position (hedge mode
+        tracks LONG/SHORT as entirely separate books, selected by
+        positionSide, not by net side) - there is no code path here that
+        could ever increase or flip the position."""
         return (
             self._request(
                 "POST",
@@ -146,7 +189,6 @@ class BingXDemoTradingConnector:
                     "positionSide": "LONG",
                     "type": "MARKET",
                     "quantity": quantity,
-                    "reduceOnly": "true",
                     "clientOrderID": client_order_id,
                 },
             )

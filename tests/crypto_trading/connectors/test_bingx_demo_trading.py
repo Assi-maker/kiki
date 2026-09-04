@@ -1,4 +1,4 @@
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs
 
 import pytest
 import respx
@@ -43,7 +43,13 @@ def test_place_entry_order_with_sl_tp_hits_vst_host_with_signed_request():
     assert result == {"orderId": "ex-1", "avgPrice": "50030"}
     request = route.calls[0].request
     assert request.headers["X-BX-APIKEY"] == "k"
-    params = parse_qs(urlparse(str(request.url)).query)
+    # POST sends params in the body, not the URL query string - a raw,
+    # unencoded JSON-valued stopLoss/takeProfit param in the URL triggers a
+    # CloudFront-level rejection (confirmed live, 2026-09-04), so the query
+    # string is empty and everything lives in the request body instead.
+    assert request.url.query == b""
+    body = request.content.decode("utf-8")
+    params = parse_qs(body)
     assert params["symbol"] == ["BTC-USDT"]
     assert params["clientOrderID"] == ["cid-1"]
     assert "signature" in params
