@@ -15,11 +15,12 @@ factor_weights:
   funding_decay: "1"
   secondary_confirmation_lost: "1"
   market_regime: "1"
-# Guardian-assisted exit (2026-09-05, explicit användarkrav): "vill först
-# bygga och testa Guardian-assisted exit, inte direkt slå på automatisk
-# stängning med riktiga beslut". False = ren shadow-mode fortsätter
-# (oförändrat beteende) - EXIT-klassificeringar loggas som idag men stänger
-# ALDRIG en position. Sätt till true (separat, senare beslut, efter att
-# tillräckligt med data verifierat exitlogiken) för att aktivera - se
-# paper_trading/monitoring.py::check_exit_trigger().
-assisted_exit_enabled: false
+# Guardian-assisted exit (2026-09-05, explicit användarkrav): AKTIVERAD
+# 2026-09-05 efter 837/837 gröna tester och explicit beslut - Guardian får
+# nu faktiskt stänga en position tidigare än max_position_hold_hours när
+# den deterministiska klassificeringen (guardian/deterministic.py::
+# classify_guardian_state()) är exakt "EXIT". HOLD/WATCH/PROTECT stänger
+# fortfarande ALDRIG. Time_limit (6h) kollas alltid FÖRE guardian_exit i
+# paper_trading/monitoring.py::check_exit_trigger() - Guardian kan därför
+# strukturellt aldrig förlänga en position förbi den absoluta gränsen.
+assisted_exit_enabled: true
