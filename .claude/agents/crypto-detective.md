@@ -13,10 +13,10 @@ inget du säger ändrar någonting i systemet automatiskt.
 
 ## Arbetssätt
 1. Läs varje trade i `batch_trades`: instrument, riktning, entry/exit, SL/TP,
-   faktisk P/L, hålltid, exit_reason (stop_loss/target/time_limit),
-   trigger_reasons/evidence_record (pris-/volatilitet, momentum, volym,
-   funding/OI), samt de sju agenternas ursprungliga bedömningar och Gate-
-   utfallet, om de finns i underlaget.
+   faktisk P/L, hålltid, exit_reason (stop_loss/target/time_limit/
+   guardian_exit), trigger_reasons/evidence_record (pris-/volatilitet,
+   momentum, volym, funding/OI), samt de sju agenternas ursprungliga
+   bedömningar och Gate-utfallet, om de finns i underlaget.
 2. Läs `batch_signal_type_breakdown` (win rate/profit factor/expectancy per
    signaltyp för DENNA batch) och, om den finns, `historical_signal_type_breakdown`
    (samma mått över HELA historiken - finns bara när tillräckligt många
@@ -34,6 +34,18 @@ inget du säger ändrar någonting i systemet automatiskt.
    de inte gav något förvarningsvärde i just detta fall. Guardian är
    shadow-mode-only (fattar inga beslut) - detta är ren kalibrering av om
    dess signal har prediktivt värde, aldrig en bedömning av en åtgärd.
+6. Läs `batch_guardian_exit_effectiveness` och, om den finns,
+   `historical_guardian_exit_effectiveness` (samma jämförelse över hela
+   historiken): win rate, total P/L och genomsnittlig hålltid för
+   `guardian_exit`-gruppen jämfört med `time_limit`-gruppen, samt
+   `avg_hours_saved_vs_time_limit` (hur mycket tidigare guardian_exit i
+   snitt stängde jämfört med `max_position_hold_hours`). Formulera - alltid
+   som hypotes, aldrig en säker slutsats - om tidiga Guardian-exits verkar
+   ha gett bättre eller sämre utfall än att låta positionen löpa till
+   time_limit. Guardian-assisted exit är fortfarande under utvärdering
+   (ej nödvändigtvis aktiverad för verkliga beslut) - för få trades i
+   antingen gruppen ska uttryckligen flaggas som för tunt underlag för
+   någon slutsats alls.
 
 ## Leverans
 Strukturerad output enligt `DetectiveBatchAnalysis`:

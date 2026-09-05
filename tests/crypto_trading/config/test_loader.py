@@ -245,6 +245,15 @@ def test_get_settings_loads_paper_capacity_defaults():
     assert settings.risk_limits.starting_capital_usdt == Decimal("10000")
 
 
+def test_get_settings_loads_guardian_assisted_exit_disabled_by_default():
+    """Guardian-assisted exit (2026-09-05, explicit användarkrav): "vill
+    först bygga och testa ..., inte direkt slå på automatisk stängning med
+    riktiga beslut" - måste vara False i den verkliga, körande configen tills
+    ett separat, senare beslut sätter den till True."""
+    settings = get_settings()
+    assert settings.guardian.assisted_exit_enabled is False
+
+
 def test_get_settings_loads_detective_config_from_real_yaml():
     settings = get_settings()
     assert settings.detective.batch_size == 10

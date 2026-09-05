@@ -8,6 +8,7 @@ from crypto_trading.connectors.bingx_demo_trading import BingXDemoTradingConnect
 from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.paper_trading.demo_execution import (
+    close_guardian_exit_positions,
     close_time_limit_positions,
     process_pending_positions,
     reconcile_active_executions,
@@ -36,6 +37,7 @@ def run_demo_execution_tick(
             stale_after_seconds=settings.demo_execution.claim_stale_after_seconds,
         )
         reconcile_active_executions(repo, connector, market_data_connector, run_id, now)
+        close_guardian_exit_positions(repo, connector, run_id, now)
         close_time_limit_positions(
             repo, connector, settings.risk_limits.max_position_hold_hours, run_id, now
         )

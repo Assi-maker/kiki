@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from crypto_trading.config.loader import RiskLimitsConfig
+from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig
 from crypto_trading.paper_trading.execution import compute_fees, compute_fill_price, compute_funding
 from crypto_trading.paper_trading.monitoring import check_exit_trigger
 from crypto_trading.schemas.event import Event
@@ -19,15 +19,31 @@ def close_triggered_positions(
     now: datetime,
     risk_limits: RiskLimitsConfig,
     run_id: str,
+    guardian_config: GuardianConfig | None = None,
 ) -> list[Position]:
     """Itererar repo.find_open_positions() (redan idempotent - en stängd
     position dyker aldrig upp igen där, SPEC §8.6). price_lookup:
-    instrument -> (candle_low, candle_high, current_price, funding_rate)."""
+    instrument -> (candle_low, candle_high, current_price, funding_rate).
+
+    guardian_config (2026-09-05, Guardian-assisted exit): valfri, default
+    None - bevarar exakt tidigare beteende för alla anropare som inte
+    känner till funktionen än. Bara när guardian_config.assisted_exit_enabled
+    är True slår denna funktion alls upp positionens senaste Guardian-
+    observation (repo.find_latest_guardian_observation(), en extra
+    per-position-fråga bara betald när funktionen faktiskt är påslagen) och
+    skickar dess state vidare till check_exit_trigger()."""
     closed: list[Position] = []
     for position in repo.find_open_positions():
         if position.instrument not in price_lookup:
             continue
         candle_low, candle_high, current_price, funding_rate = price_lookup[position.instrument]
+
+        assisted_exit_enabled = guardian_config is not None and guardian_config.assisted_exit_enabled
+        guardian_state = None
+        if assisted_exit_enabled:
+            latest_observation = repo.find_latest_guardian_observation(position.position_id)
+            if latest_observation is not None:
+                guardian_state = latest_observation["state"]
 
         trigger = check_exit_trigger(
             position,
@@ -36,6 +52,8 @@ def close_triggered_positions(
             current_price,
             now,
             risk_limits.max_position_hold_hours,
+            guardian_state=guardian_state,
+            guardian_assisted_exit_enabled=assisted_exit_enabled,
         )
         if trigger is None:
             continue

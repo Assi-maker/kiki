@@ -149,3 +149,120 @@ def test_compute_hold_hours_matches_elapsed_time():
     hours = compute_hold_hours(_position(), now)
 
     assert hours == Decimal("2.5")
+
+
+# --- Guardian-assisted exit (2026-09-05) ---
+# Prioritetsordning: stop_loss -> target -> time_limit -> guardian_exit.
+# guardian_exit stänger ENDAST när guardian_assisted_exit_enabled=True OCH
+# guardian_state=="EXIT" - se check_exit_trigger()s docstring.
+
+_WITHIN_RANGE = dict(
+    candle_low=Decimal("49900"), candle_high=Decimal("50100"), current_price=Decimal("50000")
+)
+
+
+def test_strong_edge_hold_state_never_exits_even_when_feature_enabled():
+    """Stark edge (HOLD) -> ingen exit, oavsett att funktionen är påslagen."""
+    result = check_exit_trigger(
+        _position(), **_WITHIN_RANGE, now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24, guardian_state="HOLD", guardian_assisted_exit_enabled=True,
+    )
+    assert result is None
+
+
+def test_weakening_edge_watch_state_never_exits():
+    """WATCH = fortsatt bevakning, ingen stängning (punkt 5)."""
+    result = check_exit_trigger(
+        _position(), **_WITHIN_RANGE, now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24, guardian_state="WATCH", guardian_assisted_exit_enabled=True,
+    )
+    assert result is None
+
+
+def test_protect_state_alone_never_exits_deterministic_criteria_not_met():
+    """PROTECT = tydlig försämring, men stängning kräver de deterministiska
+    exit-kriterierna (state=="EXIT") - PROTECT i sig stänger ALDRIG
+    (punkt 6), även med funktionen påslagen och positionen inom SL/TP/tid."""
+    result = check_exit_trigger(
+        _position(), **_WITHIN_RANGE, now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24, guardian_state="PROTECT", guardian_assisted_exit_enabled=True,
+    )
+    assert result is None
+
+
+def test_clearly_deteriorated_edge_exit_state_can_trigger_guardian_exit():
+    """Tydligt försämrad edge (EXIT) -> Guardian kan ge en exit-signal
+    (punkt 7), när funktionen är aktiverad och inom time limit."""
+    result = check_exit_trigger(
+        _position(), **_WITHIN_RANGE, now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24, guardian_state="EXIT", guardian_assisted_exit_enabled=True,
+    )
+    assert result == ("guardian_exit", Decimal("50000"))
+
+
+def test_exit_state_never_triggers_when_feature_flag_disabled():
+    """Shadow-mode tills funktionen aktiveras separat: state=="EXIT" men
+    guardian_assisted_exit_enabled=False (default) -> ingen stängning."""
+    result = check_exit_trigger(
+        _position(), **_WITHIN_RANGE, now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24, guardian_state="EXIT", guardian_assisted_exit_enabled=False,
+    )
+    assert result is None
+
+
+def test_exit_state_never_triggers_by_default_without_passing_guardian_args():
+    """Bakåtkompatibilitet: en anropare som inte känner till funktionen alls
+    (inga guardian-argument) får exakt samma beteende som innan ändringen."""
+    result = check_exit_trigger(
+        _position(), **_WITHIN_RANGE, now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24,
+    )
+    assert result is None
+
+
+def test_guardian_cannot_extend_position_past_the_hard_time_limit():
+    """Guardian får aldrig förlänga en position förbi den hårda time limit
+    (punkt: absolut säkerhetsgräns) - även om Guardian-state vore "HOLD"
+    (dvs. "behåll") vid exakt tidsgränsen stänger time_limit-logiken ändå."""
+    result = check_exit_trigger(
+        _position(), **_WITHIN_RANGE, now=_OPENED_AT + timedelta(hours=25),
+        max_position_hold_hours=24, guardian_state="HOLD", guardian_assisted_exit_enabled=True,
+    )
+    assert result == ("time_limit", Decimal("50000"))
+
+
+def test_time_limit_wins_over_guardian_exit_when_both_conditions_are_true():
+    """Time limit fungerar som absolut fallback: när BÅDE tidsgränsen är
+    nådd OCH Guardian-state är "EXIT" samtidigt, vinner time_limit -
+    guardian_exit kan strukturellt aldrig nås efter tidsgränsen."""
+    result = check_exit_trigger(
+        _position(), **_WITHIN_RANGE, now=_OPENED_AT + timedelta(hours=25),
+        max_position_hold_hours=24, guardian_state="EXIT", guardian_assisted_exit_enabled=True,
+    )
+    exit_reason, _ = result
+    assert exit_reason == "time_limit"
+
+
+def test_stop_loss_still_checked_before_guardian_exit():
+    """SL/TP har alltid högst prioritet, oförändrat av den nya funktionen."""
+    result = check_exit_trigger(
+        _position(), candle_low=Decimal("48000"), candle_high=Decimal("50100"),
+        current_price=Decimal("48500"), now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24, guardian_state="EXIT", guardian_assisted_exit_enabled=True,
+    )
+    exit_reason, _ = result
+    assert exit_reason == "stop_loss"
+
+
+def test_positive_pnl_alone_does_not_cause_guardian_exit():
+    """Positiv PnL ensam orsakar inte exit: guardian_state kommer alltid
+    från den redan deterministiska klassificeringen (classify_guardian_state,
+    som aldrig ger EXIT bara av positiv PnL - se test_deterministic.py). Här:
+    priset ligger nära target (positiv PnL), men Guardian-state är "PROTECT"
+    (inte "EXIT") -> ingen stängning, exakt som om PnL vore negativ."""
+    result = check_exit_trigger(
+        _position(), candle_low=Decimal("51000"), candle_high=Decimal("51900"),
+        current_price=Decimal("51800"), now=_OPENED_AT + timedelta(hours=1),
+        max_position_hold_hours=24, guardian_state="PROTECT", guardian_assisted_exit_enabled=True,
+    )
+    assert result is None

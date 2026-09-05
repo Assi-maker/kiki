@@ -169,6 +169,53 @@ def reconcile_active_executions(
         )
 
 
+def close_guardian_exit_positions(
+    repo: Repository,
+    connector: BingXDemoTradingConnector,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Guardian-assisted exit (2026-09-05), Demo-sidans motsvarighet till
+    close_time_limit_positions() ovan. Till skillnad från time_limit (en
+    trivial, billig funktion av bara opened_at/now som kan omberäknas
+    oberoende utan risk för avvikelse, se close_time_limit_positions()
+    docstring) FÅR denna funktion aldrig självständigt köra om Guardians
+    egen klassificering - det skulle antingen dubbla AI-budgetkonsumtionen
+    (crypto-guardian-anropet är redan gjort, en gång, i guardian/tick.py)
+    eller riskera att PAPER och Demo landar i olika beslut om färsk
+    marknadsdata hunnit ändras mellan de två anropen (explicit
+    användarkrav: "Demo och PAPER ska fortsätta följa samma beslut/logik").
+    Väntar därför istället alltid in att PAPER-positionen (den delade
+    `positions`-raden, enda källan till sanning) redan stängts med
+    exit_reason="guardian_exit" av paper_trading/position_closing.py, och
+    speglar bara det beslutet på börssidan - exakt samma "en enda
+    beslutsfattare, en ren spegling" som reconcile_active_executions()
+    redan använder för SL/TP (fast där upptäcker börsen sin egen SL/TP-
+    order, här måste vi aktivt stänga eftersom BingX inte känner till
+    Guardians beslut alls)."""
+    for row in repo.find_active_demo_executions():
+        position = repo.get_position(row["position_id"])
+        if position is None or position.status != "CLOSED" or position.exit_reason != "guardian_exit":
+            continue
+        try:
+            connector.cancel_all_open_orders(position.instrument)
+            client_order_id = _client_order_id(position.position_id, "g")
+            result = connector.close_position_market(
+                position.instrument,
+                quantity=row.get("entry_quantity") or "0",
+                client_order_id=client_order_id,
+            )
+            repo.close_demo_execution(
+                position.position_id, "GUARDIAN_EXIT", str(result.get("avgPrice", "")), now
+            )
+            log_event(run_id, event="demo_guardian_exit_closed", position_id=position.position_id)
+        except _GUARDED_ERRORS as exc:
+            log_event(
+                run_id, event="demo_guardian_exit_close_failed", position_id=position.position_id,
+                error_type=type(exc).__name__, error=str(exc),
+            )
+
+
 def close_time_limit_positions(
     repo: Repository,
     connector: BingXDemoTradingConnector,

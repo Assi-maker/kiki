@@ -476,6 +476,35 @@ def test_zero_size_positions_are_excluded_from_stats_and_surfaced_as_blocked_cou
     assert runner.captured_context["blocked_by_exposure_count_in_batch"] == 1
 
 
+def test_context_includes_guardian_exit_effectiveness_and_max_hold_hours(tmp_path):
+    """Guardian-assisted exit (2026-09-05): Detective ska kunna analysera i
+    efterhand om Guardian-exits förbättrade resultatet jämfört med
+    time_limit - kräver att context faktiskt bär både jämförelsen och den
+    absoluta gränsen den mäts mot."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(3):
+        _seed_closed_trade(repo, i, win=True)
+    fixture = DetectiveBatchAnalysis(
+        agent_name="crypto-detective", run_id="run-1", created_at=_NOW, status="ok",
+        observations=["obs"], winning_patterns=["win"], losing_patterns=["loss"],
+    )
+    runner = _ContextCapturingRunner(fixture)
+
+    result = run_detective_batch(repo, runner, _settings_with(), "run-1", _NOW)
+
+    assert result is not None
+    assert runner.captured_context["max_position_hold_hours"] == _settings().risk_limits.max_position_hold_hours
+    assert "batch_guardian_exit_effectiveness" in runner.captured_context
+    assert runner.captured_context["batch_guardian_exit_effectiveness"] == {
+        "guardian_exit": None,
+        "time_limit": None,
+    }
+    assert result.stats_snapshot["batch_guardian_exit_effectiveness"] == {
+        "guardian_exit": None,
+        "time_limit": None,
+    }
+
+
 def test_small_history_produces_observations_but_never_touches_config(tmp_path):
     """Liten historik (under min_history_for_win_loss_comparison) ger
     fortfarande observationer - bara utan den historiska WIN-vs-LOSS-

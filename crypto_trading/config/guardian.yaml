@@ -15,3 +15,11 @@ factor_weights:
   funding_decay: "1"
   secondary_confirmation_lost: "1"
   market_regime: "1"
+# Guardian-assisted exit (2026-09-05, explicit användarkrav): "vill först
+# bygga och testa Guardian-assisted exit, inte direkt slå på automatisk
+# stängning med riktiga beslut". False = ren shadow-mode fortsätter
+# (oförändrat beteende) - EXIT-klassificeringar loggas som idag men stänger
+# ALDRIG en position. Sätt till true (separat, senare beslut, efter att
+# tillräckligt med data verifierat exitlogiken) för att aktivera - se
+# paper_trading/monitoring.py::check_exit_trigger().
+assisted_exit_enabled: false

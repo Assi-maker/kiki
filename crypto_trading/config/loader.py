@@ -154,6 +154,16 @@ class GuardianConfig(BaseModel):
             "market_regime": Decimal("1"),
         }
     )
+    # Guardian-assisted exit (2026-09-05, explicit användarkrav): defaultar
+    # till False - Guardian ska fortsätta vara rent shadow-only (bara
+    # observera/logga, aldrig stänga) tills tillräckligt med data samlats
+    # för att verifiera exitlogiken. Sätts till True (separat, senare
+    # beslut) för att låta en EXIT-klassificering (guardian/deterministic.py
+    # ::classify_guardian_state()) faktiskt stänga en position tidigare än
+    # max_position_hold_hours - se paper_trading/monitoring.py::
+    # check_exit_trigger(). Rör ALDRIG SL/TP eller den absoluta
+    # time_limit-gränsen, bara OM en tidigare stängning tillåts alls.
+    assisted_exit_enabled: bool = False
 
 
 class NotifyConfig(BaseModel):

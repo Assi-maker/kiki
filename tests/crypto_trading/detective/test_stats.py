@@ -1,9 +1,10 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.detective.stats import (
     compute_batch_win_loss_counts,
     compute_breakdown_by_signal_type,
+    compute_guardian_exit_effectiveness,
 )
 from crypto_trading.schemas.assessments import RiskAssessment
 from crypto_trading.schemas.candidate import Candidate
@@ -116,6 +117,79 @@ def _zero_size_position(position_id: str) -> Position:
         funding=Decimal("0"),
         closed_at=_LATER,
     )
+
+
+def _position_with_exit(
+    position_id: str, exit_reason: str, closed_at: datetime, win: bool, size: Decimal = Decimal("1000")
+) -> Position:
+    return Position(
+        position_id=position_id,
+        candidate_id=position_id,
+        instrument="BTCUSDT",
+        direction="LONG",
+        status="CLOSED",
+        theoretical_entry=Decimal("50000"),
+        simulated_fill_entry=Decimal("50025"),
+        stop_loss=Decimal("49000"),
+        target=Decimal("52000"),
+        size=size,
+        fill_model_version="v1",
+        opened_at=_NOW,
+        theoretical_exit=Decimal("52000") if win else Decimal("49000"),
+        simulated_fill_exit=Decimal("51975") if win else Decimal("48975"),
+        exit_reason=exit_reason,
+        fees=Decimal("0.4"),
+        funding=Decimal("0"),
+        closed_at=closed_at,
+    )
+
+
+def test_compute_guardian_exit_effectiveness_compares_the_two_groups():
+    positions = [
+        _position_with_exit("g1", "guardian_exit", _NOW + timedelta(hours=3), win=True),
+        _position_with_exit("g2", "guardian_exit", _NOW + timedelta(hours=5), win=False),
+        _position_with_exit("t1", "time_limit", _NOW + timedelta(hours=24), win=True),
+        _position_with_exit("t2", "time_limit", _NOW + timedelta(hours=24), win=False),
+    ]
+
+    result = compute_guardian_exit_effectiveness(positions, max_position_hold_hours=24)
+
+    assert result["guardian_exit"]["trade_count"] == 2
+    assert result["guardian_exit"]["win_rate"] == "0.5"
+    assert result["guardian_exit"]["avg_hold_hours"] == 4.0
+    assert result["guardian_exit"]["avg_hours_saved_vs_time_limit"] == 20.0
+    assert result["time_limit"]["trade_count"] == 2
+    assert result["time_limit"]["avg_hold_hours"] == 24.0
+    assert result["time_limit"]["avg_hours_saved_vs_time_limit"] == 0.0
+
+
+def test_compute_guardian_exit_effectiveness_returns_none_for_empty_group():
+    positions = [_position_with_exit("t1", "time_limit", _NOW + timedelta(hours=24), win=True)]
+
+    result = compute_guardian_exit_effectiveness(positions, max_position_hold_hours=24)
+
+    assert result["guardian_exit"] is None
+    assert result["time_limit"] is not None
+
+
+def test_compute_guardian_exit_effectiveness_excludes_zero_size_blocked_positions():
+    positions = [
+        _position_with_exit("g1", "guardian_exit", _NOW + timedelta(hours=3), win=True),
+        _position_with_exit("g2", "guardian_exit", _NOW + timedelta(hours=3), win=True, size=Decimal("0")),
+    ]
+
+    result = compute_guardian_exit_effectiveness(positions, max_position_hold_hours=24)
+
+    assert result["guardian_exit"]["trade_count"] == 1
+
+
+def test_compute_guardian_exit_effectiveness_ignores_stop_loss_and_target_exits():
+    positions = [_position("p1", win=True), _position("p2", win=False)]
+
+    result = compute_guardian_exit_effectiveness(positions, max_position_hold_hours=24)
+
+    assert result["guardian_exit"] is None
+    assert result["time_limit"] is None
 
 
 def test_compute_batch_win_loss_counts_counts_wins_and_losses():

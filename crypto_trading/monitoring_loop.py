@@ -83,7 +83,9 @@ def run_monitoring_tick(
                 funding_rate,
             )
 
-        closed = close_triggered_positions(repo, price_lookup, now, settings.risk_limits, run_id)
+        closed = close_triggered_positions(
+            repo, price_lookup, now, settings.risk_limits, run_id, guardian_config=settings.guardian
+        )
         repo.complete_run(
             run_id, datetime.now(UTC), "ok" if not errors else "partial_error", errors
         )

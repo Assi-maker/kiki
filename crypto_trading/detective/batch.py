@@ -11,6 +11,7 @@ from crypto_trading.detective.context import build_position_analysis_context
 from crypto_trading.detective.stats import (
     compute_batch_win_loss_counts,
     compute_breakdown_by_signal_type,
+    compute_guardian_exit_effectiveness,
 )
 from crypto_trading.logging import log_event
 from crypto_trading.schemas.candidate import Candidate
@@ -128,15 +129,21 @@ def run_detective_batch(
 
     counts = compute_batch_win_loss_counts(batch_positions)
     signal_type_breakdown = compute_breakdown_by_signal_type(batch_positions, candidates_by_id)
+    guardian_exit_effectiveness = compute_guardian_exit_effectiveness(
+        batch_positions, settings.risk_limits.max_position_hold_hours
+    )
 
     context: dict = {
         "run_id": run_id,
         "batch_trades": position_contexts,
         "batch_signal_type_breakdown": signal_type_breakdown,
         "blocked_by_exposure_count_in_batch": counts["blocked_by_exposure_count"],
+        "max_position_hold_hours": settings.risk_limits.max_position_hold_hours,
+        "batch_guardian_exit_effectiveness": guardian_exit_effectiveness,
     }
 
     historical_breakdown = None
+    historical_guardian_exit_effectiveness = None
     all_closed = repo.find_closed_positions()
     if len(all_closed) >= settings.detective.min_history_for_win_loss_comparison:
         all_candidates_by_id = {}
@@ -146,6 +153,10 @@ def run_detective_batch(
                 all_candidates_by_id[position.candidate_id] = candidate
         historical_breakdown = compute_breakdown_by_signal_type(all_closed, all_candidates_by_id)
         context["historical_signal_type_breakdown"] = historical_breakdown
+        historical_guardian_exit_effectiveness = compute_guardian_exit_effectiveness(
+            all_closed, settings.risk_limits.max_position_hold_hours
+        )
+        context["historical_guardian_exit_effectiveness"] = historical_guardian_exit_effectiveness
 
     agent_def = load_agent_definition(_DETECTIVE_AGENT_FILE)
     assessment = runner.run(agent_def, context, DetectiveBatchAnalysis)
@@ -186,6 +197,8 @@ def run_detective_batch(
             "batch_signal_type_breakdown": signal_type_breakdown,
             "historical_signal_type_breakdown": historical_breakdown,
             "blocked_by_exposure_count": counts["blocked_by_exposure_count"],
+            "batch_guardian_exit_effectiveness": guardian_exit_effectiveness,
+            "historical_guardian_exit_effectiveness": historical_guardian_exit_effectiveness,
         },
         ai_cost_usd=cost_usd if billed else Decimal("0"),
     )

@@ -44,6 +44,50 @@ def compute_batch_win_loss_counts(positions: list[Position]) -> dict:
     }
 
 
+def compute_guardian_exit_effectiveness(
+    positions: list[Position], max_position_hold_hours: int
+) -> dict:
+    """Guardian-assisted exit (2026-09-05, explicit användarkrav: "Detective
+    ska kunna analysera i efterhand om Guardian-exits faktiskt förbättrade
+    resultatet jämfört med att vänta på time limit"). Grupperar redan
+    STÄNGDA positioner på exit_reason ("guardian_exit" vs "time_limit") och
+    återanvänder samma redan testade PnL-/win-rate-formler som
+    compute_breakdown_by_signal_type() - ingen egen PnL-formel, ingen egen
+    "vad hade hänt istället"-simulering (Detective producerar bara
+    hypoteser från redan persisterad data, aldrig påhittad
+    counterfactual-marknadsdata). avg_hours_saved_vs_time_limit är bara
+    beskrivande (hur mycket tidigare guardian_exit-gruppen i snitt
+    stängde jämfört med den absoluta gränsen), ingen bedömning av om det
+    var rätt beslut - det är precis den hypotesen Detective själv ska
+    formulera utifrån dessa två gruppers win rate/PnL. Nollstorlekspositioner
+    (_is_blocked_by_exposure()) exkluderas av samma skäl som i
+    compute_batch_win_loss_counts()."""
+
+    def _hold_hours(position: Position) -> float:
+        return (position.closed_at - position.opened_at).total_seconds() / 3600
+
+    def _summary(group: list[Position]) -> dict | None:
+        if not group:
+            return None
+        pnls = trade_pnls(group)
+        avg_hold_hours = sum(_hold_hours(p) for p in group) / len(group)
+        return {
+            "trade_count": len(group),
+            "win_rate": _optional_str(compute_win_rate(pnls)),
+            "total_pnl_usdt": str(sum(pnls, Decimal("0"))),
+            "avg_hold_hours": round(avg_hold_hours, 2),
+            "avg_hours_saved_vs_time_limit": round(max_position_hold_hours - avg_hold_hours, 2),
+        }
+
+    closed = [p for p in positions if p.status == "CLOSED" and not _is_blocked_by_exposure(p)]
+    guardian_exits = [p for p in closed if p.exit_reason == "guardian_exit"]
+    time_limit_exits = [p for p in closed if p.exit_reason == "time_limit"]
+    return {
+        "guardian_exit": _summary(guardian_exits),
+        "time_limit": _summary(time_limit_exits),
+    }
+
+
 def compute_breakdown_by_signal_type(
     positions: list[Position], candidates_by_id: dict[str, Candidate]
 ) -> dict[str, dict]:

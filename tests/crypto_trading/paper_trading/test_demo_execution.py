@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.paper_trading.demo_execution import (
+    close_guardian_exit_positions,
     close_time_limit_positions,
     process_pending_positions,
     reconcile_active_executions,
@@ -197,6 +198,95 @@ def test_reconcile_active_executions_classifies_target_when_price_is_closer_to_t
     reconcile_active_executions(repo, connector, market_data, "run-1", _NOW + timedelta(minutes=5))
 
     assert repo.get_demo_execution("pos-1")["exit_reason"] == "target"
+
+
+def _close_paper_position(repo, position_id: str, exit_reason: str, closed_at: datetime) -> None:
+    repo.close_position_with_event(
+        position_id=position_id,
+        theoretical_exit=Decimal("49500"),
+        simulated_fill_exit=Decimal("49500"),
+        exit_reason=exit_reason,
+        fees=Decimal("0.4"),
+        funding=Decimal("0"),
+        closed_at=closed_at,
+        event=Event(
+            event_id=f"POSITION_CLOSED:{position_id}", event_type="POSITION_CLOSED",
+            aggregate_type="position", aggregate_id=position_id, occurred_at=closed_at,
+            run_id="run-1", schema_version=1, payload={"exit_reason": exit_reason},
+        ),
+    )
+
+
+# --- Guardian-assisted exit (2026-09-05) ---
+# close_guardian_exit_positions() speglar bara PAPER-positionens redan
+# fattade beslut (positions.exit_reason=="guardian_exit") - kör ALDRIG om
+# Guardians egen klassificering själv (se dess docstring: "Demo och PAPER
+# ska fortsätta följa samma beslut/logik", "ingen budget-bypass").
+
+
+def test_close_guardian_exit_positions_closes_exchange_position_when_paper_closed_with_guardian_exit(
+    tmp_path,
+):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector()
+    process_pending_positions(repo, connector, {"BTC-USDT": 3}, "run-1", _NOW)
+    _close_paper_position(repo, "pos-1", "guardian_exit", _NOW + timedelta(minutes=30))
+
+    close_guardian_exit_positions(repo, connector, "run-1", _NOW + timedelta(minutes=31))
+
+    row = repo.get_demo_execution("pos-1")
+    assert row["phase"] == "CLOSED"
+    assert row["exit_reason"] == "GUARDIAN_EXIT"
+    assert ("cancel_all_open_orders", "BTC-USDT") in connector.calls
+    close_calls = [c for c in connector.calls if c[0] == "close_position_market"]
+    assert len(close_calls) == 1
+
+
+def test_close_guardian_exit_positions_does_nothing_while_paper_position_still_open(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector()
+    process_pending_positions(repo, connector, {"BTC-USDT": 3}, "run-1", _NOW)
+
+    close_guardian_exit_positions(repo, connector, "run-1", _NOW + timedelta(minutes=5))
+
+    row = repo.get_demo_execution("pos-1")
+    assert row["phase"] == "ACTIVE"
+    close_calls = [c for c in connector.calls if c[0] == "close_position_market"]
+    assert close_calls == []
+
+
+def test_close_guardian_exit_positions_ignores_positions_closed_for_other_reasons(tmp_path):
+    """PAPER/Demo-logiken förblir konsekvent: stop_loss/target/time_limit
+    hanteras redan av reconcile_active_executions()/close_time_limit_positions()
+    - denna funktion rör sig ALDRIG för dem, bara för exit_reason=="guardian_exit"."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector()
+    process_pending_positions(repo, connector, {"BTC-USDT": 3}, "run-1", _NOW)
+    _close_paper_position(repo, "pos-1", "stop_loss", _NOW + timedelta(minutes=30))
+
+    close_guardian_exit_positions(repo, connector, "run-1", _NOW + timedelta(minutes=31))
+
+    row = repo.get_demo_execution("pos-1")
+    assert row["phase"] == "ACTIVE"  # oförändrad - inte denna funktions ansvar
+    close_calls = [c for c in connector.calls if c[0] == "close_position_market"]
+    assert close_calls == []
+
+
+def test_close_guardian_exit_positions_never_touches_positions_table(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector()
+    process_pending_positions(repo, connector, {"BTC-USDT": 3}, "run-1", _NOW)
+    _close_paper_position(repo, "pos-1", "guardian_exit", _NOW + timedelta(minutes=30))
+    before = repo.get_position("pos-1")
+
+    close_guardian_exit_positions(repo, connector, "run-1", _NOW + timedelta(minutes=31))
+
+    after = repo.get_position("pos-1")
+    assert after == before  # PAPER-raden är redan sanningen, aldrig omskriven här
 
 
 def test_close_time_limit_positions_closes_and_never_touches_positions_table(tmp_path):

@@ -196,3 +196,43 @@ def test_run_guardian_tick_body_still_persists_observation_when_budget_exhausted
     assert len(observations) == 1
     assert observations[0].state == "WATCH"  # first observation, non-HOLD -> should_invoke_ai() would be True
     assert observations[0].ai_reasoning is None  # ...but budget exhaustion still blocked the call
+
+
+def test_run_guardian_tick_body_reaches_exit_state_even_when_budget_exhausted(tmp_path):
+    """Guardian-assisted exit (2026-09-05, explicit användarkrav: 'ingen
+    budget-bypass'). Den deterministiska EXIT-klassificeringen (guardian/
+    deterministic.py::classify_guardian_state()) är fri/kostar ingenting -
+    bara den TOLKANDE AI-förklaringen (ai_reasoning) är budget-gated (se
+    should_invoke_ai()/_budget_allows_one_more_call() ovan). Detta bevisar
+    att en tom AI-budget INTE kan blockera/förvränga EXIT-beslutet självt -
+    det finns alltså ingen väg att "kringgå" budgeten genom att fler
+    positioner stängs: stängning är helt oberoende av om AI-anropet
+    lyckas. Samma mönster/lekvärden som test_..._when_budget_exhausted
+    ovan, bara med tröskeln satt så lågt att ENBART time_decay (0.1667)
+    redan klassificeras som EXIT."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    opened_at = _NOW - timedelta(hours=30)  # time_decay klipps till 1.0 (>24h max hold)
+    _seed_candidate_and_position(repo, opened_at=opened_at)
+    for i in range(600):
+        repo.record_ai_call_event(
+            Event(event_id=f"AI_CALL_MADE:exhaust:{i}", event_type="AI_CALL_MADE",
+                  aggregate_type="candidate", aggregate_id="exhaust", occurred_at=_NOW,
+                  run_id="run-0", schema_version=1, payload={"role": "risk", "status": "ok", "cost_usd": "10.00"}),
+        )
+    connector = _StubConnector(price="100")  # matches entry - only time_decay drives the state
+    settings = _settings().model_copy(
+        update={
+            "guardian": GuardianConfig(
+                watch_decay_threshold=Decimal("0.01"),
+                protect_decay_threshold=Decimal("0.02"),
+                exit_decay_threshold=Decimal("0.1"),  # time_decay alone (0.1667) clears this
+            )
+        }
+    )
+
+    observations = run_guardian_tick_body(repo, connector, _FakeRunner(), settings, "run-1", _NOW)
+
+    assert len(observations) == 1
+    assert observations[0].state == "EXIT"  # deterministic classification, unaffected by budget
+    assert observations[0].ai_reasoning is None  # budget exhaustion still blocked the AI narration
+    assert observations[0].ai_cost_usd is None
