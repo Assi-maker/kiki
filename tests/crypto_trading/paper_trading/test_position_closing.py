@@ -16,6 +16,7 @@ def _risk_limits(**overrides) -> RiskLimitsConfig:
         risk_per_trade_pct=Decimal("0.01"),
         max_concurrent_positions=5,
         max_total_exposure_pct=Decimal("1.0"),
+        max_position_notional_usdt=Decimal("1000000"),
         spread_pct=Decimal("0.0005"),
         slippage_pct=Decimal("0.0005"),
         fee_pct=Decimal("0.0004"),

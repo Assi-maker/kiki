@@ -25,6 +25,19 @@ max_concurrent_positions: 20
 # verkliga stop-avstånd Risk Agent föreslår per trade, som denna ändring
 # inte rör).
 max_total_exposure_pct: "1.00"
+# Fast per-trade-tak (2026-09-05, explicit användarkrav: "varje trade får
+# bara 1000 usdt per gång så att vi kan ha 10 olika positioner igång
+# samtidigt"). Extra golv OVANPÅ risk_per_trade_pct-formeln
+# (paper_trading/position_sizing.py::compute_position_size), rör den
+# ALDRIG - med typiska stop-avstånd på 2-5% gav risk-formeln själv en
+# raw_size på 2000-5000 USDT, så bara 2-5 samtidiga positioner kunde tömma
+# hela den 10000 USDT stora poolen ovan, långt under målet 10-20 samtidiga
+# positioner (se 2026-09-05 rotorsaksanalys). 1000 USDT × 10000-poolen ger
+# exakt 10 samtidiga fullstora positioner. Klipper bara NEDÅT (mot en
+# annars större raw_size) - vid breda stop-avstånd där raw_size redan är
+# under 1000 är denna gräns overksam, risk_per_trade_pct-garantin gäller
+# fortfarande obruten.
+max_position_notional_usdt: "1000"
 spread_pct: "0.0005"
 slippage_pct: "0.0005"
 fee_pct: "0.0004"

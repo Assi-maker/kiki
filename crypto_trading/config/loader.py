@@ -68,6 +68,12 @@ class RiskLimitsConfig(BaseModel):
     risk_per_trade_pct: Decimal = Field(gt=0, le=1)
     max_concurrent_positions: int = Field(gt=0)
     max_total_exposure_pct: Decimal = Field(gt=0, le=1)
+    # Fast per-trade-tak (2026-09-05, explicit användarkrav): se
+    # paper_trading/position_sizing.py::compute_position_size() docstring
+    # för den fulla motiveringen - löser att bara 2-5 trades kunde tömma
+    # hela exponeringspoolen (max_total_exposure_pct) utan att röra
+    # risk_per_trade_pct.
+    max_position_notional_usdt: Decimal = Field(gt=0)
     spread_pct: Decimal = Field(ge=0)
     slippage_pct: Decimal = Field(ge=0)
     fee_pct: Decimal = Field(ge=0)

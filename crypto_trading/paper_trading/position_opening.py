@@ -73,6 +73,7 @@ def open_position_for_candidate(
         risk_per_trade_pct=risk_limits.risk_per_trade_pct,
         open_positions_notional=open_positions_notional,
         max_total_exposure_pct=risk_limits.max_total_exposure_pct,
+        max_position_notional=risk_limits.max_position_notional_usdt,
     )
     simulated_fill_entry = compute_fill_price(
         reference_price, _DIRECTION, risk_limits.spread_pct, risk_limits.slippage_pct, "entry"
