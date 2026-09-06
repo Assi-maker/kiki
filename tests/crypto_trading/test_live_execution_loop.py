@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.config.loader import get_settings
@@ -11,20 +11,29 @@ _NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
 
 
 class _SpyConnector:
+    def __init__(self, order_status="FILLED"):
+        self.place_calls = 0
+        self._order_status = order_status
+
     def set_leverage(self, symbol, leverage=10, side="LONG"):
         return {}
 
     def place_entry_order_with_sl_tp(self, **kwargs):
+        self.place_calls += 1
         return {"orderId": "ex-1", "avgPrice": "50010"}
 
     def get_order_by_client_order_id(self, symbol, client_order_id):
-        return {"orderId": "ex-1", "status": "FILLED", "executedQty": "0.002", "avgPrice": "50010"}
+        return {
+            "orderId": "ex-1", "status": self._order_status,
+            "executedQty": "0.002" if self._order_status == "FILLED" else "0",
+            "avgPrice": "50010",
+        }
 
     def get_all_positions(self):
-        return []
+        return [{"symbol": "BTC-USDT", "positionAmt": "0.002"}] if self._order_status == "FILLED" else []
 
     def get_position(self, symbol):
-        return None
+        return {"symbol": symbol, "positionAmt": "0.002"} if self._order_status == "FILLED" else None
 
     def get_balance(self):
         return {"availableMargin": "100.00"}
@@ -68,6 +77,32 @@ def test_run_live_execution_tick_processes_pending_positions(tmp_path):
 
     row = repo.get_live_execution("pos-1")
     assert row["phase"] == "ACTIVE"
+
+
+def test_run_live_execution_tick_resolves_a_pending_entry_across_ticks_without_duplicate_order(tmp_path):
+    """End-to-end (2026-09-06 safety audit, Risk D fix): an order left
+    uncertain (still "NEW") after one tick must be resolved - never
+    resubmitted - by resolve_pending_entries() on a later tick."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo)
+    connector = _SpyConnector(order_status="NEW")
+
+    run_live_execution_tick(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, get_settings(), _NOW,
+    )
+    assert repo.get_live_execution("pos-1")["phase"] == "ENTRY_SUBMITTED"
+    assert connector.place_calls == 1
+
+    connector._order_status = "FILLED"
+    run_live_execution_tick(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, get_settings(), _NOW + timedelta(minutes=1),
+    )
+
+    row = repo.get_live_execution("pos-1")
+    assert row["phase"] == "ACTIVE"
+    assert connector.place_calls == 1  # still exactly one - resolution never resubmits
 
 
 def test_run_live_execution_tick_never_crashes_the_caller_on_unexpected_error(tmp_path):

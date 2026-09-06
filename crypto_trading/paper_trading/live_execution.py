@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 
+import httpx
+
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.bingx_live_trading import (
     BingXLiveTradingConnector,
@@ -15,6 +17,22 @@ from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository
 
 _GUARDED_ERRORS = (ConnectorUnavailableError, LiveExecutionGuardError)
+
+# 2026-09-06 safety audit (Risk D fix): any of these during a placement
+# attempt OR a status lookup means the true exchange outcome cannot be
+# determined right now - httpx.TransportError included because
+# BingXLiveTradingConnector's own tenacity retry re-raises it verbatim
+# after exhausting retries (unlike ConnectorUnavailableError, which is
+# raised only once an actual response was received). Every caller treats
+# all three identically: never conclude FAILED or FILLED from an error,
+# never resubmit - see _resolve_uncertain_entry().
+_ORDER_STATE_UNKNOWN_ERRORS = (ConnectorUnavailableError, LiveExecutionGuardError, httpx.TransportError)
+
+# A confirmed, terminal, zero-fill outcome - the ONLY basis on which an
+# entry is ever marked FAILED after having been placed. Anything else
+# (NEW, PARTIALLY_FILLED, an unrecognized/future status string, or no
+# order found at all) is deliberately classified UNKNOWN, never guessed.
+_TERMINAL_NEGATIVE_STATUSES = frozenset({"CANCELED", "REJECTED", "EXPIRED"})
 
 
 def _client_order_id(position_id: str, suffix: str) -> str:
@@ -101,20 +119,93 @@ def has_sufficient_live_capacity(
         return False  # fail-closed: never open a position when capacity/balance is unknown
 
 
-def _confirm_fill(
-    connector: BingXLiveTradingConnector, symbol: str, client_order_id: str, requested_quantity: str
-) -> tuple[bool, str, str]:
-    """Fail-safe fill confirmation (spec §8, user-mandated): local state must
-    never show ACTIVE for a position that isn't genuinely, fully filled on
-    the exchange. Returns (filled, executed_qty, avg_price)."""
-    order = connector.get_order_by_client_order_id(symbol, client_order_id)
+def _lookup_order(
+    connector: BingXLiveTradingConnector, symbol: str, client_order_id: str
+) -> dict | None:
+    """Read-only lookup by the deterministic clientOrderID - the one and
+    only way this module ever tries to learn an order's true state. Any
+    error collapses to None here, deliberately identical to "order not
+    found": both mean "cannot determine the true state right now", and
+    every caller must treat them the same way (see _classify_order_state)."""
+    try:
+        return connector.get_order_by_client_order_id(symbol, client_order_id)
+    except _ORDER_STATE_UNKNOWN_ERRORS:
+        return None
+
+
+def _classify_order_state(order: dict | None) -> str:
+    """Never guesses. Returns exactly one of:
+    - "FILLED": exchange confirms status == "FILLED".
+    - "REJECTED": exchange confirms a terminal negative status
+      (CANCELED/REJECTED/EXPIRED) with zero executed quantity - a genuine,
+      unambiguous "this order will never fill".
+    - "UNKNOWN": everything else - no order found, a lookup error, a still-
+      open status (NEW), a PARTIALLY_FILLED status, or any unrecognized
+      status string. UNKNOWN must never be treated as either outcome by
+      any caller (2026-09-06 safety audit, Risk D fix)."""
     if order is None:
-        return False, "0", "0"
+        return "UNKNOWN"
     status = order.get("status", "")
-    executed_qty = str(order.get("executedQty", "0"))
-    if status != "FILLED":
-        return False, executed_qty, str(order.get("avgPrice", "0"))
-    return True, executed_qty, str(order.get("avgPrice", "0"))
+    executed_qty = Decimal(str(order.get("executedQty", "0") or "0"))
+    if status == "FILLED":
+        return "FILLED"
+    if status in _TERMINAL_NEGATIVE_STATUSES and executed_qty == 0:
+        return "REJECTED"
+    return "UNKNOWN"
+
+
+def _resolve_uncertain_entry(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    position: Position,
+    client_order_id: str,
+    run_id: str,
+    now: datetime,
+    origin: str,
+    placement_error: Exception | None = None,
+) -> None:
+    """The single place this module ever decides an entry's fate from a
+    status lookup - used both right after a fresh placement attempt and by
+    every later recovery/resolution pass, so there is exactly one
+    classification policy, never a second, looser one. On UNKNOWN, this
+    function writes nothing at all: the row is left exactly as it already
+    is (CLAIMED or ENTRY_SUBMITTED), to be looked up again next tick.
+    Preferring a stuck, manually-recoverable pending position over any risk
+    of a duplicate live order is an explicit, user-mandated trade-off
+    (2026-09-06 safety audit, Risk D fix)."""
+    order = _lookup_order(connector, position.instrument, client_order_id)
+    state = _classify_order_state(order)
+    if state == "FILLED":
+        repo.update_live_execution_submitted(
+            position.position_id,
+            entry_client_order_id=client_order_id,
+            entry_exchange_order_id=client_order_id,
+            entry_quantity=str(order.get("executedQty", "0")),  # type: ignore[union-attr]
+            exchange_fill_entry=str(order.get("avgPrice", "0")),  # type: ignore[union-attr]
+            sl_exchange_order_id=None,
+            tp_exchange_order_id=None,
+            updated_at=now,
+        )
+        log_event(
+            run_id, event="live_order_confirmed_filled", position_id=position.position_id,
+            instrument=position.instrument, origin=origin,
+        )
+        return
+    if state == "REJECTED":
+        detail = f"order confirmed rejected/canceled by exchange (status={order.get('status')})"  # type: ignore[union-attr]
+        if placement_error is not None:
+            detail = f"{detail}; placement error was {type(placement_error).__name__}: {placement_error}"
+        repo.mark_live_execution_failed(position.position_id, detail, now)
+        log_event(
+            run_id, event="live_order_rejected", position_id=position.position_id,
+            instrument=position.instrument, origin=origin,
+        )
+        return
+    log_event(
+        run_id, event="live_order_status_uncertain", position_id=position.position_id,
+        instrument=position.instrument, origin=origin,
+        placement_error_type=type(placement_error).__name__ if placement_error is not None else None,
+    )
 
 
 def _submit_entry_order(
@@ -138,39 +229,32 @@ def _submit_entry_order(
             stop_loss_price=str(position.stop_loss),
             target_price=str(position.target),
         )
-        filled, executed_qty, avg_price = _confirm_fill(
-            connector, position.instrument, client_order_id, str(quantity)
-        )
-        if not filled:
-            repo.mark_live_execution_failed(
-                position.position_id, f"entry order not filled (status check): {executed_qty}", now
-            )
-            log_event(
-                run_id, event="live_order_not_filled", position_id=position.position_id,
-                instrument=position.instrument,
-            )
-            return
-        repo.update_live_execution_submitted(
-            position.position_id,
-            entry_client_order_id=client_order_id,
-            entry_exchange_order_id=client_order_id,
-            entry_quantity=executed_qty,  # exchange-confirmed, never the requested quantity
-            exchange_fill_entry=avg_price,
-            sl_exchange_order_id=None,
-            tp_exchange_order_id=None,
-            updated_at=now,
-        )
+    except _ORDER_STATE_UNKNOWN_ERRORS as exc:
+        # Placement itself errored (including a network timeout) - the
+        # exchange may have received and processed the order despite the
+        # error on our side. NEVER resubmit blindly: look up the
+        # deterministic clientOrderID first (2026-09-06 safety audit,
+        # Risk D fix, user-mandated).
         log_event(
-            run_id, event="live_order_submitted", position_id=position.position_id,
-            instrument=position.instrument, margin_usdt=str(margin_usdt),
-            notional_usdt=str(notional_usdt), leverage=str(leverage),
+            run_id, event="live_order_placement_uncertain", position_id=position.position_id,
+            instrument=position.instrument, error_type=type(exc).__name__, error=str(exc),
         )
-    except _GUARDED_ERRORS as exc:
-        repo.mark_live_execution_failed(position.position_id, f"{type(exc).__name__}: {exc}", now)
-        log_event(
-            run_id, event="live_order_failed", position_id=position.position_id,
-            error_type=type(exc).__name__, error=str(exc),
+        _resolve_uncertain_entry(
+            repo, connector, position, client_order_id, run_id, now,
+            origin="placement_error", placement_error=exc,
         )
+        return
+    # Placement call itself succeeded - durably record that fact BEFORE
+    # attempting to confirm the fill, so a crash here is recoverable as "an
+    # order was submitted, only its outcome needs resolving" rather than
+    # being indistinguishable from "never submitted" (restart-safety).
+    repo.mark_live_execution_entry_submitted(position.position_id, client_order_id, now)
+    log_event(
+        run_id, event="live_order_placed", position_id=position.position_id,
+        instrument=position.instrument, margin_usdt=str(margin_usdt),
+        notional_usdt=str(notional_usdt), leverage=str(leverage),
+    )
+    _resolve_uncertain_entry(repo, connector, position, client_order_id, run_id, now, origin="post_submit")
 
 
 def process_pending_positions(
@@ -229,44 +313,57 @@ def process_pending_positions(
 def recover_stale_claims(
     repo: Repository,
     connector: BingXLiveTradingConnector,
-    quantity_precision_by_symbol: dict[str, int],
-    min_notional_by_symbol: dict[str, Decimal],
-    settings: Settings,
     run_id: str,
     now: datetime,
     stale_after_seconds: int,
 ) -> None:
-    """Crash recovery: a row stuck in CLAIMED past the grace window means
-    the process died between claiming and confirming submission. Looks the
-    order up by its deterministic clientOrderID BEFORE ever resubmitting -
-    never a blind retry, same discipline as demo_execution.py."""
-    cfg = settings.live_execution
+    """Crash recovery for rows stuck in CLAIMED past the grace window: looks
+    the order up by its deterministic clientOrderID - NEVER resubmits.
+
+    2026-09-06 safety audit (Risk D fix): the previous version fell through
+    to a blind `_submit_entry_order()` call whenever the lookup wasn't an
+    exact "FILLED" match - including when the order was merely still
+    pending, partially filled, or the lookup itself failed - which could
+    have placed a genuine duplicate live order. Now routed through the same
+    `_resolve_uncertain_entry()` every other recovery path uses: a
+    definite FILLED promotes to ACTIVE, a definite REJECTED marks FAILED,
+    and anything else leaves the row exactly as CLAIMED, retried again next
+    tick. No longer needs quantity/precision/settings - it never places an
+    order, only ever looks one up."""
     stale_before = now - timedelta(seconds=stale_after_seconds)
     for row in repo.find_stale_claimed_live_executions(stale_before):
         position = repo.get_position(row["position_id"])
         if position is None:
             continue
         client_order_id = _client_order_id(position.position_id, "e")
-        existing = connector.get_order_by_client_order_id(position.instrument, client_order_id)
-        if existing is not None and existing.get("status") == "FILLED":
-            repo.update_live_execution_submitted(
-                position.position_id,
-                entry_client_order_id=client_order_id,
-                entry_exchange_order_id=client_order_id,
-                entry_quantity=str(existing.get("executedQty", "")),
-                exchange_fill_entry=str(existing.get("avgPrice", "")),
-                sl_exchange_order_id=None,
-                tp_exchange_order_id=None,
-                updated_at=now,
-            )
-            continue
-        precision = quantity_precision_by_symbol.get(position.instrument, 0)
-        quantity = _quantity_for_live(
-            position.simulated_fill_entry, cfg.margin_per_trade_usdt, cfg.leverage, precision
+        _resolve_uncertain_entry(
+            repo, connector, position, client_order_id, run_id, now, origin="stale_claim_recovery",
         )
-        _submit_entry_order(
-            repo, connector, position, quantity, cfg.margin_per_trade_usdt,
-            cfg.margin_per_trade_usdt * cfg.leverage, cfg.leverage, run_id, now,
+
+
+def resolve_pending_entries(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Re-resolves any ENTRY_SUBMITTED row whose fill outcome wasn't yet
+    determined when it was first submitted - the counterpart to
+    recover_stale_claims() for orders already known to have reached the
+    exchange (2026-09-06 safety audit, Risk D fix). Never resubmits, only
+    re-runs the same deterministic clientOrderID lookup. Not gated by a
+    staleness window like recover_stale_claims's CLAIMED rows: an order
+    that has already, definitely reached the exchange should be resolved
+    the moment its outcome becomes knowable, not delayed."""
+    for row in repo.find_active_live_executions():
+        if row["phase"] != "ENTRY_SUBMITTED":
+            continue
+        position = repo.get_position(row["position_id"])
+        if position is None:
+            continue
+        client_order_id = row.get("entry_client_order_id") or _client_order_id(position.position_id, "e")
+        _resolve_uncertain_entry(
+            repo, connector, position, client_order_id, run_id, now, origin="pending_entry_resolution",
         )
 
 

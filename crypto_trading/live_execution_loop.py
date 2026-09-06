@@ -13,6 +13,7 @@ from crypto_trading.paper_trading.live_execution import (
     process_pending_positions,
     reconcile_active_executions,
     recover_stale_claims,
+    resolve_pending_entries,
 )
 from crypto_trading.storage.repository import Repository
 
@@ -28,18 +29,25 @@ def run_live_execution_tick(
 ) -> None:
     """One live-execution tick. Reconciliation-first ordering (spec §7,
     the reverse of demo_execution_loop's order): recover_stale_claims ->
-    reconcile_active_executions -> close_guardian_exit_positions ->
-    close_time_limit_positions -> process_pending_positions LAST, so any
-    new claim's capacity check already reflects this tick's own fresh
-    reconciliation. Same outer fail-safe principle as every other loop in
-    this codebase: an unexpected exception never crashes run_forever()."""
+    resolve_pending_entries -> reconcile_active_executions ->
+    close_guardian_exit_positions -> close_time_limit_positions ->
+    process_pending_positions LAST, so any new claim's capacity check
+    already reflects this tick's own fresh reconciliation. Same outer
+    fail-safe principle as every other loop in this codebase: an
+    unexpected exception never crashes run_forever().
+
+    resolve_pending_entries (2026-09-06 safety audit, Risk D fix) runs
+    right after recover_stale_claims: both resolve entries whose fill
+    outcome was uncertain when first attempted (CLAIMED and ENTRY_SUBMITTED
+    respectively), neither ever resubmits an order."""
     run_id = new_run_id()
     repo.start_run(run_id, "live_execution", now)
     try:
         recover_stale_claims(
-            repo, connector, quantity_precision_by_symbol, min_notional_by_symbol, settings,
-            run_id, now, stale_after_seconds=settings.live_execution.claim_stale_after_seconds,
+            repo, connector, run_id, now,
+            stale_after_seconds=settings.live_execution.claim_stale_after_seconds,
         )
+        resolve_pending_entries(repo, connector, run_id, now)
         reconcile_active_executions(repo, connector, market_data_connector, run_id, now)
         close_guardian_exit_positions(repo, connector, run_id, now)
         close_time_limit_positions(
