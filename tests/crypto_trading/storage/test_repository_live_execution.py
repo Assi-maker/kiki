@@ -64,6 +64,23 @@ def test_find_positions_pending_live_execution_excludes_claimed(tmp_path):
     assert [p.position_id for p in pending] == ["pos-2"]
 
 
+def test_mark_live_execution_entry_submitted_transitions_from_claimed(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    repo.claim_live_execution("pos-1", _NOW, "10", "100", "10")
+
+    repo.mark_live_execution_entry_submitted("pos-1", "cid-1", _NOW)
+
+    row = repo.get_live_execution("pos-1")
+    assert row["phase"] == "ENTRY_SUBMITTED"
+    assert row["entry_client_order_id"] == "cid-1"
+    # still unresolved - no fill data recorded yet:
+    assert row["entry_exchange_order_id"] is None
+    assert row["exchange_fill_entry"] is None
+    active = repo.find_active_live_executions()
+    assert len(active) == 1 and active[0]["phase"] == "ENTRY_SUBMITTED"
+
+
 def test_update_live_execution_submitted_then_close(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)

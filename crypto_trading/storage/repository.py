@@ -97,6 +97,9 @@ class Repository(Protocol):
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]: ...
     def find_active_live_executions(self) -> list[dict]: ...
     def find_stale_claimed_live_executions(self, older_than: datetime) -> list[dict]: ...
+    def mark_live_execution_entry_submitted(
+        self, position_id: str, entry_client_order_id: str, updated_at: datetime
+    ) -> None: ...
     def update_live_execution_submitted(
         self,
         position_id: str,
@@ -602,6 +605,16 @@ class SQLiteRepository:
             (older_than.isoformat(),),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def mark_live_execution_entry_submitted(
+        self, position_id: str, entry_client_order_id: str, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "UPDATE live_executions SET phase = 'ENTRY_SUBMITTED', entry_client_order_id = ?, "
+            "updated_at = ? WHERE position_id = ?",
+            (entry_client_order_id, updated_at.isoformat(), position_id),
+        )
+        self._conn.commit()
 
     def update_live_execution_submitted(
         self,
