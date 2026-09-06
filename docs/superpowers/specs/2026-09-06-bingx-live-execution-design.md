@@ -314,3 +314,219 @@ and the two-layer capacity/margin gate — applied in the implementation step.
 - Any change to PAPER's or Demo's own caps, sizing, or time limits.
 - Any change to the 7-role pipeline, Gate, Risk Agent, or Guardian's
   classification logic.
+
+## 17. Signal staleness / TTL control (added 2026-09-06, post-incident — spec-only, NOT YET IMPLEMENTED)
+
+**Incident this section closes:** on first activation, `find_positions_pending_live_execution()`
+(§13 below references the same query) claimed and mirrored three PAPER
+positions whose Gate `CONFIRMED` decision was ~53 hours old — the process had
+been offline since 2026-09-04 and, on restart, PAPER's own
+`max_position_hold_hours=24` monitoring closed these same positions
+(`time_limit`) in the same second LIVE's independent thread claimed and
+opened real orders against them. No staleness/TTL concept existed anywhere
+in §1–§16 above; this section defines one. Nothing in §1–§16 is changed by
+this addition — it adds a new, additional precondition to §7's existing
+capacity gate, evaluated even earlier in the same pipeline.
+
+### 17.1 Requirement
+
+A LIVE entry may mirror a PAPER/Gate-`CONFIRMED` signal **only if the
+signal's age is within an explicit LIVE TTL** at the moment of the
+eligibility check. This is a new, independent, LIVE-only precondition,
+layered in front of §7's existing two-layer capacity/margin gate — it does
+not replace or relax either layer.
+
+**TTL value: not yet decided.** No number is fixed by this section — that is
+an explicit, separate user decision required before implementation (see
+§17.7). This section specifies the mechanism and invariants only.
+
+### 17.2 TTL is LIVE-specific, never inherited from PAPER
+
+`live_execution.yaml` gains its own field (name TBD at implementation time,
+e.g. `signal_ttl_seconds`) — a new, independent `LiveExecutionConfig` value,
+following the exact same "additional, lower, layered cap" relationship §4
+and §13 already establish for `max_concurrent_positions` and
+`max_position_hold_hours`. It must **never** be derived from, defaulted to,
+or silently fall back to PAPER's `risk_limits.max_position_hold_hours`
+(currently 24h) — the two settings answer different questions (PAPER's
+governs how long a position may stay open; LIVE's TTL governs how old a
+*not-yet-opened* signal may be before LIVE is no longer allowed to act on
+it at all) and must be able to move independently. A missing/unset TTL must
+fail closed (treat as "no signal is fresh enough," never as "no limit").
+
+### 17.3 Authoritative signal timestamp — explicitly NOT LIVE claim time
+
+The age calculation is `now - signal_confirmed_at`. **`signal_confirmed_at`
+is the timestamp of the candidate's `CANDIDATE_TRANSITIONED` event with
+`to: "CONFIRMED"`** (the moment Gate actually confirmed the signal) — sourced
+from the append-only `events` table (`event_type='CANDIDATE_TRANSITIONED'`,
+`payload.to='CONFIRMED'`, `aggregate_id=candidate_id`), not a mutable column,
+so it cannot be silently altered by later, unrelated writes.
+
+Two things this timestamp is explicitly **NOT**, both confirmed wrong during
+the incident's forensic trace:
+- **Not `positions.opened_at`.** In the current schema this column is
+  stamped with the candidate's original *discovery-creation* time, not the
+  Gate-confirmation time or the actual position-open moment — confirmed
+  during the incident audit, where `opened_at` predated `CONFIRMED` by 11–20
+  minutes for the affected positions. Any implementation must verify this
+  quirk still holds (or has been fixed elsewhere) before trusting
+  `opened_at` for anything staleness-related, and should prefer the
+  `events`-table source above regardless.
+- **Not `live_executions.claimed_at`.** Claim time measures how long *LIVE
+  itself* took to notice the signal, not how old the underlying analysis is
+  — using it would make every signal appear "fresh" at the exact moment of
+  claim by construction, defeating the entire purpose of this control.
+
+If `candidates.updated_at` is used as an implementation-convenience proxy for
+the same moment, it must first be verified that nothing (Guardian, QA,
+retries, replay) ever touches a candidate row again after it reaches
+`CONFIRMED` — otherwise `updated_at` drifts forward and silently
+under-reports signal age. The `events`-table source has no such risk and is
+the preferred canonical source.
+
+### 17.4 Where the check runs, and what it must prevent
+
+The TTL check must run **before any claim or submission attempt** — earlier
+in the pipeline than §7's Layer 2 capacity/margin check, not merged into it.
+Concretely: the check happens either as a filter condition on the same query
+`find_positions_pending_live_execution()` uses (joining to the confirming
+event/timestamp and excluding anything older than the TTL from the result
+set entirely), or as an immediate post-fetch, pre-claim check in
+`process_pending_positions()` before `claim_live_execution()` is ever called
+for that row. Either shape must guarantee that a signal older than TTL:
+
+- is **never** passed to `claim_live_execution()` (no `live_executions` row
+  is ever created for it — not `CLAIMED`, not any other phase, unless
+  §17.5's own explicit skip-record applies),
+- is **never** submitted to BingX (`place_entry_order_with_sl_tp()` is never
+  called),
+- **never triggers any AI/Anthropic call** (already true structurally today
+  — LIVE's code path has zero AI/agent imports, see the forensic audit this
+  section follows from — this requirement makes that existing property an
+  explicit, permanent invariant rather than an implicit side effect that a
+  future change could accidentally break),
+- **never results in a LIVE order** of any kind.
+
+### 17.5 Deterministic handling — never retried
+
+Because signal age is monotonically non-decreasing (a signal only ever gets
+older, never fresher), the TTL exclusion is naturally stable: a signal
+excluded on one tick is excluded on every subsequent tick too, with no risk
+of "flapping" and no persisted state required for correctness. This alone
+satisfies "never retried" for the *order-placement* side.
+
+For observability, a stale exclusion must still be recorded durably enough
+that a future forensic audit does not again require reconstructing the
+decision from log files alone (as this incident did) — one of:
+- a structured `log_event(event="live_signal_stale_skipped", position_id=...,
+  candidate_id=..., signal_confirmed_at=..., signal_age_seconds=...,
+  ttl_seconds=...)` on first exclusion, or
+- reusing the existing `SKIPPED` phase/`mark_live_execution_skipped()`
+  pattern (§8's `below_exchange_minimum` case) with reason
+  `stale_signal_ttl_exceeded` — **only if** doing so can be made compatible
+  with never claiming a stale signal (§17.4); if the existing skip pattern
+  requires a claim first, a stale signal must use a different, claim-free
+  recording mechanism instead of adopting that pattern as-is.
+
+is required at minimum; a durable DB record is preferred if achievable
+without contradicting §17.4.
+
+### 17.6 The race this section closes
+
+The observed incident was not purely a missing-TTL problem — `positions`
+was already `status='CLOSED'` (PAPER's own `time_limit` closure) roughly one
+second *before* LIVE's independent thread read it as `'OPEN_POSITION'` and
+claimed it. `monitoring_loop.py` (PAPER's closer) and `live_execution_loop.py`
+(LIVE's claimer) run as fully independent threads, each computing its own
+`now = datetime.now(UTC)`, with no lock or rendezvous between PAPER's closing
+decision and LIVE's claiming decision for the same `position_id`. Two
+independent, mandatory defenses, not one:
+
+1. **TTL as the primary defense.** A TTL meaningfully smaller than PAPER's
+   own `max_position_hold_hours` (currently 24h) means a signal old enough
+   for PAPER to be closing it for time-limit reasons will, in the
+   overwhelming majority of cases, already have been excluded by §17.4 long
+   before PAPER's own closing logic ever runs — collapsing the exposure
+   window from "days, across a process restart" to, at most, a fraction of
+   the TTL itself.
+2. **A mandatory re-check at claim time, as a second, independent layer.**
+   TTL exclusion alone does not make the specific race structurally
+   impossible (a signal could in principle be claimed a moment before
+   crossing the TTL boundary while PAPER independently closes it for an
+   unrelated reason — SL, TP, or a manual action — not just time-limit).
+   The claim step itself must therefore re-verify `positions.status =
+   'OPEN_POSITION'` immediately adjacent to (ideally inside the same
+   transaction as) the atomic claim insert — never relying on a `Position`
+   object fetched earlier in the same tick. If PAPER has closed the position
+   for any reason by the time the claim actually executes, the claim must
+   fail closed (no row created, no order placed), the same way a duplicate
+   LIVE claim already fails closed today via `claim_live_execution()`'s
+   existing idempotent-insert guard.
+
+### 17.7 Explicit invariant: a stale DB row is never sufficient reason to open
+
+LIVE must never open a position for the sole reason that a `positions` row
+with `status='OPEN_POSITION'` still exists in the database. `OPEN_POSITION`
+status is necessary but not sufficient; §17.1's TTL check and §17.6's
+claim-time re-check are both required in addition, every time, with no
+code path that bypasses either for any reason (including manual replay,
+backfill, or crash recovery).
+
+### 17.8 Restart safety and idempotency
+
+- The TTL check is a pure function of `(now, signal_confirmed_at, ttl)` —
+  it is recomputed from scratch on every tick, including the very first
+  tick after any restart, and depends on no in-memory state carried between
+  process runs. A signal already stale before a restart is therefore
+  excluded on the first tick after that restart, exactly as it would have
+  been excluded on any tick before the restart — there is no "grace window"
+  or "first tick after restart" exception.
+- A signal that was correctly excluded as stale before a restart must never
+  become eligible again after a restart merely because whatever recorded
+  that exclusion (§17.5) was in-memory or was lost. Since exclusion here is
+  computed, not stored, this holds automatically — an implementation must
+  not "optimize" this into a cached/stored yes-or-no decision that could
+  itself go stale or be lost.
+- Symmetrically: nothing about this TTL check may depend on
+  `CRYPTO_TRADING_LIVE_EXECUTION_ENABLED` having been continuously set since
+  the signal was confirmed. The exact incident this section closes was
+  triggered by the flag being set for the *first* time long after the
+  signal existed — the TTL check must handle "signal confirmed while LIVE
+  was off, discovered stale only once LIVE turns on" as the normal case, not
+  an edge case.
+
+### 17.9 Required test coverage (to accompany the future implementation)
+
+All of the following must be covered by new or existing automated tests
+before this control is considered implemented — none may be satisfied by
+manual/live verification alone:
+
+1. **Fresh signal → eligible.** A signal well within TTL is claimed and
+   submitted normally (no regression to §7/§8's existing behavior).
+2. **Signal exactly at the TTL boundary → defined behavior.** The boundary
+   is inclusive of eligibility: `age <= TTL` is eligible, `age > TTL` is
+   stale. The exact-boundary case must have a dedicated test asserting this
+   specific rule (not just "some" cutoff behavior).
+3. **Signal older than TTL → rejected/stale.** No claim, no order, and
+   (§17.5) a durable/observable record of why.
+4. **Very old signal (e.g. multi-day) → never LIVE, ever**, regardless of
+   how many ticks are run against it — confirms the exclusion is stable
+   across repeated ticks, not a one-time check that could be bypassed on a
+   later attempt.
+5. **PAPER time-limit race → LIVE must not open.** A regression test
+   reproducing the exact incident shape: a position simultaneously eligible
+   for PAPER's time-limit closure and old enough to exceed LIVE's TTL must
+   result in zero LIVE claims/orders, deterministically, not just "usually."
+6. **Restart with a stale pending signal → no LIVE order.** A signal
+   confirmed while LIVE was disabled, already older than TTL by the time
+   LIVE is enabled and its thread starts, must be excluded on that very
+   first tick.
+7. **4 LIVE positions → no discovery/AI spend** (existing §7 Layer 1
+   behavior — included here as a required regression test so the new TTL
+   check is proven not to interfere with or weaken the existing capacity
+   suppression).
+8. **Margin below `margin_per_trade_usdt + margin_safety_buffer_usdt` → no
+   LIVE entry** (existing §9 behavior — same rationale: a required
+   regression test proving the new TTL check composes correctly with the
+   existing margin gate rather than replacing or short-circuiting it).
