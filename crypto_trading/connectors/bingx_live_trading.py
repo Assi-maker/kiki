@@ -224,10 +224,10 @@ class BingXLiveTradingConnector:
         )
 
     def get_balance(self) -> dict:
-        """Read-only. Real USDT-margin account balance. Exact field names
-        (e.g. `availableMargin`) are NOT YET live-verified against the real
-        account - Task 11's read-only verification step confirms them
-        before this is ever relied upon for a real balance check. Every
-        caller reads fields defensively via `.get(..., "0")`."""
+        """Read-only. Real USDT-margin account balance. Response shape and
+        field names (`availableMargin` et al.) live-verified 2026-09-06
+        (Task 11, read-only): `{"code":0,"data":{"balance":{...}}}`, exactly
+        as assumed - `data.get("balance", data)` unwraps correctly. Every
+        caller still reads fields defensively via `.get(..., "0")`."""
         data = self._request("GET", _BALANCE_PATH, {}) or {}
         return data.get("balance", data)

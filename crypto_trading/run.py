@@ -206,9 +206,10 @@ def _run_live_execution_forever(
 ) -> None:
     """Same thread-bound-connection fix as the other _run_*_forever()
     functions. min_notional_by_symbol is built ONCE here from the existing,
-    read-only get_contracts() - exact field name confirmed against the real
-    account in Task 11 (read-only), defaults to '0' (no floor) if absent so
-    this never crashes on an unexpected contract shape."""
+    read-only get_contracts() - field name `tradeMinUSDT` live-verified
+    2026-09-06 (Task 11, read-only) against the real account's contract
+    list, defaults to '0' (no floor) if absent so this never crashes on an
+    unexpected contract shape."""
     repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
     contracts = market_data_connector.get_contracts()
     quantity_precision_by_symbol = {
