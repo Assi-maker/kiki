@@ -303,7 +303,7 @@ def _migrate_runs_add_instruments_scanned(conn: sqlite3.Connection) -> None:
     för dem, aldrig ett fel eller en gissning)."""
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
     if "instruments_scanned" not in columns:
-        conn.execute("ALTER TABLE runs ADD COLUMN instruments_scanned INTEGER")
+        _add_column_idempotent(conn, "ALTER TABLE runs ADD COLUMN instruments_scanned INTEGER")
 
 
 def _migrate_candidates_add_reference_price(conn: sqlite3.Connection) -> None:
@@ -318,4 +318,17 @@ def _migrate_candidates_add_reference_price(conn: sqlite3.Connection) -> None:
     riktiga produktionsdatabaser redan existerade utan kolumnen."""
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)").fetchall()}
     if "reference_price" not in columns:
-        conn.execute("ALTER TABLE candidates ADD COLUMN reference_price TEXT")
+        _add_column_idempotent(conn, "ALTER TABLE candidates ADD COLUMN reference_price TEXT")
+
+
+def _add_column_idempotent(conn: sqlite3.Connection, alter_sql: str) -> None:
+    """Closes the same check-then-act race as _set_wal_mode_with_retry above,
+    for ADD COLUMN specifically: two connections can both see the column
+    missing via PRAGMA table_info and both attempt the ALTER TABLE - the
+    loser gets 'duplicate column name', not a real failure (the column now
+    exists, which is the only postcondition this function promises)."""
+    try:
+        conn.execute(alter_sql)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc):
+            raise
