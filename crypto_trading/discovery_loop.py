@@ -7,6 +7,7 @@ from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.market_snapshot import LiveMarketDataSource, build_live_snapshot
+from crypto_trading.paper_trading.live_execution import has_sufficient_live_capacity
 from crypto_trading.paper_trading.replay import run_single_cycle
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository
@@ -20,6 +21,8 @@ def run_discovery_tick(
     news_connector: object | None = None,
     external_data_connector: object | None = None,
     screener_runner: AgentRunner | None = None,
+    live_connector: object | None = None,
+    live_market_data_connector: object | None = None,
 ) -> list[Position]:
     """En periodisk discovery-tick (SPEC §7, PLAN_CRYPTO_PHASE5.md Task 7):
     bygger en live `MarketSnapshot` (Task 6) och kör den genom exakt samma
@@ -45,10 +48,32 @@ def run_discovery_tick(
     den sekventiella hämtningsloopen). Utan detta blev varje instrument som
     hämtades mer än några sekunder in i en flera-minuter-lång live-hämtning
     felaktigt `data_quality_invalid` - se market_snapshot.py::
-    build_live_snapshot() för full förklaring."""
+    build_live_snapshot() för full förklaring.
+
+    Layer 1 capacity/cost gate (2026-09-06, spec:
+    docs/superpowers/specs/2026-09-06-bingx-live-execution-design.md §7):
+    when live_connector is not None (only true once LIVE is armed in
+    run.py), a reconciled live-capacity/margin check runs BEFORE the
+    snapshot/candidate pipeline. If live is full or under-margined, this
+    tick is skipped entirely - no snapshot fetch, no candidate search, no
+    AI calls - logged as a clean 'ok' run, not an error. live_connector is
+    None (the default) everywhere in this codebase today, so this is a
+    zero-behavior-change no-op until that thread exists and is armed."""
     run_id = new_run_id()
     now = datetime.now(UTC)
     repo.start_run(run_id, "discovery", now)
+    if live_connector is not None:
+        required_margin = (
+            settings.live_execution.margin_per_trade_usdt
+            + settings.live_execution.margin_safety_buffer_usdt
+        )
+        if not has_sufficient_live_capacity(
+            repo, live_connector, live_market_data_connector or connector,
+            settings.live_execution.max_concurrent_positions, required_margin, run_id, now,
+        ):
+            log_event(run_id, event="discovery_suppressed_live_capacity")
+            repo.complete_run(run_id, datetime.now(UTC), "ok", [], instruments_scanned=0)
+            return []
     try:
         snapshot = build_live_snapshot(
             connector, settings, now, clock=lambda: datetime.now(UTC), run_id=run_id
@@ -83,6 +108,8 @@ def run_forever(
     news_connector: object | None = None,
     external_data_connector: object | None = None,
     screener_runner: AgentRunner | None = None,
+    live_connector: object | None = None,
+    live_market_data_connector: object | None = None,
 ) -> None:
     while True:
         run_discovery_tick(
@@ -93,5 +120,7 @@ def run_forever(
             news_connector=news_connector,
             external_data_connector=external_data_connector,
             screener_runner=screener_runner,
+            live_connector=live_connector,
+            live_market_data_connector=live_market_data_connector,
         )
         time.sleep(settings.pipeline.discovery_interval_minutes * 60)

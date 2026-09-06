@@ -1,9 +1,12 @@
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import patch
 
 from crypto_trading.agents.runner import MockAgentRunner
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.discovery_loop import run_discovery_tick
+from crypto_trading.schemas.event import Event
+from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import SQLiteRepository
 from tests.crypto_trading.test_market_snapshot import (
     _ms,
@@ -200,3 +203,96 @@ def test_run_discovery_tick_recovers_a_mid_analysis_crash_on_the_next_tick(tmp_p
     assert "UNDER_AI_ANALYSIS" not in final_statuses
     assert "ANALYSIS_INTERRUPTED" not in final_statuses
     assert final_statuses & {"CONFIRMED", "NO_TRADE", "REJECTED"}
+
+
+_LIVE_NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
+
+
+def _seed_active_live_position(repo, position_id: str) -> None:
+    """Seeds a real OPEN_POSITION + a matching ACTIVE live_executions row -
+    the reconciled-capacity check (has_sufficient_live_capacity) counts
+    THESE rows, never a mocked connector method alone, so a test proving
+    the capacity gate must actually populate them."""
+    position = Position(
+        position_id=position_id, candidate_id=position_id, instrument="BTC-USDT",
+        direction="LONG", status="OPEN_POSITION", theoretical_entry=Decimal("50000"),
+        simulated_fill_entry=Decimal("50000"), stop_loss=Decimal("49000"),
+        target=Decimal("52000"), size=Decimal("1000"), fill_model_version="v1",
+        opened_at=_LIVE_NOW,
+    )
+    repo.create_position_with_event(
+        position,
+        Event(event_id=f"POSITION_OPENED:{position_id}", event_type="POSITION_OPENED",
+              aggregate_type="position", aggregate_id=position_id, occurred_at=_LIVE_NOW,
+              run_id="seed", schema_version=1, payload={}),
+    )
+    repo.claim_live_execution(position_id, _LIVE_NOW, "10", "100", "10")
+    repo.update_live_execution_submitted(
+        position_id, f"cid-{position_id}", f"ex-{position_id}", "0.002", "50000",
+        None, None, _LIVE_NOW,
+    )
+
+
+class _LiveConnectorStub:
+    """Confirms every seeded ACTIVE row is still genuinely open on the
+    exchange (reconciliation finds nothing stale to close), and reports
+    ample balance - so the ONLY thing that can make capacity read "full"
+    is the number of seeded rows the test itself set up, not the mock."""
+
+    def get_position(self, symbol):
+        return {"symbol": symbol, "positionAmt": "0.002"}
+
+    def get_balance(self):
+        return {"availableMargin": "100.00"}
+
+
+def test_run_discovery_tick_skips_entirely_when_live_capacity_full(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(4):  # settings' default live_execution.max_concurrent_positions == 4
+        _seed_active_live_position(repo, f"live-pos-{i}")
+    settings = _settings()
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    connector = _stub_connector_with_one_healthy_symbol()
+
+    positions = run_discovery_tick(
+        connector, repo, runner, settings,
+        live_connector=_LiveConnectorStub(), live_market_data_connector=connector,
+    )
+
+    assert positions == []
+    assert repo.find_candidates_by_status("CANDIDATE") == []  # never even discovered
+    run_rows = repo._conn.execute("SELECT status FROM runs ORDER BY started_at DESC LIMIT 1").fetchall()
+    assert run_rows[0]["status"] == "ok"  # a clean, logged no-op, not an error
+
+
+def test_run_discovery_tick_proceeds_normally_when_live_disabled(tmp_path):
+    """live_connector=None (the default) - today's exact behavior,
+    unaffected by anything in this plan. Seeds the same 4 active LIVE rows
+    as the "full" test above to prove it's live_connector=None, not an
+    empty DB, that short-circuits the gate."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(4):
+        _seed_active_live_position(repo, f"live-pos-{i}")
+    settings = _settings()
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    connector = _stub_connector_with_one_healthy_symbol()
+
+    positions = run_discovery_tick(connector, repo, runner, settings)
+
+    assert isinstance(positions, list)  # completes normally, gate never even runs
+
+
+def test_run_discovery_tick_proceeds_when_live_capacity_available(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(3):  # one slot free under the default cap of 4
+        _seed_active_live_position(repo, f"live-pos-{i}")
+    settings = _settings()
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    connector = _stub_connector_with_one_healthy_symbol()
+
+    positions = run_discovery_tick(
+        connector, repo, runner, settings,
+        live_connector=_LiveConnectorStub(), live_market_data_connector=connector,
+    )
+
+    assert isinstance(positions, list)
