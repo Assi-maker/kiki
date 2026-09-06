@@ -170,6 +170,41 @@ CREATE TABLE IF NOT EXISTS demo_executions (
     closed_at TEXT
 );
 
+-- BingX Live execution (2026-09-06): strictly additive third parallel
+-- observer of an already-Gate-approved PAPER position (alongside PAPER's
+-- own `positions` and BingX Demo's `demo_executions`) - never joined-into
+-- or written-from position_opening.py/position_closing.py or
+-- demo_execution.py, see
+-- docs/superpowers/specs/2026-09-06-bingx-live-execution-design.md.
+-- phase: CLAIMED -> ENTRY_SUBMITTED -> ACTIVE -> CLOSED / FAILED / SKIPPED
+-- (SKIPPED: capacity/margin/exchange-minimum prevented this position from
+-- ever getting a live order - a safe, expected outcome, not an error).
+-- margin_usdt/notional_usdt/leverage are recorded per-row even though
+-- currently constant (10/100/10) - audit trail if the fixed values ever
+-- change. realized_fees_usdt/realized_funding_usdt are populated at close
+-- from BingX's own income/commission data, NULL when not yet known/N/A.
+CREATE TABLE IF NOT EXISTS live_executions (
+    position_id TEXT PRIMARY KEY,
+    phase TEXT NOT NULL,
+    entry_client_order_id TEXT,
+    entry_exchange_order_id TEXT,
+    entry_quantity TEXT,
+    sl_exchange_order_id TEXT,
+    tp_exchange_order_id TEXT,
+    exit_reason TEXT,
+    exchange_fill_entry TEXT,
+    exchange_fill_exit TEXT,
+    last_error TEXT,
+    margin_usdt TEXT,
+    notional_usdt TEXT,
+    leverage TEXT,
+    realized_fees_usdt TEXT,
+    realized_funding_usdt TEXT,
+    claimed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    closed_at TEXT
+);
+
 -- Position Guardian (2026-09-04): strictly append-only, shadow-mode-only
 -- observer of an already-open PAPER position, see
 -- docs/superpowers/specs/2026-09-04-position-guardian-design.md.

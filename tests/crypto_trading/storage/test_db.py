@@ -255,6 +255,18 @@ def test_demo_executions_table_exists(tmp_path):
     }
 
 
+def test_live_executions_table_exists(tmp_path):
+    conn = get_connection(tmp_path / "t.db")
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(live_executions)").fetchall()}
+    assert columns == {
+        "position_id", "phase", "entry_client_order_id", "entry_exchange_order_id",
+        "entry_quantity", "sl_exchange_order_id", "tp_exchange_order_id", "exit_reason",
+        "exchange_fill_entry", "exchange_fill_exit", "last_error", "margin_usdt",
+        "notional_usdt", "leverage", "realized_fees_usdt", "realized_funding_usdt",
+        "claimed_at", "updated_at", "closed_at",
+    }
+
+
 def test_guardian_observations_table_exists(tmp_path):
     conn = get_connection(tmp_path / "t.db")
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(guardian_observations)").fetchall()}
