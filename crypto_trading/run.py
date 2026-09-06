@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+from decimal import Decimal
 
 import uvicorn
 from fastapi import FastAPI
@@ -11,6 +12,7 @@ from crypto_trading import (
     detective_loop,
     discovery_loop,
     guardian_loop,
+    live_execution_loop,
     monitoring_loop,
     notify_loop,
 )
@@ -21,8 +23,10 @@ from crypto_trading.config.loader import (
     get_settings,
     is_demo_execution_enabled,
     is_guardian_enabled,
+    is_live_execution_enabled,
 )
 from crypto_trading.connectors.bingx_demo_trading import BingXDemoTradingConnector
+from crypto_trading.connectors.bingx_live_trading import BingXLiveTradingConnector
 from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.connectors.external_data import ExternalDataConnector
 from crypto_trading.connectors.news_rss import NewsRSSConnector
@@ -136,6 +140,21 @@ def build_demo_trading_connector_from_env() -> BingXDemoTradingConnector | None:
     return BingXDemoTradingConnector(api_key=api_key, api_secret=api_secret)
 
 
+def build_live_trading_connector_from_env() -> BingXLiveTradingConnector | None:
+    """Opt-in, same pattern as build_demo_trading_connector_from_env(): if
+    the dedicated LIVE credentials aren't set, the thread simply doesn't
+    start. Deliberately reads ONLY BINGX_API_KEY/BINGX_API_SECRET (confirmed
+    by the user to be the real, dedicated LIVE-account keys, sitting unused
+    in .env specifically reserved for this - never
+    CRYPTO_TRADING_BINGX_DEMO_API_KEY/_SECRET, which is Demo's own,
+    separate credential pair)."""
+    api_key = os.environ.get("BINGX_API_KEY")
+    api_secret = os.environ.get("BINGX_API_SECRET")
+    if not api_key or not api_secret:
+        return None
+    return BingXLiveTradingConnector(api_key=api_key, api_secret=api_secret)
+
+
 def build_dashboard_app_from_env(
     repo_factory: RepositoryFactory, settings: Settings
 ) -> FastAPI | None:
@@ -156,6 +175,7 @@ def _run_discovery_forever(
     news_connector: NewsRSSConnector | None,
     external_data_connector: ExternalDataConnector | None,
     screener_runner: AgentRunner | None = None,
+    live_connector: BingXLiveTradingConnector | None = None,
 ) -> None:
     """Konstruerar sin egen Repository (och därmed sqlite3-anslutning) HÄR,
     inne i den tråd som faktiskt kör discovery-loopen. En sqlite3-anslutning
@@ -174,6 +194,32 @@ def _run_discovery_forever(
         news_connector=news_connector,
         external_data_connector=external_data_connector,
         screener_runner=screener_runner,
+        live_connector=live_connector,
+        live_market_data_connector=connector,
+    )
+
+
+def _run_live_execution_forever(
+    market_data_connector: BingXMarketDataConnector,
+    live_connector: BingXLiveTradingConnector,
+    settings: Settings,
+) -> None:
+    """Same thread-bound-connection fix as the other _run_*_forever()
+    functions. min_notional_by_symbol is built ONCE here from the existing,
+    read-only get_contracts() - exact field name confirmed against the real
+    account in Task 11 (read-only), defaults to '0' (no floor) if absent so
+    this never crashes on an unexpected contract shape."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    contracts = market_data_connector.get_contracts()
+    quantity_precision_by_symbol = {
+        c["symbol"]: int(c.get("quantityPrecision", 0)) for c in contracts
+    }
+    min_notional_by_symbol = {
+        c["symbol"]: Decimal(str(c.get("tradeMinUSDT", "0"))) for c in contracts
+    }
+    live_execution_loop.run_forever(
+        repo, live_connector, market_data_connector, quantity_precision_by_symbol,
+        min_notional_by_symbol, settings,
     )
 
 
@@ -302,9 +348,14 @@ def main() -> None:
         cache_ttl_seconds=300,
     )
 
+    live_connector = build_live_trading_connector_from_env() if is_live_execution_enabled() else None
+
     discovery_thread = threading.Thread(
         target=_run_discovery_forever,
-        args=(connector, runner, settings, news_connector, external_data_connector, screener_runner),
+        args=(
+            connector, runner, settings, news_connector, external_data_connector,
+            screener_runner, live_connector,
+        ),
         daemon=True,
     )
     monitoring_thread = threading.Thread(
@@ -381,6 +432,26 @@ def main() -> None:
     else:
         log_event(
             "startup", event="guardian_disabled", reason="CRYPTO_TRADING_GUARDIAN_ENABLED not set"
+        )
+
+    if is_live_execution_enabled():
+        if live_connector is not None:
+            threads.append(
+                threading.Thread(
+                    target=_run_live_execution_forever,
+                    args=(connector, live_connector, settings),
+                    daemon=True,
+                )
+            )
+        else:
+            log_event(
+                "startup", event="live_execution_disabled",
+                reason="BINGX_API_KEY/BINGX_API_SECRET missing",
+            )
+    else:
+        log_event(
+            "startup", event="live_execution_disabled",
+            reason="CRYPTO_TRADING_LIVE_EXECUTION_ENABLED not set",
         )
 
     for thread in threads:
