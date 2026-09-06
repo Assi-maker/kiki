@@ -1,0 +1,15 @@
+# BingX Live execution (2026-09-06) - a third, independent parallel
+# observer of PAPER's Gate-approved trades, see
+# docs/superpowers/specs/2026-09-06-bingx-live-execution-design.md. Whether
+# the thread runs at all is an env-var arm flag
+# (CRYPTO_TRADING_LIVE_EXECUTION_ENABLED), not this file. max_concurrent_positions,
+# margin_per_trade_usdt, and leverage are hard user-mandated caps - never
+# raise them without a fresh, explicit user decision.
+check_interval_seconds: 30
+claim_stale_after_seconds: 30
+max_retries: 3
+max_concurrent_positions: 4
+margin_per_trade_usdt: "10"
+leverage: 10
+max_position_hold_hours: 6
+margin_safety_buffer_usdt: "1.00"

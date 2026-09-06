@@ -166,6 +166,27 @@ class GuardianConfig(BaseModel):
     assisted_exit_enabled: bool = False
 
 
+class LiveExecutionConfig(BaseModel):
+    # BingX Live execution (2026-09-06) - a tightly bounded, real-money
+    # controlled test, see
+    # docs/superpowers/specs/2026-09-06-bingx-live-execution-design.md.
+    # max_concurrent_positions/margin_per_trade_usdt/leverage/
+    # max_position_hold_hours are hard user-mandated caps - completely
+    # independent of PAPER's own risk_limits.yaml (max_concurrent_positions,
+    # max_position_notional_usdt, max_position_hold_hours), never derived
+    # from them. margin_safety_buffer_usdt is a separate fail-safe
+    # threshold on the balance CHECK only - it must never inflate the
+    # order's own size, which stays fixed at margin_per_trade_usdt.
+    check_interval_seconds: int = Field(gt=0, default=30)
+    claim_stale_after_seconds: int = Field(gt=0, default=30)
+    max_retries: int = Field(gt=0, default=3)
+    max_concurrent_positions: int = Field(gt=0, default=4)
+    margin_per_trade_usdt: Decimal = Field(gt=0, default=Decimal("10"))
+    leverage: int = Field(gt=0, default=10)
+    max_position_hold_hours: int = Field(gt=0, default=6)
+    margin_safety_buffer_usdt: Decimal = Field(ge=0, default=Decimal("1.00"))
+
+
 class NotifyConfig(BaseModel):
     notification_level: Literal["important", "decisions", "debug"]
     notify_interval_seconds: int = Field(gt=0)
@@ -186,6 +207,7 @@ class Settings(BaseModel):
     detective: DetectiveConfig = Field(default_factory=DetectiveConfig)
     demo_execution: DemoExecutionConfig = Field(default_factory=DemoExecutionConfig)
     guardian: GuardianConfig = Field(default_factory=GuardianConfig)
+    live_execution: LiveExecutionConfig = Field(default_factory=LiveExecutionConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -215,6 +237,7 @@ def get_settings() -> Settings:
         detective=_load_yaml_model(_CONFIG_DIR / "detective.yaml", DetectiveConfig),
         demo_execution=_load_yaml_model(_CONFIG_DIR / "demo_execution.yaml", DemoExecutionConfig),
         guardian=_load_yaml_model(_CONFIG_DIR / "guardian.yaml", GuardianConfig),
+        live_execution=_load_yaml_model(_CONFIG_DIR / "live_execution.yaml", LiveExecutionConfig),
     )
 
 
@@ -235,3 +258,11 @@ def is_demo_execution_enabled() -> bool:
     Telegram) are gated in this codebase, and keeps "should this thread run
     at all" a deploy-time decision, not a checked-in default."""
     return bool(os.environ.get("CRYPTO_TRADING_DEMO_EXECUTION_ENABLED"))
+
+
+def is_live_execution_enabled() -> bool:
+    """Opt-in arm flag for the BingX Live execution thread - same pattern as
+    is_demo_execution_enabled()/is_guardian_enabled(). Stays unset/False for
+    the entire implementation plan; activation is a separate, later,
+    explicit decision (see design spec §16)."""
+    return bool(os.environ.get("CRYPTO_TRADING_LIVE_EXECUTION_ENABLED"))
