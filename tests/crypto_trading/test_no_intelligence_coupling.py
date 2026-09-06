@@ -35,17 +35,19 @@ def test_intelligence_never_imports_crypto_trading():
 
 
 def test_crypto_trading_has_no_broker_account_or_order_code():
-    """SPEC_CRYPTO.md §1/§19 (2026-09-04 amendment): the absolute ban on
-    broker/order code narrowed to "no LIVE broker account", with one
-    explicit, reviewed exception for BingX Demo (VST)-only execution -
-    never the live account (see
-    docs/superpowers/specs/2026-09-04-bingx-demo-execution-design.md). Only
-    the files that implement/wire that exception may contain these terms;
+    """SPEC_CRYPTO.md §1/§19 (2026-09-04 amendment, extended 2026-09-06): the
+    absolute ban on broker/order code narrowed to "no LIVE broker account",
+    with two explicit, reviewed exceptions - BingX Demo (VST)-only execution
+    (docs/superpowers/specs/2026-09-04-bingx-demo-execution-design.md) and
+    the tightly bounded BingX Live execution controlled test
+    (docs/superpowers/specs/2026-09-06-bingx-live-execution-design.md). Only
+    the files that implement/wire those exceptions may contain these terms;
     everywhere else in crypto_trading/ must stay exactly as clean as
     before."""
     forbidden_terms = ("account_balance", "place_order", "broker_credential", "api_secret")
     allowed_files = {
         _REPO_ROOT / "crypto_trading" / "connectors" / "bingx_demo_trading.py",
+        _REPO_ROOT / "crypto_trading" / "connectors" / "bingx_live_trading.py",
         _REPO_ROOT / "crypto_trading" / "run.py",
     }
     crypto_trading_files = (_REPO_ROOT / "crypto_trading").rglob("*.py")
