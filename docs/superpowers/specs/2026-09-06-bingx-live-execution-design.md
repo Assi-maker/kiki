@@ -1,7 +1,8 @@
 # BingX Live Execution — Design Spec
 
 Date: 2026-09-06
-Status: Approved by user (design level), pending SPEC_CRYPTO.md amendment + implementation plan.
+Status: Approved by user, incl. margin_safety_buffer_usdt=1.00 (locked).
+Pending SPEC_CRYPTO.md amendment + implementation plan.
 Not activated. `CRYPTO_TRADING_LIVE_EXECUTION_ENABLED` stays unset until a separate,
 explicit go-ahead after this plan's test suite passes.
 
@@ -202,11 +203,15 @@ slot that's actually free again.
 
 - `get_balance()` queried at both gating layers (§7) before any order.
 - Required available margin per new trade: `margin_per_trade_usdt` (10) +
-  `margin_safety_buffer_usdt` (new tunable, proposed default 1 USDT to
-  absorb entry/exit fees so a trade never gets exchange-rejected purely for
-  insufficient margin after fees — req. 20's "kontrollera saldo innan
-  order", made concrete). If available margin is short, no order is sent —
-  same skip-safely behavior as §8's minimum-notional case.
+  `margin_safety_buffer_usdt` (**locked: 1.00 USDT**, confirmed with user) —
+  i.e. a trade may only be sent if available margin ≥ 11 USDT. This buffer
+  is a separate fail-safe threshold only: it absorbs entry/exit fees so a
+  trade never gets exchange-rejected purely for insufficient margin after
+  fees (req. 20's "kontrollera saldo innan order", made concrete). It must
+  **never** inflate the position itself — the order quantity is still
+  computed from exactly `margin_per_trade_usdt=10` × `leverage=10` (§8),
+  never from 11. If available margin is short of 11 USDT, no order is
+  sent — same skip-safely behavior as §8's minimum-notional case.
 - Exchange-level rejection (any response, including insufficient balance)
   still gets the unconditional fail-safe treatment from §10 — the buffer
   reduces how often that path is hit, it does not replace it.
