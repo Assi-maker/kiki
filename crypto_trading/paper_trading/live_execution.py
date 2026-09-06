@@ -9,6 +9,7 @@ from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.bingx_live_trading import (
     BingXLiveTradingConnector,
     LiveExecutionGuardError,
+    OrderRejectedError,
 )
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.logging import log_event
@@ -229,6 +230,26 @@ def _submit_entry_order(
             stop_loss_price=str(position.stop_loss),
             target_price=str(position.target),
         )
+    except OrderRejectedError as exc:
+        # The exchange's own synchronous response to THIS submission was a
+        # definitive, structured rejection (spec §10: "any response from
+        # the exchange, including a rejection: no blind retry, phase=FAILED,
+        # stop"). Zero fill is guaranteed - no order was ever created for
+        # client_order_id, so there is nothing to look up and no risk in
+        # concluding FAILED immediately. This is what frees the LIVE
+        # capacity slot instead of leaving it stuck forever (a lookup-based
+        # recovery could never resolve this case: querying a client_order_id
+        # that was never accepted will always come back "not found", which
+        # must stay UNKNOWN under _classify_order_state - the same ambiguity
+        # a genuine transport error produces).
+        repo.mark_live_execution_failed(
+            position.position_id, f"order rejected by exchange at placement: {exc}", now,
+        )
+        log_event(
+            run_id, event="live_order_rejected", position_id=position.position_id,
+            instrument=position.instrument, origin="placement_rejected", error=str(exc),
+        )
+        return
     except _ORDER_STATE_UNKNOWN_ERRORS as exc:
         # Placement itself errored (including a network timeout) - the
         # exchange may have received and processed the order despite the

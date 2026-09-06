@@ -37,6 +37,31 @@ class LiveExecutionGuardError(Exception):
     docs/superpowers/specs/2026-09-06-bingx-live-execution-design.md."""
 
 
+class OrderRejectedError(Exception):
+    """Raised only by place_entry_order_with_sl_tp(), only when the
+    exchange's own synchronous response to THIS specific submission is a
+    definitive, structured rejection (a parsed JSON body with a non-zero
+    `code` - the exchange received, parsed, and refused the request, e.g.
+    "TP Price must be greater than Last Price"). This is never a guess:
+    the order-placement endpoint is synchronous, so this response IS the
+    authoritative, zero-fill outcome for this exact submission - there is
+    no order to look up afterwards, because none was ever created.
+    Deliberately NOT a ConnectorUnavailableError subclass: a genuine
+    transport/format ambiguity (timeout, non-JSON body, a bare HTTP status
+    error) must keep raising plain ConnectorUnavailableError and go through
+    the existing lookup-based resolution - only a confirmed rejection ends
+    up here (2026-09-06 fix, following the same-day Risk D audit)."""
+
+
+class _ApiCodeError(ConnectorUnavailableError):
+    """Internal-only: raised by _request() for a parsed response body whose
+    `code` is non-zero. A ConnectorUnavailableError subclass so every other
+    call site (get_balance, get_all_positions, set_leverage, the two order
+    lookups, get_open_orders) keeps behaving exactly as before - only
+    place_entry_order_with_sl_tp gives this a different, more specific
+    meaning by catching it and re-raising OrderRejectedError."""
+
+
 class BingXLiveTradingConnector:
     """Order placement/cancel/query against the user's REAL BingX account.
     `_base_url` is a hardcoded class constant, never a constructor parameter
@@ -112,7 +137,7 @@ class BingXLiveTradingConnector:
                     f"BingX Live: non-JSON response from {path} (status {response.status_code})"
                 )
             if body.get("code") != 0:
-                raise ConnectorUnavailableError(
+                raise _ApiCodeError(
                     f"BingX Live API error {body.get('code')}: {body.get('msg')} ({path})"
                 )
             return body.get("data")
@@ -160,7 +185,10 @@ class BingXLiveTradingConnector:
                 separators=(",", ":"),
             ),
         }
-        return _unwrap_order(self._request("POST", _ORDER_PATH, params))
+        try:
+            return _unwrap_order(self._request("POST", _ORDER_PATH, params))
+        except _ApiCodeError as exc:
+            raise OrderRejectedError(str(exc)) from exc
 
     def get_order_by_client_order_id(self, symbol: str, client_order_id: str) -> dict | None:
         try:

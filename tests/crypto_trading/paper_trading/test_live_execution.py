@@ -4,6 +4,7 @@ from decimal import Decimal
 import httpx
 
 from crypto_trading.config.loader import get_settings
+from crypto_trading.connectors.bingx_live_trading import OrderRejectedError
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.paper_trading.live_execution import (
     close_guardian_exit_positions,
@@ -349,10 +350,12 @@ def test_process_pending_positions_promotes_to_active_when_timeout_but_lookup_co
 
 
 def test_process_pending_positions_leaves_claimed_on_application_level_placement_error(tmp_path):
-    """ConnectorUnavailableError (an application-level error, e.g. an
-    exchange-returned error code) during placement is treated identically
-    to a transport-level timeout: never conclude anything without a
-    lookup, never resubmit."""
+    """A genuinely ambiguous ConnectorUnavailableError during placement
+    (e.g. a non-JSON response or a bare HTTP status error - real
+    transport/format ambiguity, NOT a parsed exchange rejection, which is
+    OrderRejectedError since the 2026-09-06 fix) is treated identically to
+    a transport-level timeout: never conclude anything without a lookup,
+    never resubmit."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(
@@ -370,6 +373,84 @@ def test_process_pending_positions_leaves_claimed_on_application_level_placement
     row = repo.get_live_execution("pos-1")
     assert row["phase"] == "CLAIMED"
     assert len(connector.calls) == 1
+
+
+def test_process_pending_positions_marks_failed_immediately_on_order_rejected_error(tmp_path):
+    """OrderRejectedError (the exchange's own definitive, structured
+    rejection of this exact submission, e.g. "TP Price must be greater than
+    Last Price") must conclude FAILED immediately, with zero lookup calls -
+    there is nothing to look up, since no order was ever created. This is
+    the 2026-09-06 fix: previously this case was indistinguishable from a
+    genuine timeout and left CLAIMED forever, permanently blocking a LIVE
+    capacity slot."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector(
+        balance="100.00", all_positions=[],
+        place_raises=OrderRejectedError(
+            "BingX Live API error 101400: TP Price must be greater than Last Price "
+            "(/openApi/swap/v2/trade/order)"
+        ),
+    )
+    settings = get_settings()
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    row = repo.get_live_execution("pos-1")
+    assert row["phase"] == "FAILED"
+    assert "rejected" in row["last_error"].lower()
+    assert "TP Price must be greater than Last Price" in row["last_error"]
+    assert len(connector.calls) == 1  # exactly one placement attempt, never resubmitted
+    assert connector.lookup_calls == 0  # no lookup needed - nothing was ever created to find
+
+
+def test_a_rejected_entry_frees_the_live_capacity_slot_for_the_next_candidate(tmp_path):
+    """The concrete incident this fix targets: a rejected entry must not
+    permanently consume one of the 4 hard-capped LIVE slots. Two pending
+    positions, capacity for only one - the first is rejected, and the
+    second must then be able to claim the freed slot in the same tick."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, position_id="pos-1")
+    _open_position(repo, position_id="pos-2")
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = get_settings()
+    settings = settings.model_copy(
+        update={"live_execution": settings.live_execution.model_copy(
+            update={"max_concurrent_positions": 1}
+        )}
+    )
+
+    # pos-1's placement is rejected outright; pos-2 (still pending after)
+    # must see the freed slot and go on to succeed.
+    original_place = connector.place_entry_order_with_sl_tp
+    calls = {"n": 0}
+
+    def place_with_first_rejected(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OrderRejectedError(
+                "BingX Live API error 101400: TP Price must be greater than Last Price"
+            )
+        return original_place(**kwargs)
+
+    connector.place_entry_order_with_sl_tp = place_with_first_rejected
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    assert repo.get_live_execution("pos-1")["phase"] == "FAILED"
+    assert repo.get_live_execution("pos-2")["phase"] == "ACTIVE"
+    # the reconciled count used for gating never counts the rejected row -
+    # confirm pos-2 (genuinely open on the exchange) is the only one counted
+    connector._all_positions = [{"symbol": "BTC-USDT", "positionAmt": "1"}]
+    assert reconcile_active_executions(
+        repo, connector, _SpyMarketDataConnector(), "r1", _NOW
+    ) == 1
 
 
 def test_resolve_pending_entries_never_resubmits_across_repeated_uncertain_ticks(tmp_path):

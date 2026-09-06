@@ -8,6 +8,7 @@ from httpx import Response
 from crypto_trading.connectors.bingx_live_trading import (
     BingXLiveTradingConnector,
     LiveExecutionGuardError,
+    OrderRejectedError,
 )
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 
@@ -61,16 +62,70 @@ def test_set_leverage_defaults_to_10x():
 
 
 @respx.mock
-def test_place_entry_order_raises_on_api_error_code():
+def test_place_entry_order_raises_order_rejected_on_definitive_api_error_code():
+    """A parsed JSON body with a non-zero `code` is the exchange's own
+    synchronous, authoritative refusal of THIS submission - a genuine
+    rejection, not ambiguity, so it must NOT surface as the same
+    ConnectorUnavailableError used for real transport/format ambiguity
+    (2026-09-06 fix: the previous behavior left rejected LIVE entries stuck
+    in CLAIMED forever, permanently blocking a capacity slot)."""
     respx.post(f"{_LIVE_BASE}/openApi/swap/v2/trade/order").mock(
         return_value=Response(200, json={"code": 80001, "msg": "insufficient balance", "data": {}})
     )
 
-    with pytest.raises(ConnectorUnavailableError, match="insufficient balance"):
+    with pytest.raises(OrderRejectedError, match="insufficient balance"):
         _connector().place_entry_order_with_sl_tp(
             symbol="BTC-USDT", quantity="0.002", client_order_id="lv-cid-1",
             stop_loss_price="49000", target_price="52000",
         )
+
+
+@respx.mock
+def test_place_entry_order_raises_order_rejected_not_connector_unavailable():
+    """OrderRejectedError must not also be a ConnectorUnavailableError -
+    callers that distinguish the two (paper_trading/live_execution.py) rely
+    on them being unrelated exception types, not a subclass relationship."""
+    respx.post(f"{_LIVE_BASE}/openApi/swap/v2/trade/order").mock(
+        return_value=Response(
+            200, json={"code": 101400, "msg": "TP Price must exceed Last Price", "data": {}}
+        )
+    )
+
+    try:
+        _connector().place_entry_order_with_sl_tp(
+            symbol="BTC-USDT", quantity="0.002", client_order_id="lv-cid-1",
+            stop_loss_price="49000", target_price="52000",
+        )
+        raise AssertionError("expected OrderRejectedError")
+    except OrderRejectedError as exc:
+        assert not isinstance(exc, ConnectorUnavailableError)
+
+
+@respx.mock
+def test_get_order_status_still_raises_connector_unavailable_on_api_error_code():
+    """Non-placement calls must be provably unaffected by the placement-only
+    OrderRejectedError distinction: a lookup's own `code != 0` response
+    (e.g. "order does not exist") stays exactly the pre-existing
+    ConnectorUnavailableError - callers rely on this to fall through to
+    None (order-not-found is inherently ambiguous, never a confirmed
+    rejection, see get_order_status/get_order_by_client_order_id)."""
+    respx.get(f"{_LIVE_BASE}/openApi/swap/v2/trade/order").mock(
+        return_value=Response(200, json={"code": 80016, "msg": "order does not exist", "data": {}})
+    )
+
+    assert _connector().get_order_status("BTC-USDT", "missing-order") is None
+
+
+@respx.mock
+def test_set_leverage_still_raises_connector_unavailable_on_api_error_code():
+    """Same non-regression proof as above, for a non-order-placement
+    mutating call."""
+    respx.post(f"{_LIVE_BASE}/openApi/swap/v2/trade/leverage").mock(
+        return_value=Response(200, json={"code": 80014, "msg": "invalid leverage", "data": {}})
+    )
+
+    with pytest.raises(ConnectorUnavailableError, match="invalid leverage"):
+        _connector().set_leverage("BTC-USDT")
 
 
 def test_refuses_to_place_order_against_a_non_live_host():
