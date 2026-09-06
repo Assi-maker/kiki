@@ -278,6 +278,35 @@ def _submit_entry_order(
     _resolve_uncertain_entry(repo, connector, position, client_order_id, run_id, now, origin="post_submit")
 
 
+def _signal_is_fresh(
+    repo: Repository, position: Position, ttl_seconds: int, run_id: str, now: datetime
+) -> bool:
+    """Spec §17: a Gate-CONFIRMED signal may only be claimed/submitted by
+    LIVE if its age is within the LIVE-specific TTL - never inherited from
+    PAPER's own max_position_hold_hours. The authoritative timestamp is the
+    candidate's CANDIDATE_TRANSITIONED-to-CONFIRMED event
+    (get_candidate_confirmed_at()), never positions.opened_at (stamped with
+    discovery-creation time, not confirmation time) and never this
+    function's own `now` (that would make every signal "fresh" by
+    construction). A missing CONFIRMED event fails closed - never fresh.
+    The boundary is inclusive: age == ttl_seconds is still fresh, only
+    age > ttl_seconds is stale. Because age is a pure, monotonically
+    non-decreasing function of (now, confirmed_at), a signal excluded here
+    is excluded on every later tick too, including the first tick after any
+    restart - no persisted "already considered" state is needed or kept."""
+    confirmed_at = repo.get_candidate_confirmed_at(position.candidate_id)
+    age_seconds = (now - confirmed_at).total_seconds() if confirmed_at is not None else None
+    if confirmed_at is not None and age_seconds <= ttl_seconds:
+        return True
+    log_event(
+        run_id, event="live_signal_stale_skipped", position_id=position.position_id,
+        candidate_id=position.candidate_id,
+        signal_confirmed_at=confirmed_at.isoformat() if confirmed_at is not None else None,
+        signal_age_seconds=age_seconds, ttl_seconds=ttl_seconds,
+    )
+    return False
+
+
 def process_pending_positions(
     repo: Repository,
     connector: BingXLiveTradingConnector,
@@ -297,6 +326,8 @@ def process_pending_positions(
     retried next tick, picked up automatically once a slot frees."""
     cfg = settings.live_execution
     for position in repo.find_positions_pending_live_execution(limit):
+        if not _signal_is_fresh(repo, position, cfg.signal_ttl_seconds, run_id, now):
+            continue  # never claimed/submitted (spec §17.4) - other pending positions still tried
         if not has_sufficient_live_capacity(
             repo, connector, market_data_connector, cfg.max_concurrent_positions,
             cfg.margin_per_trade_usdt + cfg.margin_safety_buffer_usdt, run_id, now,

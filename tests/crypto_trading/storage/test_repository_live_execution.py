@@ -166,3 +166,83 @@ def test_live_execution_never_writes_to_positions_table(tmp_path):
     after = repo.get_position("pos-1")
     assert after == before
     assert after.status == "OPEN_POSITION"  # untouched by live_execution close
+
+
+def _confirm_signal(repo: SQLiteRepository, candidate_id: str, confirmed_at: datetime) -> None:
+    """Spec §17.3's authoritative signal timestamp: a CANDIDATE_TRANSITIONED
+    event with payload.to == 'CONFIRMED'. transition_candidate_with_event()
+    inserts the event regardless of whether a matching `candidates` row
+    exists (its UPDATE simply affects zero rows if not) - fine for these
+    tests, which only need the event to exist for get_candidate_confirmed_at()."""
+    event = Event(
+        event_id=f"CANDIDATE_TRANSITIONED:{candidate_id}:CONFIRMED:{confirmed_at.isoformat()}",
+        event_type="CANDIDATE_TRANSITIONED",
+        aggregate_type="candidate",
+        aggregate_id=candidate_id,
+        occurred_at=confirmed_at,
+        run_id="seed",
+        schema_version=1,
+        payload={"from": "UNDER_AI_ANALYSIS", "to": "CONFIRMED"},
+    )
+    repo.transition_candidate_with_event(candidate_id, "CONFIRMED", confirmed_at, event)
+
+
+def test_get_candidate_confirmed_at_returns_the_confirmed_transition_timestamp(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    confirmed_at = _NOW - timedelta(minutes=10)
+    _confirm_signal(repo, "cand-1", confirmed_at)
+
+    assert repo.get_candidate_confirmed_at("cand-1") == confirmed_at
+
+
+def test_get_candidate_confirmed_at_returns_none_when_never_confirmed(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    assert repo.get_candidate_confirmed_at("cand-never-confirmed") is None
+
+
+def test_get_candidate_confirmed_at_ignores_non_confirmed_transitions(tmp_path):
+    """A CANDIDATE_TRANSITIONED event that isn't the CONFIRMED one (e.g.
+    CANDIDATE -> UNDER_AI_ANALYSIS) must never be mistaken for the signal
+    timestamp."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    event = Event(
+        event_id="CANDIDATE_TRANSITIONED:cand-1:UNDER_AI_ANALYSIS",
+        event_type="CANDIDATE_TRANSITIONED",
+        aggregate_type="candidate",
+        aggregate_id="cand-1",
+        occurred_at=_NOW - timedelta(minutes=5),
+        run_id="seed",
+        schema_version=1,
+        payload={"from": "CANDIDATE", "to": "UNDER_AI_ANALYSIS"},
+    )
+    not_confirmed_at = _NOW - timedelta(minutes=5)
+    repo.transition_candidate_with_event("cand-1", "UNDER_AI_ANALYSIS", not_confirmed_at, event)
+
+    assert repo.get_candidate_confirmed_at("cand-1") is None
+
+
+def test_claim_live_execution_fails_closed_when_position_no_longer_open(tmp_path):
+    """Race defense (spec §17.6): the observed live incident had PAPER's
+    own time-limit closer flip positions.status to CLOSED roughly one
+    second before LIVE's independent thread claimed the same row as still
+    OPEN_POSITION. The atomic claim itself must re-verify status - not rely
+    on a Position object read earlier - so a position closed by ANY
+    concurrent PAPER decision (time-limit, SL, TP, manual) can never be
+    claimed by LIVE, even if an earlier read of it still said OPEN_POSITION."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    close_event = Event(
+        event_id="POSITION_CLOSED:pos-1", event_type="POSITION_CLOSED",
+        aggregate_type="position", aggregate_id="pos-1", occurred_at=_NOW,
+        run_id="seed", schema_version=1, payload={"exit_reason": "time_limit"},
+    )
+    repo.close_position_with_event(
+        "pos-1", Decimal("50100"), Decimal("50090"), "time_limit",
+        Decimal("1"), Decimal("0"), _NOW, close_event,
+    )
+
+    claimed = repo.claim_live_execution("pos-1", _NOW, "10", "100", "10")
+
+    assert claimed is False
+    assert repo.get_live_execution("pos-1") is None

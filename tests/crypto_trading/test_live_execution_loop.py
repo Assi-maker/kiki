@@ -63,6 +63,16 @@ def _seed_open_position(repo, position_id="pos-1"):
         run_id="seed", schema_version=1, payload={},
     )
     repo.create_position_with_event(position, event)
+    # Spec §17.3's authoritative signal timestamp - fresh at _NOW, well
+    # within the default signal_ttl_seconds, so these pre-existing tests
+    # keep exercising claim/submit exactly as before the TTL check existed.
+    confirmed_event = Event(
+        event_id=f"CANDIDATE_TRANSITIONED:{position_id}:CONFIRMED",
+        event_type="CANDIDATE_TRANSITIONED", aggregate_type="candidate",
+        aggregate_id=position_id, occurred_at=_NOW, run_id="seed",
+        schema_version=1, payload={"from": "UNDER_AI_ANALYSIS", "to": "CONFIRMED"},
+    )
+    repo.transition_candidate_with_event(position_id, "CONFIRMED", _NOW, confirmed_event)
 
 
 def test_run_live_execution_tick_processes_pending_positions(tmp_path):

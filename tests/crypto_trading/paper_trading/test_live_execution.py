@@ -22,7 +22,13 @@ from crypto_trading.storage.repository import SQLiteRepository
 _NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
 
 
-def _open_position(repo, position_id="pos-1", opened_at=_NOW, entry=Decimal("50000")) -> Position:
+def _open_position(
+    repo, position_id="pos-1", opened_at=_NOW, entry=Decimal("50000"), confirmed_at=None,
+) -> Position:
+    """confirmed_at defaults to opened_at - i.e. the signal is fresh at
+    `_NOW` unless a test explicitly backdates it - so every pre-existing
+    test in this file (which assumes immediate eligibility) keeps passing
+    unchanged under the new TTL check (spec §17)."""
     position = Position(
         position_id=position_id, candidate_id=position_id, instrument="BTC-USDT",
         direction="LONG", status="OPEN_POSITION", theoretical_entry=entry,
@@ -35,7 +41,20 @@ def _open_position(repo, position_id="pos-1", opened_at=_NOW, entry=Decimal("500
         run_id="seed", schema_version=1, payload={},
     )
     repo.create_position_with_event(position, event)
+    _confirm_signal(repo, position_id, confirmed_at if confirmed_at is not None else opened_at)
     return position
+
+
+def _confirm_signal(repo, candidate_id, confirmed_at) -> None:
+    """Spec §17.3's authoritative signal timestamp: a CANDIDATE_TRANSITIONED
+    event with payload.to == 'CONFIRMED', sourced from the events table."""
+    event = Event(
+        event_id=f"CANDIDATE_TRANSITIONED:{candidate_id}:CONFIRMED:{confirmed_at.isoformat()}",
+        event_type="CANDIDATE_TRANSITIONED", aggregate_type="candidate",
+        aggregate_id=candidate_id, occurred_at=confirmed_at, run_id="seed",
+        schema_version=1, payload={"from": "UNDER_AI_ANALYSIS", "to": "CONFIRMED"},
+    )
+    repo.transition_candidate_with_event(candidate_id, "CONFIRMED", confirmed_at, event)
 
 
 class _SpyConnector:
@@ -182,6 +201,146 @@ def test_process_pending_positions_claims_and_submits_when_capacity_available(tm
     assert row["phase"] == "ACTIVE"
     assert row["margin_usdt"] == "10"
     assert row["notional_usdt"] == "100"
+
+
+def _with_ttl(settings, ttl_seconds):
+    return settings.model_copy(
+        update={"live_execution": settings.live_execution.model_copy(
+            update={"signal_ttl_seconds": ttl_seconds}
+        )}
+    )
+
+
+def test_process_pending_positions_claims_a_fresh_signal_within_ttl(tmp_path):
+    """Spec §17.9 case 1: a signal well within TTL is claimed and submitted
+    exactly as before the TTL check existed - no regression to §7/§8."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, confirmed_at=_NOW - timedelta(minutes=5))
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = _with_ttl(get_settings(), ttl_seconds=1800)
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    row = repo.get_live_execution("pos-1")
+    assert row["phase"] == "ACTIVE"
+
+
+def test_process_pending_positions_treats_signal_exactly_at_ttl_boundary_as_eligible(tmp_path):
+    """Spec §17.9 case 2: age == TTL exactly is defined as still eligible
+    (inclusive boundary) - not stale."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, confirmed_at=_NOW - timedelta(seconds=1800))
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = _with_ttl(get_settings(), ttl_seconds=1800)
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    row = repo.get_live_execution("pos-1")
+    assert row["phase"] == "ACTIVE"
+
+
+def test_process_pending_positions_never_claims_a_signal_older_than_ttl(tmp_path):
+    """Spec §17.9 case 3: one second past TTL is stale - never claimed,
+    never submitted to BingX, zero AI involvement (the connector here has
+    no AI-call surface at all, so len(connector.calls) == 0 structurally
+    proves no order and, by construction of this module, no AI credit was
+    ever at risk)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, confirmed_at=_NOW - timedelta(seconds=1801))
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = _with_ttl(get_settings(), ttl_seconds=1800)
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    assert repo.get_live_execution("pos-1") is None  # never claimed at all
+    assert connector.calls == []  # never even attempted an order
+
+
+def test_process_pending_positions_never_claims_a_very_old_signal_across_repeated_ticks(tmp_path):
+    """Spec §17.9 case 4: a multi-day-old signal is never claimed, on this
+    tick or any later one - the exclusion is a pure function of (now,
+    confirmed_at, ttl), so it can never "eventually" succeed."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, confirmed_at=_NOW - timedelta(days=2))
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = _with_ttl(get_settings(), ttl_seconds=1800)
+
+    for tick_offset in (0, 60, 3600, 7200):
+        process_pending_positions(
+            repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+            {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW + timedelta(seconds=tick_offset),
+        )
+
+    assert repo.get_live_execution("pos-1") is None
+    assert connector.calls == []
+
+
+def test_process_pending_positions_treats_a_missing_confirmed_event_as_stale(tmp_path):
+    """Fail-closed (spec §17.2/§17.3): if the authoritative CONFIRMED event
+    cannot be found at all, the signal must never be treated as fresh."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    position = Position(
+        position_id="pos-1", candidate_id="pos-1", instrument="BTC-USDT",
+        direction="LONG", status="OPEN_POSITION", theoretical_entry=Decimal("50000"),
+        simulated_fill_entry=Decimal("50000"), stop_loss=Decimal("49000"),
+        target=Decimal("52000"), size=Decimal("1000"), fill_model_version="v1", opened_at=_NOW,
+    )
+    event = Event(
+        event_id="POSITION_OPENED:pos-1", event_type="POSITION_OPENED",
+        aggregate_type="position", aggregate_id="pos-1", occurred_at=_NOW,
+        run_id="seed", schema_version=1, payload={},
+    )
+    repo.create_position_with_event(position, event)  # deliberately no CONFIRMED event
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = _with_ttl(get_settings(), ttl_seconds=1800)
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    assert repo.get_live_execution("pos-1") is None
+    assert connector.calls == []
+
+
+def test_process_pending_positions_restart_never_reclaims_an_already_stale_signal(tmp_path):
+    """Spec §17.9 case 6 / §17.8 restart safety: a signal already stale
+    before "LIVE was enabled" (modeled here as a fresh process_pending_
+    positions call with no prior in-memory state - the only state that
+    exists is durable DB state) must be excluded on the very first tick,
+    exactly as it would be on any later one. There is no persisted
+    "already considered" flag to lose across a restart, because the check
+    is a pure function of (now, confirmed_at, ttl) - this test proves a
+    brand-new call sees it as stale immediately, and a second, later call
+    (simulating a further restart) still does."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, confirmed_at=_NOW - timedelta(hours=10))
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = _with_ttl(get_settings(), ttl_seconds=1800)
+
+    # "first tick after restart"
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+    assert repo.get_live_execution("pos-1") is None
+
+    # "a further restart" - freshly re-evaluated, still excluded
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r2", _NOW + timedelta(hours=1),
+    )
+    assert repo.get_live_execution("pos-1") is None
+    assert connector.calls == []
 
 
 def test_process_pending_positions_skips_when_capacity_full(tmp_path):

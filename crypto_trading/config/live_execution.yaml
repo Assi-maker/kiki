@@ -13,3 +13,7 @@ margin_per_trade_usdt: "10"
 leverage: 10
 max_position_hold_hours: 6
 margin_safety_buffer_usdt: "1.00"
+# Signal staleness/TTL (locked 2026-09-06, spec §17): a Gate-CONFIRMED
+# signal older than this may never be claimed/submitted by LIVE. LIVE-only,
+# independent of max_position_hold_hours above.
+signal_ttl_seconds: 1800

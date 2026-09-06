@@ -185,6 +185,13 @@ class LiveExecutionConfig(BaseModel):
     leverage: int = Field(gt=0, default=10)
     max_position_hold_hours: int = Field(gt=0, default=6)
     margin_safety_buffer_usdt: Decimal = Field(ge=0, default=Decimal("1.00"))
+    # Signal staleness/TTL (2026-09-06, spec §17, locked at exactly 30
+    # minutes) - a separate, LIVE-only precondition, never derived from or
+    # falling back to PAPER's risk_limits.max_position_hold_hours (24h).
+    # Governs how old a Gate-CONFIRMED signal may be before LIVE is still
+    # permitted to claim/submit it at all - see
+    # paper_trading/live_execution.py::process_pending_positions().
+    signal_ttl_seconds: int = Field(gt=0, default=1800)
 
 
 class NotifyConfig(BaseModel):

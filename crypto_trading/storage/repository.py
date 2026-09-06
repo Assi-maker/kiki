@@ -95,6 +95,7 @@ class Repository(Protocol):
     ) -> bool: ...
     def get_live_execution(self, position_id: str) -> dict | None: ...
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]: ...
+    def get_candidate_confirmed_at(self, candidate_id: str) -> datetime | None: ...
     def find_active_live_executions(self) -> list[dict]: ...
     def find_stale_claimed_live_executions(self, older_than: datetime) -> list[dict]: ...
     def mark_live_execution_entry_submitted(
@@ -561,13 +562,23 @@ class SQLiteRepository:
         notional_usdt: str, leverage: str,
     ) -> bool:
         try:
+            # Race defense (spec §17.6): re-verifies positions.status is
+            # still OPEN_POSITION as part of the SAME atomic statement as
+            # the claim insert - never trusts a Position object read
+            # earlier in the tick. Closes the exact race observed live,
+            # where PAPER's own time-limit closer and LIVE's independent
+            # claiming thread acted on the same position within the same
+            # second, with no lock between them.
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO live_executions "
                 "(position_id, phase, margin_usdt, notional_usdt, leverage, "
-                "claimed_at, updated_at) VALUES (?, 'CLAIMED', ?, ?, ?, ?, ?)",
+                "claimed_at, updated_at) "
+                "SELECT ?, 'CLAIMED', ?, ?, ?, ?, ? WHERE EXISTS ("
+                "SELECT 1 FROM positions WHERE position_id = ? AND status = 'OPEN_POSITION')",
                 (
                     position_id, margin_usdt, notional_usdt, leverage,
                     claimed_at.isoformat(), claimed_at.isoformat(),
+                    position_id,
                 ),
             )
             claimed = cur.rowcount > 0
@@ -591,6 +602,25 @@ class SQLiteRepository:
             (limit,),
         ).fetchall()
         return [self._row_to_position(row) for row in rows]
+
+    def get_candidate_confirmed_at(self, candidate_id: str) -> datetime | None:
+        """Authoritative signal timestamp for LIVE's TTL check (spec §17.3):
+        the moment Gate actually confirmed the candidate, sourced from the
+        append-only events table - never positions.opened_at (stamped with
+        discovery-creation time, not confirmation time, per the incident
+        forensic trace) and never LIVE claim time. ASC LIMIT 1 picks the
+        first CONFIRMED transition deterministically, in the (currently
+        unseen) event a candidate were ever re-confirmed more than once."""
+        row = self._conn.execute(
+            "SELECT occurred_at FROM events WHERE aggregate_id = ? "
+            "AND event_type = 'CANDIDATE_TRANSITIONED' "
+            "AND json_extract(payload, '$.to') = 'CONFIRMED' "
+            "ORDER BY occurred_at ASC LIMIT 1",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return datetime.fromisoformat(row["occurred_at"])
 
     def find_active_live_executions(self) -> list[dict]:
         rows = self._conn.execute(
