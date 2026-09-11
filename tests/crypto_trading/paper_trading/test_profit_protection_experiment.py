@@ -1,10 +1,11 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from crypto_trading.config.loader import GuardianConfig
+from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig
 from crypto_trading.paper_trading.profit_protection_experiment import (
     FROZEN_THRESHOLDS_PCT,
     _guardian_state_for,
+    advance_shadow,
     seed_shadows_for_position,
 )
 from crypto_trading.schemas.guardian import GuardianObservation
@@ -100,3 +101,165 @@ def test_seed_shadows_for_position_is_idempotent(tmp_path):
     seed_shadows_for_position(repo, _position(), activated_at=_NOW, now=_NOW)
     seed_shadows_for_position(repo, _position(), activated_at=_NOW, now=_NOW)
     assert len(repo.find_all_profit_protection_shadows()) == 2
+
+
+def _shadow_row(repo, **overrides) -> dict:
+    defaults = dict(
+        shadow_id="pos-1:0.010", position_id="pos-1", instrument="BTCUSDT",
+        threshold_pct="0.010", entry_price=Decimal("50000"),
+        original_stop_loss=Decimal("49000"), target=Decimal("52000"),
+        threshold_price=Decimal("50500"), opened_at=_NOW, created_at=_NOW,
+    )
+    defaults.update(overrides)
+    repo.seed_profit_protection_shadow(**defaults)
+    return repo.get_profit_protection_shadow(defaults["shadow_id"])
+
+
+def _risk_limits(**overrides) -> RiskLimitsConfig:
+    defaults = dict(
+        starting_capital_usdt=Decimal("10000"), risk_per_trade_pct=Decimal("0.01"),
+        max_concurrent_positions=5, max_total_exposure_pct=Decimal("1.0"),
+        max_position_notional_usdt=Decimal("1000000"), spread_pct=Decimal("0.0005"),
+        slippage_pct=Decimal("0.0005"), fee_pct=Decimal("0.0004"), max_position_hold_hours=24,
+    )
+    defaults.update(overrides)
+    return RiskLimitsConfig(**defaults)
+
+
+def _seed_real_position(repo, **overrides) -> None:
+    from crypto_trading.schemas.event import Event
+    position = _position(**overrides)
+    repo.create_position_with_event(
+        position,
+        Event(
+            event_id=f"POSITION_OPENED:{position.position_id}", event_type="POSITION_OPENED",
+            aggregate_type="position", aggregate_id=position.position_id,
+            occurred_at=position.opened_at, run_id="seed", schema_version=1, payload={},
+        ),
+    )
+
+
+def test_advance_shadow_does_not_move_sl_when_threshold_not_reached(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    advance_shadow(
+        shadow, candle_low=Decimal("49500"), candle_high=Decimal("50100"),
+        current_price=Decimal("50000"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "OPEN"
+    assert row["threshold_reached"] == 0
+    assert row["breakeven_stop_loss"] is None
+
+
+def test_advance_shadow_activates_breakeven_starting_next_tick_only(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    # Tick 1: threshold touched (candle_high 50600 >= 50500), no stop/target hit
+    advance_shadow(
+        shadow, candle_low=Decimal("50100"), candle_high=Decimal("50600"),
+        current_price=Decimal("50400"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    after_tick_1 = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert after_tick_1["threshold_reached"] == 1
+    assert after_tick_1["breakeven_stop_loss"] == "50000"
+    assert after_tick_1["status"] == "OPEN"  # never closed same tick it activated
+
+    # Tick 2: price drops to exactly breakeven - now the active SL, closes here
+    tick_2_time = _NOW + timedelta(minutes=1)
+    advance_shadow(
+        after_tick_1, candle_low=Decimal("49900"), candle_high=Decimal("50200"),
+        current_price=Decimal("50000"), funding_rate=Decimal("0"), now=tick_2_time,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    after_tick_2 = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert after_tick_2["status"] == "CLOSED"
+    assert after_tick_2["exit_reason"] == "stop_loss"
+
+
+def test_advance_shadow_same_candle_threshold_and_stop_resolves_stop_first(tmp_path):
+    """Spec G8: a candle whose low <= original SL (49000) and whose high
+    also >= threshold (50500) must be resolved as the stop firing first -
+    threshold is never considered reached on a candle that also breached
+    the pre-existing SL."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    advance_shadow(
+        shadow, candle_low=Decimal("48900"), candle_high=Decimal("50600"),
+        current_price=Decimal("49500"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "CLOSED"
+    assert row["exit_reason"] == "stop_loss"
+    assert row["threshold_reached"] == 0  # never got the chance - stop fired first
+
+
+def test_advance_shadow_time_limit_fires_when_hold_hours_exceeded(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    later = _NOW + timedelta(hours=25)
+    advance_shadow(
+        shadow, candle_low=Decimal("49500"), candle_high=Decimal("50100"),
+        current_price=Decimal("49800"), funding_rate=Decimal("0"), now=later,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "CLOSED"
+    assert row["exit_reason"] == "time_limit"
+    assert row["theoretical_exit"] == "49800"  # current_price, not candle_high/low
+
+
+def test_advance_shadow_guardian_exit_fires_only_when_enabled_and_state_is_exit(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    advance_shadow(
+        shadow, candle_low=Decimal("49500"), candle_high=Decimal("50100"),
+        current_price=Decimal("49900"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state="EXIT",
+        guardian_assisted_exit_enabled=True, risk_limits=_risk_limits(), repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "CLOSED"
+    assert row["exit_reason"] == "guardian_exit"
+
+
+def test_advance_shadow_guardian_exit_state_never_closes_when_disabled(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    advance_shadow(
+        shadow, candle_low=Decimal("49500"), candle_high=Decimal("50100"),
+        current_price=Decimal("49900"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state="EXIT",
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "OPEN"
+
+
+def test_advance_shadow_updates_mfe_and_mae_before_any_exit_check(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    advance_shadow(
+        shadow, candle_low=Decimal("49700"), candle_high=Decimal("50300"),
+        current_price=Decimal("50000"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["mfe"] == "300"   # 50300 - 50000
+    assert row["mae"] == "-300"  # 49700 - 50000

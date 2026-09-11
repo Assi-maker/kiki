@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig, Settings
+from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig
 from crypto_trading.paper_trading.execution import (
     FILL_MODEL_VERSION,
     compute_fees,
@@ -71,3 +71,119 @@ def seed_shadows_for_position(
             opened_at=position.opened_at,
             created_at=now,
         )
+
+
+def advance_shadow(
+    shadow: dict,
+    candle_low: Decimal,
+    candle_high: Decimal,
+    current_price: Decimal,
+    funding_rate: Decimal,
+    now: datetime,
+    max_position_hold_hours: int,
+    guardian_state: str | None,
+    guardian_assisted_exit_enabled: bool,
+    risk_limits: RiskLimitsConfig,
+    repo: Repository,
+) -> None:
+    """One shadow row, one tick (spec §5.2). Conservative ordering (G7/G8):
+    stop -> target -> time_limit -> guardian_exit, always checked against
+    the ACTIVE sl as of the START of this tick - a new threshold-touch is
+    only ever detected AFTER all four checks, and only takes effect
+    starting the tick after this one (activate_profit_protection_breakeven
+    is a separate call the NEXT tick will see via `shadow["breakeven_stop_loss"]`
+    being non-None, never within this same call)."""
+    shadow_id = shadow["shadow_id"]
+    entry_price = Decimal(shadow["entry_price"])
+    original_stop_loss = Decimal(shadow["original_stop_loss"])
+    target = Decimal(shadow["target"])
+    threshold_price = Decimal(shadow["threshold_price"])
+    breakeven_stop_loss = (
+        Decimal(shadow["breakeven_stop_loss"])
+        if shadow["breakeven_stop_loss"] is not None
+        else None
+    )
+    active_sl = breakeven_stop_loss if breakeven_stop_loss is not None else original_stop_loss
+
+    mfe = max(Decimal(shadow["mfe"]), candle_high - entry_price)
+    mae = min(Decimal(shadow["mae"]), candle_low - entry_price)
+    repo.record_profit_protection_tick(shadow_id, mfe, mae, now)
+
+    opened_at = datetime.fromisoformat(shadow["opened_at"])
+    hold_hours = Decimal(str((now - opened_at).total_seconds())) / Decimal("3600")
+
+    exit_reason: str | None = None
+    theoretical_exit: Decimal | None = None
+    if candle_low <= active_sl:
+        exit_reason, theoretical_exit = "stop_loss", min(candle_low, active_sl)
+    elif candle_high >= target:
+        exit_reason, theoretical_exit = "target", min(candle_high, target)
+    elif hold_hours >= max_position_hold_hours:
+        exit_reason, theoretical_exit = "time_limit", current_price
+    elif guardian_assisted_exit_enabled and guardian_state == "EXIT":
+        exit_reason, theoretical_exit = "guardian_exit", current_price
+
+    if exit_reason is not None:
+        _close_shadow(repo, shadow, exit_reason, theoretical_exit, funding_rate, risk_limits, now)
+        return
+
+    if not shadow["threshold_reached"] and candle_high >= threshold_price:
+        repo.activate_profit_protection_breakeven(shadow_id, entry_price, now, now)
+
+
+def _close_shadow(
+    repo: Repository,
+    shadow: dict,
+    exit_reason: str,
+    theoretical_exit: Decimal,
+    funding_rate: Decimal,
+    risk_limits: RiskLimitsConfig,
+    closed_at: datetime,
+) -> None:
+    """Spec §5.4: size/simulated_fill_entry are read from the real
+    position (plan correction, PnL-parity data sourcing) - they never
+    change before the real position closes, so this read is always safe
+    whether or not the real position has closed yet. Never writes to
+    `positions` - only reads via repo.get_position() and writes via
+    repo.close_profit_protection_shadow()."""
+    real_position = repo.get_position(shadow["position_id"])
+    simulated_fill_exit = compute_fill_price(
+        theoretical_exit, _DIRECTION, risk_limits.spread_pct, risk_limits.slippage_pct, "exit"
+    )
+    fees = compute_fees(real_position.size, risk_limits.fee_pct)
+    opened_at = datetime.fromisoformat(shadow["opened_at"])
+    hold_hours = Decimal(str((closed_at - opened_at).total_seconds())) / Decimal("3600")
+    funding = compute_funding(real_position.size, funding_rate, hold_hours)
+
+    ephemeral = Position(
+        position_id=shadow["shadow_id"],
+        candidate_id="profit_protection_experiment",
+        instrument=shadow["instrument"],
+        direction=_DIRECTION,
+        status="CLOSED",
+        theoretical_entry=Decimal(shadow["entry_price"]),
+        simulated_fill_entry=real_position.simulated_fill_entry,
+        stop_loss=Decimal(shadow["original_stop_loss"]),
+        target=Decimal(shadow["target"]),
+        size=real_position.size,
+        fill_model_version=FILL_MODEL_VERSION,
+        opened_at=opened_at,
+        theoretical_exit=theoretical_exit,
+        simulated_fill_exit=simulated_fill_exit,
+        exit_reason=exit_reason,
+        fees=fees,
+        funding=funding,
+        closed_at=closed_at,
+    )
+    shadow_realized_pnl = compute_pnl(ephemeral)
+    repo.close_profit_protection_shadow(
+        shadow_id=shadow["shadow_id"],
+        exit_reason=exit_reason,
+        theoretical_exit=theoretical_exit,
+        simulated_fill_exit=simulated_fill_exit,
+        fees=fees,
+        funding=funding,
+        closed_at=closed_at,
+        shadow_realized_pnl=shadow_realized_pnl,
+        updated_at=closed_at,
+    )
