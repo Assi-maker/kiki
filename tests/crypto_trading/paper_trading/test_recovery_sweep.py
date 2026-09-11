@@ -62,7 +62,9 @@ def _seed_confirmed_candidate(repo, candidate: Candidate, confirmed_at: datetime
         aggregate_type="candidate", aggregate_id=candidate.candidate_id, occurred_at=confirmed_at,
         run_id="seed", schema_version=1, payload={},
     )
-    repo.create_candidate_with_event(candidate.model_copy(update={"status": "NEW"}), create_event)
+    repo.create_candidate_with_event(
+        candidate.model_copy(update={"status": "CANDIDATE"}), create_event
+    )
     repo.save_assessment(candidate.candidate_id, "risk", candidate.risk)
     transition_event = Event(
         event_id=f"CANDIDATE_TRANSITIONED:{candidate.candidate_id}:CONFIRMED",

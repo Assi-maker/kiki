@@ -8,6 +8,7 @@ from crypto_trading.config.loader import Settings
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.market_snapshot import LiveMarketDataSource, build_live_snapshot
 from crypto_trading.paper_trading.live_execution import has_sufficient_live_capacity
+from crypto_trading.paper_trading.recovery_sweep import sweep_confirmed_candidates_without_position
 from crypto_trading.paper_trading.replay import run_single_cycle
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository
@@ -62,6 +63,15 @@ def run_discovery_tick(
     run_id = new_run_id()
     now = datetime.now(UTC)
     repo.start_run(run_id, "discovery", now)
+    try:
+        sweep_confirmed_candidates_without_position(
+            repo, connector, settings.risk_limits, now, run_id
+        )
+    except Exception as exc:
+        log_event(
+            run_id, event="recovery_sweep_failed",
+            error_type=type(exc).__name__, error=str(exc),
+        )
     if live_connector is not None:
         required_margin = (
             settings.live_execution.margin_per_trade_usdt

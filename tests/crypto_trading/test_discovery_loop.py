@@ -296,3 +296,70 @@ def test_run_discovery_tick_proceeds_when_live_capacity_available(tmp_path):
     )
 
     assert isinstance(positions, list)
+
+
+def test_run_discovery_tick_recovers_an_orphaned_confirmed_candidate_at_tick_start(tmp_path):
+    """P2 remediation (2026-09-11): a CONFIRMED candidate with no position
+    row (simulating a prior crash between confirmation and open) gets a
+    PAPER position opened at the very start of the next discovery tick -
+    before the tick's own snapshot/candidate-search logic runs at all."""
+    from crypto_trading.schemas.assessments import RiskAssessment
+    from crypto_trading.schemas.candidate import Candidate
+    from crypto_trading.schemas.evidence import (
+        CandidateEvidenceRecord,
+        FundingOpenInterestEvidence,
+        MomentumBreakoutEvidence,
+        PriceVolatilityEvidence,
+        VolumeEvidence,
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    connector = _stub_connector_with_one_healthy_symbol()  # BTCUSDT ticker @ 50000
+    now = datetime.now(UTC)
+    placeholder = dict(triggered=True, metric="m", value=1.0, baseline=0.0, threshold=0.5)
+    evidence = CandidateEvidenceRecord(
+        instrument="BTCUSDT", timeframes=["1h"], evaluated_at=now,
+        price_volatility_evidence=PriceVolatilityEvidence(**placeholder),
+        momentum_breakout_evidence=MomentumBreakoutEvidence(**placeholder),
+        volume_evidence=VolumeEvidence(**placeholder),
+        funding_oi_evidence=FundingOpenInterestEvidence(**placeholder),
+        candidate_score=0.8, trigger_reasons=["price_volatility"],
+        data_quality_status="ok", outcome="worth_deeper_analysis",
+    )
+    risk = RiskAssessment(
+        agent_name="crypto-risk-agent", run_id="run-0", created_at=now, status="ok",
+        suggested_stop_loss="49000", suggested_target="52000",
+        downside="d", liquidity_risk="l", model_risk="m", timing_risk="t",
+    )
+    candidate = Candidate(
+        candidate_id="orphan-1", idempotency_key="key-orphan-1", instrument="BTCUSDT",
+        discovery_run_id="run-0", evidence_hash="hash-1", status="CANDIDATE",
+        evidence_record=evidence, created_at=now, updated_at=now, risk=risk,
+    )
+    repo.create_candidate_with_event(
+        candidate,
+        Event(
+            event_id="CANDIDATE_CREATED:orphan-1", event_type="CANDIDATE_CREATED",
+            aggregate_type="candidate", aggregate_id="orphan-1", occurred_at=now,
+            run_id="run-0", schema_version=1, payload={},
+        ),
+    )
+    repo.save_assessment("orphan-1", "risk", risk)
+    repo.transition_candidate_with_event(
+        "orphan-1", "CONFIRMED", now,
+        Event(
+            event_id="CANDIDATE_TRANSITIONED:orphan-1:CONFIRMED",
+            event_type="CANDIDATE_TRANSITIONED", aggregate_type="candidate",
+            aggregate_id="orphan-1", occurred_at=now, run_id="run-0",
+            schema_version=1, payload={"from": "UNDER_AI_ANALYSIS", "to": "CONFIRMED"},
+        ),
+    )
+    # Activate the watermark BEFORE the candidate's confirmed_at, so this
+    # tick's sweep treats it as a genuine forward-recovery target.
+    repo.set_recovery_sweep_activated_at_if_missing(now - timedelta(seconds=1))
+
+    run_discovery_tick(connector, repo, MockAgentRunner(_happy_fixtures()), _settings(top_n=1))
+
+    position = repo.get_position("orphan-1")
+    assert position is not None
+    assert position.status == "OPEN_POSITION"
