@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig
@@ -43,7 +43,19 @@ def close_triggered_positions(
         if assisted_exit_enabled:
             latest_observation = repo.find_latest_guardian_observation(position.position_id)
             if latest_observation is not None:
-                guardian_state = latest_observation["state"]
+                # Staleness guard (2026-09-11 remediation): a Guardian
+                # observation older than 2x the normal check cadence relative
+                # to the price point being evaluated is never trusted for an
+                # assisted exit - fails closed to "no observation" (never
+                # triggers guardian_exit), same inclusive boundary convention
+                # as live_execution.py::_signal_is_fresh(). This matters most
+                # during monitoring catch-up (this function's caller can be
+                # replaying many historical candles per Guardian tick), but
+                # applies uniformly to normal ticks too.
+                observed_at = datetime.fromisoformat(latest_observation["observed_at"])
+                staleness_limit = timedelta(seconds=2 * guardian_config.check_interval_seconds)
+                if now - observed_at <= staleness_limit:
+                    guardian_state = latest_observation["state"]
 
         trigger = check_exit_trigger(
             position,

@@ -184,7 +184,7 @@ _WITHIN_RANGE_PRICE_LOOKUP = {
 def test_guardian_exit_closes_position_when_enabled_and_state_is_exit(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed(repo, _open_position())
-    observed_at = _OPENED_AT + timedelta(minutes=30)
+    observed_at = _OPENED_AT + timedelta(hours=1) - timedelta(seconds=30)
     _seed_guardian_observation(repo, "pos-1", "EXIT", observed_at)
     guardian_config = GuardianConfig(assisted_exit_enabled=True)
 
@@ -270,7 +270,9 @@ def test_guardian_exit_on_one_position_never_affects_a_different_open_position(t
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed(repo, _open_position(position_id="pos-1", instrument="BTCUSDT"))
     _seed(repo, _open_position(position_id="pos-2", instrument="ETHUSDT"))
-    _seed_guardian_observation(repo, "pos-1", "EXIT", _OPENED_AT + timedelta(minutes=30))
+    _seed_guardian_observation(
+        repo, "pos-1", "EXIT", _OPENED_AT + timedelta(hours=1) - timedelta(seconds=30)
+    )
     # pos-2 har ingen Guardian-observation alls.
     price_lookup = {
         "BTCUSDT": (Decimal("49900"), Decimal("50100"), Decimal("50050"), Decimal("0.0001")),
@@ -286,3 +288,45 @@ def test_guardian_exit_on_one_position_never_affects_a_different_open_position(t
     closed_ids = {p.position_id for p in closed}
     assert closed_ids == {"pos-1"}
     assert repo.get_position("pos-2").status == "OPEN_POSITION"
+
+
+def test_guardian_exit_ignored_when_observation_older_than_two_check_intervals(tmp_path):
+    """P1 remediation (2026-09-11): a Guardian observation is only trusted
+    for an assisted exit if it's no older than 2 x guardian.check_interval_
+    seconds relative to the price point being evaluated. default
+    check_interval_seconds=60 -> 120s window. An observation from 5 minutes
+    ago is stale - treated exactly as if no observation existed at all, so
+    guardian_exit never fires and the position stays open (nothing else
+    triggers in _WITHIN_RANGE_PRICE_LOOKUP)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed(repo, _open_position())
+    now = _OPENED_AT + timedelta(hours=1)
+    _seed_guardian_observation(repo, "pos-1", "EXIT", now - timedelta(minutes=5))
+    guardian_config = GuardianConfig(assisted_exit_enabled=True, check_interval_seconds=60)
+
+    closed = close_triggered_positions(
+        repo, _WITHIN_RANGE_PRICE_LOOKUP, now=now,
+        risk_limits=_risk_limits(), run_id="run-1", guardian_config=guardian_config,
+    )
+
+    assert closed == []
+    assert repo.get_position("pos-1").status == "OPEN_POSITION"
+
+
+def test_guardian_exit_still_fires_when_observation_is_within_two_check_intervals(tmp_path):
+    """Boundary/regression companion to the staleness test above: an
+    observation exactly at the 2x check_interval boundary (inclusive, same
+    convention as LIVE's signal TTL check) still counts as fresh."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed(repo, _open_position())
+    now = _OPENED_AT + timedelta(hours=1)
+    guardian_config = GuardianConfig(assisted_exit_enabled=True, check_interval_seconds=60)
+    _seed_guardian_observation(repo, "pos-1", "EXIT", now - timedelta(seconds=120))
+
+    closed = close_triggered_positions(
+        repo, _WITHIN_RANGE_PRICE_LOOKUP, now=now,
+        risk_limits=_risk_limits(), run_id="run-1", guardian_config=guardian_config,
+    )
+
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "guardian_exit"
