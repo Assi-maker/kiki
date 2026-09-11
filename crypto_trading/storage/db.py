@@ -238,6 +238,51 @@ BEFORE DELETE ON guardian_observations
 BEGIN
     SELECT RAISE(ABORT, 'guardian_observations is append-only: DELETE is not permitted');
 END;
+
+-- Profit Protection PAPER shadow experiment (2026-09-11) - strictly
+-- additive shadow simulation of an already-open PAPER position, see
+-- docs/superpowers/specs/2026-09-11-profit-protection-experiment-design.md.
+-- NEVER joined-into or written-from position_opening.py/position_closing.py,
+-- never read by Gate/Risk/Guardian/LIVE. One row per (position_id,
+-- threshold_pct) - at most 2 rows per real position (FROZEN_THRESHOLDS_PCT
+-- always has exactly two values). The one-time activation watermark for
+-- this feature lives in schema_meta (key 'profit_protection_activated_at'),
+-- same pattern as recovery_sweep_activated_at - deliberately no separate
+-- table for that.
+CREATE TABLE IF NOT EXISTS profit_protection_shadow_positions (
+    shadow_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    threshold_pct TEXT NOT NULL,
+    entry_price TEXT NOT NULL,
+    original_stop_loss TEXT NOT NULL,
+    target TEXT NOT NULL,
+    threshold_price TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    threshold_reached INTEGER NOT NULL DEFAULT 0,
+    threshold_reached_at TEXT,
+    breakeven_stop_loss TEXT,
+    mfe TEXT NOT NULL DEFAULT '0',
+    mae TEXT NOT NULL DEFAULT '0',
+    exit_reason TEXT,
+    theoretical_exit TEXT,
+    simulated_fill_exit TEXT,
+    fees TEXT,
+    funding TEXT,
+    closed_at TEXT,
+    shadow_realized_pnl TEXT,
+    hypothetical_baseline_exit_reason TEXT,
+    hypothetical_baseline_pnl TEXT,
+    pnl_difference TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pp_shadow_position
+    ON profit_protection_shadow_positions(position_id);
+CREATE INDEX IF NOT EXISTS idx_pp_shadow_status
+    ON profit_protection_shadow_positions(status);
 """
 
 

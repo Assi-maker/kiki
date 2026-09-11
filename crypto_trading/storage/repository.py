@@ -140,6 +140,8 @@ class Repository(Protocol):
     ) -> bool: ...
     def get_recovery_sweep_activated_at(self) -> datetime | None: ...
     def set_recovery_sweep_activated_at_if_missing(self, activated_at: datetime) -> bool: ...
+    def get_profit_protection_activated_at(self) -> datetime | None: ...
+    def set_profit_protection_activated_at_if_missing(self, activated_at: datetime) -> bool: ...
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
     def complete_run(
         self,
@@ -822,6 +824,26 @@ class SQLiteRepository:
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO schema_meta (key, value) VALUES "
             "('recovery_sweep_activated_at', ?)",
+            (activated_at.isoformat(),),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_profit_protection_activated_at(self) -> datetime | None:
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'profit_protection_activated_at'"
+        ).fetchone()
+        return datetime.fromisoformat(row["value"]) if row is not None else None
+
+    def set_profit_protection_activated_at_if_missing(self, activated_at: datetime) -> bool:
+        """One-time activation watermark (spec G6, plan correction C1) -
+        same INSERT OR IGNORE first-writer-wins idempotency as
+        set_recovery_sweep_activated_at_if_missing(). Whichever timestamp is
+        set FIRST is authoritative forever: any position opened before it
+        is permanently excluded from the experiment."""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO schema_meta (key, value) VALUES "
+            "('profit_protection_activated_at', ?)",
             (activated_at.isoformat(),),
         )
         self._conn.commit()
