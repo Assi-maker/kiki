@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig
+from crypto_trading.paper_trading.execution import compute_fees, compute_fill_price, compute_pnl
 from crypto_trading.paper_trading.profit_protection_experiment import (
     FROZEN_THRESHOLDS_PCT,
     _guardian_state_for,
@@ -378,3 +379,62 @@ def test_advance_shadow_close_is_a_noop_when_real_position_is_missing(tmp_path):
     )  # must not raise
     row = repo.get_profit_protection_shadow("pos-missing:0.010")
     assert row["status"] == "OPEN"
+
+
+def test_shadow_realized_pnl_matches_compute_pnl_formula_exactly(tmp_path):
+    """Proves the ephemeral Position built in _close_shadow produces the
+    exact same number compute_pnl() would produce for an equivalent real
+    position - the single-source-of-truth guarantee from spec §5.4."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1")
+    shadow = _shadow_row(repo)
+    risk_limits = _risk_limits()
+
+    advance_shadow(
+        shadow, candle_low=Decimal("52100"), candle_high=Decimal("52100"),
+        current_price=Decimal("52050"), funding_rate=Decimal("0.0001"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=risk_limits, repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["exit_reason"] == "target"
+
+    # Recompute independently, using the real position's own known fields
+    # plus the same formulas, and assert equality with what got stored.
+    real_position = repo.get_position("pos-1")
+    expected_theoretical_exit = min(Decimal("52100"), Decimal("52000"))  # target=52000
+    expected_fill_exit = compute_fill_price(
+        expected_theoretical_exit, "LONG", risk_limits.spread_pct, risk_limits.slippage_pct, "exit"
+    )
+    expected_fees = compute_fees(real_position.size, risk_limits.fee_pct)
+    assert Decimal(row["simulated_fill_exit"]) == expected_fill_exit
+    assert Decimal(row["fees"]) == expected_fees
+
+    expected_ephemeral = Position(
+        position_id="x", candidate_id="x", instrument="BTCUSDT", direction="LONG",
+        status="CLOSED", theoretical_entry=Decimal("50000"),
+        simulated_fill_entry=real_position.simulated_fill_entry,
+        stop_loss=Decimal("49000"), target=Decimal("52000"), size=real_position.size,
+        fill_model_version="v1", opened_at=_NOW,
+        theoretical_exit=expected_theoretical_exit, simulated_fill_exit=expected_fill_exit,
+        exit_reason="target", fees=expected_fees,
+        funding=Decimal(row["funding"]), closed_at=_NOW,
+    )
+    assert Decimal(row["shadow_realized_pnl"]) == compute_pnl(expected_ephemeral)
+
+
+def test_shadow_close_never_writes_to_positions_table(tmp_path):
+    """G1: closing a shadow must never mutate the real position row."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1")
+    before = repo.get_position("pos-1")
+    shadow = _shadow_row(repo)
+    advance_shadow(
+        shadow, candle_low=Decimal("48900"), candle_high=Decimal("49000"),
+        current_price=Decimal("48950"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    after = repo.get_position("pos-1")
+    assert before == after
+    assert after.status == "OPEN_POSITION"  # still open - only the shadow closed
