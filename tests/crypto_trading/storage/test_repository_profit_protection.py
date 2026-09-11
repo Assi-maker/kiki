@@ -40,3 +40,51 @@ def test_profit_protection_shadow_positions_table_exists(tmp_path):
         "closed_at", "shadow_realized_pnl", "hypothetical_baseline_exit_reason",
         "hypothetical_baseline_pnl", "pnl_difference", "created_at", "updated_at",
     }
+
+
+def _seed_shadow_kwargs(**overrides) -> dict:
+    defaults = dict(
+        shadow_id="pos-1:0.010", position_id="pos-1", instrument="BTCUSDT",
+        threshold_pct="0.010", entry_price=Decimal("50000"),
+        original_stop_loss=Decimal("49000"), target=Decimal("52000"),
+        threshold_price=Decimal("50500"), opened_at=_NOW, created_at=_NOW,
+    )
+    defaults.update(overrides)
+    return defaults
+
+
+def test_seed_profit_protection_shadow_creates_a_row_with_open_status(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    created = repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    assert created is True
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "OPEN"
+    assert row["threshold_reached"] == 0
+    assert row["entry_price"] == "50000"
+
+
+def test_seed_profit_protection_shadow_is_idempotent(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    first = repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    second = repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    assert first is True
+    assert second is False
+
+
+def test_find_open_profit_protection_shadows_excludes_closed_rows(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs(shadow_id="a", position_id="a"))
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs(shadow_id="b", position_id="b"))
+    repo.close_profit_protection_shadow(
+        shadow_id="a", exit_reason="target", theoretical_exit=Decimal("52000"),
+        simulated_fill_exit=Decimal("51974"), fees=Decimal("2"), funding=Decimal("0"),
+        closed_at=_NOW, shadow_realized_pnl=Decimal("100"), updated_at=_NOW,
+    )
+    open_rows = repo.find_open_profit_protection_shadows()
+    assert [r["shadow_id"] for r in open_rows] == ["b"]
+
+
+def test_find_all_profit_protection_shadows_returns_open_and_closed(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    assert len(repo.find_all_profit_protection_shadows()) == 1

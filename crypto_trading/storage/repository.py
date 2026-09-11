@@ -142,6 +142,22 @@ class Repository(Protocol):
     def set_recovery_sweep_activated_at_if_missing(self, activated_at: datetime) -> bool: ...
     def get_profit_protection_activated_at(self) -> datetime | None: ...
     def set_profit_protection_activated_at_if_missing(self, activated_at: datetime) -> bool: ...
+    def seed_profit_protection_shadow(
+        self,
+        shadow_id: str,
+        position_id: str,
+        instrument: str,
+        threshold_pct: str,
+        entry_price: Decimal,
+        original_stop_loss: Decimal,
+        target: Decimal,
+        threshold_price: Decimal,
+        opened_at: datetime,
+        created_at: datetime,
+    ) -> bool: ...
+    def get_profit_protection_shadow(self, shadow_id: str) -> dict | None: ...
+    def find_open_profit_protection_shadows(self) -> list[dict]: ...
+    def find_all_profit_protection_shadows(self) -> list[dict]: ...
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
     def complete_run(
         self,
@@ -848,6 +864,53 @@ class SQLiteRepository:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    def seed_profit_protection_shadow(
+        self,
+        shadow_id: str,
+        position_id: str,
+        instrument: str,
+        threshold_pct: str,
+        entry_price: Decimal,
+        original_stop_loss: Decimal,
+        target: Decimal,
+        threshold_price: Decimal,
+        opened_at: datetime,
+        created_at: datetime,
+    ) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO profit_protection_shadow_positions "
+            "(shadow_id, position_id, instrument, threshold_pct, entry_price, "
+            "original_stop_loss, target, threshold_price, opened_at, status, "
+            "threshold_reached, mfe, mae, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 0, '0', '0', ?, ?)",
+            (
+                shadow_id, position_id, instrument, threshold_pct, str(entry_price),
+                str(original_stop_loss), str(target), str(threshold_price),
+                opened_at.isoformat(), created_at.isoformat(), created_at.isoformat(),
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_profit_protection_shadow(self, shadow_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM profit_protection_shadow_positions WHERE shadow_id = ?",
+            (shadow_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_open_profit_protection_shadows(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM profit_protection_shadow_positions WHERE status = 'OPEN'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_all_profit_protection_shadows(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM profit_protection_shadow_positions"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def save_forecast_record(self, record: ForecastRecord) -> None:
         self._conn.execute(
