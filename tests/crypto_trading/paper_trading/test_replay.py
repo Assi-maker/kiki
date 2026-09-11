@@ -576,7 +576,8 @@ def test_one_candidates_open_failure_does_not_block_the_other_candidates_in_the_
     that would previously have aborted the whole open-loop). The healthy
     candidate must still get its position opened."""
     repo = SQLiteRepository(tmp_path / "t.db")
-    broken_candidate = _confirmed_candidate_for_instrument("broken-1", "ETHUSDT")  # no ETHUSDT ticker
+    # no ETHUSDT ticker in the snapshot below:
+    broken_candidate = _confirmed_candidate_for_instrument("broken-1", "ETHUSDT")
     healthy_candidate = _confirmed_candidate_for_instrument("healthy-1", "BTCUSDT")
     btc_ticker = Ticker(
         instrument="BTCUSDT", last_price=Decimal("50000"), price_change=Decimal("0"),

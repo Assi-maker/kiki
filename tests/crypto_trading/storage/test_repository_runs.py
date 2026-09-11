@@ -116,12 +116,14 @@ def test_find_latest_completed_run_returns_the_most_recent_completed_row(tmp_pat
     repo.complete_run("run-1", datetime(2026, 9, 11, 12, 0, 30, tzinfo=UTC), "ok", [])
     repo.start_run("run-2", "monitoring", datetime(2026, 9, 11, 12, 1, 0, tzinfo=UTC))
     repo.complete_run("run-2", datetime(2026, 9, 11, 12, 1, 30, tzinfo=UTC), "error", ["boom"])
-    repo.start_run("run-3", "monitoring", datetime(2026, 9, 11, 12, 2, 0, tzinfo=UTC))  # still running
+    # still running:
+    repo.start_run("run-3", "monitoring", datetime(2026, 9, 11, 12, 2, 0, tzinfo=UTC))
 
     result = repo.find_latest_completed_run("monitoring")
 
-    assert result["run_id"] == "run-2"  # most recent COMPLETED row, ignoring the still-running one
-    assert result["status"] == "error"  # 'error' still counts as completed - it finished, it just failed
+    # most recent COMPLETED row, ignoring the still-running one:
+    assert result["run_id"] == "run-2"
+    assert result["status"] == "error"  # 'error' still counts as completed - it just failed
 
 
 def test_find_latest_completed_run_filters_by_run_type(tmp_path):
