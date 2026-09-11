@@ -1,0 +1,9 @@
+# Profit Protection PAPER shadow experiment (2026-09-11) - see
+# docs/superpowers/specs/2026-09-11-profit-protection-experiment-design.md.
+# The only tunable is whether the experiment runs at all, exactly like
+# guardian.yaml's assisted_exit_enabled - no separate thread, no env-var
+# arm flag (this hooks into the already-running monitoring tick). The two
+# tested thresholds (+1.0%/+1.5%) are NOT configurable here - they are a
+# frozen constant, FROZEN_THRESHOLDS_PCT, in
+# paper_trading/profit_protection_experiment.py (spec G9).
+enabled: false

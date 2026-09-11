@@ -194,6 +194,18 @@ class LiveExecutionConfig(BaseModel):
     signal_ttl_seconds: int = Field(gt=0, default=1800)
 
 
+class ProfitProtectionExperimentConfig(BaseModel):
+    # Profit Protection PAPER shadow experiment (2026-09-11) - see
+    # docs/superpowers/specs/2026-09-11-profit-protection-experiment-design.md.
+    # `enabled` is the ONLY field: turns the experiment's seed/tick/backfill
+    # logic on or off inside monitoring_loop.py's existing tick, same shape
+    # as GuardianConfig.assisted_exit_enabled - no separate thread. The two
+    # tested thresholds are NOT here (spec G9): they are the frozen
+    # FROZEN_THRESHOLDS_PCT constant in
+    # paper_trading/profit_protection_experiment.py, never config-driven.
+    enabled: bool = False
+
+
 class NotifyConfig(BaseModel):
     notification_level: Literal["important", "decisions", "debug"]
     notify_interval_seconds: int = Field(gt=0)
@@ -215,6 +227,9 @@ class Settings(BaseModel):
     demo_execution: DemoExecutionConfig = Field(default_factory=DemoExecutionConfig)
     guardian: GuardianConfig = Field(default_factory=GuardianConfig)
     live_execution: LiveExecutionConfig = Field(default_factory=LiveExecutionConfig)
+    profit_protection_experiment: ProfitProtectionExperimentConfig = Field(
+        default_factory=ProfitProtectionExperimentConfig
+    )
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -245,6 +260,9 @@ def get_settings() -> Settings:
         demo_execution=_load_yaml_model(_CONFIG_DIR / "demo_execution.yaml", DemoExecutionConfig),
         guardian=_load_yaml_model(_CONFIG_DIR / "guardian.yaml", GuardianConfig),
         live_execution=_load_yaml_model(_CONFIG_DIR / "live_execution.yaml", LiveExecutionConfig),
+        profit_protection_experiment=_load_yaml_model(
+            _CONFIG_DIR / "profit_protection_experiment.yaml", ProfitProtectionExperimentConfig
+        ),
     )
 
 
