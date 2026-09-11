@@ -1,17 +1,24 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig
+from crypto_trading.config.loader import (
+    GuardianConfig,
+    ProfitProtectionExperimentConfig,
+    RiskLimitsConfig,
+    Settings,
+)
 from crypto_trading.paper_trading.execution import compute_fees, compute_fill_price, compute_pnl
 from crypto_trading.paper_trading.profit_protection_experiment import (
     FROZEN_THRESHOLDS_PCT,
     _guardian_state_for,
     advance_shadow,
+    run_profit_protection_experiment_tick,
     seed_shadows_for_position,
 )
 from crypto_trading.schemas.guardian import GuardianObservation
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import SQLiteRepository
+from tests.crypto_trading.test_market_snapshot import _settings as _market_settings
 
 _NOW = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
 
@@ -438,3 +445,83 @@ def test_shadow_close_never_writes_to_positions_table(tmp_path):
     after = repo.get_position("pos-1")
     assert before == after
     assert after.status == "OPEN_POSITION"  # still open - only the shadow closed
+
+
+def _settings_with_pp(enabled: bool, guardian_assisted: bool = False) -> Settings:
+    # _market_settings(top_n=1) is the exact same full-Settings builder
+    # tests/crypto_trading/test_monitoring_loop.py already uses (imported
+    # there the same way, from test_market_snapshot.py) - avoids
+    # constructing a second, divergent fake Settings for this same purpose.
+    settings = _market_settings(top_n=1)
+    settings.profit_protection_experiment = ProfitProtectionExperimentConfig(enabled=enabled)
+    settings.guardian.assisted_exit_enabled = guardian_assisted
+    return settings
+
+
+def test_tick_does_nothing_when_experiment_disabled(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1")
+    position = repo.get_position("pos-1")
+    price_lookup = {"BTCUSDT": (Decimal("49500"), Decimal("50100"), Decimal("49900"), Decimal("0"))}
+    run_profit_protection_experiment_tick(
+        repo, [position], [], price_lookup, _NOW, _settings_with_pp(enabled=False), "run-1"
+    )
+    assert repo.find_all_profit_protection_shadows() == []
+    assert repo.get_profit_protection_activated_at() is None
+
+
+def test_tick_seeds_and_advances_a_newly_opened_position_in_the_same_tick(tmp_path):
+    """Plan correction C2 - a position that opens and immediately stops
+    out on the very first tick the experiment observes it must still be
+    seeded AND closed within that same tick call, never left stranded."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1")
+    position = repo.get_position("pos-1")
+    price_lookup = {
+        "BTCUSDT": (Decimal("48900"), Decimal("49000"), Decimal("48950"), Decimal("0"))
+    }
+    run_profit_protection_experiment_tick(
+        repo, [position], [], price_lookup, _NOW, _settings_with_pp(enabled=True), "run-1"
+    )
+    shadows = repo.find_all_profit_protection_shadows()
+    assert len(shadows) == 2
+    assert all(s["status"] == "CLOSED" for s in shadows)
+    assert all(s["exit_reason"] == "stop_loss" for s in shadows)
+
+
+def test_tick_defers_seeding_when_instrument_missing_from_price_lookup(tmp_path):
+    """Plan correction C2 - mirrors close_triggered_positions's own
+    'instrument not in price_lookup -> skip' behavior; never seeds on
+    absent data."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1")
+    position = repo.get_position("pos-1")
+    run_profit_protection_experiment_tick(
+        repo, [position], [], {}, _NOW, _settings_with_pp(enabled=True), "run-1"
+    )
+    assert repo.find_all_profit_protection_shadows() == []
+
+
+def test_tick_backfills_baseline_outcome_for_positions_closed_this_tick(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1")
+    position = repo.get_position("pos-1")
+    settings = _settings_with_pp(enabled=True)
+    price_lookup = {"BTCUSDT": (Decimal("49700"), Decimal("50100"), Decimal("50000"), Decimal("0"))}
+    run_profit_protection_experiment_tick(
+        repo, [position], [], price_lookup, _NOW, settings, "run-1"
+    )
+    # Simulate the real position closing on a later tick (as
+    # close_triggered_positions would report it):
+    closed_position = position.model_copy(update={
+        "status": "CLOSED", "exit_reason": "stop_loss",
+        "theoretical_exit": Decimal("49000"), "simulated_fill_exit": Decimal("48975.5"),
+        "fees": Decimal("2"), "funding": Decimal("0"), "closed_at": _NOW,
+    })
+    later = _NOW + timedelta(minutes=1)
+    run_profit_protection_experiment_tick(
+        repo, [], [closed_position], {}, later, settings, "run-2"
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["hypothetical_baseline_exit_reason"] == "stop_loss"
+    assert row["hypothetical_baseline_pnl"] is not None

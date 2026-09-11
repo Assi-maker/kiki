@@ -196,3 +196,61 @@ def _close_shadow(
         shadow_realized_pnl=shadow_realized_pnl,
         updated_at=closed_at,
     )
+
+
+def run_profit_protection_experiment_tick(
+    repo: Repository,
+    open_positions: list[Position],
+    closed_positions: list[Position],
+    price_lookup: dict[str, tuple[Decimal, Decimal, Decimal, Decimal]],
+    now: datetime,
+    settings: Settings,
+    run_id: str,
+) -> None:
+    """Spec §3.2/§5, plan correction C2: seed -> advance -> backfill, in
+    that strict order, every tick. Called from monitoring_loop.py AFTER
+    close_triggered_positions, wrapped in the caller's own try/except -
+    this function itself never needs to guard against crashing the caller,
+    only against writing anything outside profit_protection_shadow_positions."""
+    if not settings.profit_protection_experiment.enabled:
+        return
+
+    repo.set_profit_protection_activated_at_if_missing(now)
+    activated_at = repo.get_profit_protection_activated_at()
+
+    # 1) Seed - only for positions whose instrument's candle is actually
+    # available this tick (plan correction C2: never seed on absent data,
+    # mirrors close_triggered_positions's own price_lookup-presence skip).
+    for position in open_positions:
+        if position.instrument not in price_lookup:
+            continue
+        seed_shadows_for_position(repo, position, activated_at, now)
+
+    # 2) Advance every currently-open shadow (includes any just seeded
+    # above, since find_open_profit_protection_shadows() re-queries after
+    # the seed loop's commits) against this same tick's price_lookup.
+    guardian_assisted_exit_enabled = settings.guardian.assisted_exit_enabled
+    for shadow in repo.find_open_profit_protection_shadows():
+        if shadow["instrument"] not in price_lookup:
+            continue
+        candle_low, candle_high, current_price, funding_rate = price_lookup[shadow["instrument"]]
+        guardian_state = (
+            _guardian_state_for(repo, shadow["position_id"], now, settings.guardian)
+            if guardian_assisted_exit_enabled
+            else None
+        )
+        advance_shadow(
+            shadow, candle_low, candle_high, current_price, funding_rate, now,
+            settings.risk_limits.max_position_hold_hours, guardian_state,
+            guardian_assisted_exit_enabled, settings.risk_limits, repo,
+        )
+
+    # 3) Backfill baseline outcome for whatever close_triggered_positions
+    # closed this same tick (spec §5.5) - read-only against `positions`.
+    for position in closed_positions:
+        if position.exit_reason is None or position.fees is None or position.funding is None:
+            continue  # defensive - close_triggered_positions always sets these
+        baseline_pnl = compute_pnl(position)
+        repo.backfill_profit_protection_baseline_outcome(
+            position.position_id, position.exit_reason, baseline_pnl, now
+        )
