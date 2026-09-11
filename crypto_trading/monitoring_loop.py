@@ -8,6 +8,7 @@ from typing import Protocol
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.logging import log_event, new_run_id
+from crypto_trading.paper_trading.monitoring_catchup import run_monitoring_catchup
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
 from crypto_trading.schemas.market import FundingRate, Kline, Ticker
 from crypto_trading.schemas.trade import Position
@@ -99,6 +100,7 @@ def run_monitoring_tick(
 
 
 def run_forever(connector: LivePriceSource, repo: Repository, settings: Settings) -> None:
+    run_monitoring_catchup(connector, repo, settings, datetime.now(UTC))
     while True:
         run_monitoring_tick(connector, repo, settings)
         time.sleep(settings.pipeline.monitoring_interval_seconds)
