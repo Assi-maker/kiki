@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -8,6 +9,7 @@ from crypto_trading.config.loader import (
     Settings,
 )
 from crypto_trading.paper_trading.execution import compute_fees, compute_fill_price, compute_pnl
+from crypto_trading.paper_trading.position_closing import close_triggered_positions
 from crypto_trading.paper_trading.profit_protection_experiment import (
     FROZEN_THRESHOLDS_PCT,
     _guardian_state_for,
@@ -525,3 +527,132 @@ def test_tick_backfills_baseline_outcome_for_positions_closed_this_tick(tmp_path
     row = repo.get_profit_protection_shadow("pos-1:0.010")
     assert row["hypothetical_baseline_exit_reason"] == "stop_loss"
     assert row["hypothetical_baseline_pnl"] is not None
+
+
+def test_tick_isolates_one_shadows_advance_failure_from_the_rest(tmp_path, monkeypatch, caplog):
+    """Review round 1, finding 1 - a single shadow's advance_shadow raising
+    must never abort the batch: every OTHER shadow this tick still gets
+    processed normally, no exception propagates out of
+    run_profit_protection_experiment_tick, and the failure is logged via
+    the existing log_event isolation pattern (see
+    recovery_sweep.py::recovery_sweep_ticker_unavailable)."""
+    import crypto_trading.paper_trading.profit_protection_experiment as pp_module
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1", instrument="BTCUSDT")
+    _seed_real_position(repo, position_id="pos-2", instrument="ETHUSDT")
+    position_1 = repo.get_position("pos-1")
+    position_2 = repo.get_position("pos-2")
+    settings = _settings_with_pp(enabled=True)
+    price_lookup = {
+        "BTCUSDT": (Decimal("49500"), Decimal("50100"), Decimal("49900"), Decimal("0")),
+        "ETHUSDT": (Decimal("48900"), Decimal("49000"), Decimal("48950"), Decimal("0")),
+    }
+    real_advance_shadow = pp_module.advance_shadow
+
+    def _flaky_advance_shadow(shadow, *args, **kwargs):
+        if shadow["position_id"] == "pos-1":
+            raise ValueError("boom")
+        return real_advance_shadow(shadow, *args, **kwargs)
+
+    monkeypatch.setattr(pp_module, "advance_shadow", _flaky_advance_shadow)
+
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        pp_module.run_profit_protection_experiment_tick(
+            repo, [position_1, position_2], [], price_lookup, _NOW, settings, "run-1"
+        )  # must not raise despite pos-1's shadows always failing
+
+    all_shadows = repo.find_all_profit_protection_shadows()
+    pos1_shadows = [s for s in all_shadows if s["position_id"] == "pos-1"]
+    pos2_shadows = [s for s in all_shadows if s["position_id"] == "pos-2"]
+    assert len(pos1_shadows) == 2
+    assert all(s["status"] == "OPEN" for s in pos1_shadows)  # untouched by the failed advance
+    assert len(pos2_shadows) == 2
+    assert all(s["status"] == "CLOSED" and s["exit_reason"] == "stop_loss" for s in pos2_shadows)
+    assert "profit_protection_shadow_advance_failed" in caplog.text
+    assert "pos-1:0.010" in caplog.text
+    assert "pos-1:0.015" in caplog.text
+
+
+def test_tick_advances_a_shadow_seeded_on_an_earlier_tick_against_fresh_data(tmp_path):
+    """Review round 1, finding 2 - proves the advance loop genuinely
+    re-evaluates ALL open shadows fresh on every independent call, not just
+    ones seeded within the same call. Tick 1 only touches the +1.0%
+    threshold (no stop/target/time_limit hit). Tick 2 is a wholly separate,
+    later call whose candle drops to exactly the new breakeven level (entry
+    price, 50000) - a level the ORIGINAL stop_loss (49000) would never have
+    triggered on its own, so a stop_loss close at exactly 50000 can only
+    happen if tick 2 genuinely re-read and used the breakeven state tick 1
+    persisted."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1")
+    position = repo.get_position("pos-1")
+    settings = _settings_with_pp(enabled=True)
+
+    # Tick 1: candle touches +1.0% threshold (50500) but not stop/target/time_limit.
+    tick_1_price_lookup = {
+        "BTCUSDT": (Decimal("50100"), Decimal("50600"), Decimal("50400"), Decimal("0"))
+    }
+    run_profit_protection_experiment_tick(
+        repo, [position], [], tick_1_price_lookup, _NOW, settings, "run-1"
+    )
+    after_tick_1 = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert after_tick_1["status"] == "OPEN"
+    assert after_tick_1["threshold_reached"] == 1
+    assert after_tick_1["breakeven_stop_loss"] == "50000"
+
+    # Tick 2 (separate call, later `now`): candle drops to exactly the
+    # breakeven level (50000) - well above the original stop_loss (49000),
+    # so only the fresh, re-queried breakeven state can explain this close.
+    tick_2_time = _NOW + timedelta(minutes=1)
+    tick_2_price_lookup = {
+        "BTCUSDT": (Decimal("50000"), Decimal("50100"), Decimal("50050"), Decimal("0"))
+    }
+    run_profit_protection_experiment_tick(
+        repo, [position], [], tick_2_price_lookup, tick_2_time, settings, "run-2"
+    )
+    after_tick_2 = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert after_tick_2["status"] == "CLOSED"
+    assert after_tick_2["exit_reason"] == "stop_loss"
+    assert after_tick_2["theoretical_exit"] == "50000"  # entry/breakeven, never the original 49000
+
+
+def test_guardian_state_lookup_matches_close_triggered_positions_accept_reject_parity(tmp_path):
+    """Task 5's promised G4 parity proof (missing until review round 1):
+    _guardian_state_for is a deliberate, read-only DUPLICATE of
+    close_triggered_positions's own staleness-guarded Guardian read - this
+    proves the two never silently drift apart on the same inputs, for both
+    the accept (fresh observation) and reject (stale observation) cases."""
+    guardian_config = GuardianConfig(assisted_exit_enabled=True, check_interval_seconds=60)
+    risk_limits = _risk_limits(max_position_hold_hours=1000)  # keep time_limit unreachable
+    price_lookup = {"BTCUSDT": (Decimal("49500"), Decimal("50100"), Decimal("49900"), Decimal("0"))}
+    # _position()'s defaults: stop_loss=49000, target=52000 - both far from this
+    # price_lookup, so guardian_exit is the ONLY possible close reason here.
+
+    # ACCEPT case: fresh observation, both must accept.
+    repo_accept = SQLiteRepository(tmp_path / "accept.db")
+    _seed_real_position(repo_accept, position_id="pos-1")
+    repo_accept.save_guardian_observation(GuardianObservation(
+        observation_id="obs-1", position_id="pos-1", observed_at=_NOW - timedelta(seconds=30),
+        state="EXIT", decay_score=Decimal("0.9"), progress_ratio=Decimal("0"),
+        unrealized_pnl=Decimal("0"), factors={}, run_id="run-1",
+    ))
+    closed = close_triggered_positions(
+        repo_accept, price_lookup, _NOW, risk_limits, "run-1", guardian_config=guardian_config
+    )
+    assert len(closed) == 1 and closed[0].exit_reason == "guardian_exit"
+    assert _guardian_state_for(repo_accept, "pos-1", _NOW, guardian_config) == "EXIT"
+
+    # REJECT case: stale observation (> 2x check_interval_seconds), both must reject.
+    repo_reject = SQLiteRepository(tmp_path / "reject.db")
+    _seed_real_position(repo_reject, position_id="pos-1")
+    repo_reject.save_guardian_observation(GuardianObservation(
+        observation_id="obs-2", position_id="pos-1", observed_at=_NOW - timedelta(seconds=121),
+        state="EXIT", decay_score=Decimal("0.9"), progress_ratio=Decimal("0"),
+        unrealized_pnl=Decimal("0"), factors={}, run_id="run-1",
+    ))
+    closed = close_triggered_positions(
+        repo_reject, price_lookup, _NOW, risk_limits, "run-1", guardian_config=guardian_config
+    )
+    assert closed == []  # baseline stays open - guardian_exit rejected as stale
+    assert _guardian_state_for(repo_reject, "pos-1", _NOW, guardian_config) is None

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig, Settings
+from crypto_trading.logging import log_event
 from crypto_trading.paper_trading.execution import (
     FILL_MODEL_VERSION,
     compute_fees,
@@ -30,8 +31,9 @@ def _guardian_state_for(
     own staleness-guarded Guardian read (spec G4) - deliberately duplicated,
     not shared, so position_closing.py (baseline exit logic) stays
     completely untouched. See
-    test_guardian_state_lookup_matches_close_triggered_positions_exactly in
-    Task 9 for the parity proof against the real function."""
+    test_guardian_state_lookup_matches_close_triggered_positions_accept_reject_parity
+    in test_profit_protection_experiment.py for the parity proof against the
+    real function."""
     if not guardian_config.assisted_exit_enabled:
         return None
     latest_observation = repo.find_latest_guardian_observation(position_id)
@@ -233,17 +235,35 @@ def run_profit_protection_experiment_tick(
     for shadow in repo.find_open_profit_protection_shadows():
         if shadow["instrument"] not in price_lookup:
             continue
-        candle_low, candle_high, current_price, funding_rate = price_lookup[shadow["instrument"]]
-        guardian_state = (
-            _guardian_state_for(repo, shadow["position_id"], now, settings.guardian)
-            if guardian_assisted_exit_enabled
-            else None
-        )
-        advance_shadow(
-            shadow, candle_low, candle_high, current_price, funding_rate, now,
-            settings.risk_limits.max_position_hold_hours, guardian_state,
-            guardian_assisted_exit_enabled, settings.risk_limits, repo,
-        )
+        try:
+            candle_low, candle_high, current_price, funding_rate = price_lookup[
+                shadow["instrument"]
+            ]
+            guardian_state = (
+                _guardian_state_for(repo, shadow["position_id"], now, settings.guardian)
+                if guardian_assisted_exit_enabled
+                else None
+            )
+            advance_shadow(
+                shadow, candle_low, candle_high, current_price, funding_rate, now,
+                settings.risk_limits.max_position_hold_hours, guardian_state,
+                guardian_assisted_exit_enabled, settings.risk_limits, repo,
+            )
+        except Exception as exc:
+            # Review finding (round 1): a single malformed/unexpected shadow row
+            # must never abort every OTHER shadow's advance this tick, nor skip
+            # step 3's backfill loop entirely - same "isolate one item's
+            # failure, keep processing the batch" pattern as
+            # recovery_sweep.py::recovery_sweep_ticker_unavailable and
+            # position_opening.py::position_open_skipped_non_numeric_risk_values.
+            log_event(
+                run_id,
+                event="profit_protection_shadow_advance_failed",
+                shadow_id=shadow["shadow_id"],
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            continue
 
     # 3) Backfill baseline outcome for whatever close_triggered_positions
     # closed this same tick (spec §5.5) - read-only against `positions`.
