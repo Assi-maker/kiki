@@ -42,3 +42,32 @@ def _guardian_state_for(
     if now - observed_at <= staleness_limit:
         return latest_observation["state"]
     return None
+
+
+def _shadow_id(position_id: str, threshold_pct: Decimal) -> str:
+    return f"{position_id}:{threshold_pct}"
+
+
+def seed_shadows_for_position(
+    repo: Repository, position: Position, activated_at: datetime, now: datetime
+) -> None:
+    """Spec §5.1, G6: only ever seeds a position opened at-or-after the
+    activation watermark. Idempotent per (position_id, threshold) via
+    Repository.seed_profit_protection_shadow's own INSERT OR IGNORE."""
+    if position.opened_at < activated_at:
+        return
+    for threshold_pct in FROZEN_THRESHOLDS_PCT:
+        shadow_id = _shadow_id(position.position_id, threshold_pct)
+        threshold_price = position.theoretical_entry * (1 + threshold_pct)
+        repo.seed_profit_protection_shadow(
+            shadow_id=shadow_id,
+            position_id=position.position_id,
+            instrument=position.instrument,
+            threshold_pct=str(threshold_pct),
+            entry_price=position.theoretical_entry,
+            original_stop_loss=position.stop_loss,
+            target=position.target,
+            threshold_price=threshold_price,
+            opened_at=position.opened_at,
+            created_at=now,
+        )
