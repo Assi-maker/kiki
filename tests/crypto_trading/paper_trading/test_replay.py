@@ -10,7 +10,12 @@ from crypto_trading.config.loader import (
     RiskLimitsConfig,
     Settings,
 )
-from crypto_trading.paper_trading.replay import MarketSnapshot, run_replay, run_single_cycle
+from crypto_trading.paper_trading.replay import (
+    MarketSnapshot,
+    _open_positions_for_confirmed_candidates,
+    run_replay,
+    run_single_cycle,
+)
 from crypto_trading.schemas.assessments import (
     BearAdversarialAssessment,
     BullThesisAssessment,
@@ -19,6 +24,14 @@ from crypto_trading.schemas.assessments import (
     QAAssessment,
     RiskAssessment,
     TechnicalAssessment,
+)
+from crypto_trading.schemas.candidate import Candidate
+from crypto_trading.schemas.evidence import (
+    CandidateEvidenceRecord,
+    FundingOpenInterestEvidence,
+    MomentumBreakoutEvidence,
+    PriceVolatilityEvidence,
+    VolumeEvidence,
 )
 from crypto_trading.schemas.market import FundingRate, InstrumentMetadata, Kline, Ticker
 from crypto_trading.storage.repository import SQLiteRepository
@@ -529,3 +542,58 @@ def test_replay_is_deterministic_on_repeated_runs(tmp_path):
     assert a.exit_reason == b.exit_reason
     assert a.fees == b.fees
     assert a.funding == b.funding
+
+
+def _confirmed_candidate_for_instrument(candidate_id: str, instrument: str) -> Candidate:
+    placeholder = dict(triggered=True, metric="m", value=1.0, baseline=0.0, threshold=0.5)
+    evidence = CandidateEvidenceRecord(
+        instrument=instrument, timeframes=["1h"], evaluated_at=_T0,
+        price_volatility_evidence=PriceVolatilityEvidence(**placeholder),
+        momentum_breakout_evidence=MomentumBreakoutEvidence(**placeholder),
+        volume_evidence=VolumeEvidence(**placeholder),
+        funding_oi_evidence=FundingOpenInterestEvidence(**placeholder),
+        candidate_score=0.8, trigger_reasons=["price_volatility"],
+        data_quality_status="ok", outcome="worth_deeper_analysis",
+    )
+    return Candidate(
+        candidate_id=candidate_id, idempotency_key=f"key-{candidate_id}", instrument=instrument,
+        discovery_run_id="run-1", evidence_hash="hash-1", status="CONFIRMED",
+        evidence_record=evidence, created_at=_T0, updated_at=_T0,
+        risk=RiskAssessment(
+            agent_name="crypto-risk-agent", run_id="run-1", created_at=_T0, status="ok",
+            suggested_stop_loss="49000", suggested_target="52000",
+            downside="d", liquidity_risk="l", model_risk="m", timing_risk="t",
+        ),
+    )
+
+
+def test_one_candidates_open_failure_does_not_block_the_other_candidates_in_the_same_batch(
+    tmp_path,
+):
+    """P2 remediation (2026-09-11): 'immediate position creation where
+    safe' - two CONFIRMED candidates in the same cycle, one whose
+    instrument is missing from snapshot.tickers (simulating a KeyError
+    that would previously have aborted the whole open-loop). The healthy
+    candidate must still get its position opened."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    broken_candidate = _confirmed_candidate_for_instrument("broken-1", "ETHUSDT")  # no ETHUSDT ticker
+    healthy_candidate = _confirmed_candidate_for_instrument("healthy-1", "BTCUSDT")
+    btc_ticker = Ticker(
+        instrument="BTCUSDT", last_price=Decimal("50000"), price_change=Decimal("0"),
+        price_change_percent=Decimal("0"), high_price=Decimal("50000"),
+        low_price=Decimal("50000"), volume=Decimal("100"), quote_volume=Decimal("1000000"),
+        open_price=Decimal("50000"), ask_price=Decimal("50000"), ask_qty=Decimal("1"),
+        bid_price=Decimal("50000"), bid_qty=Decimal("1"), observed_at=_T0,
+    )
+    snapshot = MarketSnapshot(
+        simulated_now=_T0, instruments={}, tickers={"BTCUSDT": btc_ticker},
+        klines={}, funding_rates={}, data_quality_status={},
+    )
+
+    opened = _open_positions_for_confirmed_candidates(
+        [broken_candidate, healthy_candidate], snapshot, repo, _settings(), run_id="run-1"
+    )
+
+    assert [p.position_id for p in opened] == ["healthy-1"]
+    assert repo.get_position("healthy-1") is not None
+    assert repo.get_position("broken-1") is None

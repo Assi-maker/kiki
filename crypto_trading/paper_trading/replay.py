@@ -9,9 +9,11 @@ from pydantic import BaseModel
 from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
+from crypto_trading.logging import log_event
 from crypto_trading.orchestrator import run_discovery_cycle
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
 from crypto_trading.paper_trading.position_opening import open_position_for_candidate
+from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.market import FundingRate, InstrumentMetadata, Kline, Ticker
 from crypto_trading.schemas.trade import Position
 from crypto_trading.screening.candidate_engine import (
@@ -172,27 +174,54 @@ def run_single_cycle(
         external_data_connector=external_data_connector,
     )
 
-    opened: list[Position] = []
-    for candidate in processed:
-        if candidate.status != "CONFIRMED":
-            continue
-        reference_price = snapshot.tickers[candidate.instrument].last_price
-        position = open_position_for_candidate(
-            candidate,
-            repo,
-            settings.risk_limits,
-            reference_price,
-            snapshot.simulated_now,
-            run_id,
-        )
-        if position is not None:
-            opened.append(position)
+    opened = _open_positions_for_confirmed_candidates(processed, snapshot, repo, settings, run_id)
 
     price_lookup = _build_price_lookup(snapshot)
     close_triggered_positions(
         repo, price_lookup, snapshot.simulated_now, settings.risk_limits, run_id
     )
 
+    return opened
+
+
+def _open_positions_for_confirmed_candidates(
+    processed: list[Candidate],
+    snapshot: MarketSnapshot,
+    repo: Repository,
+    settings: Settings,
+    run_id: str,
+) -> list[Position]:
+    """Opens a PAPER position immediately for each newly-CONFIRMED candidate
+    from this cycle's run_discovery_cycle() call, using this cycle's own
+    fresh ticker price as the reference price - unchanged from the original
+    inline-loop behavior.
+
+    Wrapped per-candidate (P2 remediation, 2026-09-11): one candidate's
+    failure (a missing snapshot.tickers entry, a transient open_position_
+    for_candidate() error) must never stop the remaining candidates in the
+    same batch from getting their position opened too - the same "one bad
+    item never blocks the batch" principle used everywhere else in this
+    codebase. A candidate skipped here is not permanently lost: paper_
+    trading/recovery_sweep.py::sweep_confirmed_candidates_without_position()
+    recovers it on a later discovery tick."""
+    opened: list[Position] = []
+    for candidate in processed:
+        if candidate.status != "CONFIRMED":
+            continue
+        try:
+            reference_price = snapshot.tickers[candidate.instrument].last_price
+            position = open_position_for_candidate(
+                candidate, repo, settings.risk_limits, reference_price,
+                snapshot.simulated_now, run_id,
+            )
+        except Exception as exc:
+            log_event(
+                run_id, event="position_open_failed", candidate_id=candidate.candidate_id,
+                instrument=candidate.instrument, error_type=type(exc).__name__, error=str(exc),
+            )
+            continue
+        if position is not None:
+            opened.append(position)
     return opened
 
 
