@@ -138,6 +138,8 @@ class Repository(Protocol):
         closed_at: datetime,
         event: Event,
     ) -> None: ...
+    def get_recovery_sweep_activated_at(self) -> datetime | None: ...
+    def set_recovery_sweep_activated_at_if_missing(self, activated_at: datetime) -> bool: ...
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
     def complete_run(
         self,
@@ -790,6 +792,29 @@ class SQLiteRepository:
         except Exception:
             self._conn.rollback()
             raise
+
+    def get_recovery_sweep_activated_at(self) -> datetime | None:
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'recovery_sweep_activated_at'"
+        ).fetchone()
+        return datetime.fromisoformat(row["value"]) if row is not None else None
+
+    def set_recovery_sweep_activated_at_if_missing(self, activated_at: datetime) -> bool:
+        """P2 remediation (2026-09-11): one-time activation watermark for
+        paper_trading/recovery_sweep.py - same INSERT OR IGNORE first-writer-
+        wins idempotency already used for schema_meta's own schema_version
+        row. Whichever timestamp is set FIRST (this database's very first
+        ever recovery-sweep call) is authoritative forever, never overwritten
+        by a later restart - this is what makes the sweep strictly forward-
+        looking: any CONFIRMED candidate from before this moment is
+        permanently excluded from automatic recovery."""
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO schema_meta (key, value) VALUES "
+            "('recovery_sweep_activated_at', ?)",
+            (activated_at.isoformat(),),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def save_forecast_record(self, record: ForecastRecord) -> None:
         self._conn.execute(
