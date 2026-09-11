@@ -88,3 +88,86 @@ def test_find_all_profit_protection_shadows_returns_open_and_closed(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
     assert len(repo.find_all_profit_protection_shadows()) == 1
+
+
+def test_record_profit_protection_tick_updates_mfe_and_mae(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    repo.record_profit_protection_tick("pos-1:0.010", Decimal("600"), Decimal("-100"), _NOW)
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["mfe"] == "600"
+    assert row["mae"] == "-100"
+
+
+def test_activate_profit_protection_breakeven_sets_fields_once(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    repo.activate_profit_protection_breakeven("pos-1:0.010", Decimal("50000"), _NOW, _NOW)
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["threshold_reached"] == 1
+    assert row["breakeven_stop_loss"] == "50000"
+
+
+def test_activate_profit_protection_breakeven_is_a_no_op_once_already_active(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    repo.activate_profit_protection_breakeven("pos-1:0.010", Decimal("50000"), _NOW, _NOW)
+    later = _NOW + timedelta(minutes=5)
+    repo.activate_profit_protection_breakeven("pos-1:0.010", Decimal("99999"), later, later)
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["breakeven_stop_loss"] == "50000"  # never overwritten
+
+
+def test_close_profit_protection_shadow_sets_terminal_fields(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    repo.close_profit_protection_shadow(
+        shadow_id="pos-1:0.010", exit_reason="stop_loss",
+        theoretical_exit=Decimal("49000"), simulated_fill_exit=Decimal("48975.5"),
+        fees=Decimal("2"), funding=Decimal("0"), closed_at=_NOW,
+        shadow_realized_pnl=Decimal("-125"), updated_at=_NOW,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "CLOSED"
+    assert row["exit_reason"] == "stop_loss"
+    assert row["shadow_realized_pnl"] == "-125"
+    assert row["pnl_difference"] is None  # baseline not yet known
+
+
+def test_close_profit_protection_shadow_computes_pnl_difference_if_baseline_already_known(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    repo.backfill_profit_protection_baseline_outcome("pos-1", "stop_loss", Decimal("-500"), _NOW)
+    repo.close_profit_protection_shadow(
+        shadow_id="pos-1:0.010", exit_reason="stop_loss",
+        theoretical_exit=Decimal("49000"), simulated_fill_exit=Decimal("48975.5"),
+        fees=Decimal("2"), funding=Decimal("0"), closed_at=_NOW,
+        shadow_realized_pnl=Decimal("-125"), updated_at=_NOW,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["pnl_difference"] == "375"  # -125 - (-500)
+
+
+def test_backfill_profit_protection_baseline_outcome_updates_all_thresholds_for_a_position(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs(shadow_id="pos-1:0.010", threshold_pct="0.010"))
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs(shadow_id="pos-1:0.015", threshold_pct="0.015"))
+    repo.backfill_profit_protection_baseline_outcome("pos-1", "target", Decimal("1000"), _NOW)
+    for shadow_id in ("pos-1:0.010", "pos-1:0.015"):
+        row = repo.get_profit_protection_shadow(shadow_id)
+        assert row["hypothetical_baseline_exit_reason"] == "target"
+        assert row["hypothetical_baseline_pnl"] == "1000"
+
+
+def test_backfill_computes_pnl_difference_if_shadow_already_closed(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    repo.close_profit_protection_shadow(
+        shadow_id="pos-1:0.010", exit_reason="stop_loss",
+        theoretical_exit=Decimal("49000"), simulated_fill_exit=Decimal("48975.5"),
+        fees=Decimal("2"), funding=Decimal("0"), closed_at=_NOW,
+        shadow_realized_pnl=Decimal("-125"), updated_at=_NOW,
+    )
+    repo.backfill_profit_protection_baseline_outcome("pos-1", "stop_loss", Decimal("-500"), _NOW)
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["pnl_difference"] == "375"

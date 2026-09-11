@@ -158,6 +158,31 @@ class Repository(Protocol):
     def get_profit_protection_shadow(self, shadow_id: str) -> dict | None: ...
     def find_open_profit_protection_shadows(self) -> list[dict]: ...
     def find_all_profit_protection_shadows(self) -> list[dict]: ...
+    def record_profit_protection_tick(
+        self, shadow_id: str, mfe: Decimal, mae: Decimal, updated_at: datetime
+    ) -> None: ...
+    def activate_profit_protection_breakeven(
+        self,
+        shadow_id: str,
+        breakeven_stop_loss: Decimal,
+        threshold_reached_at: datetime,
+        updated_at: datetime,
+    ) -> None: ...
+    def close_profit_protection_shadow(
+        self,
+        shadow_id: str,
+        exit_reason: str,
+        theoretical_exit: Decimal,
+        simulated_fill_exit: Decimal,
+        fees: Decimal,
+        funding: Decimal,
+        closed_at: datetime,
+        shadow_realized_pnl: Decimal,
+        updated_at: datetime,
+    ) -> None: ...
+    def backfill_profit_protection_baseline_outcome(
+        self, position_id: str, exit_reason: str, baseline_pnl: Decimal, updated_at: datetime
+    ) -> None: ...
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
     def complete_run(
         self,
@@ -911,6 +936,103 @@ class SQLiteRepository:
             "SELECT * FROM profit_protection_shadow_positions"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_profit_protection_tick(
+        self, shadow_id: str, mfe: Decimal, mae: Decimal, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "UPDATE profit_protection_shadow_positions SET mfe = ?, mae = ?, updated_at = ? "
+            "WHERE shadow_id = ? AND status = 'OPEN'",
+            (str(mfe), str(mae), updated_at.isoformat(), shadow_id),
+        )
+        self._conn.commit()
+
+    def activate_profit_protection_breakeven(
+        self,
+        shadow_id: str,
+        breakeven_stop_loss: Decimal,
+        threshold_reached_at: datetime,
+        updated_at: datetime,
+    ) -> None:
+        # WHERE threshold_reached = 0 makes this a one-time transition -
+        # a later, accidental second call (e.g. a retried tick) can never
+        # move an already-active breakeven level, spec G7/G8's "next tick
+        # only" guarantee holds even under retries.
+        self._conn.execute(
+            "UPDATE profit_protection_shadow_positions SET threshold_reached = 1, "
+            "threshold_reached_at = ?, breakeven_stop_loss = ?, updated_at = ? "
+            "WHERE shadow_id = ? AND status = 'OPEN' AND threshold_reached = 0",
+            (
+                threshold_reached_at.isoformat(), str(breakeven_stop_loss),
+                updated_at.isoformat(), shadow_id,
+            ),
+        )
+        self._conn.commit()
+
+    def close_profit_protection_shadow(
+        self,
+        shadow_id: str,
+        exit_reason: str,
+        theoretical_exit: Decimal,
+        simulated_fill_exit: Decimal,
+        fees: Decimal,
+        funding: Decimal,
+        closed_at: datetime,
+        shadow_realized_pnl: Decimal,
+        updated_at: datetime,
+    ) -> None:
+        row = self._conn.execute(
+            "SELECT hypothetical_baseline_pnl FROM profit_protection_shadow_positions "
+            "WHERE shadow_id = ?",
+            (shadow_id,),
+        ).fetchone()
+        pnl_difference = None
+        if row is not None and row["hypothetical_baseline_pnl"] is not None:
+            pnl_difference = shadow_realized_pnl - Decimal(row["hypothetical_baseline_pnl"])
+        self._conn.execute(
+            "UPDATE profit_protection_shadow_positions SET status = 'CLOSED', "
+            "exit_reason = ?, theoretical_exit = ?, simulated_fill_exit = ?, fees = ?, "
+            "funding = ?, closed_at = ?, shadow_realized_pnl = ?, pnl_difference = ?, "
+            "updated_at = ? WHERE shadow_id = ? AND status = 'OPEN'",
+            (
+                exit_reason, str(theoretical_exit), str(simulated_fill_exit), str(fees),
+                str(funding), closed_at.isoformat(), str(shadow_realized_pnl),
+                str(pnl_difference) if pnl_difference is not None else None,
+                updated_at.isoformat(), shadow_id,
+            ),
+        )
+        self._conn.commit()
+
+    def backfill_profit_protection_baseline_outcome(
+        self, position_id: str, exit_reason: str, baseline_pnl: Decimal, updated_at: datetime
+    ) -> None:
+        """Called once per real position close (spec §5.5) - updates every
+        threshold's shadow row for that position_id. Whichever of
+        (shadow close, this backfill) happens second is what fills
+        pnl_difference (spec §4.3) - this method fills it here if the
+        shadow already closed; close_profit_protection_shadow() fills it
+        there if this backfill already ran first."""
+        rows = self._conn.execute(
+            "SELECT shadow_id, status, shadow_realized_pnl "
+            "FROM profit_protection_shadow_positions WHERE position_id = ?",
+            (position_id,),
+        ).fetchall()
+        for row in rows:
+            pnl_difference = None
+            if row["status"] == "CLOSED" and row["shadow_realized_pnl"] is not None:
+                pnl_difference = Decimal(row["shadow_realized_pnl"]) - baseline_pnl
+            self._conn.execute(
+                "UPDATE profit_protection_shadow_positions SET "
+                "hypothetical_baseline_exit_reason = ?, hypothetical_baseline_pnl = ?, "
+                "pnl_difference = COALESCE(?, pnl_difference), updated_at = ? "
+                "WHERE shadow_id = ?",
+                (
+                    exit_reason, str(baseline_pnl),
+                    str(pnl_difference) if pnl_difference is not None else None,
+                    updated_at.isoformat(), row["shadow_id"],
+                ),
+            )
+        self._conn.commit()
 
     def save_forecast_record(self, record: ForecastRecord) -> None:
         self._conn.execute(
