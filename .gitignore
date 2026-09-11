@@ -33,3 +33,6 @@ data/crypto_trading.db-shm
 # OS
 Thumbs.db
 .DS_Store
+
+# Git worktrees (subagent-driven-development isolated workspaces)
+.worktrees/
