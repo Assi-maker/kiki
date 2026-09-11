@@ -170,6 +170,7 @@ class Repository(Protocol):
     def find_all_positions(self, limit: int, offset: int = 0) -> list[Position]: ...
     def get_gate_decision(self, candidate_id: str) -> dict | None: ...
     def find_latest_run(self, run_type: str) -> dict | None: ...
+    def find_latest_completed_run(self, run_type: str) -> dict | None: ...
     def find_recent_runs(self, limit: int, offset: int = 0) -> list[dict]: ...
     def find_all_forecasts(self, limit: int, offset: int = 0) -> list[ForecastRecord]: ...
     def find_closed_positions(self) -> list[Position]: ...
@@ -1087,6 +1088,19 @@ class SQLiteRepository:
         if row is None:
             return None
         return dict(row)
+
+    def find_latest_completed_run(self, run_type: str) -> dict | None:
+        """Same as find_latest_run() but only ever returns a row whose
+        completed_at is set - the only kind of row a catch-up/recovery
+        mechanism can safely treat as 'this run genuinely finished'. A row
+        stuck at status='running' means the process died mid-tick and must
+        never be used as a time anchor."""
+        row = self._conn.execute(
+            "SELECT * FROM runs WHERE run_type = ? AND completed_at IS NOT NULL "
+            "ORDER BY completed_at DESC LIMIT 1",
+            (run_type,),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     def find_recent_runs(self, limit: int, offset: int = 0) -> list[dict]:
         """Fas 7 (dashboard SYSTEM HEALTH): senaste runs oavsett typ,

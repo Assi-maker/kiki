@@ -94,3 +94,39 @@ def test_complete_run_redacts_secrets_in_error_strings_before_persisting(tmp_pat
     assert "123456789:FAKEBOTTOKENFAKEFAKEFAKE" not in stored_errors[1]
     assert "***REDACTED***" in stored_errors[0]
     assert "***REDACTED***" in stored_errors[1]
+
+
+def test_find_latest_completed_run_returns_none_when_no_runs_exist(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    assert repo.find_latest_completed_run("monitoring") is None
+
+
+def test_find_latest_completed_run_ignores_a_row_still_running(tmp_path):
+    """A row with status='running'/completed_at=NULL means the process
+    died mid-tick - never a safe catch-up anchor."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.start_run("run-1", "monitoring", datetime(2026, 9, 11, 12, 0, tzinfo=UTC))
+
+    assert repo.find_latest_completed_run("monitoring") is None
+
+
+def test_find_latest_completed_run_returns_the_most_recent_completed_row(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.start_run("run-1", "monitoring", datetime(2026, 9, 11, 12, 0, tzinfo=UTC))
+    repo.complete_run("run-1", datetime(2026, 9, 11, 12, 0, 30, tzinfo=UTC), "ok", [])
+    repo.start_run("run-2", "monitoring", datetime(2026, 9, 11, 12, 1, 0, tzinfo=UTC))
+    repo.complete_run("run-2", datetime(2026, 9, 11, 12, 1, 30, tzinfo=UTC), "error", ["boom"])
+    repo.start_run("run-3", "monitoring", datetime(2026, 9, 11, 12, 2, 0, tzinfo=UTC))  # still running
+
+    result = repo.find_latest_completed_run("monitoring")
+
+    assert result["run_id"] == "run-2"  # most recent COMPLETED row, ignoring the still-running one
+    assert result["status"] == "error"  # 'error' still counts as completed - it finished, it just failed
+
+
+def test_find_latest_completed_run_filters_by_run_type(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.start_run("run-1", "discovery", datetime(2026, 9, 11, 12, 0, tzinfo=UTC))
+    repo.complete_run("run-1", datetime(2026, 9, 11, 12, 0, 30, tzinfo=UTC), "ok", [])
+
+    assert repo.find_latest_completed_run("monitoring") is None
