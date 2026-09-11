@@ -263,3 +263,118 @@ def test_advance_shadow_updates_mfe_and_mae_before_any_exit_check(tmp_path):
     row = repo.get_profit_protection_shadow("pos-1:0.010")
     assert row["mfe"] == "300"   # 50300 - 50000
     assert row["mae"] == "-300"  # 49700 - 50000
+
+
+def test_advance_shadow_target_gap_closes_at_target_not_candle_high(tmp_path):
+    """Review finding 1a: the target branch had zero coverage. A candle that
+    gaps strictly past target (52000) to 52300 must still theoretically-exit
+    at target itself, never at the gapped candle_high - the conservative
+    min() formula, not "whatever price the candle happened to touch"."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    advance_shadow(
+        shadow, candle_low=Decimal("51000"), candle_high=Decimal("52300"),
+        current_price=Decimal("52200"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "CLOSED"
+    assert row["exit_reason"] == "target"
+    assert row["theoretical_exit"] == "52000"  # min(52300, 52000) - never the gapped price
+
+
+def test_advance_shadow_stop_loss_gap_uses_actual_candle_low_not_sl_level(tmp_path):
+    """Review finding 1b: every prior stop_loss test had candle_low within a
+    tick of the SL, so min(candle_low, active_sl) always degenerated to the
+    same value regardless of which operand "won". This pins the ACTUAL
+    behavior of that formula for a genuine gap-through: the stop_loss branch
+    only ever fires when candle_low <= active_sl, so min(candle_low,
+    active_sl) is mathematically forced to equal candle_low (the worse,
+    more pessimistic price actually touched this candle) whenever the gap is
+    strict - never the SL level itself. This mirrors the target branch's own
+    forced resolution to `target` (never the gapped candle_high) - in both
+    cases the formula picks the value less favorable to the shadow's
+    reported outcome: the worse price for a loss, the capped price for a
+    win. Verified directly: min(Decimal('48500'), Decimal('49000')) ==
+    Decimal('48500')."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo)
+    shadow = _shadow_row(repo)
+    advance_shadow(
+        shadow, candle_low=Decimal("48500"), candle_high=Decimal("49800"),
+        current_price=Decimal("48700"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "CLOSED"
+    assert row["exit_reason"] == "stop_loss"
+    assert row["theoretical_exit"] == "48500"  # min(48500, 49000) == candle_low, not the SL level
+
+
+class _SpyRepo:
+    """Review finding 2: a minimal spy proving the MECHANISM (threshold-
+    detection code is never even reached this tick), not just the outcome -
+    the real repo's own `WHERE status = 'OPEN'` guard on
+    activate_profit_protection_breakeven would silently reject that write
+    anyway once the row is CLOSED, so an outcome-only assertion can't tell
+    the difference between "never called" and "called but rejected"."""
+
+    def __init__(self, real_position):
+        self._real_position = real_position
+        self.activate_calls = 0
+
+    def record_profit_protection_tick(self, shadow_id, mfe, mae, updated_at):
+        pass
+
+    def activate_profit_protection_breakeven(
+        self, shadow_id, breakeven_stop_loss, threshold_reached_at, updated_at
+    ):
+        self.activate_calls += 1
+
+    def close_profit_protection_shadow(self, **kwargs):
+        pass
+
+    def get_position(self, position_id):
+        return self._real_position
+
+
+def test_advance_shadow_same_candle_never_calls_activate_breakeven(tmp_path):
+    """Review finding 2: directly proves the mandated `return` after closing
+    means threshold-detection code is never reached this tick - independent
+    of whatever the real repository's own guard would have done."""
+    real_repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(real_repo)
+    shadow = _shadow_row(real_repo)
+    real_position = real_repo.get_position("pos-1")
+    spy = _SpyRepo(real_position)
+    advance_shadow(
+        shadow, candle_low=Decimal("48900"), candle_high=Decimal("50600"),
+        current_price=Decimal("49500"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=spy,
+    )
+    assert spy.activate_calls == 0
+
+
+def test_advance_shadow_close_is_a_noop_when_real_position_is_missing(tmp_path):
+    """Review finding 3: _close_shadow must never let an unhandled
+    AttributeError escape when repo.get_position() returns None (defensive -
+    in practice positions are never deleted, but the experiment must not be
+    able to abort other shadows' processing in the same tick)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    # Deliberately do NOT seed a real position for "pos-missing" - the
+    # shadow references a position_id with no row in `positions`.
+    shadow = _shadow_row(
+        repo, shadow_id="pos-missing:0.010", position_id="pos-missing"
+    )
+    advance_shadow(
+        shadow, candle_low=Decimal("48900"), candle_high=Decimal("50600"),
+        current_price=Decimal("49500"), funding_rate=Decimal("0"), now=_NOW,
+        max_position_hold_hours=24, guardian_state=None,
+        guardian_assisted_exit_enabled=False, risk_limits=_risk_limits(), repo=repo,
+    )  # must not raise
+    row = repo.get_profit_protection_shadow("pos-missing:0.010")
+    assert row["status"] == "OPEN"

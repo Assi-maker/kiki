@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig
+from crypto_trading.config.loader import GuardianConfig, RiskLimitsConfig, Settings
 from crypto_trading.paper_trading.execution import (
     FILL_MODEL_VERSION,
     compute_fees,
@@ -147,6 +147,15 @@ def _close_shadow(
     `positions` - only reads via repo.get_position() and writes via
     repo.close_profit_protection_shadow()."""
     real_position = repo.get_position(shadow["position_id"])
+    if real_position is None:
+        # Defensive only: in today's codebase positions are never deleted, so
+        # the real position backing a shadow always exists in practice. But
+        # per G1 ("no production impact"), this experiment's own code must
+        # never let an unexpected AttributeError escape into the shared
+        # monitoring tick - that would abort every OTHER shadow's processing
+        # this same tick, not just this one. Leave the shadow row untouched
+        # (no partial writes) rather than risk that.
+        return
     simulated_fill_exit = compute_fill_price(
         theoretical_exit, _DIRECTION, risk_limits.spread_pct, risk_limits.slippage_pct, "exit"
     )
