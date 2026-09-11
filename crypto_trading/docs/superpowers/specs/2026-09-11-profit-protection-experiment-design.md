@@ -62,14 +62,27 @@ These are binding constraints on the implementation, not aspirations:
   one.
 - **G8 — Same-candle ambiguity is resolved conservatively.** See §5.2 for
   the exact rule and its proof.
-- **G9 — +1.0% and +1.5% are frozen, pre-registered hypotheses.** They are
-  hard-coded as the only two variants this experiment runs. No code path
+- **G9 — +1.0% and +1.5% are frozen, pre-registered hypotheses — not a
+  config parameter.** They are hard-coded as a module-level constant (see
+  §6) — there is no `thresholds_pct` config field, no YAML key, and no
+  environment variable that can add, remove, or change which thresholds
+  the experiment runs. Changing the set of tested thresholds requires
+  editing and re-reviewing the source constant itself, the same weight as
+  any other code change — never a config/deploy-time toggle. No code path
   in this design selects, tunes, ranks, or auto-promotes a threshold based
   on observed results. The report (§7) explicitly labels both as
   "pre-registered hypotheses under test", never as "the winner" or "the
   recommended value". Changing which thresholds are tested (or promoting
   one to production) is an explicit, separate, future human decision —
   out of scope for this feature.
+  Separately, the report's 0.3% "approx breakeven" classification band
+  (§7.2) is a **reporting-only label**: it is never read by the state
+  machine, never affects `active_sl`, seeding, exit simulation, PnL,
+  `pnl_difference`, drawdown/expectancy/profit-factor, or any threshold
+  comparison — it exists solely so a human reading the report can see
+  "reached threshold, ended near flat" as its own bucket. Changing that
+  band's value can only ever change how a row is *labeled* in §7.2/§7.4/
+  §7.5, never any simulated or realized number.
 - **G10 — Isolation is proven, not assumed.** A test explicitly forces the
   experiment tick function to raise, and asserts (a) `close_triggered_positions`
   already ran and its result is returned unaffected, (b) the real position's
@@ -232,7 +245,8 @@ None of these methods touch the `positions` table.
 On every experiment tick, for every `position` in `open_positions` (the
 same list `run_monitoring_tick` already built) where
 `position.opened_at >= activated_at`: if no shadow rows exist yet for
-`position.position_id`, seed one row per frozen threshold (G6). Seeding
+`position.position_id`, seed one row per threshold in `FROZEN_THRESHOLDS_PCT`
+(§6, G9 — always exactly `0.010` and `0.015`, never config-driven) (G6). Seeding
 copies `entry_price`/`original_stop_loss`/`target`/`opened_at` from the
 `Position` object at that instant — never re-reads them later, so a
 (disallowed, hypothetical) future change to the real position can never
@@ -341,15 +355,31 @@ exit_reason, compute_pnl(position))` — read-only with respect to
 ```python
 class ProfitProtectionExperimentConfig(BaseModel):
     enabled: bool = False
-    thresholds_pct: list[Decimal] = Field(
-        default_factory=lambda: [Decimal("0.010"), Decimal("0.015")]
-    )
 ```
 
 Opt-in, same as `GuardianConfig`/`DemoExecutionConfig` — default `enabled=False`
-changes nothing for any existing deployment. `thresholds_pct` is documented
-in the class docstring as **frozen for the duration of this experiment
-(G9)** — not a tuning knob.
+changes nothing for any existing deployment. `enabled` is the ONLY field:
+it turns the experiment's seeding/tick/backfill logic on or off, and
+nothing else about the experiment is configurable.
+
+The two thresholds themselves are **not** a config field (G9). They are a
+frozen module-level constant in
+`crypto_trading/paper_trading/profit_protection_experiment.py`:
+
+```python
+# Pre-registered hypotheses under test (2026-09-11). Frozen for the
+# duration of this experiment - not a tuning parameter, not read from
+# config/YAML/env. Changing this set is a source-code change requiring
+# the same review as any other logic change, never a deploy-time toggle.
+FROZEN_THRESHOLDS_PCT: tuple[Decimal, ...] = (Decimal("0.010"), Decimal("0.015"))
+```
+
+Every place that previously would have read `settings.profit_protection_experiment.thresholds_pct`
+(seeding in §5.1, the report in §7) instead imports and uses
+`FROZEN_THRESHOLDS_PCT` directly. A test asserts this tuple is exactly
+`(Decimal("0.010"), Decimal("0.015"))` and that `ProfitProtectionExperimentConfig`
+has no `thresholds_pct` field (so a future edit can't quietly reintroduce
+it as configurable without that test failing).
 
 ## 7. Reporting
 
@@ -371,6 +401,17 @@ actually executed),
 `"protection_worsened_other"`} (see §7.3 for exact definitions).
 
 ### 7.2 Reach-classification (per user requirement #4)
+
+**This entire section is reporting-only.** The bucket a row falls into
+here is a label computed at report time for human readability. None of
+these five buckets, and specifically not the 0.3% `_BREAKEVEN_BAND_PCT`
+constant used by `reached_threshold_baseline_approx_breakeven`, ever
+feeds back into §5's state machine, `active_sl`, seeding, exit
+simulation, `shadow_realized_pnl`, `pnl_difference`, drawdown/
+expectancy/profit-factor, or any comparison between the two thresholds.
+Changing `_BREAKEVEN_BAND_PCT` can only change how a closed row is
+*labeled* below — it can never change a single simulated price, exit, or
+dollar figure anywhere in this feature.
 
 Every shadow row is classified into exactly one of:
 
@@ -412,7 +453,41 @@ Only computed once both `shadow_realized_pnl` and
   `profit_protection_hypothetical_exit_reason != "target"` and
   `pnl_difference < 0`.
 
-### 7.4 Aggregate stats (per threshold and combined)
+### 7.4 Sample sizes (explicit, per user requirement)
+
+Before any ratio, rate, or aggregate stat, the report shows the raw
+counts it is built from — so a reader never has to infer sample size
+from a percentage. For **each threshold separately**, and once more
+**combined**:
+
+- `n_closed` — closed shadow rows.
+- `n_reached_threshold` — of those, `threshold_reached == True`.
+- `n_not_reached` — `n_closed - n_reached_threshold`
+  (`never_reached_threshold`, §7.2).
+- `n_baseline_losses_after_threshold` — reached threshold, and
+  `hypothetical_baseline_pnl < 0` (`reached_threshold_baseline_loss`,
+  §7.2).
+- `n_baseline_target_winners_after_threshold` — reached threshold, and
+  `hypothetical_baseline_exit_reason == "target"`
+  (`reached_threshold_baseline_big_winner`, §7.2).
+- `n_shadow_winners` — `shadow_realized_pnl > 0`.
+- `n_shadow_losses` — `shadow_realized_pnl < 0`.
+
+**Combined semantics, stated explicitly to avoid ambiguity:** "combined"
+pools shadow rows across both thresholds for the same closed-shadow
+population (i.e. it is a row-level count over all `profit_protection_shadow_positions`
+rows with `status == "CLOSED"`, not a position-level count) — a single
+real position that produced two closed shadow rows (one per threshold)
+contributes two rows to the combined counts. This is stated once, at the
+top of the combined block in the report's JSON, so it is never mistaken
+for a deduplicated position count. Combined is shown only for fields
+where pooling is meaningful (all seven above); it is never shown for
+anything that would need per-threshold context to interpret (e.g. no
+combined `conversion_ratio` — see §7.5 — since averaging across two
+different frozen hypotheses would blur exactly the comparison this
+experiment exists to make).
+
+### 7.5 Aggregate stats (per threshold and combined)
 
 Reusing `performance/metrics.py`'s existing functions
 (`compute_win_rate`, `compute_expectancy`, `compute_profit_factor`,
@@ -421,19 +496,54 @@ and, separately, against the baseline PnL series for the *same subset of
 positions* (so the comparison is apples-to-apples on identical trade
 counts) — total P/L, expectancy, average, median, win rate, profit
 factor, max drawdown, plus: count reached +1.0%, count reached +1.5%,
-count that reached-then-reverted-to-loss-under-baseline, and
-MFE-to-realized-gain conversion ratio (`shadow_realized_pnl / mfe` where
-`mfe > 0`, averaged).
+count that reached-then-reverted-to-loss-under-baseline, and the
+MFE-to-realized-gain conversion ratio defined below.
 
-### 7.5 Chronological robustness split
+**MFE-to-realized-gain conversion ratio — corrected definition.** The
+naive `shadow_realized_pnl / mfe` mixes a USDT amount with a raw price
+delta and is not comparable across instruments of different price scale.
+Instead, both sides are converted to the same dimensionless, per-instrument-
+comparable unit before dividing:
+
+```
+mfe_pct        = mfe / entry_price                      # price move, as a fraction of entry
+realized_pnl_pct = shadow_realized_pnl / position_size   # same convention already used
+                                                          # by paper_track_report.py's own
+                                                          # pnl_pct = pnl / p.size (§7.2)
+
+conversion_ratio = realized_pnl_pct / mfe_pct
+```
+
+`position_size` is read via `repo.get_position(position_id).size`, same
+as §7.2's `position_size` (not duplicated into the shadow table).
+`realized_pnl_pct` already nets out fees/funding (it comes from
+`compute_pnl()`), while `mfe_pct` is a pure price-move fraction — the
+ratio therefore answers "of the best price move this trade ever saw
+(as a %), what fraction did the realized P/L (as a %) actually capture",
+comparable across instruments regardless of price scale.
+
+**Division-by-zero / undefined handling**, explicit per row:
+- If `mfe <= 0` (the trade was never favorable even momentarily —
+  possible if it stops out on the very first candle, or for a variant
+  whose `entry_price` is used as `mfe`'s reference so `mfe` starts at
+  `0`), `mfe_pct <= 0` and `conversion_ratio` is **`None`** (undefined,
+  never `0` or `Infinity`, never fabricated) — that row is excluded from
+  the averaged ratio, and the report's aggregate field additionally
+  states `conversion_ratio_excluded_count` so the exclusion is visible,
+  not silent.
+- The averaged `conversion_ratio` reported in these aggregates is the
+  mean over only the rows where it is defined.
+
+### 7.6 Chronological robustness split
 
 Positions are ordered by `opened_at` and split into a first half / second
 half (by count, not by date range, so both halves have comparable sample
-size); §7.4's aggregate stats are computed separately for each half, per
-threshold, so a threshold that looks good only in one half is visible as
-such, per explicit user requirement.
+size); §7.4's sample-size counts and §7.5's aggregate stats are both
+computed separately for each half, per threshold, so a threshold that
+looks good only in one half is visible as such, per explicit user
+requirement.
 
-### 7.6 Framing (G9)
+### 7.7 Framing (G9)
 
 The report's top-level JSON includes a fixed, non-conditional field:
 
@@ -499,10 +609,12 @@ After implementation, before considering this feature done:
 
 ## 10. How to run (once implemented)
 
-1. Set `enabled: true` and confirm `thresholds_pct` under
-   `profit_protection_experiment` in the environment's config YAML (or via
-   whatever mechanism `Settings` already uses for this project — no new
-   env-var precedent needed beyond the existing config-loading path).
+1. Set `enabled: true` under `profit_protection_experiment` in the
+   environment's config YAML (or via whatever mechanism `Settings`
+   already uses for this project — no new env-var precedent needed
+   beyond the existing config-loading path). There is nothing else to
+   configure — the thresholds are fixed at `0.010`/`0.015` in source
+   (§6, G9) and cannot be changed via config.
 2. Restart the monitoring process. The first tick sets the activation
    watermark; only positions opened from that instant onward are ever
    seeded.
