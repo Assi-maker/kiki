@@ -137,7 +137,7 @@ class Repository(Protocol):
         funding: Decimal,
         closed_at: datetime,
         event: Event,
-    ) -> None: ...
+    ) -> bool: ...
     def get_recovery_sweep_activated_at(self) -> datetime | None: ...
     def set_recovery_sweep_activated_at_if_missing(self, activated_at: datetime) -> bool: ...
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
@@ -771,12 +771,20 @@ class SQLiteRepository:
         funding: Decimal,
         closed_at: datetime,
         event: Event,
-    ) -> None:
+    ) -> bool:
+        """P4 remediation (2026-09-11): the WHERE status = 'OPEN_POSITION'
+        clause makes this atomic against a concurrent close of the same
+        position - only the caller whose UPDATE actually flips status ever
+        gets True/inserts the event; a second, racing caller's UPDATE
+        affects zero rows and returns False, never silently overwriting the
+        first close's exit data or inserting a duplicate POSITION_CLOSED
+        event. Same statement-level race-defense pattern already used by
+        claim_live_execution()'s own WHERE EXISTS guard."""
         try:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE positions SET status = 'CLOSED', theoretical_exit = ?, "
                 "simulated_fill_exit = ?, exit_reason = ?, fees = ?, funding = ?, closed_at = ? "
-                "WHERE position_id = ?",
+                "WHERE position_id = ? AND status = 'OPEN_POSITION'",
                 (
                     str(theoretical_exit),
                     str(simulated_fill_exit),
@@ -787,8 +795,11 @@ class SQLiteRepository:
                     position_id,
                 ),
             )
-            self._insert_event(event)
+            closed = cur.rowcount > 0
+            if closed:
+                self._insert_event(event)
             self._conn.commit()
+            return closed
         except Exception:
             self._conn.rollback()
             raise

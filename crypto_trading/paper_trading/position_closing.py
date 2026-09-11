@@ -88,7 +88,7 @@ def close_triggered_positions(
             schema_version=1,
             payload={"exit_reason": exit_reason},
         )
-        repo.close_position_with_event(
+        was_closed = repo.close_position_with_event(
             position_id=position.position_id,
             theoretical_exit=theoretical_exit,
             simulated_fill_exit=simulated_fill_exit,
@@ -98,5 +98,7 @@ def close_triggered_positions(
             closed_at=now,
             event=event,
         )
+        if not was_closed:
+            continue  # lost the race to a concurrent closer - never double-close, never re-report
         closed.append(repo.get_position(position.position_id))
     return closed

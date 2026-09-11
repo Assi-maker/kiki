@@ -102,7 +102,7 @@ def test_close_position_with_event_updates_exit_fields_and_status(tmp_path):
     repo.create_position_with_event(position, _make_event(position, "POSITION_OPENED"))
 
     close_event = _make_event(position, "POSITION_CLOSED")
-    repo.close_position_with_event(
+    closed = repo.close_position_with_event(
         position_id="pos-1",
         theoretical_exit="49000",
         simulated_fill_exit="48950",
@@ -113,6 +113,7 @@ def test_close_position_with_event_updates_exit_fields_and_status(tmp_path):
         event=close_event,
     )
 
+    assert closed is True
     reloaded = repo.get_position("pos-1")
     assert reloaded.status == "CLOSED"
     assert reloaded.exit_reason == "stop_loss"
@@ -121,6 +122,44 @@ def test_close_position_with_event_updates_exit_fields_and_status(tmp_path):
     assert reloaded.fees == Decimal("2")
     assert reloaded.funding == Decimal("1")
     assert reloaded.closed_at == _NOW
+
+
+def test_close_position_with_event_returns_false_and_does_not_double_close_when_already_closed(
+    tmp_path,
+):
+    """P4 remediation (2026-09-11): the atomic WHERE status='OPEN_POSITION'
+    guard. A second close attempt on an already-CLOSED position (the race
+    two concurrent callers - e.g. a normal monitoring tick and a catch-up
+    pass - could otherwise both win) affects zero rows, returns False, and
+    inserts no duplicate POSITION_CLOSED event; the first close's data is
+    never overwritten."""
+    repo = SQLiteRepository(tmp_path / "test.db")
+    position = _make_position()
+    repo.create_position_with_event(position, _make_event(position, "POSITION_OPENED"))
+    first_event = _make_event(position, "POSITION_CLOSED")
+
+    first = repo.close_position_with_event(
+        position_id="pos-1", theoretical_exit="49000", simulated_fill_exit="48950",
+        exit_reason="stop_loss", fees="2", funding="1", closed_at=_NOW, event=first_event,
+    )
+    second_event = Event(
+        event_id="POSITION_CLOSED:pos-1:second", event_type="POSITION_CLOSED",
+        aggregate_type="position", aggregate_id="pos-1", occurred_at=_NOW,
+        run_id="run-2", schema_version=1, payload={},
+    )
+    second = repo.close_position_with_event(
+        position_id="pos-1", theoretical_exit="99999", simulated_fill_exit="99999",
+        exit_reason="target", fees="0", funding="0", closed_at=_NOW, event=second_event,
+    )
+
+    assert first is True
+    assert second is False
+    reloaded = repo.get_position("pos-1")
+    assert reloaded.exit_reason == "stop_loss"  # first close's data wins, never overwritten
+    event_count = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM events WHERE event_type = 'POSITION_CLOSED'"
+    ).fetchone()["n"]
+    assert event_count == 1
 
 
 def test_close_position_with_event_is_atomic_on_failure(tmp_path):
