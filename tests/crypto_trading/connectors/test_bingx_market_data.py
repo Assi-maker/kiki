@@ -1,5 +1,6 @@
 import time
 
+import httpx
 import pytest
 import respx
 from httpx import Response, TimeoutException
@@ -184,3 +185,38 @@ def test_cache_avoids_duplicate_http_call_within_ttl():
     connector.get_ticker("BTC-USDT")
     connector.get_ticker("BTC-USDT")
     assert route.call_count == 1  # andra anropet kom från cachen, inget nytt HTTP-anrop
+
+
+@respx.mock
+def test_get_klines_omits_start_end_time_when_not_given():
+    route = respx.get(f"{_BASE_URL}/openApi/swap/v3/quote/klines").mock(
+        return_value=httpx.Response(200, json={"code": 0, "msg": "", "data": []})
+    )
+    _connector().get_klines("BTC-USDT", "1m", limit=5)
+    request = route.calls.last.request
+    assert "startTime" not in request.url.params
+    assert "endTime" not in request.url.params
+
+
+@respx.mock
+def test_get_klines_includes_start_end_time_when_given():
+    route = respx.get(f"{_BASE_URL}/openApi/swap/v3/quote/klines").mock(
+        return_value=httpx.Response(200, json={"code": 0, "msg": "", "data": []})
+    )
+    _connector().get_klines(
+        "BTC-USDT", "1m", limit=1440, start_time_ms=1788393600000, end_time_ms=1788480000000
+    )
+    request = route.calls.last.request
+    assert request.url.params["startTime"] == "1788393600000"
+    assert request.url.params["endTime"] == "1788480000000"
+
+
+@respx.mock
+def test_get_funding_rate_includes_start_end_time_when_given():
+    route = respx.get(f"{_BASE_URL}/openApi/swap/v2/quote/fundingRate").mock(
+        return_value=httpx.Response(200, json={"code": 0, "msg": "", "data": []})
+    )
+    _connector().get_funding_rate("BTC-USDT", limit=50, start_time_ms=1788393600000, end_time_ms=1788480000000)
+    request = route.calls.last.request
+    assert request.url.params["startTime"] == "1788393600000"
+    assert request.url.params["endTime"] == "1788480000000"

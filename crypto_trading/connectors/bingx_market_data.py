@@ -47,22 +47,39 @@ class BingXMarketDataConnector(BaseMarketDataConnector):
         2026-09-01: samma svarsschema per element som get_ticker()."""
         return self._get(_TICKER_PATH, {"timestamp": self._timestamp_ms()})
 
-    def get_klines(self, symbol: str, interval: str, limit: int = 100) -> list[dict]:
-        return self._get(
-            _KLINES_PATH,
-            {
-                "symbol": symbol,
-                "interval": interval,
-                "limit": limit,
-                "timestamp": self._timestamp_ms(),
-            },
-        )
+    def get_klines(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int = 100,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[dict]:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+            "timestamp": self._timestamp_ms(),
+        }
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        return self._get(_KLINES_PATH, params)
 
-    def get_funding_rate(self, symbol: str, limit: int = 1) -> list[dict]:
-        return self._get(
-            _FUNDING_RATE_PATH,
-            {"symbol": symbol, "limit": limit, "timestamp": self._timestamp_ms()},
-        )
+    def get_funding_rate(
+        self,
+        symbol: str,
+        limit: int = 1,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[dict]:
+        params = {"symbol": symbol, "limit": limit, "timestamp": self._timestamp_ms()}
+        if start_time_ms is not None:
+            params["startTime"] = start_time_ms
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms
+        return self._get(_FUNDING_RATE_PATH, params)
 
     def get_open_interest(self, symbol: str) -> dict:
         return self._get(_OPEN_INTEREST_PATH, {"symbol": symbol, "timestamp": self._timestamp_ms()})
