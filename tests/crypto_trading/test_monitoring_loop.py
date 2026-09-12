@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -214,7 +215,7 @@ def test_run_monitoring_tick_skips_instrument_on_empty_klines_without_blocking_o
 
 
 def test_a_crash_in_the_profit_protection_experiment_never_affects_real_position_closing(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
     """Spec G10 (explicit user requirement #8): forces the experiment tick
     to raise and proves (a) the real stop_loss close still happens and is
@@ -238,10 +239,12 @@ def test_a_crash_in_the_profit_protection_experiment_never_affects_real_position
         funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
     )
 
-    closed = run_monitoring_tick(connector, repo, _settings())  # must never raise
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        closed = run_monitoring_tick(connector, repo, _settings())  # must never raise
 
     assert len(closed) == 1
     assert closed[0].exit_reason == "stop_loss"
     assert closed[0].status == "CLOSED"
     row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
     assert row["status"] == "ok"  # the OUTER try/except never even saw the failure
+    assert "profit_protection_experiment_tick_failed" in caplog.text  # (c) failure is logged
