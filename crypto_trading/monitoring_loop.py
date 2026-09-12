@@ -10,6 +10,9 @@ from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.paper_trading.monitoring_catchup import run_monitoring_catchup
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
+from crypto_trading.paper_trading.profit_protection_experiment import (
+    run_profit_protection_experiment_tick,
+)
 from crypto_trading.schemas.market import FundingRate, Kline, Ticker
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository
@@ -53,7 +56,8 @@ def run_monitoring_tick(
         price_lookup: dict[str, tuple[Decimal, Decimal, Decimal, Decimal]] = {}
         errors: list[str] = []
 
-        for position in repo.find_open_positions():
+        open_positions = list(repo.find_open_positions())
+        for position in open_positions:
             symbol = position.instrument
             if symbol in price_lookup:
                 continue
@@ -87,6 +91,15 @@ def run_monitoring_tick(
         closed = close_triggered_positions(
             repo, price_lookup, now, settings.risk_limits, run_id, guardian_config=settings.guardian
         )
+        try:
+            run_profit_protection_experiment_tick(
+                repo, open_positions, closed, price_lookup, now, settings, run_id
+            )
+        except Exception as exc:
+            log_event(
+                run_id, event="profit_protection_experiment_tick_failed",
+                error_type=type(exc).__name__, error=str(exc),
+            )
         repo.complete_run(
             run_id, datetime.now(UTC), "ok" if not errors else "partial_error", errors
         )

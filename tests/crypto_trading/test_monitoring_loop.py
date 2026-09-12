@@ -211,3 +211,37 @@ def test_run_monitoring_tick_skips_instrument_on_empty_klines_without_blocking_o
     assert btc_position.status == "OPEN_POSITION"
     row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
     assert row["status"] == "partial_error"
+
+
+def test_a_crash_in_the_profit_protection_experiment_never_affects_real_position_closing(
+    tmp_path, monkeypatch
+):
+    """Spec G10 (explicit user requirement #8): forces the experiment tick
+    to raise and proves (a) the real stop_loss close still happens and is
+    still returned, (b) no exception propagates out of run_monitoring_tick,
+    (c) the failure is logged."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    def _raiser(*args, **kwargs):
+        raise RuntimeError("boom - simulated PP experiment failure")
+
+    monkeypatch.setattr(
+        monitoring_loop_module, "run_profit_protection_experiment_tick", _raiser
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    closed = run_monitoring_tick(connector, repo, _settings())  # must never raise
+
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "stop_loss"
+    assert closed[0].status == "CLOSED"
+    row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
+    assert row["status"] == "ok"  # the OUTER try/except never even saw the failure
