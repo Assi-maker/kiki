@@ -1,8 +1,12 @@
 """Read-only Profit Protection experiment report (2026-09-11). See
 docs/superpowers/specs/2026-09-11-profit-protection-experiment-design.md.
 
-Never writes to the DB, never started by run.py - run manually:
-`python -m crypto_trading.performance.profit_protection_report`.
+Never writes any experiment or trading data, never started by run.py - run
+manually: `python -m crypto_trading.performance.profit_protection_report`.
+(Constructing `SQLiteRepository` does run init_schema's idempotent `CREATE
+TABLE IF NOT EXISTS`/`INSERT OR IGNORE schema_version` - harmless, and the
+same property `performance/paper_track_report.py` already has, but worth
+naming precisely rather than the stronger "never writes to the DB".)
 
 Spec G9 / plan correction: +1.0% and +1.5% are frozen, pre-registered
 hypotheses. This report never selects a winner or recommends promotion to
@@ -210,17 +214,42 @@ def build_report(repo: Repository) -> dict:
     for threshold_pct in FROZEN_THRESHOLDS_PCT:
         key = str(threshold_pct)
         rows_for_threshold = [r for r in all_rows if r["threshold_pct"] == key]
-        rows_for_threshold.sort(key=lambda r: r["opened_at"])
-        midpoint = len(rows_for_threshold) // 2
+        # Review finding 6 (final whole-branch review): filter to CLOSED
+        # BEFORE computing the split midpoint, not after. `_stats_block`
+        # itself already filters to CLOSED internally, so computing the
+        # midpoint over ALL rows_for_threshold (OPEN/ABANDONED included)
+        # systematically shrank the second half's closed-trade count,
+        # since non-CLOSED rows sort last by opened_at (they're the most
+        # recently seeded, still-unresolved trades) and always land in the
+        # second half - the opposite of "both halves have comparable
+        # sample size" (spec S7.6).
+        closed_for_threshold = sorted(
+            (r for r in rows_for_threshold if r["status"] == "CLOSED"),
+            key=lambda r: r["opened_at"],
+        )
+        midpoint = len(closed_for_threshold) // 2
+        stats = _stats_block(closed_for_threshold, repo)
+        # Review finding 1 (final whole-branch review): surface the count
+        # of shadows abandoned (real position no longer open, for any
+        # reason - see run_profit_protection_experiment_tick) so that
+        # exclusion from every other stat in this block is visible, never
+        # silent.
+        stats["sample_sizes"]["n_abandoned"] = sum(
+            1 for r in rows_for_threshold if r["status"] == "ABANDONED"
+        )
         per_threshold[key] = {
-            **_stats_block(rows_for_threshold, repo),
+            **stats,
             "chronological_split": {
-                "first_half": _stats_block(rows_for_threshold[:midpoint], repo),
-                "second_half": _stats_block(rows_for_threshold[midpoint:], repo),
+                "first_half": _stats_block(closed_for_threshold[:midpoint], repo),
+                "second_half": _stats_block(closed_for_threshold[midpoint:], repo),
             },
         }
 
     combined_closed = [r for r in all_rows if r["status"] == "CLOSED"]
+    combined_sample_sizes = _sample_sizes(combined_closed)
+    combined_sample_sizes["n_abandoned"] = sum(
+        1 for r in all_rows if r["status"] == "ABANDONED"
+    )
     combined = {
         "note_on_combined": (
             "Row-level counts pooled across both thresholds - a single "
@@ -228,7 +257,7 @@ def build_report(repo: Repository) -> dict:
             "threshold) contributes two rows here, this is not a "
             "deduplicated position count."
         ),
-        "sample_sizes": _sample_sizes(combined_closed),
+        "sample_sizes": combined_sample_sizes,
     }
 
     return {
