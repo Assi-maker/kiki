@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import tempfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from crypto_trading.backtest.dataset import BacktestTarget
-from crypto_trading.backtest.guardian_replay import copy_guardian_history
+from crypto_trading.backtest.guardian_replay import _row_to_observation
 from crypto_trading.backtest.historical_fetch import (
     HistoricalMarketDataSource,
     fetch_historical_funding,
@@ -82,9 +83,9 @@ def replay_position(
     run_id: str,
 ) -> None:
     """Writes ONLY into backtest_repo. source_repo is only ever READ from
-    (Guardian history, copied incrementally once per candle tick - see
-    the `up_to` note below) and never written to - see this function's
-    own test_replay_position_never_writes_to_the_source_repo."""
+    (Guardian history, via a one-shot fetch + local watermark pointer -
+    see the loop below) and never written to - see this function's own
+    test_replay_position_never_writes_to_the_source_repo."""
     window_end = target.opened_at + timedelta(hours=24)
     # Deliberately NOT clamped to datetime.now(UTC): the exchange already
     # returns no future candles on its own, so a wall-clock clamp buys
@@ -94,12 +95,45 @@ def replay_position(
     # this function's own determinism guarantee (review round 1, Bundled
     # Fix 1).
 
-    klines = fetch_historical_klines(
-        connector, target.instrument, _KLINE_INTERVAL, target.opened_at, window_end, cache_dir
-    )
-    funding_rates = fetch_historical_funding(
-        connector, target.instrument, target.opened_at, window_end, cache_dir
-    )
+    now_utc = datetime.now(UTC)
+    window_is_complete = now_utc >= window_end
+    if window_is_complete:
+        klines = fetch_historical_klines(
+            connector, target.instrument, _KLINE_INTERVAL, target.opened_at, window_end, cache_dir
+        )
+        funding_rates = fetch_historical_funding(
+            connector, target.instrument, target.opened_at, window_end, cache_dir
+        )
+    else:
+        # Review round 2, Important Fix 2: `window_end` is fixed at
+        # `opened_at + 24h` (never clamped to `now_utc` - see the comment
+        # above), so for any position opened <24h before this run,
+        # `window_end` is still in the future relative to real wall-clock
+        # time. The exchange can only return whatever candles exist so
+        # far for such a window - a genuinely PARTIAL result. Persisting
+        # that partial result under `cache_dir` would be unsafe: the
+        # cache key is (symbol, interval, start, end) only, indistinguishable
+        # from a later run's key once the window has truly elapsed and
+        # complete data exists - and fetch_historical_klines/funding only
+        # ever re-fetch when no cache file is present, so a later run
+        # would silently keep reading this run's truncated data forever.
+        # Fetching into a throwaway temp directory instead of the real
+        # `cache_dir` guarantees this run's partial fetch can never be
+        # mistaken for a complete one by any future run (which looks only
+        # in the real `cache_dir`), and the temp directory is cleaned up
+        # automatically when this `with` block exits, so nothing
+        # orphaned accumulates. This run's own replay still proceeds
+        # against whatever partial data was returned - an honest,
+        # inherent limitation of replaying a still-in-progress position,
+        # not a bug.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_cache_dir = Path(tmp_dir)
+            klines = fetch_historical_klines(
+                connector, target.instrument, _KLINE_INTERVAL, target.opened_at, window_end, tmp_cache_dir
+            )
+            funding_rates = fetch_historical_funding(
+                connector, target.instrument, target.opened_at, window_end, tmp_cache_dir
+            )
 
     position = Position(
         position_id=target.position_id, candidate_id=target.position_id,
@@ -131,21 +165,33 @@ def replay_position(
 
     scoped_repo = _SinglePositionRepo(backtest_repo, target.position_id)
 
+    # One-shot fetch of the position's full source Guardian history, plus
+    # a local watermark pointer into it (review round 2, Important Fix
+    # 1): the round-1 fix (re-calling copy_guardian_history with a
+    # growing `up_to` on every single tick) correctly eliminated the
+    # look-ahead bug but was O(candles x observations) - it re-read and
+    # re-filtered the ENTIRE source history, and re-attempted an INSERT
+    # OR IGNORE for every already-copied row, on every tick (measured:
+    # ~21s for one position at realistic 1440-candle/1440-observation
+    # scale). find_guardian_observations_for_position already returns
+    # rows sorted ascending by observed_at (see its own "ORDER BY
+    # observed_at ASC" - Repository's implementation), so a single
+    # forward-only pointer that only ever advances (never re-scans a row
+    # it already copied) preserves the EXACT same no-look-ahead guarantee
+    # - backtest_repo only ever contains observations with `observed_at
+    # <= <this tick's candle timestamp>` - in O(total observations) work
+    # per position instead of O(candles x observations).
+    guardian_history = [
+        (datetime.fromisoformat(row["observed_at"]), row)
+        for row in source_repo.find_guardian_observations_for_position(target.position_id)
+    ]
+    guardian_cursor = 0
+
     evaluable = [k for k in klines if k.observed_at > target.opened_at]  # entry candle itself is never re-evaluated
     for kline in evaluable:  # already ascending (fetch_historical_klines sorts) - never process out of order
-        # Incremental, time-bounded Guardian copy (review round 1, Critical
-        # Fix 1): copying a position's ENTIRE Guardian history up front (as
-        # a prior version of this function did) let an observation dated
-        # AFTER this candle leak backwards - find_latest_guardian_
-        # observation's staleness guard only checks "not too old", it has
-        # NO upper bound on observed_at, so `now - observed_at` going
-        # negative for a future observation trivially satisfies `<=`.
-        # Bounding every copy to `up_to=kline.observed_at` guarantees
-        # backtest_repo only ever contains what would have been visible at
-        # this exact point in the replay - a real no-look-ahead guarantee,
-        # not just a comment. INSERT OR IGNORE makes the repeated, growing-
-        # bound copy idempotent and safe to call every tick.
-        copy_guardian_history(source_repo, backtest_repo, target.position_id, up_to=kline.observed_at)
+        while guardian_cursor < len(guardian_history) and guardian_history[guardian_cursor][0] <= kline.observed_at:
+            backtest_repo.save_guardian_observation(_row_to_observation(guardian_history[guardian_cursor][1]))
+            guardian_cursor += 1
 
         funding_rate = _latest_funding_rate(funding_rates, kline.observed_at)
         price_lookup = {

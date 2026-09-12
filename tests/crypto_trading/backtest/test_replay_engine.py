@@ -231,3 +231,66 @@ def test_replay_position_does_not_corrupt_an_earlier_right_censored_position_sha
     position_b_after = backtest.get_position("pos-B")
     assert position_b_after.status == "CLOSED"
     assert position_b_after.exit_reason == "stop_loss"
+
+
+def test_replay_position_does_not_cache_a_partial_fetch_for_a_still_in_progress_window(tmp_path):
+    """Regression test for review round 2, Important Fix 2: when a
+    position's 24h replay window (`opened_at + 24h`, fixed - see review
+    round 1, Bundled Fix 1) extends past real wall-clock `now` (true for
+    any position opened <24h before the run), the exchange can only
+    return whatever candles exist so far - a genuinely PARTIAL result.
+    That partial result must never be persisted under the same cache key
+    a later, genuinely-complete-window run would also use - otherwise a
+    later run would silently keep reading this run's truncated data
+    forever. Proven here with two separate replay_position calls sharing
+    the SAME cache_dir and the SAME connector (which counts calls and
+    returns MORE candles on its second call, simulating newly-available
+    data once real time has caught up): if the first call's fetch were
+    wrongly cached under the shared cache_dir, the second call's
+    connector would never be re-invoked and the second replay would see
+    only the first, stale candle set."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    recent_opened_at = datetime.now(UTC) - timedelta(hours=1)  # window extends ~23h into the future - incomplete
+    c1 = recent_opened_at + timedelta(minutes=1)
+
+    class _CountingConnector:
+        def __init__(self):
+            self.klines_call_count = 0
+
+        def get_klines(self, symbol, interval, limit=100, start_time_ms=None, end_time_ms=None):
+            self.klines_call_count += 1
+            # 1st call ("now"): no exit trigger - only partial data exists
+            # so far. 2nd call ("later", real time having caught up):
+            # a candle that breaches the stop - the newly-available data.
+            all_klines = (
+                [_kline("50100", _ms(c1))]
+                if self.klines_call_count == 1
+                else [_kline("48000", _ms(c1), high="48000", low="48000")]
+            )
+            return [
+                k for k in all_klines
+                if (start_time_ms is None or k["time"] >= start_time_ms)
+                and (end_time_ms is None or k["time"] <= end_time_ms)
+            ]
+
+        def get_funding_rate(self, symbol, limit=1, start_time_ms=None, end_time_ms=None):
+            return []
+
+    connector = _CountingConnector()
+    shared_cache_dir = tmp_path / "cache"
+    settings = get_settings()
+
+    backtest_first = SQLiteRepository(tmp_path / "first.db")
+    replay_position(
+        _target(opened_at=recent_opened_at), connector, source, backtest_first, settings, shared_cache_dir, "run-1"
+    )
+    backtest_second = SQLiteRepository(tmp_path / "second.db")
+    replay_position(
+        _target(opened_at=recent_opened_at), connector, source, backtest_second, settings, shared_cache_dir, "run-2"
+    )
+
+    assert connector.klines_call_count == 2  # NOT cached - the second call actually re-fetched
+    assert backtest_first.get_position("pos-1").status == "OPEN_POSITION"  # 1st run's partial data: no trigger
+    second_position = backtest_second.get_position("pos-1")
+    assert second_position.status == "CLOSED"  # 2nd run saw the newly-available data, not the 1st run's cache
+    assert second_position.exit_reason == "stop_loss"
