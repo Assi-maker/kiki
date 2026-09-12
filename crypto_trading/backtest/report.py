@@ -134,6 +134,48 @@ def _split_report_with_extras(repo: Repository, targets: list[BacktestTarget]) -
             if t["pnl_difference"] is not None
             and t["reach_classification"] != "blocked_by_exposure"
         ]
+        # Paired subset (final whole-branch review, Critical Fix 2). The
+        # two lists above mirror `build_report()`'s own (reused,
+        # unmodified) `shadow_total_pnl_usdt`/`baseline_total_pnl_usdt`:
+        # independently filtered, never paired by row. Under any
+        # right-censoring - a shadow that closed while its baseline is
+        # still open - that compares two DIFFERENT samples, and the sign
+        # of the headline number becomes a sampling artifact. Real-run
+        # evidence: train@1.0% unpaired read "shadow 201.54 vs baseline
+        # 219.50" (PP looks 17.96 USDT worse); the same 24 PAIRED trades
+        # read "shadow 236.57 vs baseline 219.50" (PP is 17.07 USDT
+        # better). These fields are strictly ADDITIVE - every existing
+        # field above keeps its old, unpaired value so nothing that
+        # already consumes this report changes meaning. The existing
+        # `pnl_diffs`/bootstrap CI is already correctly paired by
+        # construction (a trade's `pnl_difference` is only non-null once
+        # both sides are known) and is deliberately left untouched.
+        paired = [
+            t for t in block["trades"]
+            if t["baseline_actual_pnl"] is not None
+            and t["profit_protection_hypothetical_pnl"] is not None
+            and t["reach_classification"] != "blocked_by_exposure"
+        ]
+        paired_shadow_pnls = [Decimal(t["profit_protection_hypothetical_pnl"]) for t in paired]
+        paired_baseline_pnls = [Decimal(t["baseline_actual_pnl"]) for t in paired]
+        paired_shadow_median = _median(paired_shadow_pnls)
+        paired_baseline_median = _median(paired_baseline_pnls)
+        block["n_paired"] = len(paired)
+        block["n_baseline_pending"] = sum(
+            1 for t in block["trades"]
+            if t["profit_protection_hypothetical_pnl"] is not None
+            and t["baseline_actual_pnl"] is None
+            and t["reach_classification"] != "blocked_by_exposure"
+        )
+        block["paired_shadow_total_pnl_usdt"] = str(sum(paired_shadow_pnls, Decimal("0")))
+        block["paired_baseline_total_pnl_usdt"] = str(sum(paired_baseline_pnls, Decimal("0")))
+        block["paired_shadow_median_pnl_usdt"] = (
+            str(paired_shadow_median) if paired_shadow_median is not None else None
+        )
+        block["paired_baseline_median_pnl_usdt"] = (
+            str(paired_baseline_median) if paired_baseline_median is not None else None
+        )
+
         shadow_median = _median(shadow_pnls)
         baseline_median = _median(baseline_pnls)
         block["shadow_median_pnl_usdt"] = str(shadow_median) if shadow_median is not None else None

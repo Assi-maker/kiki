@@ -2,10 +2,49 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from crypto_trading.backtest.dataset import BacktestTarget
-from crypto_trading.backtest.report import _bootstrap_ci, _median, build_tier1_report
+from crypto_trading.backtest.report import (
+    _bootstrap_ci,
+    _median,
+    _split_report_with_extras,
+    build_tier1_report,
+)
+from crypto_trading.paper_trading.profit_protection_experiment import _shadow_id
 from crypto_trading.storage.repository import SQLiteRepository
 
 _NOW = datetime(2026, 9, 3, 8, 0, tzinfo=UTC)
+
+
+def _seed_shadow_row(
+    repo, position_id: str, threshold_pct: Decimal,
+    shadow_pnl: str | None, baseline_pnl: str | None, instrument: str = "BTCUSDT",
+) -> str:
+    """Seeds one shadow row through the repository's own public API only
+    (no raw SQL), so these tests stay honest about what the real write
+    path can actually produce.
+
+    `shadow_pnl=None` leaves the row OPEN (right-censored shadow);
+    `baseline_pnl=None` leaves the baseline outcome unfilled (the real
+    position has not closed in the replay window yet). The backfill runs
+    BEFORE the close so `pnl_difference` is populated by
+    close_profit_protection_shadow exactly as production orders it."""
+    shadow_id = _shadow_id(position_id, threshold_pct)
+    repo.seed_profit_protection_shadow(
+        shadow_id=shadow_id, position_id=position_id, instrument=instrument,
+        threshold_pct=str(threshold_pct), entry_price=Decimal("50000"),
+        original_stop_loss=Decimal("49000"), target=Decimal("60000"),
+        threshold_price=Decimal("50500"), opened_at=_NOW, created_at=_NOW,
+    )
+    if baseline_pnl is not None:
+        repo.backfill_profit_protection_baseline_outcome(
+            position_id, "stop_loss", Decimal(baseline_pnl), _NOW
+        )
+    if shadow_pnl is not None:
+        repo.close_profit_protection_shadow(
+            shadow_id=shadow_id, exit_reason="target", theoretical_exit=Decimal("51000"),
+            simulated_fill_exit=Decimal("50975"), fees=Decimal("0"), funding=Decimal("0"),
+            closed_at=_NOW, shadow_realized_pnl=Decimal(shadow_pnl), updated_at=_NOW,
+        )
+    return shadow_id
 
 
 def test_median_odd_count():
@@ -98,6 +137,69 @@ def test_build_tier1_report_flags_baseline_parity_mismatch(tmp_path):
     assert report["baseline_parity_mismatches"][0]["position_id"] == "pos-1"
     assert report["baseline_parity_mismatches"][0]["replayed_exit_reason"] == "stop_loss"
     assert report["baseline_parity_mismatches"][0]["production_exit_reason"] == "target"
+
+
+def test_split_report_paired_totals_exclude_right_censored_rows(tmp_path):
+    """Regression test for the final whole-branch review's Critical Fix 2.
+
+    `build_report()` (reused, unmodified) computes
+    `shadow_total_pnl_usdt` from every row with a non-null shadow P/L and
+    `baseline_total_pnl_usdt` from every row with a non-null baseline P/L
+    - two INDEPENDENTLY filtered lists, never paired by row. Any
+    right-censoring (a shadow that closed while its baseline is still
+    open) therefore adds shadow P/L with no matching baseline P/L, and
+    the headline "shadow vs baseline" comparison silently compares two
+    different samples.
+
+    Real-run evidence: train@1.0% unpaired read "shadow 201.54 vs
+    baseline 219.50" (PP looks 17.96 USDT WORSE); the same 24 PAIRED
+    trades read "shadow 236.57 vs baseline 219.50" (PP is 17.07 USDT
+    BETTER). The sign of the headline number was a sampling artifact.
+
+    This fixture reproduces that sign inversion in miniature: two fully
+    paired rows where the baseline beats the shadow (10 vs 30, 20 vs 40 =
+    shadow 30, baseline 70), plus ONE right-censored row contributing a
+    large shadow-only P/L (100) and no baseline. Unpaired: shadow 130 >
+    baseline 70 (shadow "wins"). Paired: shadow 30 < baseline 70 (shadow
+    loses). The paired fields must report the paired truth."""
+    train = SQLiteRepository(tmp_path / "train.db")
+    _seed_shadow_row(train, "pos-paired-1", Decimal("0.010"), shadow_pnl="10", baseline_pnl="30")
+    _seed_shadow_row(train, "pos-paired-2", Decimal("0.010"), shadow_pnl="20", baseline_pnl="40")
+    # Right-censored: shadow closed, baseline still open -> no baseline P/L.
+    _seed_shadow_row(train, "pos-censored", Decimal("0.010"), shadow_pnl="100", baseline_pnl=None)
+
+    block = _split_report_with_extras(train, [])["per_threshold"]["0.010"]
+
+    # The pre-existing, unpaired fields must be untouched (additive fix).
+    assert Decimal(block["shadow_total_pnl_usdt"]) == Decimal("130")
+    assert Decimal(block["baseline_total_pnl_usdt"]) == Decimal("70")
+
+    # The new paired fields drop the right-censored row from BOTH sides,
+    # which flips which side is larger - the whole point of the fix.
+    assert block["n_paired"] == 2
+    assert block["n_baseline_pending"] == 1
+    assert Decimal(block["paired_shadow_total_pnl_usdt"]) == Decimal("30")
+    assert Decimal(block["paired_baseline_total_pnl_usdt"]) == Decimal("70")
+    assert Decimal(block["paired_shadow_total_pnl_usdt"]) < Decimal(block["paired_baseline_total_pnl_usdt"])
+    assert Decimal(block["shadow_total_pnl_usdt"]) > Decimal(block["baseline_total_pnl_usdt"])
+
+    # Medians over the paired subset only: [10, 20] -> 15, [30, 40] -> 35.
+    assert Decimal(block["paired_shadow_median_pnl_usdt"]) == Decimal("15")
+    assert Decimal(block["paired_baseline_median_pnl_usdt"]) == Decimal("35")
+
+
+def test_split_report_paired_medians_are_none_when_nothing_is_paired(tmp_path):
+    train = SQLiteRepository(tmp_path / "train.db")
+    _seed_shadow_row(train, "pos-censored", Decimal("0.010"), shadow_pnl="100", baseline_pnl=None)
+
+    block = _split_report_with_extras(train, [])["per_threshold"]["0.010"]
+
+    assert block["n_paired"] == 0
+    assert block["n_baseline_pending"] == 1
+    assert Decimal(block["paired_shadow_total_pnl_usdt"]) == Decimal("0")
+    assert Decimal(block["paired_baseline_total_pnl_usdt"]) == Decimal("0")
+    assert block["paired_shadow_median_pnl_usdt"] is None
+    assert block["paired_baseline_median_pnl_usdt"] is None
 
 
 def test_build_tier1_report_per_position_table_has_required_columns(tmp_path):
