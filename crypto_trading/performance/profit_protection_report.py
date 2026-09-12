@@ -26,9 +26,25 @@ from crypto_trading.performance.metrics import (
     compute_profit_factor,
     compute_win_rate,
 )
+from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository, SQLiteRepository
 
 _BREAKEVEN_BAND_PCT = Decimal("0.003")
+
+_BLOCKED_BY_EXPOSURE_LABEL = "blocked_by_exposure"
+
+
+def _is_blocked_by_exposure(position: Position) -> bool:
+    """Same definition/semantics as performance/paper_track_report.py::
+    _is_blocked_by_exposure() and detective/stats.py::_is_blocked_by_exposure()
+    - a position whose `size` was pushed to 0 by max_total_exposure_pct
+    (paper_trading/position_sizing.py::compute_position_size()) represents
+    zero real market exposure and must never be divided into or counted
+    toward any dollar-based statistic in this report. Price-based measures
+    (mfe/mae/threshold_reached) are unaffected - they're computed from
+    price alone, never from position size."""
+    return position.size == Decimal("0")
+
 
 _NOTE = (
     "Pre-registered hypotheses under test: +1.0% and +1.5%. This report "
@@ -134,27 +150,45 @@ def _stats_block(rows: list[dict], repo: Repository) -> dict:
     trades = []
     reach_counts: dict[str, int] = {}
     outcome_counts: dict[str, int] = {}
+    n_blocked_by_exposure = 0
+    active_rows: list[dict] = []
 
     for row in closed:
         real_position = repo.get_position(row["position_id"])
-        position_size = real_position.size if real_position is not None else Decimal("1")
-        entry_price = Decimal(row["entry_price"])
+        blocked = real_position is not None and _is_blocked_by_exposure(real_position)
 
-        bucket = _classify_reach(row, position_size)
-        reach_counts[bucket] = reach_counts.get(bucket, 0) + 1
-
-        if row["shadow_realized_pnl"] is not None:
-            shadow_pnls.append(Decimal(row["shadow_realized_pnl"]))
-        if row["hypothetical_baseline_pnl"] is not None:
-            baseline_pnls.append(Decimal(row["hypothetical_baseline_pnl"]))
-
-        ratio = _conversion_ratio(row, position_size, entry_price)
-        if ratio is None:
-            ratios_excluded += 1
+        if blocked:
+            # Never divide by a real position's size==0 (breakeven-band
+            # check in _classify_reach, realized_pnl_pct in
+            # _conversion_ratio) - price-only measures (threshold_reached,
+            # already folded into sample_sizes above) still count this row;
+            # every dollar-based measure below excludes it, visibly, via
+            # n_blocked_by_exposure and this dedicated bucket/outcome label
+            # rather than a silent drop.
+            n_blocked_by_exposure += 1
+            bucket = _BLOCKED_BY_EXPOSURE_LABEL
+            outcome = _BLOCKED_BY_EXPOSURE_LABEL
         else:
-            ratios.append(ratio)
+            position_size = real_position.size if real_position is not None else Decimal("1")
+            entry_price = Decimal(row["entry_price"])
 
-        outcome = _outcome_label(row)
+            bucket = _classify_reach(row, position_size)
+
+            if row["shadow_realized_pnl"] is not None:
+                shadow_pnls.append(Decimal(row["shadow_realized_pnl"]))
+            if row["hypothetical_baseline_pnl"] is not None:
+                baseline_pnls.append(Decimal(row["hypothetical_baseline_pnl"]))
+
+            ratio = _conversion_ratio(row, position_size, entry_price)
+            if ratio is None:
+                ratios_excluded += 1
+            else:
+                ratios.append(ratio)
+
+            outcome = _outcome_label(row)
+            active_rows.append(row)
+
+        reach_counts[bucket] = reach_counts.get(bucket, 0) + 1
         outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
 
         trades.append({
@@ -168,15 +202,17 @@ def _stats_block(rows: list[dict], repo: Repository) -> dict:
             "reach_classification": bucket,
         })
 
-    improved = sum(1 for r in closed if r["pnl_difference"] is not None and Decimal(r["pnl_difference"]) > 0)
-    worsened = sum(1 for r in closed if r["pnl_difference"] is not None and Decimal(r["pnl_difference"]) < 0)
+    sample_sizes["n_blocked_by_exposure"] = n_blocked_by_exposure
+
+    improved = sum(1 for r in active_rows if r["pnl_difference"] is not None and Decimal(r["pnl_difference"]) > 0)
+    worsened = sum(1 for r in active_rows if r["pnl_difference"] is not None and Decimal(r["pnl_difference"]) < 0)
     loss_saved = sum(
-        1 for r in closed
+        1 for r in active_rows
         if r["hypothetical_baseline_pnl"] is not None and r["shadow_realized_pnl"] is not None
         and Decimal(r["hypothetical_baseline_pnl"]) < 0 and Decimal(r["shadow_realized_pnl"]) >= 0
     )
     winner_clipped = sum(
-        1 for r in closed
+        1 for r in active_rows
         if r["hypothetical_baseline_exit_reason"] == "target"
         and r["exit_reason"] != "target"
         and r["pnl_difference"] is not None and Decimal(r["pnl_difference"]) < 0
@@ -186,10 +222,10 @@ def _stats_block(rows: list[dict], repo: Repository) -> dict:
         "sample_sizes": sample_sizes,
         "reach_classification_counts": reach_counts,
         "profit_protection_improved_pl": {"count": improved, "total_usdt": str(sum(
-            (Decimal(r["pnl_difference"]) for r in closed if r["pnl_difference"] is not None
+            (Decimal(r["pnl_difference"]) for r in active_rows if r["pnl_difference"] is not None
              and Decimal(r["pnl_difference"]) > 0), Decimal("0")))},
         "profit_protection_worsened_pl": {"count": worsened, "total_usdt": str(sum(
-            (Decimal(r["pnl_difference"]) for r in closed if r["pnl_difference"] is not None
+            (Decimal(r["pnl_difference"]) for r in active_rows if r["pnl_difference"] is not None
              and Decimal(r["pnl_difference"]) < 0), Decimal("0")))},
         "loss_saved_count": loss_saved,
         "large_winner_clipped_count": winner_clipped,

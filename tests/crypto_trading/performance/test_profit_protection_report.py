@@ -5,6 +5,7 @@ from crypto_trading.performance.profit_protection_report import (
     _BREAKEVEN_BAND_PCT,
     _classify_reach,
     _conversion_ratio,
+    _is_blocked_by_exposure,
     _sample_sizes,
     build_report,
 )
@@ -138,6 +139,41 @@ def test_report_note_is_always_present_regardless_of_data(tmp_path):
     report = build_report(repo)
     assert "Pre-registered hypotheses under test" in report["note"]
     assert "never selects a winner" in report["note"]
+
+
+def _make_position(position_id: str, instrument: str, size: Decimal) -> Position:
+    return Position(
+        position_id=position_id, candidate_id=position_id, instrument=instrument,
+        direction="LONG", status="CLOSED", theoretical_entry=Decimal("50000"),
+        simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"),
+        target=Decimal("52000"), size=size, fill_model_version="v1", opened_at=_NOW,
+        theoretical_exit=Decimal("49000"), simulated_fill_exit=Decimal("48975"),
+        exit_reason="stop_loss", fees=Decimal("0"), funding=Decimal("0"), closed_at=_NOW,
+    )
+
+
+def _seed_position(repo, position_id: str, instrument: str, size: Decimal) -> None:
+    position = _make_position(position_id, instrument, size)
+    repo.create_position_with_event(
+        position,
+        Event(
+            event_id=f"POSITION_OPENED:{position_id}", event_type="POSITION_OPENED",
+            aggregate_type="position", aggregate_id=position_id, occurred_at=_NOW,
+            run_id="seed", schema_version=1, payload={},
+        ),
+    )
+
+
+def test_is_blocked_by_exposure_true_for_zero_size():
+    """Same definition/semantics as performance/paper_track_report.py::
+    _is_blocked_by_exposure() and detective/stats.py::_is_blocked_by_exposure()
+    - a position whose size was pushed to 0 by max_total_exposure_pct
+    represents zero real market exposure."""
+    assert _is_blocked_by_exposure(_make_position("p", "BTCUSDT", Decimal("0"))) is True
+
+
+def test_is_blocked_by_exposure_false_for_positive_size():
+    assert _is_blocked_by_exposure(_make_position("p", "BTCUSDT", Decimal("1000"))) is False
 
 
 def _seed_shadow_kwargs(**overrides) -> dict:
@@ -383,3 +419,125 @@ def test_build_report_integration_with_real_seeded_advanced_and_closed_positions
     assert combined_sizes["n_shadow_winners"] == 0
     assert combined_sizes["n_shadow_losses"] == 4
     assert combined_sizes["n_abandoned"] == 0
+
+
+def _seed_closed_shadow(
+    repo, shadow_id, position_id, instrument, threshold_pct, mfe, threshold_reached,
+    shadow_realized_pnl, baseline_pnl, exit_reason="stop_loss", baseline_exit_reason="stop_loss",
+):
+    """Test-only helper: seeds a shadow row and drives it straight to CLOSED
+    with backfilled baseline outcome via the real repository write methods
+    (seed/close/backfill), bypassing the full tick orchestration - the
+    values under test here (mfe/threshold_reached/pnl) are set directly
+    since this test targets profit_protection_report.py's own aggregation
+    logic, not the state machine that produces these values in production."""
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs(
+        shadow_id=shadow_id, position_id=position_id, instrument=instrument,
+        threshold_pct=threshold_pct,
+    ))
+    if threshold_reached:
+        repo.activate_profit_protection_breakeven(shadow_id, Decimal("50000"), _NOW, _NOW)
+    repo.record_profit_protection_tick(shadow_id, mfe, Decimal("-100"), _NOW)
+    repo.close_profit_protection_shadow(
+        shadow_id=shadow_id, exit_reason=exit_reason, theoretical_exit=Decimal("49000"),
+        simulated_fill_exit=Decimal("48975"), fees=Decimal("0"), funding=Decimal("0"),
+        closed_at=_NOW, shadow_realized_pnl=shadow_realized_pnl, updated_at=_NOW,
+    )
+    repo.backfill_profit_protection_baseline_outcome(
+        position_id, baseline_exit_reason, baseline_pnl, _NOW
+    )
+
+
+def test_build_report_all_positions_blocked_by_exposure_does_not_crash(tmp_path):
+    """Regression (size=0 report crash): every closed shadow this tick is
+    linked to a real position whose size was pushed to 0 by the exposure
+    pool cap (paper_trading/position_sizing.py::compute_position_size()).
+    Before the fix, _classify_reach's breakeven-band division and
+    _conversion_ratio's realized_pnl_pct division both divided by this 0,
+    raising decimal.DivisionUndefined. threshold_reached=1 and mfe>0 are
+    chosen deliberately to exercise BOTH crash sites."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_position(repo, "pos-1", "BTCUSDT", Decimal("0"))
+    _seed_position(repo, "pos-2", "ETHUSDT", Decimal("0"))
+    _seed_closed_shadow(
+        repo, "pos-1:0.010", "pos-1", "BTCUSDT", "0.010",
+        mfe=Decimal("900"), threshold_reached=1,
+        shadow_realized_pnl=Decimal("0"), baseline_pnl=Decimal("0"),
+    )
+    _seed_closed_shadow(
+        repo, "pos-2:0.010", "pos-2", "ETHUSDT", "0.010",
+        mfe=Decimal("0"), threshold_reached=0,
+        shadow_realized_pnl=Decimal("0"), baseline_pnl=Decimal("0"),
+    )
+
+    report = build_report(repo)  # must not raise decimal.DivisionUndefined
+
+    block = report["per_threshold"]["0.010"]
+    sizes = block["sample_sizes"]
+    assert sizes["n_closed"] == 2
+    assert sizes["n_reached_threshold"] == 1  # threshold_reached is still counted for blocked rows
+    assert sizes["n_not_reached"] == 1
+    assert sizes["n_blocked_by_exposure"] == 2
+    assert block["reach_classification_counts"] == {"blocked_by_exposure": 2}
+    assert block["shadow_total_pnl_usdt"] == "0"
+    assert block["shadow_win_rate"] is None  # undefined - no economically-active trades at all
+    assert block["shadow_expectancy_usdt"] is None
+    assert block["shadow_profit_factor"] is None
+    assert block["shadow_max_drawdown_usdt"] is None
+    assert block["conversion_ratio_avg"] is None
+    # never even considered, not "excluded due to mfe<=0"
+    assert block["conversion_ratio_excluded_count"] == 0
+    assert block["loss_saved_count"] == 0
+    assert block["large_winner_clipped_count"] == 0
+
+
+def test_build_report_mixed_blocked_and_active_positions_separates_dollar_stats(tmp_path):
+    """Regression: one economically-active position (size>0) and one
+    blocked-by-exposure position (size=0, given a deliberately large,
+    obviously-wrong shadow_realized_pnl/baseline_pnl here to prove the
+    exclusion is a real size==0 check, not an accident of the blocked
+    row's real-world value always happening to be 0). Price-based counts
+    (n_closed/n_reached_threshold) must include both; every dollar-based
+    aggregate must reflect ONLY the active position."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_position(repo, "pos-active", "BTCUSDT", Decimal("5000"))
+    _seed_position(repo, "pos-blocked", "ETHUSDT", Decimal("0"))
+    _seed_closed_shadow(
+        repo, "pos-active:0.010", "pos-active", "BTCUSDT", "0.010",
+        mfe=Decimal("500"), threshold_reached=1,
+        shadow_realized_pnl=Decimal("250"), baseline_pnl=Decimal("-100"),
+        exit_reason="target", baseline_exit_reason="stop_loss",
+    )
+    _seed_closed_shadow(
+        repo, "pos-blocked:0.010", "pos-blocked", "ETHUSDT", "0.010",
+        mfe=Decimal("900"), threshold_reached=1,
+        shadow_realized_pnl=Decimal("99999"), baseline_pnl=Decimal("99999"),
+        exit_reason="target", baseline_exit_reason="target",
+    )
+
+    report = build_report(repo)  # must not raise decimal.DivisionUndefined
+
+    block = report["per_threshold"]["0.010"]
+    sizes = block["sample_sizes"]
+    assert sizes["n_closed"] == 2
+    assert sizes["n_reached_threshold"] == 2
+    assert sizes["n_blocked_by_exposure"] == 1
+
+    assert block["reach_classification_counts"]["blocked_by_exposure"] == 1
+    assert sum(
+        v for k, v in block["reach_classification_counts"].items() if k != "blocked_by_exposure"
+    ) == 1
+
+    # Every dollar aggregate reflects pos-active ONLY - pos-blocked's huge
+    # 99999 values must never leak in despite threshold_reached=1/mfe>0.
+    assert block["shadow_total_pnl_usdt"] == "250"
+    assert Decimal(block["shadow_win_rate"]) == Decimal("1")
+    assert Decimal(block["shadow_expectancy_usdt"]) == Decimal("250")
+    assert block["conversion_ratio_excluded_count"] == 0
+    expected_ratio = _conversion_ratio(
+        {"mfe": "500", "shadow_realized_pnl": "250"}, Decimal("5000"), Decimal("50000")
+    )
+    assert Decimal(block["conversion_ratio_avg"]) == expected_ratio
+    assert block["profit_protection_improved_pl"]["count"] == 1
+    assert Decimal(block["profit_protection_improved_pl"]["total_usdt"]) == Decimal("350")
+    assert block["loss_saved_count"] == 1  # pos-active: baseline -100 -> shadow 250 >= 0
