@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.backtest.guardian_replay import copy_guardian_history
@@ -49,6 +49,38 @@ def test_copy_guardian_history_never_writes_to_the_source_repo(tmp_path):
     copy_guardian_history(source, backtest, "pos-1")
 
     assert len(source.find_guardian_observations_for_position("pos-1")) == 1  # unchanged, not duplicated
+
+
+def test_copy_guardian_history_up_to_excludes_future_observations(tmp_path):
+    """`up_to` must exclude any observation whose observed_at is AFTER the
+    given cutoff - this is the no-look-ahead guarantee a tick-by-tick
+    replay caller relies on. Without this filter, a Guardian observation
+    dated after the candle currently being replayed would leak backwards
+    (find_latest_guardian_observation's staleness guard has no upper
+    bound on observed_at)."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    backtest = SQLiteRepository(tmp_path / "backtest.db")
+    source.save_guardian_observation(_observation("obs-past", "pos-1", "WATCH", _NOW))
+    source.save_guardian_observation(_observation("obs-future", "pos-1", "EXIT", _NOW + timedelta(hours=10)))
+
+    count = copy_guardian_history(source, backtest, "pos-1", up_to=_NOW)
+
+    assert count == 1
+    copied = backtest.find_guardian_observations_for_position("pos-1")
+    assert {o["observation_id"] for o in copied} == {"obs-past"}
+
+
+def test_copy_guardian_history_up_to_none_copies_everything(tmp_path):
+    """The default (up_to=None) preserves the original copy-everything
+    behavior, unchanged."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    backtest = SQLiteRepository(tmp_path / "backtest.db")
+    source.save_guardian_observation(_observation("obs-past", "pos-1", "WATCH", _NOW))
+    source.save_guardian_observation(_observation("obs-future", "pos-1", "EXIT", _NOW + timedelta(hours=10)))
+
+    count = copy_guardian_history(source, backtest, "pos-1")
+
+    assert count == 2
 
 
 def test_copy_guardian_history_factors_field_round_trip(tmp_path):
