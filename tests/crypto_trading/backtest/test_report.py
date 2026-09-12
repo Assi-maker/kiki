@@ -316,6 +316,71 @@ def test_split_report_paired_medians_are_none_when_nothing_is_paired(tmp_path):
     assert block["paired_baseline_median_pnl_usdt"] is None
 
 
+def _seed_open_position(repo, position_id: str) -> None:
+    repo.create_position_with_event(
+        Position(
+            position_id=position_id, candidate_id=position_id, instrument="BTCUSDT",
+            direction="LONG", status="OPEN_POSITION", theoretical_entry=Decimal("50000"),
+            simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"),
+            target=Decimal("52000"), size=Decimal("1000"), fill_model_version="v1",
+            opened_at=_NOW,
+        ),
+        Event(
+            event_id=f"e-{position_id}", event_type="POSITION_OPENED", aggregate_type="position",
+            aggregate_id=position_id, occurred_at=_NOW, run_id="seed", schema_version=1, payload={},
+        ),
+    )
+
+
+def _target_for(position_id: str) -> BacktestTarget:
+    return BacktestTarget(
+        position_id=position_id, instrument="BTCUSDT", entry_price=Decimal("50000"),
+        simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"), target=Decimal("52000"),
+        opened_at=_NOW, original_size=Decimal("500"), original_status="OPEN_POSITION",
+        original_exit_reason=None, original_closed_at=None,
+        original_theoretical_exit=None, original_simulated_fill_exit=None,
+    )
+
+
+def test_split_report_counts_right_censored_shadows_and_positions(tmp_path):
+    """Final whole-branch review, Important Fix 6: right-censored rows -
+    shadows and baseline positions that the replay window ran out on
+    before they could close - are excluded from every statistic in the
+    block (build_report filters to status == 'CLOSED'). That exclusion
+    must be VISIBLE, never silent, or the reader cannot tell a clean
+    sample from a heavily truncated one."""
+    train = SQLiteRepository(tmp_path / "train.db")
+    # Two OPEN shadows at 1.0%, one OPEN at 1.5%, one CLOSED at 1.0%.
+    _seed_shadow_row(train, "pos-open-1", Decimal("0.010"), shadow_pnl=None, baseline_pnl=None)
+    _seed_shadow_row(train, "pos-open-2", Decimal("0.010"), shadow_pnl=None, baseline_pnl=None)
+    _seed_shadow_row(train, "pos-open-2", Decimal("0.015"), shadow_pnl=None, baseline_pnl=None)
+    _seed_shadow_row(train, "pos-closed", Decimal("0.010"), shadow_pnl="10", baseline_pnl="5")
+
+    # Two positions left OPEN in the replay, one absent from this repo
+    # entirely (routed to the other split - must NOT be counted here).
+    _seed_open_position(train, "pos-open-1")
+    _seed_open_position(train, "pos-open-2")
+    targets = [_target_for(p) for p in ("pos-open-1", "pos-open-2", "pos-in-other-split")]
+
+    split = _split_report_with_extras(train, targets)
+
+    assert split["per_threshold"]["0.010"]["n_open_right_censored"] == 2
+    assert split["per_threshold"]["0.015"]["n_open_right_censored"] == 1
+    # Position-level, so counted once regardless of how many thresholds
+    # each position seeded, and scoped to THIS repo only.
+    assert split["n_baseline_positions_open_in_replay"] == 2
+
+
+def test_split_report_right_censored_counts_are_zero_for_a_clean_split(tmp_path):
+    train = SQLiteRepository(tmp_path / "train.db")
+    _seed_shadow_row(train, "pos-closed", Decimal("0.010"), shadow_pnl="10", baseline_pnl="5")
+
+    split = _split_report_with_extras(train, [_target_for("pos-closed")])
+
+    assert split["per_threshold"]["0.010"]["n_open_right_censored"] == 0
+    assert split["n_baseline_positions_open_in_replay"] == 0
+
+
 def test_build_tier1_report_per_position_table_has_required_columns(tmp_path):
     source = SQLiteRepository(tmp_path / "source.db")
     train = SQLiteRepository(tmp_path / "train.db")

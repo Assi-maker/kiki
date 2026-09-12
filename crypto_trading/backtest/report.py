@@ -155,7 +155,29 @@ def _baseline_pnl(position) -> Decimal:
 
 def _split_report_with_extras(repo: Repository, targets: list[BacktestTarget]) -> dict:
     base = build_report(repo)
-    for block in base["per_threshold"].values():
+    # Final whole-branch review, Important Fix 6: right-censored rows -
+    # shadows and baseline positions the replay window ran out on before
+    # they could close - are excluded from every statistic in this report
+    # (`build_report` filters to status == "CLOSED" throughout). That
+    # exclusion has to be VISIBLE, or a reader cannot tell a clean sample
+    # from a heavily truncated one. Two separate counts, deliberately:
+    # `n_open_right_censored` is SHADOW-row-level and therefore belongs
+    # per threshold, while a baseline position is open or not regardless
+    # of threshold, so counting it per threshold would double-count it.
+    # Keeping them apart avoids summing a shadow count and a position
+    # count into one number that means neither.
+    open_shadows = repo.find_open_profit_protection_shadows()
+    # Scoped to THIS repo (train vs test), never the global target list:
+    # a target routed to the other split simply isn't found here.
+    base["n_baseline_positions_open_in_replay"] = sum(
+        1 for target in targets
+        if (position := repo.get_position(target.position_id)) is not None
+        and position.status == "OPEN_POSITION"
+    )
+    for key, block in base["per_threshold"].items():
+        block["n_open_right_censored"] = sum(
+            1 for shadow in open_shadows if shadow["threshold_pct"] == key
+        )
         shadow_pnls = [
             Decimal(t["profit_protection_hypothetical_pnl"]) for t in block["trades"]
             if t["profit_protection_hypothetical_pnl"] is not None
