@@ -389,6 +389,11 @@ def test_build_tier1_report_per_position_table_has_required_columns(tmp_path):
     report = build_tier1_report(train, test_repo, source, [])
 
     assert report["per_position_table"] == []  # empty dataset -> empty table, never crashes
+    # Final whole-branch review, Fix 7: loss_saved_count is structurally
+    # always 0 for a breakeven-stop mechanism, so the report must say so
+    # rather than let a reader take the zero as "no protective value
+    # found".
+    assert "loss_saved_count is structurally always 0" in report["metric_caveats"]
     required_columns = {
         "position_id", "instrument", "entry", "threshold", "threshold_reached",
         "mfe", "mae", "baseline_exit", "baseline_pnl", "shadow_exit", "shadow_pnl",

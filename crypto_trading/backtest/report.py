@@ -26,6 +26,22 @@ _PER_POSITION_COLUMNS = sorted([
 ])
 
 
+# Final whole-branch review, Fix 7. `loss_saved_count` requires
+# `baseline_pnl < 0 AND shadow_pnl >= 0`, which this mechanism can never
+# produce: a breakeven exit always pays spread + slippage + fees, so the
+# shadow P/L is strictly negative after costs. The zero is a structural
+# property of the metric's definition, not an empirical finding, and
+# must not be read as "the experiment found no protective value".
+_METRIC_CAVEATS = (
+    "loss_saved_count is structurally always 0 for a breakeven-stop "
+    "mechanism (a breakeven exit always costs spread+slippage+fees, "
+    "strictly negative after costs) - it is not a signal that the "
+    "experiment found no protective value. Read "
+    "profit_protection_improved_pl / large_winner_clipped_count / the "
+    "paired totals and paired bootstrap CI instead."
+)
+
+
 def _median(values: list[Decimal]) -> Decimal | None:
     if not values:
         return None
@@ -269,4 +285,5 @@ def build_tier1_report(
         "baseline_parity_mismatches": train_mismatches + test_mismatches,
         "per_position_table": train_rows + test_rows,
         "per_position_table_columns": _PER_POSITION_COLUMNS,
+        "metric_caveats": _METRIC_CAVEATS,
     }
