@@ -65,21 +65,58 @@ def _bootstrap_ci(
     return means[lower_idx], means[upper_idx]
 
 
+_CLOSED_AT_TOLERANCE_HOURS = 1.0
+
+
 def _baseline_parity_mismatches(repo: Repository, targets: list[BacktestTarget]) -> list[dict]:
     mismatches = []
     for target in targets:
         if target.original_status != "CLOSED":
             continue
         replayed = repo.get_position(target.position_id)
-        if replayed is None or replayed.status != "CLOSED":
-            continue  # not in this repo (train vs test split) or didn't close in the replay window
-        if replayed.exit_reason != target.original_exit_reason:
+        if replayed is None:
+            # Not in this repo at all - it was routed to the OTHER
+            # train/test split. That's routing, not a disagreement, so it
+            # stays a silent skip.
+            continue
+        if replayed.status != "CLOSED":
+            # Final whole-branch review, Important Fix 3: production
+            # closed this position but the replay left it open. This used
+            # to be lumped into the `continue` above and silently
+            # dropped - it is the exact disagreement class that would
+            # have surfaced Critical Fix 1's unreachable-`time_limit` bug
+            # immediately (7 such positions existed in the real run,
+            # invisible, while only 4 unrelated mismatches were
+            # reported). It is a real parity failure and must be named.
             mismatches.append({
+                "position_id": target.position_id,
+                "replayed_exit_reason": None,
+                "production_exit_reason": target.original_exit_reason,
+                "note": "replay window ended with position still open",
+            })
+            continue
+        if replayed.exit_reason != target.original_exit_reason:
+            mismatch = {
                 "position_id": target.position_id,
                 "replayed_exit_reason": replayed.exit_reason,
                 "production_exit_reason": target.original_exit_reason,
-            })
+            }
+            # Plan Task 6 item 3, never implemented until this fix wave:
+            # both sides closed, but a large disagreement in WHEN is
+            # itself a finding. Only reported when both timestamps exist
+            # and the gap exceeds the tolerance, so an ordinary
+            # sub-tolerance timing jitter doesn't add noise to every row.
+            delta_hours = _closed_at_delta_hours(replayed.closed_at, target.original_closed_at)
+            if delta_hours is not None and delta_hours > _CLOSED_AT_TOLERANCE_HOURS:
+                mismatch["closed_at_delta_hours"] = delta_hours
+            mismatches.append(mismatch)
     return mismatches
+
+
+def _closed_at_delta_hours(replayed_closed_at, production_closed_at) -> float | None:
+    if replayed_closed_at is None or production_closed_at is None:
+        return None
+    return abs((replayed_closed_at - production_closed_at).total_seconds()) / 3600
 
 
 def _per_position_rows(repo: Repository, targets: list[BacktestTarget]) -> list[dict]:

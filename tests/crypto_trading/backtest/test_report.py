@@ -1,7 +1,9 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.backtest.dataset import BacktestTarget
+from crypto_trading.schemas.event import Event
+from crypto_trading.schemas.trade import Position
 from crypto_trading.backtest.report import (
     _bootstrap_ci,
     _median,
@@ -137,6 +139,118 @@ def test_build_tier1_report_flags_baseline_parity_mismatch(tmp_path):
     assert report["baseline_parity_mismatches"][0]["position_id"] == "pos-1"
     assert report["baseline_parity_mismatches"][0]["replayed_exit_reason"] == "stop_loss"
     assert report["baseline_parity_mismatches"][0]["production_exit_reason"] == "target"
+
+
+def test_baseline_parity_flags_production_closed_but_replay_still_open(tmp_path):
+    """Regression test for the final whole-branch review's Important Fix
+    3. `_baseline_parity_mismatches` used to `continue` past any replayed
+    position that was not CLOSED, silently dropping the exact
+    disagreement class - production closed it, the replay left it open -
+    that would have surfaced Critical Fix 1's unreachable-`time_limit`
+    bug immediately. 7 such positions existed in the real run, invisible;
+    only 4 unrelated mismatches were reported."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    train = SQLiteRepository(tmp_path / "train.db")
+    test_repo = SQLiteRepository(tmp_path / "test.db")
+
+    # Seeded OPEN and deliberately never closed: the replay window ran out.
+    train.create_position_with_event(
+        Position(
+            position_id="pos-open", candidate_id="pos-open", instrument="BTCUSDT",
+            direction="LONG", status="OPEN_POSITION", theoretical_entry=Decimal("50000"),
+            simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"),
+            target=Decimal("52000"), size=Decimal("1000"), fill_model_version="v1",
+            opened_at=_NOW,
+        ),
+        Event(
+            event_id="e1", event_type="POSITION_OPENED", aggregate_type="position",
+            aggregate_id="pos-open", occurred_at=_NOW, run_id="seed", schema_version=1, payload={},
+        ),
+    )
+    target = BacktestTarget(
+        position_id="pos-open", instrument="BTCUSDT", entry_price=Decimal("50000"),
+        simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"), target=Decimal("52000"),
+        opened_at=_NOW, original_size=Decimal("500"),
+        original_status="CLOSED",  # production DID close this one
+        original_exit_reason="time_limit",
+        original_closed_at=_NOW + timedelta(hours=24),
+        original_theoretical_exit=Decimal("50100"), original_simulated_fill_exit=Decimal("50075"),
+    )
+
+    report = build_tier1_report(train, test_repo, source, [target])
+
+    assert len(report["baseline_parity_mismatches"]) == 1
+    mismatch = report["baseline_parity_mismatches"][0]
+    assert mismatch["position_id"] == "pos-open"
+    assert mismatch["replayed_exit_reason"] is None
+    assert mismatch["production_exit_reason"] == "time_limit"
+    assert mismatch["note"] == "replay window ended with position still open"
+
+
+def test_baseline_parity_stays_silent_for_a_target_routed_to_the_other_split(tmp_path):
+    """A target that simply is not in THIS repo (it was routed to the
+    other train/test split) is routing, not a disagreement - it must
+    still be a silent skip, not a new false mismatch."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    train = SQLiteRepository(tmp_path / "train.db")
+    test_repo = SQLiteRepository(tmp_path / "test.db")
+    target = BacktestTarget(
+        position_id="pos-elsewhere", instrument="BTCUSDT", entry_price=Decimal("50000"),
+        simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"), target=Decimal("52000"),
+        opened_at=_NOW, original_size=Decimal("500"), original_status="CLOSED",
+        original_exit_reason="target", original_closed_at=_NOW,
+        original_theoretical_exit=Decimal("52000"), original_simulated_fill_exit=Decimal("51974"),
+    )
+
+    report = build_tier1_report(train, test_repo, source, [target])
+
+    assert report["baseline_parity_mismatches"] == []
+
+
+def test_baseline_parity_reports_closed_at_delta_hours_when_both_timestamps_exist(tmp_path):
+    """Plan Task 6 item 3, never implemented until this fix wave: when
+    the replay and production BOTH closed the position, a large
+    disagreement in WHEN they closed is itself a finding, even though
+    this fixture's exit_reason also disagrees."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    train = SQLiteRepository(tmp_path / "train.db")
+    test_repo = SQLiteRepository(tmp_path / "test.db")
+    replay_closed_at = _NOW + timedelta(hours=2)
+    train.create_position_with_event(
+        Position(
+            position_id="pos-1", candidate_id="pos-1", instrument="BTCUSDT",
+            direction="LONG", status="OPEN_POSITION", theoretical_entry=Decimal("50000"),
+            simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"),
+            target=Decimal("52000"), size=Decimal("1000"), fill_model_version="v1",
+            opened_at=_NOW,
+        ),
+        Event(
+            event_id="e1", event_type="POSITION_OPENED", aggregate_type="position",
+            aggregate_id="pos-1", occurred_at=_NOW, run_id="seed", schema_version=1, payload={},
+        ),
+    )
+    train.close_position_with_event(
+        "pos-1", Decimal("49000"), Decimal("48975"), "stop_loss",
+        Decimal("0"), Decimal("0"), replay_closed_at,
+        Event(
+            event_id="e2", event_type="POSITION_CLOSED", aggregate_type="position",
+            aggregate_id="pos-1", occurred_at=replay_closed_at, run_id="seed",
+            schema_version=1, payload={},
+        ),
+    )
+    target = BacktestTarget(
+        position_id="pos-1", instrument="BTCUSDT", entry_price=Decimal("50000"),
+        simulated_fill_entry=Decimal("50025"), stop_loss=Decimal("49000"), target=Decimal("52000"),
+        opened_at=_NOW, original_size=Decimal("500"), original_status="CLOSED",
+        original_exit_reason="target",
+        original_closed_at=_NOW + timedelta(hours=9),  # 7h later than the replay
+        original_theoretical_exit=Decimal("52000"), original_simulated_fill_exit=Decimal("51974"),
+    )
+
+    report = build_tier1_report(train, test_repo, source, [target])
+
+    mismatch = report["baseline_parity_mismatches"][0]
+    assert mismatch["closed_at_delta_hours"] == 7.0
 
 
 def test_split_report_paired_totals_exclude_right_censored_rows(tmp_path):
