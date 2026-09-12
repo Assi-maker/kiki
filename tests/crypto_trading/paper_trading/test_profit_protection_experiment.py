@@ -617,6 +617,83 @@ def test_tick_advances_a_shadow_seeded_on_an_earlier_tick_against_fresh_data(tmp
     assert after_tick_2["theoretical_exit"] == "50000"  # entry/breakeven, never the original 49000
 
 
+def test_tick_abandons_shadow_when_position_closed_outside_this_experiments_tracking(tmp_path):
+    """Review finding 1 (final whole-branch review): simulates
+    monitoring_catchup.py's replay path, which can close a real PAPER
+    position via close_triggered_positions when replaying missed candles
+    after a restart, WITHOUT ever calling this experiment's tick hook
+    (monitoring_catchup.py is explicitly out of scope to touch for this
+    fix - see the review's constraints, so this test drives
+    close_triggered_positions directly to stand in for it). The next
+    NORMAL tick sees pos-1 absent from BOTH `open_positions` and
+    `closed_positions` (this tick never observed its close - it already
+    happened during the simulated catch-up replay above) - exactly the
+    stranding scenario finding 1 describes - and must mark its shadows
+    ABANDONED rather than leaving them OPEN forever with no path to
+    resolution, or silently advancing them later against a candle that
+    may by then belong only to an unrelated position sharing the same
+    instrument."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1", instrument="BTCUSDT")
+    position = repo.get_position("pos-1")
+    settings = _settings_with_pp(enabled=True)
+
+    # Tick 1: seed pos-1's shadows, no exit condition this tick.
+    price_lookup = {"BTCUSDT": (Decimal("49700"), Decimal("50100"), Decimal("50000"), Decimal("0"))}
+    run_profit_protection_experiment_tick(
+        repo, [position], [], price_lookup, _NOW, settings, "run-1"
+    )
+    seeded = repo.find_all_profit_protection_shadows()
+    assert len(seeded) == 2
+    assert all(s["status"] == "OPEN" for s in seeded)
+
+    # Simulate monitoring_catchup.py's replay: the real position closes via
+    # the same close_triggered_positions the catch-up module calls, but
+    # this experiment's tick hook never runs for it.
+    catchup_time = _NOW + timedelta(minutes=1)
+    catchup_price_lookup = {
+        "BTCUSDT": (Decimal("48900"), Decimal("49000"), Decimal("48950"), Decimal("0"))
+    }
+    closed = close_triggered_positions(
+        repo, catchup_price_lookup, catchup_time, settings.risk_limits, "catchup-run"
+    )
+    assert len(closed) == 1  # the real position genuinely closed via "catch-up"
+    assert all(s["status"] == "OPEN" for s in repo.find_all_profit_protection_shadows())
+
+    # Next NORMAL tick: pos-1 is absent from BOTH lists, and nothing else
+    # tracks its instrument (empty price_lookup) this tick.
+    later = catchup_time + timedelta(minutes=1)
+    run_profit_protection_experiment_tick(repo, [], [], {}, later, settings, "run-2")
+
+    shadows = repo.find_all_profit_protection_shadows()
+    assert len(shadows) == 2
+    assert all(s["status"] == "ABANDONED" for s in shadows)
+
+
+def test_tick_does_not_abandon_shadow_for_a_merely_transient_missing_candle(tmp_path):
+    """The open-positions membership check (finding 1) must only abandon a
+    shadow when its real position is confirmed no longer open - never for
+    an ordinary tick where the instrument's candle happens to be absent
+    while the real position is still genuinely open."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_real_position(repo, position_id="pos-1", instrument="BTCUSDT")
+    position = repo.get_position("pos-1")
+    settings = _settings_with_pp(enabled=True)
+    price_lookup = {"BTCUSDT": (Decimal("49700"), Decimal("50100"), Decimal("50000"), Decimal("0"))}
+    run_profit_protection_experiment_tick(
+        repo, [position], [], price_lookup, _NOW, settings, "run-1"
+    )
+
+    later = _NOW + timedelta(minutes=1)
+    run_profit_protection_experiment_tick(
+        repo, [position], [], {}, later, settings, "run-2"  # position still open, no candle this tick
+    )
+
+    shadows = repo.find_all_profit_protection_shadows()
+    assert len(shadows) == 2
+    assert all(s["status"] == "OPEN" for s in shadows)
+
+
 def test_guardian_state_lookup_matches_close_triggered_positions_accept_reject_parity(tmp_path):
     """Task 5's promised G4 parity proof (missing until review round 1):
     _guardian_state_for is a deliberate, read-only DUPLICATE of

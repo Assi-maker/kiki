@@ -159,6 +159,45 @@ def test_backfill_profit_protection_baseline_outcome_updates_all_thresholds_for_
         assert row["hypothetical_baseline_pnl"] == "1000"
 
 
+def test_abandon_profit_protection_shadow_sets_abandoned_status(tmp_path):
+    """Review finding 1 (final whole-branch review)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    later = _NOW + timedelta(minutes=5)
+    repo.abandon_profit_protection_shadow("pos-1:0.010", later)
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "ABANDONED"
+    assert row["updated_at"] == later.isoformat()
+
+
+def test_abandon_profit_protection_shadow_excludes_row_from_open_shadows(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    repo.abandon_profit_protection_shadow("pos-1:0.010", _NOW)
+    assert repo.find_open_profit_protection_shadows() == []
+    assert len(repo.find_all_profit_protection_shadows()) == 1  # still visible to the report
+
+
+def test_abandon_profit_protection_shadow_is_a_no_op_once_already_closed(tmp_path):
+    """Mirrors close_profit_protection_shadow's own WHERE status = 'OPEN'
+    guard - an already-CLOSED shadow's terminal fields must never be
+    clobbered by a later, spurious abandon call."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())
+    repo.close_profit_protection_shadow(
+        shadow_id="pos-1:0.010", exit_reason="target",
+        theoretical_exit=Decimal("52000"), simulated_fill_exit=Decimal("51974"),
+        fees=Decimal("2"), funding=Decimal("0"), closed_at=_NOW,
+        shadow_realized_pnl=Decimal("100"), updated_at=_NOW,
+    )
+    later = _NOW + timedelta(minutes=5)
+    repo.abandon_profit_protection_shadow("pos-1:0.010", later)
+    row = repo.get_profit_protection_shadow("pos-1:0.010")
+    assert row["status"] == "CLOSED"
+    assert row["exit_reason"] == "target"
+    assert row["updated_at"] == _NOW.isoformat()  # untouched by the no-op abandon call
+
+
 def test_backfill_computes_pnl_difference_if_shadow_already_closed(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     repo.seed_profit_protection_shadow(**_seed_shadow_kwargs())

@@ -231,10 +231,31 @@ def run_profit_protection_experiment_tick(
     # 2) Advance every currently-open shadow (includes any just seeded
     # above, since find_open_profit_protection_shadows() re-queries after
     # the seed loop's commits) against this same tick's price_lookup.
+    #
+    # Review finding 1 (final whole-branch review): `open_positions` here
+    # is the SAME pre-close snapshot monitoring_loop.py passes to
+    # close_triggered_positions (see spec S3.2/S5.3) - a position closed
+    # by close_triggered_positions THIS tick is still present in it, so a
+    # shadow whose position_id is genuinely absent from this set can only
+    # mean the real position closed on some EARLIER occasion this tick
+    # never observed (monitoring_catchup.py's replay path never calls this
+    # function at all) - the exact "unhooked catch-up path" gap. Per S5.3's
+    # own proof, a shadow can never legitimately still be OPEN once its
+    # real position has left find_open_positions() - so if that's true
+    # here, this shadow is stranded, not merely waiting on a transient
+    # missing candle, and must be marked ABANDONED rather than either (a)
+    # sitting OPEN forever with no path to resolution, or (b) being handed
+    # to advance_shadow, which could evaluate it against a later candle
+    # that in truth belongs only to some unrelated, still-open position
+    # that happens to share the same instrument.
+    open_position_ids = {position.position_id for position in open_positions}
     guardian_assisted_exit_enabled = settings.guardian.assisted_exit_enabled
     for shadow in repo.find_open_profit_protection_shadows():
-        if shadow["instrument"] not in price_lookup:
+        if shadow["position_id"] not in open_position_ids:
+            repo.abandon_profit_protection_shadow(shadow["shadow_id"], now)
             continue
+        if shadow["instrument"] not in price_lookup:
+            continue  # position genuinely still open - just no candle this tick
         try:
             candle_low, candle_high, current_price, funding_rate = price_lookup[
                 shadow["instrument"]

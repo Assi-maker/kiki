@@ -183,6 +183,7 @@ class Repository(Protocol):
     def backfill_profit_protection_baseline_outcome(
         self, position_id: str, exit_reason: str, baseline_pnl: Decimal, updated_at: datetime
     ) -> None: ...
+    def abandon_profit_protection_shadow(self, shadow_id: str, abandoned_at: datetime) -> None: ...
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
     def complete_run(
         self,
@@ -1032,6 +1033,27 @@ class SQLiteRepository:
                     updated_at.isoformat(), row["shadow_id"],
                 ),
             )
+        self._conn.commit()
+
+    def abandon_profit_protection_shadow(self, shadow_id: str, abandoned_at: datetime) -> None:
+        """Review finding 1 (final whole-branch review): marks an OPEN
+        shadow whose real position is no longer open - for ANY reason
+        (closed during monitoring_catchup.py's replay without this
+        experiment's tick ever running for that close, a prior per-shadow
+        advance failure, or a missing real position row) - as ABANDONED,
+        so it can never be left sitting OPEN forever with no path to
+        resolution, nor silently keep advancing against candle data that
+        (once its own real position is gone) may belong to an unrelated
+        position sharing the same instrument. `status` has no CHECK
+        constraint (see db.py) - 'ABANDONED' is simply a new value for the
+        same TEXT column already holding 'OPEN'/'CLOSED'. A no-op if the
+        shadow is not currently OPEN, same guard style as
+        close_profit_protection_shadow's own WHERE status = 'OPEN'."""
+        self._conn.execute(
+            "UPDATE profit_protection_shadow_positions SET status = 'ABANDONED', "
+            "updated_at = ? WHERE shadow_id = ? AND status = 'OPEN'",
+            (abandoned_at.isoformat(), shadow_id),
+        )
         self._conn.commit()
 
     def save_forecast_record(self, record: ForecastRecord) -> None:
