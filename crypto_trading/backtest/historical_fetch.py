@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
 from crypto_trading.schemas.market import FundingRate, Kline
 
-_KLINE_INTERVAL = "1m"
 _MAX_CANDLES_PER_CALL = 1440  # BingX server-enforced hard cap, verified live 2026-09-12
 
 

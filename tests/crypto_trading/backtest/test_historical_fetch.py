@@ -3,7 +3,6 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import httpx
-import pytest
 import respx
 
 from crypto_trading.backtest.historical_fetch import (
@@ -56,12 +55,19 @@ def test_fetch_historical_klines_paginates_beyond_24h(tmp_path):
         start_ms = int(request.url.params["startTime"])
         return httpx.Response(200, json={"code": 0, "msg": "", "data": [_raw_kline("1", start_ms)]})
 
-    respx.get("https://open-api.bingx.com/openApi/swap/v3/quote/klines").mock(side_effect=_responder)
+    route = respx.get("https://open-api.bingx.com/openApi/swap/v3/quote/klines").mock(side_effect=_responder)
     connector = _connector()
 
     klines = fetch_historical_klines(connector, "BTC-USDT", "1m", start, end, tmp_path)
 
     assert len(klines) == 2  # one kline returned per page in this stub
+    assert route.call_count == 2  # exactly two network calls for 48h with 1440-candle limit
+    assert route.calls[0].request.url.params["limit"] == "1440"
+    assert route.calls[1].request.url.params["limit"] == "1440"
+    # Verify boundary matching: call 2's startTime equals call 1's endTime (no gap/overlap)
+    call1_end_ms = int(route.calls[0].request.url.params["endTime"])
+    call2_start_ms = int(route.calls[1].request.url.params["startTime"])
+    assert call2_start_ms == call1_end_ms
 
 
 @respx.mock
