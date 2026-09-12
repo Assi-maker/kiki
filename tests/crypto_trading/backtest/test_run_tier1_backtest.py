@@ -101,3 +101,16 @@ def test_run_tier1_backtest_isolates_per_position_connector_failures(tmp_path):
     # Verify the skip count reflects the one failure
     assert report["n_positions_skipped_due_to_fetch_error"] == 1
     assert report["n_positions_total"] == 2
+
+    # Final whole-branch review, Important Fix 4: the count alone is named
+    # `..._due_to_fetch_error`, which specifically claims "the exchange
+    # was unavailable" - but EVERY exception lands in it, a genuine logic
+    # bug included. The skipped_positions list makes the real cause
+    # visible per position instead of hiding it behind that name.
+    assert report["skipped_positions"] == [{
+        "position_id": "pos-fail",
+        "instrument": "NCFXEUR2USD-USDT",
+        "error_type": "RuntimeError",
+        "error": "Instrument NCFXEUR2USD-USDT is currently unavailable",
+    }]
+

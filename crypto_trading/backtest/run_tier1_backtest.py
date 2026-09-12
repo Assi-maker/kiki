@@ -33,6 +33,15 @@ def run_tier1_backtest(
 
     targets = select_backtest_targets(source_repo)
     n_skipped = 0
+    # Final whole-branch review, Important Fix 4: every exception during
+    # replay_position lands in `n_positions_skipped_due_to_fetch_error`,
+    # a name that specifically claims "the exchange was unavailable" - but
+    # a genuine logic bug (a ValueError, a KeyError, an AssertionError)
+    # is counted exactly the same way and is therefore indistinguishable
+    # from routine network flakiness in the report. This list records what
+    # actually went wrong per position so a real bug can't hide behind
+    # that count's name.
+    skipped_positions: list[dict] = []
     for target in targets:
         destination = train_repo if target.opened_at < split_cutoff else test_repo
         try:
@@ -43,6 +52,12 @@ def run_tier1_backtest(
                 instrument=target.instrument, error_type=type(exc).__name__, error=str(exc),
             )
             n_skipped += 1
+            skipped_positions.append({
+                "position_id": target.position_id,
+                "instrument": target.instrument,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            })
             continue
 
     report = build_tier1_report(train_repo, test_repo, source_repo, targets)
@@ -50,7 +65,10 @@ def run_tier1_backtest(
     report["n_positions_total"] = len(targets)
     report["n_positions_train"] = sum(1 for t in targets if t.opened_at < split_cutoff)
     report["n_positions_test"] = sum(1 for t in targets if t.opened_at >= split_cutoff)
+    # Kept as-is for backward compatibility with this plan's own report
+    # consumers; `skipped_positions` is the field that says WHY.
     report["n_positions_skipped_due_to_fetch_error"] = n_skipped
+    report["skipped_positions"] = skipped_positions
 
     (output_dir / "tier1_report.json").write_text(json.dumps(report, indent=2, default=str))
     return report
