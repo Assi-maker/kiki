@@ -4,6 +4,7 @@ from decimal import Decimal
 from crypto_trading.backtest.dataset import BacktestTarget
 from crypto_trading.backtest.replay_engine import replay_position
 from crypto_trading.config.loader import get_settings
+from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.paper_trading.profit_protection_experiment import _shadow_id
 from crypto_trading.schemas.guardian import GuardianObservation
 from crypto_trading.storage.repository import SQLiteRepository
@@ -294,3 +295,38 @@ def test_replay_position_does_not_cache_a_partial_fetch_for_a_still_in_progress_
     second_position = backtest_second.get_position("pos-1")
     assert second_position.status == "CLOSED"  # 2nd run saw the newly-available data, not the 1st run's cache
     assert second_position.exit_reason == "stop_loss"
+
+
+def test_replay_position_backfills_baseline_pnl_into_shadow_rows_when_baseline_closes(tmp_path):
+    """Regression test for the bug found via the real Task 8 run:
+    close_triggered_positions's return value was silently discarded, so
+    hypothetical_baseline_pnl was NEVER populated for any position across
+    the entire real run - every reached-threshold shadow row stayed
+    stuck at reached_threshold_baseline_pending forever, and
+    baseline_total_pnl_usdt/baseline_win_rate/baseline_expectancy_usdt
+    were 0/None in every report block. This is the single most important
+    test in this fix - it is the one that would have caught the exact
+    bug that just happened in the real run. Asserts the backfilled value
+    is not just non-None but matches a hand-verified compute_pnl(...)
+    call against the actual closed baseline position's own recorded
+    fields (fill prices/fees/funding) - the same production function the
+    fix itself calls, applied independently here to the position row
+    read back from backtest_repo after replay."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    backtest = SQLiteRepository(tmp_path / "backtest.db")
+    candle_time = _NOW + timedelta(minutes=1)
+    connector = _StubConnector([_kline("48000", _ms(candle_time), high="48000", low="48000")])
+    settings = get_settings()
+
+    replay_position(_target(), connector, source, backtest, settings, tmp_path / "cache", "run-1")
+
+    baseline = backtest.get_position("pos-1")
+    assert baseline.status == "CLOSED"
+    assert baseline.exit_reason == "stop_loss"
+    expected_baseline_pnl = compute_pnl(baseline)  # same production function the fix itself calls
+
+    for threshold in (Decimal("0.010"), Decimal("0.015")):
+        shadow = backtest.get_profit_protection_shadow(_shadow_id("pos-1", threshold))
+        assert shadow["hypothetical_baseline_exit_reason"] == "stop_loss"
+        assert shadow["hypothetical_baseline_pnl"] is not None
+        assert Decimal(shadow["hypothetical_baseline_pnl"]) == expected_baseline_pnl

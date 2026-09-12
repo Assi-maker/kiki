@@ -13,6 +13,7 @@ from crypto_trading.backtest.historical_fetch import (
     fetch_historical_klines,
 )
 from crypto_trading.config.loader import Settings
+from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
 from crypto_trading.paper_trading.profit_protection_experiment import (
     FROZEN_THRESHOLDS_PCT,
@@ -197,10 +198,36 @@ def replay_position(
         price_lookup = {
             target.instrument: (kline.low, kline.high, kline.close, funding_rate)
         }
-        close_triggered_positions(
+        closed_positions = close_triggered_positions(
             scoped_repo, price_lookup, kline.observed_at, settings.risk_limits,
             run_id, guardian_config=settings.guardian,
         )
+        # Baseline P/L backfill (bug found via the real Task 8 run: this
+        # step was entirely missing - close_triggered_positions's return
+        # value was discarded, so hypothetical_baseline_pnl was never
+        # populated for any position, leaving every reached-threshold
+        # shadow row stuck at reached_threshold_baseline_pending forever).
+        # Mirrors production's own run_profit_protection_experiment_tick
+        # step 3 exactly (profit_protection_experiment.py) - same
+        # defensive field guard, same compute_pnl call, same backfill
+        # call - just against `backtest_repo` (this writes to
+        # `profit_protection_shadow_positions`, not `positions`, so it
+        # must go through the real repo, not `scoped_repo` - the scoped
+        # wrapper exists only to narrow `find_open_positions()` for
+        # cross-position isolation, see `_SinglePositionRepo` above; its
+        # `__getattr__` would delegate this call correctly too, but
+        # calling `backtest_repo` directly here is clearer since nothing
+        # about this write needs or wants that scoping). `close_triggered_
+        # positions` is called unmodified above; only its return value is
+        # newly consumed here, nothing about how/when it closes positions
+        # changes.
+        for closed_position in closed_positions:
+            if closed_position.exit_reason is None or closed_position.fees is None or closed_position.funding is None:
+                continue  # defensive - close_triggered_positions always sets these (production's own guard)
+            baseline_pnl = compute_pnl(closed_position)
+            backtest_repo.backfill_profit_protection_baseline_outcome(
+                closed_position.position_id, closed_position.exit_reason, baseline_pnl, kline.observed_at
+            )
 
         any_shadow_open = False
         for threshold_pct in FROZEN_THRESHOLDS_PCT:
