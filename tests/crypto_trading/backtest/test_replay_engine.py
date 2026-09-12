@@ -22,11 +22,20 @@ class _StubConnector:
         self._funding = funding or []
 
     def get_klines(self, symbol, interval, limit=100, start_time_ms=None, end_time_ms=None):
-        return [
+        matching = [
             k for k in self._klines
             if (start_time_ms is None or k["time"] >= start_time_ms)
             and (end_time_ms is None or k["time"] <= end_time_ms)
         ]
+        # Honour the server-side candle cap the real BingX endpoint
+        # enforces (`_MAX_CANDLES_PER_CALL = 1440`, live-verified - see
+        # historical_fetch.py), returning the OLDEST `limit` candles of
+        # the requested range. Without this, a stub silently returns
+        # 1441 candles for a [t, t+1440m] request - something the real
+        # exchange can never do - and the window-length bug this module's
+        # time-limit test covers becomes invisible. A no-op for every
+        # other test here (all use far fewer than `limit` candles).
+        return matching[:limit]
 
     def get_funding_rate(self, symbol, limit=1, start_time_ms=None, end_time_ms=None):
         return self._funding
@@ -159,6 +168,51 @@ def test_replay_position_leaves_shadow_open_when_candles_run_out(tmp_path):
     assert shadow["status"] == "OPEN"  # right-censored, never silently dropped
 
 
+def test_replay_position_window_is_long_enough_to_reach_the_time_limit_exit(tmp_path):
+    """Regression test for the final whole-branch review's Critical Fix 1:
+    the replay window was `opened_at + 24h`, and the `evaluable` filter
+    excludes the entry candle itself (`observed_at > opened_at`), so the
+    last evaluable 1m candle sat at `opened_at + 23h59m` - `hold_hours`
+    topped out at 23.9833 and could NEVER satisfy
+    `hold_hours >= max_position_hold_hours` (24). `time_limit` was
+    therefore structurally unreachable: in the real run, ZERO of 76
+    replayed baselines exited `time_limit` against production's real 18,
+    and 35/76 were left artificially OPEN_POSITION and silently dropped
+    from every baseline statistic. With the window derived from
+    `settings.risk_limits.max_position_hold_hours` plus 2 minutes of
+    headroom, a flat-price stream that never touches stop-loss or target
+    must close `time_limit` on the first candle at/after the 24h mark."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    backtest = SQLiteRepository(tmp_path / "backtest.db")
+    settings = get_settings()
+    hold_hours = settings.risk_limits.max_position_hold_hours
+
+    # Flat price for the whole window: never touches stop_loss (49000) or
+    # target (60000), so the ONLY reachable exit is the time limit. The
+    # stream starts at the entry candle (minute 0, the one `evaluable`
+    # filters out) exactly as a real `startTime=opened_at` fetch does -
+    # that entry candle is what consumes the first of the 1440 slots the
+    # exchange will return, and is the whole reason the old
+    # `opened_at + 24h` window fell one candle short of the 24h mark.
+    klines = [
+        _kline("50100", _ms(_NOW + timedelta(minutes=minute)))
+        for minute in range(0, hold_hours * 60 + 3)
+    ]
+    connector = _StubConnector(klines)
+
+    replay_position(_target(), connector, source, backtest, settings, tmp_path / "cache", "run-1")
+
+    position = backtest.get_position("pos-1")
+    assert position.status == "CLOSED"
+    assert position.exit_reason == "time_limit"
+    assert (position.closed_at - _NOW) >= timedelta(hours=hold_hours)
+
+    for threshold in (Decimal("0.010"), Decimal("0.015")):
+        shadow = backtest.get_profit_protection_shadow(_shadow_id("pos-1", threshold))
+        assert shadow["status"] == "CLOSED"
+        assert shadow["exit_reason"] == "time_limit"
+
+
 def test_replay_position_ignores_a_guardian_observation_dated_after_the_candle_being_replayed(tmp_path):
     """Regression test for review round 1, Critical Fix 1: a Guardian
     observation dated AFTER the candle currently being replayed must NOT
@@ -236,20 +290,26 @@ def test_replay_position_does_not_corrupt_an_earlier_right_censored_position_sha
 
 def test_replay_position_does_not_cache_a_partial_fetch_for_a_still_in_progress_window(tmp_path):
     """Regression test for review round 2, Important Fix 2: when a
-    position's 24h replay window (`opened_at + 24h`, fixed - see review
-    round 1, Bundled Fix 1) extends past real wall-clock `now` (true for
-    any position opened <24h before the run), the exchange can only
-    return whatever candles exist so far - a genuinely PARTIAL result.
-    That partial result must never be persisted under the same cache key
-    a later, genuinely-complete-window run would also use - otherwise a
-    later run would silently keep reading this run's truncated data
-    forever. Proven here with two separate replay_position calls sharing
-    the SAME cache_dir and the SAME connector (which counts calls and
-    returns MORE candles on its second call, simulating newly-available
-    data once real time has caught up): if the first call's fetch were
-    wrongly cached under the shared cache_dir, the second call's
-    connector would never be re-invoked and the second replay would see
-    only the first, stale candle set."""
+    position's replay window (`opened_at + max_position_hold_hours + 2m`,
+    fixed - see review round 1, Bundled Fix 1 and the final whole-branch
+    review's Critical Fix 1) extends past real wall-clock `now` (true for
+    any position opened less than one hold window before the run), the
+    exchange can only return whatever candles exist so far - a genuinely
+    PARTIAL result. That partial result must never be persisted under the
+    same cache key a later, genuinely-complete-window run would also use -
+    otherwise a later run would silently keep reading this run's truncated
+    data forever. Proven here with two separate replay_position calls
+    sharing the SAME cache_dir and the SAME connector (which returns MORE
+    candles on the second REPLAY, simulating newly-available data once
+    real time has caught up): if the first replay's fetch were wrongly
+    cached under the shared cache_dir, the second replay's connector would
+    never be re-invoked and it would see only the first, stale candle set.
+
+    The connector keys its data off `self.replay_index`, flipped by the
+    test between the two replays, NOT off its own call count: since the
+    window now exceeds 1440 minutes, `fetch_historical_klines` paginates
+    and each replay legitimately issues more than one kline call, so call
+    count is no longer a proxy for "which replay is this"."""
     source = SQLiteRepository(tmp_path / "source.db")
     recent_opened_at = datetime.now(UTC) - timedelta(hours=1)  # window extends ~23h into the future - incomplete
     c1 = recent_opened_at + timedelta(minutes=1)
@@ -257,22 +317,24 @@ def test_replay_position_does_not_cache_a_partial_fetch_for_a_still_in_progress_
     class _CountingConnector:
         def __init__(self):
             self.klines_call_count = 0
+            self.replay_index = 1
 
         def get_klines(self, symbol, interval, limit=100, start_time_ms=None, end_time_ms=None):
             self.klines_call_count += 1
-            # 1st call ("now"): no exit trigger - only partial data exists
-            # so far. 2nd call ("later", real time having caught up):
-            # a candle that breaches the stop - the newly-available data.
+            # 1st replay ("now"): no exit trigger - only partial data
+            # exists so far. 2nd replay ("later", real time having caught
+            # up): a candle that breaches the stop - newly-available data.
             all_klines = (
                 [_kline("50100", _ms(c1))]
-                if self.klines_call_count == 1
+                if self.replay_index == 1
                 else [_kline("48000", _ms(c1), high="48000", low="48000")]
             )
-            return [
+            matching = [
                 k for k in all_klines
                 if (start_time_ms is None or k["time"] >= start_time_ms)
                 and (end_time_ms is None or k["time"] <= end_time_ms)
             ]
+            return matching[:limit]
 
         def get_funding_rate(self, symbol, limit=1, start_time_ms=None, end_time_ms=None):
             return []
@@ -285,12 +347,19 @@ def test_replay_position_does_not_cache_a_partial_fetch_for_a_still_in_progress_
     replay_position(
         _target(opened_at=recent_opened_at), connector, source, backtest_first, settings, shared_cache_dir, "run-1"
     )
+    calls_after_first_replay = connector.klines_call_count
+    assert calls_after_first_replay >= 2  # window > 1440m, so the pagination path is exercised
+
+    connector.replay_index = 2
     backtest_second = SQLiteRepository(tmp_path / "second.db")
     replay_position(
         _target(opened_at=recent_opened_at), connector, source, backtest_second, settings, shared_cache_dir, "run-2"
     )
 
-    assert connector.klines_call_count == 2  # NOT cached - the second call actually re-fetched
+    # NOT cached - the second replay actually re-fetched, issuing its own
+    # full set of paginated calls rather than reading the first replay's
+    # partial result back out of the shared cache_dir.
+    assert connector.klines_call_count == calls_after_first_replay * 2
     assert backtest_first.get_position("pos-1").status == "OPEN_POSITION"  # 1st run's partial data: no trigger
     second_position = backtest_second.get_position("pos-1")
     assert second_position.status == "CLOSED"  # 2nd run saw the newly-available data, not the 1st run's cache

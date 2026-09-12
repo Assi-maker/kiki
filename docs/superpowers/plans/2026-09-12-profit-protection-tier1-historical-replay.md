@@ -363,7 +363,11 @@ git commit -m "feat(crypto-trading): add Tier 1 backtest dataset selection (read
 - Produces: `fetch_historical_klines(connector, symbol: str, interval: str, start: datetime, end: datetime, cache_dir: Path) -> list[Kline]`, `fetch_historical_funding(connector, symbol: str, start: datetime, end: datetime, cache_dir: Path) -> list[FundingRate]`.
 - Consumed by: Task 5 (`replay_engine.py`).
 
-**Design:** `limit<=1440` is a hard server cap (Task verified this live: `code:109400` above it). At 1m resolution that's exactly 24h per call — since PAPER's own `max_position_hold_hours=24`, **every single position's full replay window fits in exactly one kline call and one funding call** in practice. The function still paginates in 1440-candle (1-day) chunks for the rare case a window exceeds 24h (an OPEN position replayed up to "now" could span more than a day), walking `start` forward by 1440 minutes each iteration until it reaches `end`. Caches each `(symbol, interval, start_ms, end_ms)` response to a local JSON file under `cache_dir` so re-running a report (e.g. after fixing a report-formatting bug) never re-fetches identical historical data — this is what "deterministic" (Global Constraints) rests on: the *fetch* step is the only network-facing part, and it's memoized.
+**Design:** `limit<=1440` is a hard server cap (Task verified this live: `code:109400` above it). At 1m resolution that's exactly 24h per call.
+
+> **Correction (final whole-branch review, Critical Fix 1).** This paragraph originally claimed "every single position's full replay window fits in exactly one kline call and one funding call in practice", and treated pagination as a rare edge case. That reasoning was **wrong, and it is the origin of a Critical bug** (the plan's own reasoning was at fault, not an implementer deviation — same pattern as the Task 5 Critical-1/2 entries already in the ledger). The replay window is `opened_at + max_position_hold_hours + 2 minutes`, **not** `opened_at + 24h`: with a 1440-candle cap, a call starting at `opened_at` returns candles `opened_at .. opened_at + 23h59m`, and the first of those — the entry candle — is excluded by the replay engine's `evaluable` filter, so `hold_hours` topped out at 23.9833 and the `hold_hours >= max_position_hold_hours` gate in `check_exit_trigger`/`advance_shadow` was **structurally unreachable**. Real-run evidence: zero `time_limit` baseline exits across 76 replayed positions vs production's real 18, with 35/76 left artificially `OPEN_POSITION` and silently dropped from every baseline statistic. Because the window now exceeds 1440 minutes, **the >1440-candle pagination path is always exercised, for every position — it is the normal path, never a rare edge case**, and every position's fetch issues 2 kline calls rather than 1.
+
+The function paginates in 1440-candle (1-day) chunks, walking `start` forward by 1440 minutes each iteration until it reaches `end`. Caches each `(symbol, interval, start_ms, end_ms)` response to a local JSON file under `cache_dir` so re-running a report (e.g. after fixing a report-formatting bug) never re-fetches identical historical data — this is what "deterministic" (Global Constraints) rests on: the *fetch* step is the only network-facing part, and it's memoized.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -963,8 +967,19 @@ def replay_position(
     once (Guardian history copy) and never written to - see
     guardian_replay.py::copy_guardian_history and this function's own
     test_replay_position_never_writes_to_the_source_repo."""
-    now_utc = datetime.now(UTC)
-    window_end = min(now_utc, target.opened_at + timedelta(hours=24))
+    # CORRECTED (final whole-branch review, Critical Fix 1). The original
+    # reference code below was `window_end = min(now_utc,
+    # target.opened_at + timedelta(hours=24))`. BOTH halves of that were
+    # wrong: (a) the `min(now_utc, ...)` clamp poisons the fetch cache key
+    # with a different `end` on every run (review round 1, Bundled Fix 1),
+    # and (b) `+ timedelta(hours=24)` is one candle too short to ever
+    # reach the `time_limit` exit, because the 1440-candle server cap plus
+    # the `evaluable` filter's exclusion of the entry candle caps
+    # `hold_hours` at 23.9833. The window must be derived from config with
+    # headroom, so the >1440-candle pagination path is ALWAYS exercised:
+    window_end = target.opened_at + timedelta(
+        hours=settings.risk_limits.max_position_hold_hours, minutes=2
+    )
 
     klines = fetch_historical_klines(
         connector, target.instrument, _KLINE_INTERVAL, target.opened_at, window_end, cache_dir

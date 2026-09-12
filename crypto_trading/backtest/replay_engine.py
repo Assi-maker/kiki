@@ -87,12 +87,30 @@ def replay_position(
     (Guardian history, via a one-shot fetch + local watermark pointer -
     see the loop below) and never written to - see this function's own
     test_replay_position_never_writes_to_the_source_repo."""
-    window_end = target.opened_at + timedelta(hours=24)
+    # Derived from config, never hardcoded, and with 2 minutes of headroom
+    # past the hold limit (final whole-branch review, Critical Fix 1). The
+    # old `opened_at + 24h` window was one candle too short to ever reach
+    # the `time_limit` exit: BingX caps a 1m kline call at 1440 candles
+    # (`_MAX_CANDLES_PER_CALL`, historical_fetch.py), and the first of
+    # those is the entry candle at `opened_at` itself, which the
+    # `evaluable` filter below excludes - so the last evaluable candle sat
+    # at `opened_at + 23h59m` and `hold_hours` topped out at 23.9833,
+    # never satisfying the `>= max_position_hold_hours` gate that
+    # `check_exit_trigger`/`advance_shadow` require. Real-run evidence:
+    # zero `time_limit` baseline exits across 76 positions vs production's
+    # real 18, with 35/76 left artificially OPEN_POSITION and silently
+    # dropped from every baseline statistic. The headroom pushes
+    # `window_end` past the 24h mark so `fetch_historical_klines` issues a
+    # second (already-supported) page and a candle at/after the limit is
+    # actually evaluated.
+    window_end = target.opened_at + timedelta(
+        hours=settings.risk_limits.max_position_hold_hours, minutes=2
+    )
     # Deliberately NOT clamped to datetime.now(UTC): the exchange already
     # returns no future candles on its own, so a wall-clock clamp buys
     # nothing, but it DOES poison fetch_historical_klines/funding's cache
     # key (Task 3) with a different `end` on every run for any position
-    # opened <24h before the run - breaking the run-to-run cache hit and
+    # opened less than one full hold window before the run - breaking the run-to-run cache hit and
     # this function's own determinism guarantee (review round 1, Bundled
     # Fix 1).
 
@@ -107,8 +125,9 @@ def replay_position(
         )
     else:
         # Review round 2, Important Fix 2: `window_end` is fixed at
-        # `opened_at + 24h` (never clamped to `now_utc` - see the comment
-        # above), so for any position opened <24h before this run,
+        # `opened_at + max_position_hold_hours + 2m` (never clamped to
+        # `now_utc` - see the comment above), so for any position opened
+        # less than that long before this run,
         # `window_end` is still in the future relative to real wall-clock
         # time. The exchange can only return whatever candles exist so
         # far for such a window - a genuinely PARTIAL result. Persisting
