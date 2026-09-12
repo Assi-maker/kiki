@@ -2,8 +2,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.backtest.dataset import BacktestTarget
-from crypto_trading.schemas.event import Event
-from crypto_trading.schemas.trade import Position
 from crypto_trading.backtest.report import (
     _bootstrap_ci,
     _median,
@@ -11,6 +9,8 @@ from crypto_trading.backtest.report import (
     build_tier1_report,
 )
 from crypto_trading.paper_trading.profit_protection_experiment import _shadow_id
+from crypto_trading.schemas.event import Event
+from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import SQLiteRepository
 
 _NOW = datetime(2026, 9, 3, 8, 0, tzinfo=UTC)
@@ -86,8 +86,6 @@ def test_build_tier1_report_flags_baseline_parity_mismatch(tmp_path):
     source = SQLiteRepository(tmp_path / "source.db")
     train = SQLiteRepository(tmp_path / "train.db")
     test_repo = SQLiteRepository(tmp_path / "test.db")
-    from crypto_trading.schemas.event import Event
-    from crypto_trading.schemas.trade import Position
 
     def _seed(repo, exit_reason):
         # create_position_with_event()'s INSERT only covers the "open"
@@ -294,7 +292,10 @@ def test_split_report_paired_totals_exclude_right_censored_rows(tmp_path):
     assert block["n_baseline_pending"] == 1
     assert Decimal(block["paired_shadow_total_pnl_usdt"]) == Decimal("30")
     assert Decimal(block["paired_baseline_total_pnl_usdt"]) == Decimal("70")
-    assert Decimal(block["paired_shadow_total_pnl_usdt"]) < Decimal(block["paired_baseline_total_pnl_usdt"])
+    assert (
+        Decimal(block["paired_shadow_total_pnl_usdt"])
+        < Decimal(block["paired_baseline_total_pnl_usdt"])
+    )
     assert Decimal(block["shadow_total_pnl_usdt"]) > Decimal(block["baseline_total_pnl_usdt"])
 
     # Medians over the paired subset only: [10, 20] -> 15, [30, 40] -> 35.
