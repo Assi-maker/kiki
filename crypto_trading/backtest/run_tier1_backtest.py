@@ -10,7 +10,7 @@ from crypto_trading.backtest.replay_engine import replay_position
 from crypto_trading.backtest.report import build_tier1_report
 from crypto_trading.config.loader import Settings, get_settings
 from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
-from crypto_trading.logging import new_run_id
+from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.storage.repository import Repository, SQLiteRepository
 
 
@@ -32,15 +32,25 @@ def run_tier1_backtest(
     run_id = new_run_id()
 
     targets = select_backtest_targets(source_repo)
+    n_skipped = 0
     for target in targets:
         destination = train_repo if target.opened_at < split_cutoff else test_repo
-        replay_position(target, connector, source_repo, destination, settings, cache_dir, run_id)
+        try:
+            replay_position(target, connector, source_repo, destination, settings, cache_dir, run_id)
+        except Exception as exc:
+            log_event(
+                run_id, event="replay_position_failed", position_id=target.position_id,
+                instrument=target.instrument, error_type=type(exc).__name__, error=str(exc),
+            )
+            n_skipped += 1
+            continue
 
     report = build_tier1_report(train_repo, test_repo, source_repo, targets)
     report["split_cutoff"] = split_cutoff.isoformat()
     report["n_positions_total"] = len(targets)
     report["n_positions_train"] = sum(1 for t in targets if t.opened_at < split_cutoff)
     report["n_positions_test"] = sum(1 for t in targets if t.opened_at >= split_cutoff)
+    report["n_positions_skipped_due_to_fetch_error"] = n_skipped
 
     (output_dir / "tier1_report.json").write_text(json.dumps(report, indent=2, default=str))
     return report
@@ -72,6 +82,7 @@ def main() -> None:
         {"n_positions_total": report["n_positions_total"],
          "n_positions_train": report["n_positions_train"],
          "n_positions_test": report["n_positions_test"],
+         "n_positions_skipped_due_to_fetch_error": report["n_positions_skipped_due_to_fetch_error"],
          "baseline_parity_mismatches": len(report["baseline_parity_mismatches"])},
         indent=2,
     ))
