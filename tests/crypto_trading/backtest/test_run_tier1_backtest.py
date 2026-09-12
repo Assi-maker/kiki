@@ -114,3 +114,42 @@ def test_run_tier1_backtest_isolates_per_position_connector_failures(tmp_path):
         "error": "Instrument NCFXEUR2USD-USDT is currently unavailable",
     }]
 
+
+def test_run_tier1_backtest_refuses_to_reuse_an_output_dir_with_a_prior_run(tmp_path):
+    """Final whole-branch review, Important Fix 5: re-running into a
+    non-empty --output-dir silently mixed a prior run's positions into
+    the new run's report, so the operator would read stale numbers as if
+    they were fresh. Must fail fast, before any replay work starts."""
+    import pytest
+
+    source = SQLiteRepository(tmp_path / "source.db")
+    _seed(source, "pos-1", _NOW)
+    output_dir = tmp_path / "out"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # A prior run's leftover position sitting in train.db.
+    _seed(SQLiteRepository(output_dir / "train.db"), "pos-from-a-prior-run", _NOW)
+
+    class _ExplodingConnector:
+        def get_klines(self, *args, **kwargs):
+            raise AssertionError("must fail before any replay work starts")
+
+        def get_funding_rate(self, *args, **kwargs):
+            raise AssertionError("must fail before any replay work starts")
+
+    with pytest.raises(ValueError, match="already contains a prior run"):
+        run_tier1_backtest(
+            source, _ExplodingConnector(), get_settings(), _NOW + timedelta(days=1), output_dir
+        )
+
+
+def test_run_tier1_backtest_accepts_a_fresh_output_dir(tmp_path):
+    """The guard must not fire on a genuinely fresh output_dir - including
+    the ordinary case where the directory does not exist yet."""
+    source = SQLiteRepository(tmp_path / "source.db")
+    _seed(source, "pos-1", _NOW)
+
+    report = run_tier1_backtest(
+        source, _StubConnector(), get_settings(), _NOW + timedelta(days=1), tmp_path / "fresh"
+    )
+
+    assert report["n_positions_total"] == 1

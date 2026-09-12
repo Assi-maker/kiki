@@ -31,6 +31,20 @@ def run_tier1_backtest(
     test_repo = SQLiteRepository(output_dir / "test.db")
     run_id = new_run_id()
 
+    # Final whole-branch review, Important Fix 5: re-running into an
+    # output_dir that already holds a prior run's positions silently mixed
+    # that run's rows into this one's report - replay_position's own
+    # duplicate-position_id guard raises per position, so the stale rows
+    # survived, every affected position was counted as "skipped", and the
+    # operator read a blend of two runs as if it were one fresh result.
+    # Fails fast here, before any replay work starts, rather than after a
+    # long run has already burned through the whole target list.
+    if train_repo.find_all_positions(limit=1) or test_repo.find_all_positions(limit=1):
+        raise ValueError(
+            f"run_tier1_backtest: {output_dir} already contains a prior run's "
+            "positions - pass a fresh --output-dir rather than reusing one"
+        )
+
     targets = select_backtest_targets(source_repo)
     n_skipped = 0
     # Final whole-branch review, Important Fix 4: every exception during
