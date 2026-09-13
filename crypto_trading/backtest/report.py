@@ -111,6 +111,14 @@ def _baseline_parity_mismatches(repo: Repository, targets: list[BacktestTarget])
                 "note": "replay window ended with position still open",
             })
             continue
+        # Round 2 fix wave, Important finding: this must be computed ONCE,
+        # before the exit-reason comparison below, not only inside the
+        # "reasons disagree" branch - otherwise a position where replay
+        # and production agree on WHY it closed but disagree by many
+        # hours on WHEN never gets flagged at all (empirically: replay
+        # closes stop_loss at +1h, production closes stop_loss at +21h,
+        # 20h apart, same reason -> used to return no mismatch).
+        delta_hours = _closed_at_delta_hours(replayed.closed_at, target.original_closed_at)
         if replayed.exit_reason != target.original_exit_reason:
             mismatch = {
                 "position_id": target.position_id,
@@ -122,10 +130,20 @@ def _baseline_parity_mismatches(repo: Repository, targets: list[BacktestTarget])
             # itself a finding. Only reported when both timestamps exist
             # and the gap exceeds the tolerance, so an ordinary
             # sub-tolerance timing jitter doesn't add noise to every row.
-            delta_hours = _closed_at_delta_hours(replayed.closed_at, target.original_closed_at)
             if delta_hours is not None and delta_hours > _CLOSED_AT_TOLERANCE_HOURS:
                 mismatch["closed_at_delta_hours"] = delta_hours
             mismatches.append(mismatch)
+        elif delta_hours is not None and delta_hours > _CLOSED_AT_TOLERANCE_HOURS:
+            # Exit reasons agree, but the close times still materially
+            # disagree - the same finding as above, just without a
+            # reason mismatch to carry it.
+            mismatches.append({
+                "position_id": target.position_id,
+                "replayed_exit_reason": replayed.exit_reason,
+                "production_exit_reason": target.original_exit_reason,
+                "closed_at_delta_hours": delta_hours,
+                "note": "same exit reason, materially different close time",
+            })
     return mismatches
 
 
