@@ -110,11 +110,27 @@ def main() -> None:
         split_cutoff = split_cutoff.replace(tzinfo=UTC)
 
     report = run_tier1_backtest(source_repo, connector, settings, split_cutoff, Path(args.output_dir))
+    # Round 2 fix wave, Minor finding: printing only
+    # `n_positions_skipped_due_to_fetch_error` hides the real skip reason
+    # from an operator reading console output alone - Fix 4's
+    # `skipped_positions` list already carries `error_type` per skip, this
+    # just surfaces the distinct types at the CLI so a genuine logic bug
+    # can't hide behind a name that specifically claims "fetch error".
+    # `n_baseline_positions_open_in_replay` is split-level (train/test
+    # each carry their own count via `_split_report_with_extras`) - both
+    # are printed rather than silently summed so the split is visible too.
     print(json.dumps(
         {"n_positions_total": report["n_positions_total"],
          "n_positions_train": report["n_positions_train"],
          "n_positions_test": report["n_positions_test"],
          "n_positions_skipped_due_to_fetch_error": report["n_positions_skipped_due_to_fetch_error"],
+         "skipped_error_types": sorted(set(
+             p["error_type"] for p in report["skipped_positions"]
+         )),
+         "n_baseline_positions_open_in_replay": {
+             "train": report["train"]["n_baseline_positions_open_in_replay"],
+             "test": report["test"]["n_baseline_positions_open_in_replay"],
+         },
          "baseline_parity_mismatches": len(report["baseline_parity_mismatches"])},
         indent=2,
     ))
