@@ -117,163 +117,66 @@ def _parse_positive_decimal(value: object) -> Decimal | None:
     return parsed
 
 
-def _run_claimed_sequence(
+def _handle_new_sl_filled(
     repo: Repository,
     connector: BingXLiveTradingConnector,
     position_id: str,
     instrument: str,
-    breakeven_price: Decimal,
-    new_sl_client_order_id: str,
-    position_amt: object,
+    old_sl_order_id: str,
     run_id: str,
     now: datetime,
 ) -> None:
-    """Steps 4-7 of the design spec's sequence, run immediately after a
-    successful claim. Add-before-remove throughout: no code path here ever
-    cancels the old SL before the new SL has been positively confirmed
-    NEW/PENDING."""
-    # Step 4 (spec step 2): identify exactly one existing protective SL.
-    open_orders = connector.get_open_orders(instrument)
-    sl_orders = [order for order in open_orders if order.get("type") == "STOP_MARKET"]
-    if len(sl_orders) != 1:
+    """The new SL was found FILLED (price already reached breakeven before -
+    or during - verification), a valid, safe outcome of a market-triggered
+    stop, not an error. Shared by _place_and_verify_new_sl's own FILLED
+    branch and Task 6 restart-recovery's Case B (new SL found FILLED on
+    resume) - both mean exactly the same thing: re-check real exchange
+    position state rather than assume, and never cancel the old SL from
+    here (it is likely already gone too, since the position is flat)."""
+    still_open = connector.get_position(instrument)
+    if still_open is None:
         repo.set_live_profit_protection_status(
-            position_id, "ABORTED_AMBIGUOUS_SL", now,
-            last_error=f"found {len(sl_orders)} STOP_MARKET orders, expected exactly 1",
+            position_id, "SL_REPLACED", now,
+            last_error="position closed during new SL verification (filled at/near breakeven)",
         )
         log_event(
-            run_id, event="live_pp_aborted_ambiguous_sl", position_id=position_id,
-            instrument=instrument, sl_order_count=len(sl_orders), status="ABORTED_AMBIGUOUS_SL",
+            run_id, event="live_pp_closed_during_verification", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id, status="SL_REPLACED",
         )
-        return
-
-    old_sl = sl_orders[0]
-    old_sl_order_id = str(old_sl.get("orderId"))
-    old_sl_price = str(old_sl.get("stopPrice"))
-    repo.update_live_profit_protection_old_sl(
-        position_id, old_sl_order_id=old_sl_order_id, old_sl_price=old_sl_price, updated_at=now,
-    )
-    log_event(
-        run_id, event="live_pp_old_sl_identified", position_id=position_id, instrument=instrument,
-        old_sl_order_id=old_sl_order_id, old_sl_price=old_sl_price,
-    )
-
-    # Step 5 (spec step 3): place the new break-even SL. Quantity is sourced
-    # fresh from the repository (never a cached/stale value) - the same
-    # entry_quantity recorded when this position's live entry was confirmed.
-    live_execution = repo.get_live_execution(position_id)
-    raw_entry_quantity = (live_execution or {}).get("entry_quantity")
-    entry_quantity = _parse_positive_decimal(raw_entry_quantity)
-
-    # Deep-review fix 1: a missing/zero/unparseable entry_quantity (a real,
-    # reachable state - see live_execution.py's _resolve_uncertain_entry)
-    # must abort HERE, before any placement - never fall back to "0" and
-    # send a zero-quantity stop to a real exchange. Old SL is untouched.
-    if entry_quantity is None:
-        repo.set_live_profit_protection_status(
-            position_id, "ABORTED_INVALID_ENTRY_QUANTITY", now,
-            last_error=f"entry_quantity is missing/non-positive/unparseable: {raw_entry_quantity!r}",
-        )
-        log_event(
-            run_id, event="live_pp_aborted_invalid_entry_quantity", position_id=position_id,
-            instrument=instrument, old_sl_order_id=old_sl_order_id,
-            status="ABORTED_INVALID_ENTRY_QUANTITY",
-        )
-        return
-
-    # Deep-review fix 5: cross-check against the exchange's own, freshly-read
-    # positionAmt (already in hand from the pre-claim get_position() call) -
-    # exchange state is the source of truth. A stale/diverged local
-    # entry_quantity (e.g. after a partial close) would under-size the
-    # replacement SL and leave part of a real position unprotected once the
-    # old SL is cancelled - abort rather than guess. Old SL is untouched.
-    position_amt_decimal = _parse_positive_decimal(position_amt)
-    quantity_mismatch = (
-        position_amt_decimal is None
-        or abs(entry_quantity - position_amt_decimal) / position_amt_decimal > _QUANTITY_MISMATCH_TOLERANCE
-    )
-    if quantity_mismatch:
-        repo.set_live_profit_protection_status(
-            position_id, "ABORTED_QUANTITY_MISMATCH", now,
-            last_error=(
-                f"entry_quantity {entry_quantity} vs exchange positionAmt {position_amt!r} "
-                f"exceeds tolerance {_QUANTITY_MISMATCH_TOLERANCE}"
-            ),
-        )
-        log_event(
-            run_id, event="live_pp_aborted_quantity_mismatch", position_id=position_id,
-            instrument=instrument, old_sl_order_id=old_sl_order_id,
-            entry_quantity=str(entry_quantity), position_amt=str(position_amt),
-            status="ABORTED_QUANTITY_MISMATCH",
-        )
-        return
-
-    try:
-        connector.place_stop_loss_order(
-            instrument, quantity=str(entry_quantity), stop_price=str(breakeven_price),
-            client_order_id=new_sl_client_order_id,
-        )
-    except OrderRejectedError as exc:
-        # Synchronous, structured rejection - zero fill guaranteed, nothing
-        # to look up. Old SL was never touched.
-        repo.set_live_profit_protection_status(
-            position_id, "ABORTED_NEW_SL_REJECTED", now, last_error=str(exc),
-        )
-        log_event(
-            run_id, event="live_pp_new_sl_rejected", position_id=position_id, instrument=instrument,
-            old_sl_order_id=old_sl_order_id, breakeven_price=str(breakeven_price),
-            status="ABORTED_NEW_SL_REJECTED", error=str(exc),
-        )
-        return
-
-    # Step 6 (spec step 4): verify the new SL is genuinely active before
-    # ever touching the old one - the single most important invariant here.
-    new_sl_order = _lookup_new_sl_order(connector, instrument, new_sl_client_order_id)
-    state = _classify_new_sl_state(new_sl_order)
-
-    if state == "UNKNOWN":
+    else:
+        # Shouldn't happen (a FILLED SL implies the position went flat) -
+        # treat conservatively as uncertain rather than guess, and log at a
+        # level that surfaces the anomaly for human review.
         repo.set_live_profit_protection_status(
             position_id, "UNCERTAIN_NEW_SL_STATUS", now,
-            last_error=f"new SL status could not be determined (lookup result: {new_sl_order!r})",
+            last_error="new SL reported FILLED but position is still open on the exchange",
         )
         log_event(
             run_id, event="live_pp_new_sl_status_uncertain", position_id=position_id,
             instrument=instrument, old_sl_order_id=old_sl_order_id,
-            status="UNCERTAIN_NEW_SL_STATUS",
+            status="UNCERTAIN_NEW_SL_STATUS", anomaly="filled_but_position_open",
         )
-        return  # old SL is NEVER cancelled in this branch.
+    # old SL is NEVER cancelled in either branch above.
 
-    if state == "FILLED":
-        # The price already reached breakeven between claim and placement -
-        # a valid, safe outcome of a market-triggered stop, not an error.
-        # Re-check real exchange position state rather than assume.
-        still_open = connector.get_position(instrument)
-        if still_open is None:
-            repo.set_live_profit_protection_status(
-                position_id, "SL_REPLACED", now,
-                last_error="position closed during new SL verification (filled at/near breakeven)",
-            )
-            log_event(
-                run_id, event="live_pp_closed_during_verification", position_id=position_id,
-                instrument=instrument, old_sl_order_id=old_sl_order_id, status="SL_REPLACED",
-            )
-        else:
-            # Shouldn't happen (a FILLED SL implies the position went flat)
-            # - treat conservatively as uncertain rather than guess, and log
-            # at a level that surfaces the anomaly for human review.
-            repo.set_live_profit_protection_status(
-                position_id, "UNCERTAIN_NEW_SL_STATUS", now,
-                last_error="new SL reported FILLED but position is still open on the exchange",
-            )
-            log_event(
-                run_id, event="live_pp_new_sl_status_uncertain", position_id=position_id,
-                instrument=instrument, old_sl_order_id=old_sl_order_id,
-                status="UNCERTAIN_NEW_SL_STATUS", anomaly="filled_but_position_open",
-            )
-        return  # old SL is NEVER cancelled in this branch either.
 
-    # state == "ACTIVE": the new SL is genuinely live. Only now record it
-    # and proceed to remove the old one (add-before-remove).
-    new_sl_order_id = str(new_sl_order.get("orderId"))  # type: ignore[union-attr]
+def _finalize_verified_active_new_sl(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    position_id: str,
+    instrument: str,
+    new_sl_order_id: str,
+    old_sl_order_id: str,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """The "verified-active tail": record the new SL, re-check the real
+    exchange position immediately before cancelling the old SL (deep-review
+    fix 3's orphan-SL race guard), cancel it, and finalize. Reached both by
+    _place_and_verify_new_sl's own ACTIVE branch (a fresh placement just
+    confirmed active) and by Task 6 restart-recovery's Case B (new SL found
+    already ACTIVE on resume) - in both cases the new SL is positively
+    confirmed live and only the removal of the old one remains, so the
+    remaining work is identical."""
     repo.update_live_profit_protection_new_sl(position_id, new_sl_order_id=new_sl_order_id, updated_at=now)
     log_event(
         run_id, event="live_pp_new_sl_verified", position_id=position_id, instrument=instrument,
@@ -346,6 +249,418 @@ def _run_claimed_sequence(
             run_id, event="live_pp_final_state_check_failed", position_id=position_id,
             instrument=instrument, error_type=type(exc).__name__, error=str(exc),
         )
+
+
+def _place_and_verify_new_sl(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    position_id: str,
+    instrument: str,
+    old_sl_order_id: str,
+    breakeven_price: Decimal,
+    new_sl_client_order_id: str,
+    position_amt: object,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Spec steps 3-4 (place the break-even SL, then verify it is genuinely
+    active) - shared by a fresh claim's _run_claimed_sequence (old SL just
+    identified in the same call) and by Task 6 restart-recovery's Case A
+    (full resume) and Case B's not-found-on-resume branch (old SL already
+    known from the row; placement was never confirmed before the crash, so
+    it is safe to retry under the SAME deterministic client order id - that
+    determinism is exactly what makes a lookup-first retry safe, never a
+    newly-minted id)."""
+    # Quantity is sourced fresh from the repository (never a cached/stale
+    # value) - the same entry_quantity recorded when this position's live
+    # entry was confirmed.
+    live_execution = repo.get_live_execution(position_id)
+    raw_entry_quantity = (live_execution or {}).get("entry_quantity")
+    entry_quantity = _parse_positive_decimal(raw_entry_quantity)
+
+    # Deep-review fix 1: a missing/zero/unparseable entry_quantity (a real,
+    # reachable state - see live_execution.py's _resolve_uncertain_entry)
+    # must abort HERE, before any placement - never fall back to "0" and
+    # send a zero-quantity stop to a real exchange. Old SL is untouched.
+    if entry_quantity is None:
+        repo.set_live_profit_protection_status(
+            position_id, "ABORTED_INVALID_ENTRY_QUANTITY", now,
+            last_error=f"entry_quantity is missing/non-positive/unparseable: {raw_entry_quantity!r}",
+        )
+        log_event(
+            run_id, event="live_pp_aborted_invalid_entry_quantity", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id,
+            status="ABORTED_INVALID_ENTRY_QUANTITY",
+        )
+        return
+
+    # Deep-review fix 5: cross-check against the exchange's own, freshly-read
+    # positionAmt (already in hand from the caller's own get_position() call)
+    # - exchange state is the source of truth. A stale/diverged local
+    # entry_quantity (e.g. after a partial close) would under-size the
+    # replacement SL and leave part of a real position unprotected once the
+    # old SL is cancelled - abort rather than guess. Old SL is untouched.
+    position_amt_decimal = _parse_positive_decimal(position_amt)
+    quantity_mismatch = (
+        position_amt_decimal is None
+        or abs(entry_quantity - position_amt_decimal) / position_amt_decimal > _QUANTITY_MISMATCH_TOLERANCE
+    )
+    if quantity_mismatch:
+        repo.set_live_profit_protection_status(
+            position_id, "ABORTED_QUANTITY_MISMATCH", now,
+            last_error=(
+                f"entry_quantity {entry_quantity} vs exchange positionAmt {position_amt!r} "
+                f"exceeds tolerance {_QUANTITY_MISMATCH_TOLERANCE}"
+            ),
+        )
+        log_event(
+            run_id, event="live_pp_aborted_quantity_mismatch", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id,
+            entry_quantity=str(entry_quantity), position_amt=str(position_amt),
+            status="ABORTED_QUANTITY_MISMATCH",
+        )
+        return
+
+    try:
+        connector.place_stop_loss_order(
+            instrument, quantity=str(entry_quantity), stop_price=str(breakeven_price),
+            client_order_id=new_sl_client_order_id,
+        )
+    except OrderRejectedError as exc:
+        # Synchronous, structured rejection - zero fill guaranteed, nothing
+        # to look up. Old SL was never touched.
+        repo.set_live_profit_protection_status(
+            position_id, "ABORTED_NEW_SL_REJECTED", now, last_error=str(exc),
+        )
+        log_event(
+            run_id, event="live_pp_new_sl_rejected", position_id=position_id, instrument=instrument,
+            old_sl_order_id=old_sl_order_id, breakeven_price=str(breakeven_price),
+            status="ABORTED_NEW_SL_REJECTED", error=str(exc),
+        )
+        return
+
+    # Step 6 (spec step 4): verify the new SL is genuinely active before
+    # ever touching the old one - the single most important invariant here.
+    new_sl_order = _lookup_new_sl_order(connector, instrument, new_sl_client_order_id)
+    state = _classify_new_sl_state(new_sl_order)
+
+    if state == "UNKNOWN":
+        repo.set_live_profit_protection_status(
+            position_id, "UNCERTAIN_NEW_SL_STATUS", now,
+            last_error=f"new SL status could not be determined (lookup result: {new_sl_order!r})",
+        )
+        log_event(
+            run_id, event="live_pp_new_sl_status_uncertain", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id,
+            status="UNCERTAIN_NEW_SL_STATUS",
+        )
+        return  # old SL is NEVER cancelled in this branch.
+
+    if state == "FILLED":
+        _handle_new_sl_filled(repo, connector, position_id, instrument, old_sl_order_id, run_id, now)
+        return
+
+    # state == "ACTIVE": the new SL is genuinely live. Only now record it
+    # and proceed to remove the old one (add-before-remove).
+    new_sl_order_id = str(new_sl_order.get("orderId"))  # type: ignore[union-attr]
+    _finalize_verified_active_new_sl(
+        repo, connector, position_id, instrument, new_sl_order_id, old_sl_order_id, run_id, now,
+    )
+
+
+def _run_claimed_sequence(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    position_id: str,
+    instrument: str,
+    breakeven_price: Decimal,
+    new_sl_client_order_id: str,
+    position_amt: object,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Steps 4-7 of the design spec's sequence, run immediately after a
+    successful claim (and reused verbatim by Task 6 restart-recovery's Case
+    A, which has exactly the same starting shape: no old SL identified yet).
+    Add-before-remove throughout: no code path here ever cancels the old SL
+    before the new SL has been positively confirmed NEW/PENDING."""
+    # Step 4 (spec step 2): identify exactly one existing protective SL.
+    open_orders = connector.get_open_orders(instrument)
+    sl_orders = [order for order in open_orders if order.get("type") == "STOP_MARKET"]
+    if len(sl_orders) != 1:
+        repo.set_live_profit_protection_status(
+            position_id, "ABORTED_AMBIGUOUS_SL", now,
+            last_error=f"found {len(sl_orders)} STOP_MARKET orders, expected exactly 1",
+        )
+        log_event(
+            run_id, event="live_pp_aborted_ambiguous_sl", position_id=position_id,
+            instrument=instrument, sl_order_count=len(sl_orders), status="ABORTED_AMBIGUOUS_SL",
+        )
+        return
+
+    old_sl = sl_orders[0]
+    old_sl_order_id = str(old_sl.get("orderId"))
+    old_sl_price = str(old_sl.get("stopPrice"))
+    repo.update_live_profit_protection_old_sl(
+        position_id, old_sl_order_id=old_sl_order_id, old_sl_price=old_sl_price, updated_at=now,
+    )
+    log_event(
+        run_id, event="live_pp_old_sl_identified", position_id=position_id, instrument=instrument,
+        old_sl_order_id=old_sl_order_id, old_sl_price=old_sl_price,
+    )
+
+    # Step 5-6 (spec steps 3-4): place the new break-even SL and verify it.
+    _place_and_verify_new_sl(
+        repo, connector, position_id, instrument, old_sl_order_id, breakeven_price,
+        new_sl_client_order_id, position_amt, run_id, now,
+    )
+
+
+def _recover_case_a(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    row: dict,
+    instrument: str,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Case A: old_sl_order_id is None on the row - the crash happened
+    before step 4 ever completed, so nothing was ever placed on the
+    exchange for this attempt. This is exactly the situation
+    _run_claimed_sequence already handles correctly from scratch (no old SL
+    was identified yet, so re-running step 4 onward carries zero risk of
+    misidentifying which SL is "old"). The row's already-stored
+    breakeven_price/new_sl_client_order_id are reused verbatim - never a
+    newly-generated client order id, since the deterministic id is what
+    makes retry-by-lookup safe."""
+    position_id = row["position_id"]
+    live_position = connector.get_position(instrument)
+    if live_position is None:
+        repo.set_live_profit_protection_status(
+            position_id, "POSITION_CLOSED_BEFORE_PP", now,
+            last_error="restart recovery (Case A): position already closed; no old SL had been identified",
+        )
+        log_event(
+            run_id, event="live_pp_recovery_position_closed_before_pp", position_id=position_id,
+            instrument=instrument, status="POSITION_CLOSED_BEFORE_PP", recovery_case="A",
+        )
+        return
+
+    position_amt = live_position.get("positionAmt", "0")
+    breakeven_price = Decimal(str(row["breakeven_price"]))
+    _run_claimed_sequence(
+        repo, connector, position_id, instrument, breakeven_price,
+        row["new_sl_client_order_id"], position_amt, run_id, now,
+    )
+
+
+def _recover_case_b(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    row: dict,
+    instrument: str,
+    old_sl_order_id: str,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Case B: old_sl_order_id is set but new_sl_order_id is None on the
+    row - step 4 completed, but the crash happened somewhere in
+    placement/verification, before, during, or after placing the new SL,
+    but before it was confirmed ACTIVE. The new SL's true state is looked
+    up by its deterministic client order id (never a freshly-generated
+    one) - exactly what makes this safe."""
+    position_id = row["position_id"]
+    live_position = connector.get_position(instrument)
+    if live_position is None:
+        repo.set_live_profit_protection_status(
+            position_id, "POSITION_CLOSED_BEFORE_PP", now,
+            last_error=(
+                "restart recovery (Case B): position already closed; new SL was never "
+                "confirmed placed"
+            ),
+        )
+        log_event(
+            run_id, event="live_pp_recovery_position_closed_before_pp", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id,
+            status="POSITION_CLOSED_BEFORE_PP", recovery_case="B",
+        )
+        return
+
+    position_amt = live_position.get("positionAmt", "0")
+    new_sl_client_order_id = row["new_sl_client_order_id"]
+    new_sl_order = _lookup_new_sl_order(connector, instrument, new_sl_client_order_id)
+    state = _classify_new_sl_state(new_sl_order)
+
+    if state == "ACTIVE":
+        # The new SL WAS placed successfully before the crash - resume from
+        # right after verification.
+        new_sl_order_id = str(new_sl_order.get("orderId"))  # type: ignore[union-attr]
+        _finalize_verified_active_new_sl(
+            repo, connector, position_id, instrument, new_sl_order_id, old_sl_order_id, run_id, now,
+        )
+        return
+
+    if state == "FILLED":
+        _handle_new_sl_filled(repo, connector, position_id, instrument, old_sl_order_id, run_id, now)
+        return
+
+    # state == "UNKNOWN" (not found / lookup failed / unrecognized status):
+    # the new SL was never confirmed placed - safe to retry placement using
+    # the row's stored old_sl_order_id/breakeven_price/new_sl_client_order_id
+    # (the SAME id, never a new one).
+    breakeven_price = Decimal(str(row["breakeven_price"]))
+    _place_and_verify_new_sl(
+        repo, connector, position_id, instrument, old_sl_order_id, breakeven_price,
+        new_sl_client_order_id, position_amt, run_id, now,
+    )
+
+
+def _recover_case_c(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    row: dict,
+    instrument: str,
+    old_sl_order_id: str,
+    new_sl_order_id: str,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Case C: new_sl_order_id is set on the row - step 6 completed and was
+    confirmed ACTIVE before the crash; only the pre-cancel position
+    re-check, the cancel itself, or the final status write didn't complete.
+    """
+    position_id = row["position_id"]
+    live_position = connector.get_position(instrument)
+    if live_position is None:
+        # Both orders are already durably recorded. Per the established
+        # policy elsewhere in this module, do not attempt to touch either
+        # order without a verified need - the position is already flat, so
+        # there is nothing left to protect, and touching orders on a flat
+        # position now would be exactly the "guess based on an unverified
+        # assumption" the design forbids.
+        repo.set_live_profit_protection_status(
+            position_id, "POSITION_CLOSED_DURING_REPLACEMENT", now,
+            last_error=(
+                "restart recovery (Case C): position already closed; both orders were "
+                "already recorded, neither touched"
+            ),
+        )
+        log_event(
+            run_id, event="live_pp_recovery_position_closed_during_replacement", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+            status="POSITION_CLOSED_DURING_REPLACEMENT", recovery_case="C",
+        )
+        return
+
+    try:
+        open_orders = connector.get_open_orders(instrument)
+    except _UNKNOWN_OUTCOME_ERRORS as exc:
+        # Cannot determine which orders remain right now - do not guess.
+        # The row stays CLAIMED; a later tick's recovery pass will retry
+        # once the exchange is reachable again.
+        log_event(
+            run_id, event="live_pp_recovery_open_orders_lookup_failed", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+            error_type=type(exc).__name__, error=str(exc), recovery_case="C",
+        )
+        return
+
+    sl_orders = [order for order in open_orders if order.get("type") == "STOP_MARKET"]
+    sl_order_ids = {str(order.get("orderId")) for order in sl_orders}
+
+    if not sl_orders:
+        # An anomaly this codebase's own logic should never itself produce -
+        # add-before-remove guarantees >=1 protective order at every
+        # self-caused transition. Do NOT auto-heal (do not guess a price and
+        # place a fresh SL). Logged with a clearly ERROR-signalling event
+        # name/field for human attention (log_event itself always logs at
+        # INFO - there is no lower-level primitive available in this module).
+        repo.set_live_profit_protection_status(
+            position_id, "ANOMALY_NO_PROTECTIVE_ORDER_FOUND", now,
+            last_error=(
+                "restart recovery (Case C): position still open but zero STOP_MARKET "
+                "orders exist at all (neither old nor new)"
+            ),
+        )
+        log_event(
+            run_id, event="live_pp_anomaly_no_protective_order_found", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+            status="ANOMALY_NO_PROTECTIVE_ORDER_FOUND", severity="ERROR", recovery_case="C",
+        )
+        return
+
+    if old_sl_order_id not in sl_order_ids:
+        # The old SL is already gone - the operation had actually already
+        # fully succeeded before the crash; only the final status write
+        # never landed.
+        repo.set_live_profit_protection_status(
+            position_id, "SL_REPLACED", now,
+            last_error="old SL already cancelled before restart; only the status write was missing",
+        )
+        log_event(
+            run_id, event="live_pp_sl_replaced", position_id=position_id, instrument=instrument,
+            old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+            status="SL_REPLACED", recovered=True, recovery_case="C",
+        )
+        return
+
+    # Old SL still present - attempt the cancel exactly one more time. This
+    # finite, evidence-based retry is safe: we have direct proof from the
+    # row's own recorded state (new SL already confirmed ACTIVE before the
+    # crash) that a cancel is the only remaining, safe action.
+    try:
+        connector.cancel_order(instrument, old_sl_order_id)
+    except _UNKNOWN_OUTCOME_ERRORS as exc:
+        repo.set_live_profit_protection_status(
+            position_id, "REPLACEMENT_PARTIAL", now, last_error=str(exc),
+        )
+        log_event(
+            run_id, event="live_pp_replacement_partial", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+            status="REPLACEMENT_PARTIAL", error=str(exc), recovery_case="C",
+        )
+        return
+
+    repo.set_live_profit_protection_status(position_id, "SL_REPLACED", now)
+    log_event(
+        run_id, event="live_pp_sl_replaced", position_id=position_id, instrument=instrument,
+        old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+        status="SL_REPLACED", recovery_case="C",
+    )
+
+
+def _recover_claimed_position(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    row: dict,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Resolves one CLAIMED live_profit_protection row left over from an
+    interrupted prior tick (crash/restart), per the design spec's
+    "Restart / crash recovery" section. Always re-derives truth from the
+    exchange - never assumes, never blindly resumes mid-recipe. Exactly one
+    of three cases applies, determined solely by which fields are already
+    populated on the row: the sequence this module runs is strictly
+    single-threaded and sequential, so old_sl_order_id can only ever be set
+    before the new SL placement was attempted, and new_sl_order_id can only
+    ever be set after the new SL was confirmed ACTIVE (which is always
+    after old_sl_order_id was already set)."""
+    position_id = row["position_id"]
+    position_record = repo.get_position(position_id)
+    if position_record is None:
+        return  # defensive: a claimed PP row always has a positions row
+    instrument = position_record.instrument
+
+    old_sl_order_id = row.get("old_sl_order_id")
+    new_sl_order_id = row.get("new_sl_order_id")
+
+    if old_sl_order_id is None:
+        _recover_case_a(repo, connector, row, instrument, run_id, now)
+    elif new_sl_order_id is None:
+        _recover_case_b(repo, connector, row, instrument, old_sl_order_id, run_id, now)
+    else:
+        _recover_case_c(repo, connector, row, instrument, old_sl_order_id, new_sl_order_id, run_id, now)
 
 
 def _process_position(
@@ -449,7 +764,27 @@ def run_live_profit_protection_tick(
     same malformed position may keep failing every subsequent tick - that
     is an accepted, logged, non-blocking outcome (visible via the
     "live_pp_tick_error" event for human review), never one that is allowed
-    to take down the rest of the batch."""
+    to take down the rest of the batch.
+
+    Task 6 (2026-09-13): restart/crash recovery runs FIRST, before the scan
+    below - every row still CLAIMED from an interrupted prior tick is
+    resolved forward to a terminal (or, for a fresh Case A retry, possibly
+    all the way through the sequence) status by re-deriving truth from the
+    exchange, per the design spec's "Restart / crash recovery" section. A
+    CLAIMED row is never left CLAIMED after a tick observes it. Same
+    per-position isolation discipline as the scan below: one bad recovery
+    must never block recovering or scanning any other position."""
+    for row in repo.find_claimed_live_profit_protection():
+        position_id = row["position_id"]
+        try:
+            _recover_claimed_position(repo, connector, row, run_id, now)
+        except Exception as exc:  # noqa: BLE001 - one bad recovery must never block the batch
+            log_event(
+                run_id, event="live_pp_recovery_error", position_id=position_id,
+                error_type=type(exc).__name__, error=str(exc),
+            )
+            continue
+
     for row in repo.find_active_live_executions():
         if row["phase"] != "ACTIVE":
             continue  # CLAIMED/ENTRY_SUBMITTED: not a real position yet

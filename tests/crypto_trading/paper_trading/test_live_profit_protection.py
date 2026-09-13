@@ -75,6 +75,7 @@ class _SpyConnector:
         open_orders_raises_from_call=None,
         place_sl_raises=None,
         lookup_order=None,
+        lookup_sequence=None,
         lookup_raises=None,
         cancel_raises=None,
     ):
@@ -89,6 +90,13 @@ class _SpyConnector:
         self._open_orders_raises_from_call = open_orders_raises_from_call
         self._place_sl_raises = place_sl_raises
         self._lookup_order = lookup_order
+        # Task 6: some recovery paths look up the new SL's client order id
+        # TWICE in one tick (once by the recovery pass itself, once more by
+        # a shared placement/verification helper it delegates to after a
+        # not-found result) - lookup_sequence lets a test give each call a
+        # different answer, same pattern as position_sequence above. Falls
+        # back to the static lookup_order once exhausted (or if never set).
+        self._lookup_sequence = list(lookup_sequence) if lookup_sequence is not None else None
         self._lookup_raises = lookup_raises
         self._cancel_raises = cancel_raises
 
@@ -129,6 +137,10 @@ class _SpyConnector:
         self.calls.append(("get_order_by_client_order_id", client_order_id))
         if self._lookup_raises is not None:
             raise self._lookup_raises
+        if self._lookup_sequence is not None:
+            if self._lookup_sequence:
+                return self._lookup_sequence.pop(0)
+            return self._lookup_order
         return self._lookup_order
 
     def cancel_order(self, symbol, order_id):
@@ -342,21 +354,32 @@ def test_run_tick_below_threshold_skips_no_row_created(tmp_path):
     assert connector.place_calls == []
 
 
-# --- 11. A position with an existing PP row is never re-examined --------
+# --- 11. A position with an existing PP row is never re-examined by the --
+# --- main scan (Task 6 note: a still-CLAIMED row IS now examined, but by --
+# --- the restart-recovery pass, not this scan - see the Task 6 section --
+# --- below for that behavior; a TERMINAL-status row is untouched by ------
+# --- either) ---------------------------------------------------------------
 
-def test_run_tick_position_with_existing_pp_row_is_never_touched(tmp_path):
+def test_run_tick_position_with_terminal_status_is_never_touched_by_recovery_or_scan(tmp_path):
+    """Spec test case 8: once a position's live_profit_protection row has
+    reached ANY terminal status (not CLAIMED), neither the restart-recovery
+    pass (which only ever reads rows via find_claimed_live_profit_protection,
+    i.e. status == 'CLAIMED') nor the main scan (which skips any position
+    with an existing row at all, terminal or not) may examine it again - the
+    connector must not be touched for this position at all."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_active_live_position(repo)
     repo.claim_live_profit_protection(
         "pos-1", "0.01", "50600", "50000", "existing-cid-pp", _NOW,
     )
+    repo.set_live_profit_protection_status("pos-1", "SL_REPLACED", _NOW)
     connector = _SpyConnector(positions=[_ABOVE_THRESHOLD_POSITION])
 
     run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
 
     assert connector.calls == []  # the connector is never touched at all for this position
     row = repo.get_live_profit_protection("pos-1")
-    assert row["status"] == "CLAIMED"  # left exactly as-is - Task 6's job to resolve
+    assert row["status"] == "SL_REPLACED"  # left exactly as-is
 
 
 # --- Deep-review fix 1: invalid/non-positive entry_quantity must never ---
@@ -496,5 +519,272 @@ def test_run_tick_entry_quantity_mismatch_with_exchange_position_aborts(tmp_path
     row = repo.get_live_profit_protection("pos-1")
     assert row["status"] == "ABORTED_QUANTITY_MISMATCH"
     assert row["old_sl_order_id"] == "old-sl-1"  # recorded, never cancelled
+    assert connector.place_calls == []
+    assert connector.cancel_calls == []
+
+
+# =========================================================================
+# Task 6: restart/crash recovery for rows left CLAIMED by an interrupted
+# prior tick (spec test cases 7 and 8; case labels A/B/C per the Task 6
+# brief's decision tree, keyed off which of old_sl_order_id/new_sl_order_id
+# are already populated on the row).
+# =========================================================================
+
+
+def _claim_row(repo, position_id="pos-1", new_sl_client_order_id="existing-cid-pp"):
+    """Seeds a bare CLAIMED live_profit_protection row (Case A shape: no
+    old_sl_order_id, no new_sl_order_id yet) for a position already opened
+    via _open_active_live_position."""
+    repo.claim_live_profit_protection(
+        position_id, "0.01", "50600", "50000", new_sl_client_order_id, _NOW,
+    )
+
+
+# --- Case A: old_sl_order_id is None (crash before step 4 ever completed) -
+
+def test_recovery_case_a_position_still_open_retries_from_scratch(tmp_path):
+    """Nothing was ever placed on the exchange for this attempt (old SL not
+    yet even identified) - this is exactly what _run_claimed_sequence
+    already handles from scratch. Recovery must reuse the row's stored
+    breakeven_price/new_sl_client_order_id (never mint a new client order
+    id) and complete the sequence normally."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=_ONE_OLD_SL,
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert row["old_sl_order_id"] == "old-sl-1"
+    assert row["new_sl_order_id"] == "new-sl-1"
+    assert connector.place_calls == [{
+        "symbol": "BTC-USDT", "quantity": "0.002", "stop_price": "50000",
+        "client_order_id": "existing-cid-pp",  # the SAME id stored at claim time
+    }]
+    assert connector.cancel_calls == ["old-sl-1"]
+
+
+def test_recovery_case_a_position_closed_yields_position_closed_before_pp(tmp_path):
+    """Position already flat by the time recovery observes it, and no old
+    SL was ever identified - nothing to protect, nothing was ever placed."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    connector = _SpyConnector(positions=[])  # get_position(instrument) -> None
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "POSITION_CLOSED_BEFORE_PP"
+    assert connector.place_calls == []
+    assert connector.cancel_calls == []
+
+
+# --- Case B: old_sl_order_id set, new_sl_order_id is None ------------------
+
+def test_recovery_case_b_new_sl_not_found_retries_placement_and_completes(tmp_path):
+    """New SL was never confirmed placed before the crash - safe to retry
+    placement under the SAME deterministic client order id. The lookup is
+    consulted twice in this scenario: once by the recovery pass itself
+    (not found), once more by the shared placement/verification helper
+    after the retried placement (this time found ACTIVE)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=[],  # never consulted - Case B skips the ambiguous-SL identification step
+        lookup_sequence=[None, {"orderId": "new-sl-1", "status": "NEW"}],
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert row["new_sl_order_id"] == "new-sl-1"
+    assert connector.place_calls == [{
+        "symbol": "BTC-USDT", "quantity": "0.002", "stop_price": "50000",
+        "client_order_id": "existing-cid-pp",
+    }]
+    assert connector.cancel_calls == ["old-sl-1"]
+
+
+def test_recovery_case_b_new_sl_found_active_resumes_at_verified_tail(tmp_path):
+    """New SL WAS placed successfully before the crash - resume right after
+    verification: record it, re-check the position, cancel the old SL.
+    Placement must never be retried once the new SL is confirmed active."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        lookup_order={"orderId": "new-sl-1", "status": "PENDING"},
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert row["new_sl_order_id"] == "new-sl-1"
+    assert connector.place_calls == []  # never re-placed - already confirmed active
+    assert connector.cancel_calls == ["old-sl-1"]
+
+
+def test_recovery_case_b_new_sl_found_filled_position_flat_yields_sl_replaced(tmp_path):
+    """New SL was found FILLED - the position closed at/near breakeven
+    during the interrupted attempt, a valid outcome. Re-checking the real
+    position confirms flat, so this resolves to SL_REPLACED with no further
+    order operation (mirrors the normal sequence's own FILLED branch)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    connector = _SpyConnector(
+        position_sequence=[_ABOVE_THRESHOLD_POSITION, None],  # 1st: recovery's flat-check, 2nd: FILLED re-check
+        lookup_order={"orderId": "new-sl-1", "status": "FILLED"},
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert connector.place_calls == []
+    assert connector.cancel_calls == []
+
+
+# --- Case C: new_sl_order_id is set (step 6 confirmed before the crash) ---
+
+def test_recovery_case_c_both_orders_exist_cancel_succeeds(tmp_path):
+    """Only the pre-cancel re-check, the cancel itself, or the final status
+    write didn't complete before the crash. Both orders still genuinely
+    exist on the exchange - attempt the cancel exactly once more."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=[
+            {"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"},
+            {"type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": "50000"},
+        ],
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert connector.place_calls == []  # no third order ever placed
+    assert connector.cancel_calls == ["old-sl-1"]  # exactly one more cancel attempt
+
+
+def test_recovery_case_c_both_orders_exist_cancel_fails_again(tmp_path):
+    """The single evidence-based retry cancel fails again - permanently
+    blocked, both order IDs retained, position stays protected by both."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=[
+            {"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"},
+            {"type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": "50000"},
+        ],
+        cancel_raises=ConnectorUnavailableError("still unreachable cancelling old SL"),
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "REPLACEMENT_PARTIAL"
+    assert row["old_sl_order_id"] == "old-sl-1"
+    assert row["new_sl_order_id"] == "new-sl-1"
+    assert connector.cancel_calls == ["old-sl-1"]  # exactly one attempt, not retried further
+
+
+def test_recovery_case_c_old_sl_already_gone_yields_sl_replaced_directly(tmp_path):
+    """The old SL is already gone from the exchange (cancel had actually
+    already fully succeeded before the crash) - only the final status write
+    never landed. No cancel is attempted again."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=[{"type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": "50000"}],
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert connector.cancel_calls == []  # already gone - no cancel attempted
+
+
+def test_recovery_case_c_position_closed_yields_position_closed_during_replacement(tmp_path):
+    """Both orders were already recorded (new SL confirmed active before the
+    crash); the position itself is now flat. Per the established policy,
+    neither order is touched without a verified need - there is nothing
+    left to protect."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(positions=[])  # flat
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "POSITION_CLOSED_DURING_REPLACEMENT"
+    assert connector.cancel_calls == []
+
+
+# --- Anomaly: position open, zero STOP_MARKET orders exist at all --------
+
+def test_recovery_zero_protective_orders_with_position_open_yields_anomaly(tmp_path):
+    """A state this code should never itself produce (add-before-remove
+    guarantees >=1 protective order at every self-caused transition) - do
+    not auto-heal, do not guess a price and place a fresh SL."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(positions=[_ABOVE_THRESHOLD_POSITION], open_orders=[])
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "ANOMALY_NO_PROTECTIVE_ORDER_FOUND"
     assert connector.place_calls == []
     assert connector.cancel_calls == []
