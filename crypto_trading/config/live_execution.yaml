@@ -17,10 +17,12 @@ margin_safety_buffer_usdt: "1.00"
 # signal older than this may never be claimed/submitted by LIVE. LIVE-only,
 # independent of max_position_hold_hours above.
 signal_ttl_seconds: 1800
-# Profit protection (Task 3): default-off flag and threshold. Activating
-# profit_protection_enabled is a separate, later, explicit decision, after
-# the underlying protection logic is wired and tested. The threshold itself
-# is a config value here (not hardcoded) so a future change can retune it
-# without touching code.
-profit_protection_enabled: false
+# Profit protection (Task 3): threshold is a config value here (not
+# hardcoded) so a future change can retune it without touching code.
+# Activated 2026-09-13 (explicit user decision, after full implementation +
+# 3 rounds of deep review incl. one Critical bug found/fixed/re-verified):
+# +1.0% unrealized profit -> real BingX SL moved to break-even. TP/initial
+# SL/entry/sizing/leverage/Gate/Risk/AI/exposure/Guardian all unchanged -
+# this flag ONLY arms the break-even SL replacement mechanism.
+profit_protection_enabled: true
 profit_protection_threshold_pct: "0.01"
