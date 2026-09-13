@@ -19,6 +19,34 @@ def test_claim_live_profit_protection_is_idempotent(tmp_path):
     assert second is False
 
 
+def test_claim_live_profit_protection_preserves_original_data_on_second_claim(tmp_path):
+    """The boolean return alone doesn't prove non-overwrite: INSERT OR
+    IGNORE with identical arguments can't distinguish "ignored" from
+    "silently overwrote with the same values". This is the property the
+    whole feature's idempotency rests on ("PP activates at most once per
+    position, without corrupting the original attempt's data") - so claim
+    a second time with DIFFERENT values and assert the ORIGINAL row is
+    still what's stored."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    first = repo.claim_live_profit_protection(
+        "pos-1", "0.01", "50500", "50000", "pp-cid-1", _NOW
+    )
+    second = repo.claim_live_profit_protection(
+        "pos-1", "0.02", "70700", "70000", "pp-cid-2", _NOW + timedelta(seconds=5)
+    )
+
+    assert first is True
+    assert second is False
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["threshold_pct"] == "0.01"
+    assert row["trigger_mark_price"] == "50500"
+    assert row["breakeven_price"] == "50000"
+    assert row["new_sl_client_order_id"] == "pp-cid-1"
+    assert row["claimed_at"] == _NOW.isoformat()
+    assert row["updated_at"] == _NOW.isoformat()
+
+
 def test_get_live_profit_protection_returns_none_before_claim(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
 
