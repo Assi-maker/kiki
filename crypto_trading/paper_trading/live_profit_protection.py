@@ -487,8 +487,64 @@ def _recover_case_b(
         return
 
     position_amt = live_position.get("positionAmt", "0")
+
+    # Fix 2 (deep review): the old SL can be gone by the time this recovery
+    # path runs (externally cancelled, or triggered/removed during the
+    # exact downtime this recovery path exists to handle) with the new SL
+    # never placed either - zero STOP_MARKET orders at all while the
+    # position is still open. Detect this the SAME way Case C does, before
+    # ever considering a placement or relying on a later cancel_order call
+    # against an order whose existence was never verified in this tick.
+    try:
+        open_orders = connector.get_open_orders(instrument)
+    except _UNKNOWN_OUTCOME_ERRORS as exc:
+        # Cannot determine which orders remain right now - do not guess.
+        # The row stays CLAIMED; a later tick's recovery pass will retry
+        # once the exchange is reachable again.
+        log_event(
+            run_id, event="live_pp_recovery_open_orders_lookup_failed", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id,
+            error_type=type(exc).__name__, error=str(exc), recovery_case="B",
+        )
+        return
+
+    sl_orders = [order for order in open_orders if order.get("type") == "STOP_MARKET"]
+    if not sl_orders:
+        repo.set_live_profit_protection_status(
+            position_id, "ANOMALY_NO_PROTECTIVE_ORDER_FOUND", now,
+            last_error=(
+                "restart recovery (Case B): position still open but zero STOP_MARKET "
+                "orders exist at all (neither old nor a new one was ever confirmed placed)"
+            ),
+        )
+        log_event(
+            run_id, event="live_pp_anomaly_no_protective_order_found", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id,
+            status="ANOMALY_NO_PROTECTIVE_ORDER_FOUND", severity="ERROR", recovery_case="B",
+        )
+        return
+
     new_sl_client_order_id = row["new_sl_client_order_id"]
-    new_sl_order = _lookup_new_sl_order(connector, instrument, new_sl_client_order_id)
+    # Fix 3 (deep review): a genuine lookup error must NEVER be collapsed
+    # into "not found" here - that would silently downgrade an unknown
+    # outcome into a real placement attempt, a severity regression from
+    # Task 5's original fail-closed discipline (_resolve_uncertain_entry:
+    # look up, never resubmit, when the true state can't be determined).
+    # Deliberately does NOT use _lookup_new_sl_order (which swallows every
+    # _UNKNOWN_OUTCOME_ERRORS into None, identical to "not found") - the
+    # raise is caught here, explicitly, so it can be handled differently.
+    try:
+        new_sl_order = connector.get_order_by_client_order_id(instrument, new_sl_client_order_id)
+    except _UNKNOWN_OUTCOME_ERRORS as exc:
+        # Leave the row CLAIMED; a later tick's recovery pass will retry
+        # the lookup once the exchange is reachable again. Never guess.
+        log_event(
+            run_id, event="live_pp_recovery_new_sl_lookup_failed", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id,
+            error_type=type(exc).__name__, error=str(exc), recovery_case="B",
+        )
+        return
+
     state = _classify_new_sl_state(new_sl_order)
 
     if state == "ACTIVE":
@@ -504,10 +560,13 @@ def _recover_case_b(
         _handle_new_sl_filled(repo, connector, position_id, instrument, old_sl_order_id, run_id, now)
         return
 
-    # state == "UNKNOWN" (not found / lookup failed / unrecognized status):
-    # the new SL was never confirmed placed - safe to retry placement using
-    # the row's stored old_sl_order_id/breakeven_price/new_sl_client_order_id
-    # (the SAME id, never a new one).
+    # state == "UNKNOWN" here means the lookup call itself SUCCEEDED (a
+    # genuine error already returned above, never reaching this line) and
+    # returned either no order at all or an unrecognized status - a real,
+    # determinate "not found" response. The new SL was never confirmed
+    # placed - safe to retry placement using the row's stored
+    # old_sl_order_id/breakeven_price/new_sl_client_order_id (the SAME id,
+    # never a new one).
     breakeven_price = Decimal(str(row["breakeven_price"]))
     _place_and_verify_new_sl(
         repo, connector, position_id, instrument, old_sl_order_id, breakeven_price,
@@ -567,19 +626,24 @@ def _recover_case_c(
 
     sl_orders = [order for order in open_orders if order.get("type") == "STOP_MARKET"]
     sl_order_ids = {str(order.get("orderId")) for order in sl_orders}
+    old_present = old_sl_order_id in sl_order_ids
+    new_present = new_sl_order_id in sl_order_ids
 
-    if not sl_orders:
-        # An anomaly this codebase's own logic should never itself produce -
-        # add-before-remove guarantees >=1 protective order at every
-        # self-caused transition. Do NOT auto-heal (do not guess a price and
-        # place a fresh SL). Logged with a clearly ERROR-signalling event
-        # name/field for human attention (log_event itself always logs at
-        # INFO - there is no lower-level primitive available in this module).
+    if not old_present and not new_present:
+        # Neither of OUR OWN recorded protective orders is present - an
+        # anomaly this codebase's own logic should never itself produce
+        # (add-before-remove guarantees >=1 protective order at every
+        # self-caused transition), regardless of any other unrelated orders
+        # that might exist on the instrument. Do NOT auto-heal (do not
+        # guess a price and place a fresh SL). Logged with a clearly
+        # ERROR-signalling event name/field for human attention (log_event
+        # itself always logs at INFO - there is no lower-level primitive
+        # available in this module).
         repo.set_live_profit_protection_status(
             position_id, "ANOMALY_NO_PROTECTIVE_ORDER_FOUND", now,
             last_error=(
-                "restart recovery (Case C): position still open but zero STOP_MARKET "
-                "orders exist at all (neither old nor new)"
+                "restart recovery (Case C): position still open but neither the recorded "
+                "old nor new SL order is present among open STOP_MARKET orders"
             ),
         )
         log_event(
@@ -589,8 +653,9 @@ def _recover_case_c(
         )
         return
 
-    if old_sl_order_id not in sl_order_ids:
-        # The old SL is already gone - the operation had actually already
+    if not old_present:
+        # new_present is True here (the both-absent case returned above) -
+        # the old SL is already gone - the operation had actually already
         # fully succeeded before the crash; only the final status write
         # never landed.
         repo.set_live_profit_protection_status(
@@ -604,10 +669,62 @@ def _recover_case_c(
         )
         return
 
-    # Old SL still present - attempt the cancel exactly one more time. This
-    # finite, evidence-based retry is safe: we have direct proof from the
-    # row's own recorded state (new SL already confirmed ACTIVE before the
-    # crash) that a cancel is the only remaining, safe action.
+    if not new_present:
+        # CRITICAL fix (deep review): old_sl_order_id is present, but the
+        # row's OWN recorded new_sl_order_id is NOT among the freshly-read
+        # open orders - e.g. externally cancelled, or BingX auto-cancelling
+        # a duplicate STOP_MARKET (exactly the exchange behavior the spec
+        # refuses to assume). The cancel gate must be identity-based, never
+        # presence/count-based: reaching the cancel below on this evidence
+        # alone would risk leaving a real, still-open position with ZERO
+        # stops recorded as a permanent SL_REPLACED success. Resolve the
+        # new SL's actual state the same way Case B does - via its
+        # deterministic client order id - and branch from there. The old
+        # SL is NEVER cancelled purely because it happens to still be
+        # present; only a freshly, positively confirmed new SL unlocks that.
+        new_sl_client_order_id = row["new_sl_client_order_id"]
+        new_sl_order = _lookup_new_sl_order(connector, instrument, new_sl_client_order_id)
+        state = _classify_new_sl_state(new_sl_order)
+
+        if state == "ACTIVE":
+            # Authoritative direct confirmation overrides the (possibly
+            # stale) open-orders read above - resume the tail normally.
+            _finalize_verified_active_new_sl(
+                repo, connector, position_id, instrument, new_sl_order_id, old_sl_order_id,
+                run_id, now,
+            )
+            return
+
+        if state == "FILLED":
+            _handle_new_sl_filled(repo, connector, position_id, instrument, old_sl_order_id, run_id, now)
+            return
+
+        # state == "UNKNOWN" (not found / lookup failed / unrecognized
+        # status): a new SL our own row claims was already confirmed ACTIVE
+        # can no longer be positively verified, while the old SL is still
+        # there (still protected, add-before-remove was never violated).
+        # Never blindly retry a write here (this is not "never confirmed
+        # placed" like Case B's UNKNOWN - our row already recorded it
+        # ACTIVE once) - block for human/reconciliation review instead.
+        repo.set_live_profit_protection_status(
+            position_id, "UNCERTAIN_NEW_SL_STATUS", now,
+            last_error=(
+                "restart recovery (Case C): recorded new SL is missing from open orders and "
+                f"could not be re-confirmed by lookup (result: {new_sl_order!r}); old SL left untouched"
+            ),
+        )
+        log_event(
+            run_id, event="live_pp_new_sl_status_uncertain", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+            status="UNCERTAIN_NEW_SL_STATUS", recovery_case="C",
+        )
+        return
+
+    # Both old_present and new_present are freshly, positively confirmed -
+    # the ONLY safe cancel branch. Attempt the cancel exactly one more
+    # time. This finite, evidence-based retry is safe: we have direct
+    # proof from THIS read that a cancel is the only remaining, safe
+    # action.
     try:
         connector.cancel_order(instrument, old_sl_order_id)
     except _UNKNOWN_OUTCOME_ERRORS as exc:

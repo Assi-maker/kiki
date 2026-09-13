@@ -602,7 +602,10 @@ def test_recovery_case_b_new_sl_not_found_retries_placement_and_completes(tmp_pa
     )
     connector = _SpyConnector(
         positions=[_ABOVE_THRESHOLD_POSITION],
-        open_orders=[],  # never consulted - Case B skips the ambiguous-SL identification step
+        # Fix 2: Case B now reads get_open_orders itself first (the
+        # zero-protective-orders anomaly gate) - only old-sl-1 is present,
+        # matching "new SL never confirmed placed yet".
+        open_orders=_ONE_OLD_SL,
         lookup_sequence=[None, {"orderId": "new-sl-1", "status": "NEW"}],
     )
 
@@ -630,6 +633,7 @@ def test_recovery_case_b_new_sl_found_active_resumes_at_verified_tail(tmp_path):
     )
     connector = _SpyConnector(
         positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=_ONE_OLD_SL,  # Fix 2: Case B's zero-protective-orders anomaly gate reads this first
         lookup_order={"orderId": "new-sl-1", "status": "PENDING"},
     )
 
@@ -655,6 +659,7 @@ def test_recovery_case_b_new_sl_found_filled_position_flat_yields_sl_replaced(tm
     )
     connector = _SpyConnector(
         position_sequence=[_ABOVE_THRESHOLD_POSITION, None],  # 1st: recovery's flat-check, 2nd: FILLED re-check
+        open_orders=_ONE_OLD_SL,  # Fix 2: Case B's zero-protective-orders anomaly gate reads this first
         lookup_order={"orderId": "new-sl-1", "status": "FILLED"},
     )
 
@@ -663,6 +668,64 @@ def test_recovery_case_b_new_sl_found_filled_position_flat_yields_sl_replaced(tm
     row = repo.get_live_profit_protection("pos-1")
     assert row["status"] == "SL_REPLACED"
     assert connector.place_calls == []
+    assert connector.cancel_calls == []
+
+
+# --- Fix 2 (deep review of Task 6): Case B must detect the same ----------
+# --- zero-protective-orders anomaly Case C already detects ---------------
+
+def test_recovery_case_b_zero_open_orders_yields_anomaly_not_a_blind_placement(tmp_path):
+    """Reviewer-reproduced gap: the old SL can be gone (externally
+    cancelled, or triggered) by the time Case B runs, with the new SL never
+    placed either - zero STOP_MARKET orders at all while the position is
+    still open. Case B must detect this the same way Case C does, rather
+    than placing a "fine, additive" new SL and later attempting to cancel
+    an old SL that was never verified to exist, which could silently
+    auto-heal an anomaly that should block for human review instead."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    connector = _SpyConnector(positions=[_ABOVE_THRESHOLD_POSITION], open_orders=[])
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "ANOMALY_NO_PROTECTIVE_ORDER_FOUND"
+    assert connector.place_calls == []
+    assert connector.cancel_calls == []
+
+
+# --- Fix 3 (deep review of Task 6): Case B must not collapse a genuine ---
+# --- lookup error into "not found" and retry placement on that basis -----
+
+def test_recovery_case_b_new_sl_lookup_error_leaves_row_claimed_never_retries_placement(tmp_path):
+    """Reviewer-reproduced regression: a lookup ConnectTimeout (or any
+    _UNKNOWN_OUTCOME_ERRORS) must NOT be treated the same as a genuine
+    not-found response. Task 5's original discipline for an uncertain
+    lookup is fail-CLOSED (never blindly retry a write whose outcome is
+    unknown - _resolve_uncertain_entry only ever looks up, never
+    resubmits). The row must stay CLAIMED for a later tick's recovery pass
+    to try the lookup again - a real placement must never happen here."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=_ONE_OLD_SL,
+        lookup_raises=ConnectorUnavailableError("ConnectTimeout looking up new SL"),
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "CLAIMED"  # left for the next tick's recovery pass to retry the lookup
+    assert connector.place_calls == []  # a lookup error must NEVER trigger a real placement
     assert connector.cancel_calls == []
 
 
@@ -744,6 +807,101 @@ def test_recovery_case_c_old_sl_already_gone_yields_sl_replaced_directly(tmp_pat
     row = repo.get_live_profit_protection("pos-1")
     assert row["status"] == "SL_REPLACED"
     assert connector.cancel_calls == []  # already gone - no cancel attempted
+
+
+# --- Fix 1 (deep review of Task 6): Case C's cancel must be gated on the -
+# --- recorded new SL's presence being freshly, positively confirmed - ----
+# --- never on old-SL presence alone -----------------------------------------
+
+def test_recovery_case_c_new_sl_missing_does_not_cancel_blindly_resolves_uncertain(tmp_path):
+    """CRITICAL reviewer-reproduced bug: the old SL is still present, but
+    the row's OWN recorded new_sl_order_id is NOT among the freshly-read
+    open orders (externally cancelled, or BingX auto-cancelled a duplicate
+    STOP_MARKET - exactly the exchange behavior the spec refuses to
+    assume). The previous guard checked old-SL presence only and would
+    cancel the old SL anyway, leaving a real open position with ZERO stops
+    recorded as a permanent SL_REPLACED success. The fix must NOT cancel
+    here - it must resolve the new SL's actual state via the same
+    deterministic-client-order-id lookup Case B uses, and here the lookup
+    also fails to find it - so this blocks (old SL is NEVER cancelled)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        # Old SL still present; the recorded new SL (new-sl-1) is NOT here.
+        open_orders=[{"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"}],
+        lookup_order=None,  # deterministic lookup also can't find it
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "UNCERTAIN_NEW_SL_STATUS"
+    assert connector.cancel_calls == []  # the old SL must NEVER be cancelled on this evidence
+    assert connector.place_calls == []  # never blindly re-placed either
+
+
+def test_recovery_case_c_two_unrelated_stop_orders_does_not_cancel_blindly(tmp_path):
+    """Second reviewer reproduction of the same root cause, proving the fix
+    is identity-based and not merely presence/count-based: TWO STOP_MARKET
+    orders exist (old SL plus one unrelated order), neither of which is the
+    recorded new SL. A naive "len(sl_orders) >= 2 means old+new" fix would
+    still wrongly cancel here - the fix must check new_sl_order_id
+    specifically, by id, not just count."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=[
+            {"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"},
+            {"type": "STOP_MARKET", "orderId": "unrelated-order-9", "stopPrice": "51000"},
+        ],
+        lookup_order=None,
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "UNCERTAIN_NEW_SL_STATUS"
+    assert connector.cancel_calls == []
+    assert connector.place_calls == []
+
+
+def test_recovery_case_c_new_sl_missing_from_open_orders_but_confirmed_active_via_lookup_completes(tmp_path):
+    """When the new SL isn't in the (possibly stale) open-orders read but a
+    direct deterministic-client-order-id lookup DOES positively confirm it
+    ACTIVE, that authoritative confirmation is trusted and the sequence
+    resumes normally (cancel old, finalize) - the fix must not become
+    overly conservative once genuine positive confirmation exists."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=[{"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"}],
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert connector.cancel_calls == ["old-sl-1"]
+    assert connector.place_calls == []  # never re-placed - already confirmed active
 
 
 def test_recovery_case_c_position_closed_yields_position_closed_during_replacement(tmp_path):
