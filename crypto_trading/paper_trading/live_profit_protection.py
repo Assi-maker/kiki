@@ -721,28 +721,18 @@ def _recover_case_c(
         return
 
     # Both old_present and new_present are freshly, positively confirmed -
-    # the ONLY safe cancel branch. Attempt the cancel exactly one more
-    # time. This finite, evidence-based retry is safe: we have direct
-    # proof from THIS read that a cancel is the only remaining, safe
-    # action.
-    try:
-        connector.cancel_order(instrument, old_sl_order_id)
-    except _UNKNOWN_OUTCOME_ERRORS as exc:
-        repo.set_live_profit_protection_status(
-            position_id, "REPLACEMENT_PARTIAL", now, last_error=str(exc),
-        )
-        log_event(
-            run_id, event="live_pp_replacement_partial", position_id=position_id,
-            instrument=instrument, old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
-            status="REPLACEMENT_PARTIAL", error=str(exc), recovery_case="C",
-        )
-        return
-
-    repo.set_live_profit_protection_status(position_id, "SL_REPLACED", now)
-    log_event(
-        run_id, event="live_pp_sl_replaced", position_id=position_id, instrument=instrument,
-        old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
-        status="SL_REPLACED", recovery_case="C",
+    # the ONLY safe cancel branch. Route through the SAME shared
+    # verified-active tail the fresh path and Case B's ACTIVE branch use
+    # (final-whole-branch-review fix), rather than inlining another cancel
+    # here - that tail's pre-cancel get_position re-check (Task 5 deep-
+    # review fix 3) is exactly what closes the window between Case C's own
+    # early position-liveness check (above) and the actual cancel; without
+    # routing through it, a position that went flat during that window
+    # would have been cancelled against anyway and wrongly recorded as a
+    # permanent SL_REPLACED success. This also means there is now only ONE
+    # place in the whole file that ever cancels a confirmed-old SL.
+    _finalize_verified_active_new_sl(
+        repo, connector, position_id, instrument, new_sl_order_id, old_sl_order_id, run_id, now,
     )
 
 

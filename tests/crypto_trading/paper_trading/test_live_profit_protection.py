@@ -786,6 +786,42 @@ def test_recovery_case_c_both_orders_exist_cancel_fails_again(tmp_path):
     assert connector.cancel_calls == ["old-sl-1"]  # exactly one attempt, not retried further
 
 
+def test_recovery_case_c_position_closes_between_identification_and_cancel_skips_cancel(tmp_path):
+    """Final-whole-branch-review fix: Case C's both-present cancel path must
+    go through the SAME pre-cancel get_position re-check the fresh path
+    (_finalize_verified_active_new_sl, Task 5 deep-review fix 3) already
+    has. Case C's own position-liveness check happens once, early - before
+    the get_open_orders call that identifies old/new SL presence. If the
+    position goes flat in the window between that check and the eventual
+    cancel, cancelling the old SL now and writing SL_REPLACED would be
+    exactly the "guess based on an unverified assumption" the design
+    forbids - the fresh path already refuses to do this for the identical
+    situation, so recovery must refuse it too. Must resolve to
+    POSITION_CLOSED_DURING_REPLACEMENT with the cancel skipped entirely."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW,
+    )
+    repo.update_live_profit_protection_new_sl("pos-1", new_sl_order_id="new-sl-1", updated_at=_NOW)
+    connector = _SpyConnector(
+        # 1st call: Case C's own early position-liveness check (open).
+        # 2nd call: the shared helper's pre-cancel re-check (flat).
+        position_sequence=[_ABOVE_THRESHOLD_POSITION, None],
+        open_orders=[
+            {"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"},
+            {"type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": "50000"},
+        ],
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "POSITION_CLOSED_DURING_REPLACEMENT"
+    assert connector.cancel_calls == []  # cancel skipped entirely, not attempted and failed
+
+
 def test_recovery_case_c_old_sl_already_gone_yields_sl_replaced_directly(tmp_path):
     """The old SL is already gone from the exchange (cancel had actually
     already fully succeeded before the crash) - only the final status write
