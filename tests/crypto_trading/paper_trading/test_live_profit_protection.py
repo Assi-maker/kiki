@@ -72,6 +72,7 @@ class _SpyConnector:
         positions=None,
         position_sequence=None,
         open_orders=None,
+        open_orders_raises_from_call=None,
         place_sl_raises=None,
         lookup_order=None,
         lookup_raises=None,
@@ -84,6 +85,8 @@ class _SpyConnector:
         self._positions = positions if positions is not None else []
         self._position_sequence = list(position_sequence) if position_sequence is not None else None
         self._open_orders = open_orders if open_orders is not None else []
+        self._open_orders_call_count = 0
+        self._open_orders_raises_from_call = open_orders_raises_from_call
         self._place_sl_raises = place_sl_raises
         self._lookup_order = lookup_order
         self._lookup_raises = lookup_raises
@@ -101,7 +104,13 @@ class _SpyConnector:
         return None
 
     def get_open_orders(self, symbol):
+        self._open_orders_call_count += 1
         self.calls.append(("get_open_orders", symbol))
+        if (
+            self._open_orders_raises_from_call is not None
+            and self._open_orders_call_count >= self._open_orders_raises_from_call
+        ):
+            raise ConnectorUnavailableError("get_open_orders failed on a later call")
         return self._open_orders
 
     def place_stop_loss_order(self, symbol, quantity, stop_price, client_order_id):
@@ -130,7 +139,13 @@ class _SpyConnector:
         return {}
 
 
-_ABOVE_THRESHOLD_POSITION = {"symbol": "BTC-USDT", "avgPrice": "50000", "markPrice": "50600"}  # +1.2%
+# positionAmt matches _open_active_live_position's default entry_quantity
+# ("0.002") so the quantity-vs-exchange-position cross-check (deep-review
+# fix 5) passes by default in every pre-existing test below; tests that
+# specifically exercise the mismatch set a different positionAmt.
+_ABOVE_THRESHOLD_POSITION = {
+    "symbol": "BTC-USDT", "avgPrice": "50000", "markPrice": "50600", "positionAmt": "0.002",
+}  # +1.2%
 _ONE_OLD_SL = [{"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"}]
 
 
@@ -342,3 +357,144 @@ def test_run_tick_position_with_existing_pp_row_is_never_touched(tmp_path):
     assert connector.calls == []  # the connector is never touched at all for this position
     row = repo.get_live_profit_protection("pos-1")
     assert row["status"] == "CLAIMED"  # left exactly as-is - Task 6's job to resolve
+
+
+# --- Deep-review fix 1: invalid/non-positive entry_quantity must never ---
+# --- reach a real order placement -----------------------------------------
+
+def test_run_tick_zero_entry_quantity_aborts_before_any_placement(tmp_path):
+    """Reproduces the reviewer's finding: live_execution.py's own
+    _resolve_uncertain_entry can leave entry_quantity as "0" (e.g. a fill
+    lookup response missing executedQty). Without a guard, that "0" would
+    have been sent straight to place_stop_loss_order, the old SL would then
+    have been cancelled, and the position reported SL_REPLACED while
+    actually protected by a zero-quantity stop. This must abort BEFORE
+    placement, with the old SL left completely untouched."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo, entry_quantity="0")
+    connector = _SpyConnector(positions=[_ABOVE_THRESHOLD_POSITION], open_orders=_ONE_OLD_SL)
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "ABORTED_INVALID_ENTRY_QUANTITY"
+    assert row["old_sl_order_id"] == "old-sl-1"  # recorded, never cancelled
+    assert connector.place_calls == []
+    assert connector.cancel_calls == []
+
+
+# --- Deep-review fix 2: one bad position must never block the whole tick -
+
+def test_run_tick_one_malformed_position_never_blocks_the_rest_of_the_batch(tmp_path):
+    """A malformed exchange position payload (missing avgPrice/markPrice -
+    a realistic partial/degraded API response) must not propagate out of
+    the scan loop: this module is inserted before close_time_limit_positions
+    in the real tick, so an uncaught exception here would silently disable
+    time-limit exits for every OTHER live position for the rest of the
+    tick, and - because the exception fires before any claim - the same
+    position would then repeat the exact same failure every subsequent
+    tick forever. Two positions: "pos-bad" (malformed) processed first,
+    "pos-good" (fully valid) processed second - pos-good must still reach
+    SL_REPLACED despite pos-bad blowing up first."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo, position_id="pos-bad")
+    _open_active_live_position(repo, position_id="pos-good")
+    connector = _SpyConnector(
+        # 1st call: pos-bad's threshold check (malformed, raises).
+        # 2nd call: pos-good's threshold check.
+        # 3rd call: pos-good's pre-cancel re-check (deep-review fix 3) -
+        # must still show the position open so pos-good's own sequence
+        # completes normally and isn't itself a false failure.
+        position_sequence=[
+            {"symbol": "BTC-USDT"}, _ABOVE_THRESHOLD_POSITION, _ABOVE_THRESHOLD_POSITION,
+        ],
+        open_orders=_ONE_OLD_SL,
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    assert repo.get_live_profit_protection("pos-bad") is None  # never reached a claim
+    good_row = repo.get_live_profit_protection("pos-good")
+    assert good_row is not None
+    assert good_row["status"] == "SL_REPLACED"  # pos-bad's exception did not block pos-good
+    assert len(connector.place_calls) == 1
+
+
+# --- Deep-review fix 3: orphan-SL race - re-check position before cancel -
+
+def test_run_tick_position_closes_after_new_sl_verified_skips_cancel(tmp_path):
+    """New SL verifies NEW/PENDING (not FILLED, so the existing FILLED-
+    branch re-check never fires), but the real position has since gone
+    flat (e.g. hit TP) in the window between verification and the old-SL
+    cancel. Cancelling the old SL now would be a guess about an order that
+    may no longer matter - must re-check get_position() immediately before
+    cancel_order() and, if flat, skip the cancel entirely rather than
+    assume BingX safely rejects stops on closed positions (the spec
+    explicitly refuses to assume this)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    connector = _SpyConnector(
+        position_sequence=[_ABOVE_THRESHOLD_POSITION, None],  # 1st: threshold check, 2nd: pre-cancel re-check
+        open_orders=_ONE_OLD_SL,
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "POSITION_CLOSED_DURING_REPLACEMENT"
+    assert row["new_sl_order_id"] == "new-sl-1"  # already recorded before the re-check
+    assert connector.cancel_calls == []  # cancel skipped entirely, not attempted and failed
+
+
+# --- Deep-review fix 4: SL_REPLACED must be written before the ------------
+# --- informational final-state read, not after ----------------------------
+
+def test_run_tick_final_state_read_failure_does_not_undo_sl_replaced(tmp_path):
+    """The old SL cancel (the last IRREVERSIBLE step) already succeeded by
+    the time the purely informational final get_open_orders() read runs.
+    If that read throws, the already-true success must still be recorded
+    as SL_REPLACED, never left stuck at CLAIMED."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION],
+        open_orders=_ONE_OLD_SL,
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+        open_orders_raises_from_call=2,  # 1st call (ambiguous-SL check) OK, 2nd (final check) raises
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert connector.cancel_calls == ["old-sl-1"]  # the real, irreversible cancel did happen
+
+
+# --- Deep-review fix 5: entry_quantity must match the real position size -
+
+def test_run_tick_entry_quantity_mismatch_with_exchange_position_aborts(tmp_path):
+    """entry_quantity (locally recorded at entry) has diverged from the
+    exchange's own positionAmt (e.g. a partial close since entry) by far
+    more than a reasonable tolerance - placing a replacement SL sized to
+    the stale, smaller local quantity would leave part of the real
+    position unprotected once the old SL is cancelled. Must abort before
+    ever placing the new SL, old SL left untouched."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo, entry_quantity="0.002")
+    connector = _SpyConnector(
+        positions=[{
+            "symbol": "BTC-USDT", "avgPrice": "50000", "markPrice": "50600",
+            "positionAmt": "0.01",  # 5x the locally-recorded entry_quantity
+        }],
+        open_orders=_ONE_OLD_SL,
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "ABORTED_QUANTITY_MISMATCH"
+    assert row["old_sl_order_id"] == "old-sl-1"  # recorded, never cancelled
+    assert connector.place_calls == []
+    assert connector.cancel_calls == []
