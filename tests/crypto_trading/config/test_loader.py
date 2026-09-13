@@ -280,3 +280,9 @@ def test_detective_config_defaults_when_omitted():
     assert config.batch_size == 10
     assert config.check_interval_seconds == 300
     assert config.min_history_for_win_loss_comparison == 20
+
+
+def test_get_settings_loads_live_profit_protection_defaults():
+    settings = get_settings()
+    assert settings.live_execution.profit_protection_enabled is False
+    assert settings.live_execution.profit_protection_threshold_pct == Decimal("0.01")

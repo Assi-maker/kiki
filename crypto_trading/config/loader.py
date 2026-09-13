@@ -192,6 +192,14 @@ class LiveExecutionConfig(BaseModel):
     # permitted to claim/submit it at all - see
     # paper_trading/live_execution.py::process_pending_positions().
     signal_ttl_seconds: int = Field(gt=0, default=1800)
+    # Profit protection (Task 3): default-off flag and threshold. Activating
+    # profit_protection_enabled is a separate, later, explicit decision, after
+    # the underlying protection logic is wired and tested. The threshold itself
+    # is a config value here (not hardcoded) so a future change can retune it
+    # without touching code - see the spec's explicit "the +1.0% threshold
+    # itself is not tuned in this change" guidance.
+    profit_protection_enabled: bool = Field(default=False)
+    profit_protection_threshold_pct: Decimal = Field(default=Decimal("0.01"), gt=0, le=1)
 
 
 class ProfitProtectionExperimentConfig(BaseModel):
