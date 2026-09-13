@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from crypto_trading.config.loader import get_settings
 from crypto_trading.live_execution_loop import run_live_execution_tick
@@ -131,3 +132,95 @@ def test_run_live_execution_tick_never_crashes_the_caller_on_unexpected_error(tm
         repo, _ExplodingConnector(), _SpyMarketDataConnector(), {"BTC-USDT": 3},
         {"BTC-USDT": Decimal("0")}, get_settings(), _NOW,
     )
+
+
+def _with_profit_protection_enabled(settings, enabled=True):
+    return settings.model_copy(
+        update={"live_execution": settings.live_execution.model_copy(
+            update={"profit_protection_enabled": enabled}
+        )}
+    )
+
+
+def test_run_live_execution_tick_never_calls_profit_protection_when_disabled(tmp_path):
+    """Task 7 wiring: profit_protection_enabled defaults to False, so
+    run_live_profit_protection_tick must never be invoked during a normal
+    tick unless a caller explicitly opts in via config."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo)
+    connector = _SpyConnector()
+    settings = get_settings()
+    assert settings.live_execution.profit_protection_enabled is False
+
+    with patch(
+        "crypto_trading.live_execution_loop.run_live_profit_protection_tick"
+    ) as mock_pp:
+        run_live_execution_tick(
+            repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+            {"BTC-USDT": Decimal("0")}, settings, _NOW,
+        )
+
+    mock_pp.assert_not_called()
+
+
+def test_run_live_execution_tick_calls_profit_protection_in_correct_order_when_enabled(tmp_path):
+    """Task 7 wiring / design spec "Integration point": when enabled,
+    run_live_profit_protection_tick must run after reconcile_active_
+    executions (so it scans a freshly-reconciled ACTIVE list) and before
+    close_time_limit_positions/process_pending_positions (so it never
+    races a same-tick close or a new-entry capacity check)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo)
+    connector = _SpyConnector()
+    settings = _with_profit_protection_enabled(get_settings())
+    call_order = []
+
+    def _recorder(name):
+        def _fn(*args, **kwargs):
+            call_order.append(name)
+        return _fn
+
+    with (
+        patch(
+            "crypto_trading.live_execution_loop.reconcile_active_executions",
+            side_effect=_recorder("reconcile_active_executions"),
+        ) as mock_reconcile,
+        patch(
+            "crypto_trading.live_execution_loop.run_live_profit_protection_tick",
+            side_effect=_recorder("run_live_profit_protection_tick"),
+        ) as mock_pp,
+        patch(
+            "crypto_trading.live_execution_loop.close_guardian_exit_positions",
+            side_effect=_recorder("close_guardian_exit_positions"),
+        ),
+        patch(
+            "crypto_trading.live_execution_loop.close_time_limit_positions",
+            side_effect=_recorder("close_time_limit_positions"),
+        ),
+        patch(
+            "crypto_trading.live_execution_loop.process_pending_positions",
+            side_effect=_recorder("process_pending_positions"),
+        ),
+    ):
+        run_live_execution_tick(
+            repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+            {"BTC-USDT": Decimal("0")}, settings, _NOW,
+        )
+
+    assert call_order == [
+        "reconcile_active_executions",
+        "run_live_profit_protection_tick",
+        "close_guardian_exit_positions",
+        "close_time_limit_positions",
+        "process_pending_positions",
+    ]
+
+    assert mock_pp.call_count == 1
+    pp_args = mock_pp.call_args.args
+    assert pp_args[0] is repo
+    assert pp_args[1] is connector
+    assert pp_args[2] == settings.live_execution.profit_protection_threshold_pct
+    assert pp_args[4] == _NOW
+    # Same run_id this tick used for reconcile_active_executions - proves
+    # the call isn't accidentally minting/forwarding a different run.
+    assert pp_args[3] == mock_reconcile.call_args.args[3]

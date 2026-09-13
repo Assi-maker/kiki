@@ -946,3 +946,39 @@ def test_recovery_zero_protective_orders_with_position_open_yields_anomaly(tmp_p
     assert row["status"] == "ANOMALY_NO_PROTECTIVE_ORDER_FOUND"
     assert connector.place_calls == []
     assert connector.cancel_calls == []
+
+
+# --- Production isolation (design spec "Integration point" / test plan 13) ---
+
+def test_module_never_imports_forbidden_production_modules():
+    """Design spec 'Integration point': this module is intentionally
+    standalone and must never import from paper_trading.position_closing,
+    paper_trading.profit_protection_experiment, or crypto_trading.backtest
+    (or anything under it) - same discipline as this codebase's other
+    Tier 1 production-file-isolation tests (see
+    tests/crypto_trading/test_no_intelligence_coupling.py)."""
+    import ast
+    from pathlib import Path
+
+    import crypto_trading.paper_trading.live_profit_protection as module_under_test
+
+    module_path = Path(module_under_test.__file__)
+    tree = ast.parse(module_path.read_text(encoding="utf-8"))
+    imported_modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_modules.add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported_modules.add(node.module)
+
+    forbidden_prefixes = (
+        "crypto_trading.paper_trading.position_closing",
+        "crypto_trading.paper_trading.profit_protection_experiment",
+        "crypto_trading.backtest",
+    )
+    offenders = [
+        m for m in imported_modules
+        if any(m == prefix or m.startswith(prefix + ".") for prefix in forbidden_prefixes)
+    ]
+    assert offenders == [], f"live_profit_protection.py imports forbidden modules: {offenders}"
