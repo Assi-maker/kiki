@@ -251,6 +251,40 @@ class BingXLiveTradingConnector:
             )
         )
 
+    def place_stop_loss_order(
+        self, symbol: str, quantity: str, stop_price: str, client_order_id: str
+    ) -> dict:
+        """Standalone SL replacement for LIVE Profit Protection (2026-09-13) -
+        NEVER touches TP, NEVER used at entry. Same STOP_MARKET/MARK_PRICE
+        shape as the SL sub-order inside place_entry_order_with_sl_tp's
+        combined placement, just issued alone against the same order
+        endpoint. Raises OrderRejectedError on a structured rejection -
+        identical, already-safety-audited semantics as
+        place_entry_order_with_sl_tp (a synchronous rejection here means zero
+        fill guaranteed, nothing to look up)."""
+        params = {
+            "symbol": symbol,
+            "side": "SELL",
+            "positionSide": "LONG",
+            "type": "STOP_MARKET",
+            "quantity": quantity,
+            "stopPrice": stop_price,
+            "clientOrderID": client_order_id,
+            "workingType": "MARK_PRICE",
+        }
+        try:
+            return _unwrap_order(self._request("POST", _ORDER_PATH, params))
+        except _ApiCodeError as exc:
+            raise OrderRejectedError(str(exc)) from exc
+
+    def cancel_order(self, symbol: str, order_id: str) -> dict:
+        """Cancels exactly one order by orderId - never the whole-symbol
+        cancel_all_open_orders(), which would also remove TP. Same
+        _ORDER_PATH as get_order_status()/place_entry_order_with_sl_tp(),
+        verified against CCXT's documented BingX linear-swap cancelOrder
+        implementation (DELETE, {symbol, orderId})."""
+        return self._request("DELETE", _ORDER_PATH, {"symbol": symbol, "orderId": order_id}) or {}
+
     def get_balance(self) -> dict:
         """Read-only. Real USDT-margin account balance. Response shape and
         field names (`availableMargin` et al.) live-verified 2026-09-06

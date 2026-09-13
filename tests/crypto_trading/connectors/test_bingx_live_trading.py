@@ -1,5 +1,5 @@
 import json
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 import respx
@@ -237,3 +237,54 @@ def test_close_position_market_omits_reduce_only():
     assert "reduceOnly" not in params
     assert params["side"] == ["SELL"]
     assert params["positionSide"] == ["LONG"]
+
+
+@respx.mock
+def test_place_stop_loss_order_sends_stop_market_sell_long():
+    route = respx.post(f"{_LIVE_BASE}/openApi/swap/v2/trade/order").mock(
+        return_value=Response(200, json={"code": 0, "msg": "", "data": {"order": {"orderId": "999"}}})
+    )
+    connector = _connector()
+
+    result = connector.place_stop_loss_order(
+        "BTC-USDT", quantity="0.01", stop_price="50000", client_order_id="lvabc123pp"
+    )
+
+    assert result["orderId"] == "999"
+    body = route.calls[0].request.content.decode("utf-8")
+    params = parse_qs(body)
+    assert params["side"] == ["SELL"]
+    assert params["positionSide"] == ["LONG"]
+    assert params["type"] == ["STOP_MARKET"]
+    assert params["clientOrderID"] == ["lvabc123pp"]
+
+
+@respx.mock
+def test_place_stop_loss_order_raises_order_rejected_on_structured_error():
+    respx.post(f"{_LIVE_BASE}/openApi/swap/v2/trade/order").mock(
+        return_value=Response(200, json={"code": 80001, "msg": "duplicate stop order"})
+    )
+    connector = _connector()
+
+    with pytest.raises(OrderRejectedError):
+        connector.place_stop_loss_order("BTC-USDT", "0.01", "50000", "lvabc123pp")
+
+
+@respx.mock
+def test_cancel_order_sends_delete_with_symbol_and_order_id():
+    route = respx.delete(f"{_LIVE_BASE}/openApi/swap/v2/trade/order").mock(
+        return_value=Response(200, json={"code": 0, "msg": "", "data": {"orderId": "999", "status": "CANCELED"}})
+    )
+    connector = _connector()
+
+    result = connector.cancel_order("BTC-USDT", "999")
+
+    assert result["status"] == "CANCELED"
+    query_bytes = route.calls.last.request.url.query
+    if isinstance(query_bytes, bytes):
+        query_str = query_bytes.decode("utf-8")
+    else:
+        query_str = query_bytes
+    params = parse_qs(query_str)
+    assert params["symbol"] == ["BTC-USDT"]
+    assert params["orderId"] == ["999"]
