@@ -127,6 +127,26 @@ class Repository(Protocol):
     def mark_live_execution_skipped(
         self, position_id: str, reason: str, updated_at: datetime
     ) -> None: ...
+    def claim_live_profit_protection(
+        self,
+        position_id: str,
+        threshold_pct: str,
+        trigger_mark_price: str,
+        breakeven_price: str,
+        new_sl_client_order_id: str,
+        claimed_at: datetime,
+    ) -> bool: ...
+    def get_live_profit_protection(self, position_id: str) -> dict | None: ...
+    def find_claimed_live_profit_protection(self) -> list[dict]: ...
+    def update_live_profit_protection_old_sl(
+        self, position_id: str, old_sl_order_id: str, old_sl_price: str, updated_at: datetime
+    ) -> None: ...
+    def update_live_profit_protection_new_sl(
+        self, position_id: str, new_sl_order_id: str, updated_at: datetime
+    ) -> None: ...
+    def set_live_profit_protection_status(
+        self, position_id: str, status: str, updated_at: datetime, last_error: str | None = None
+    ) -> None: ...
     def close_position_with_event(
         self,
         position_id: str,
@@ -759,6 +779,85 @@ class SQLiteRepository:
             "UPDATE live_executions SET phase = 'SKIPPED', last_error = ?, updated_at = ? "
             "WHERE position_id = ?",
             (reason, updated_at.isoformat(), position_id),
+        )
+        self._conn.commit()
+
+    def claim_live_profit_protection(
+        self,
+        position_id: str,
+        threshold_pct: str,
+        trigger_mark_price: str,
+        breakeven_price: str,
+        new_sl_client_order_id: str,
+        claimed_at: datetime,
+    ) -> bool:
+        # Idempotency gate: "PP only activates once per position" (spec's
+        # Data model section). No WHERE EXISTS positions race-guard, unlike
+        # claim_live_execution - the caller (Task 5) already verifies the
+        # live position itself before ever calling this claim, so a plain
+        # INSERT OR IGNORE on the position_id primary key is sufficient.
+        try:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO live_profit_protection "
+                "(position_id, status, threshold_pct, trigger_mark_price, breakeven_price, "
+                "new_sl_client_order_id, claimed_at, updated_at) "
+                "VALUES (?, 'CLAIMED', ?, ?, ?, ?, ?, ?)",
+                (
+                    position_id,
+                    threshold_pct,
+                    trigger_mark_price,
+                    breakeven_price,
+                    new_sl_client_order_id,
+                    claimed_at.isoformat(),
+                    claimed_at.isoformat(),
+                ),
+            )
+            claimed = cur.rowcount > 0
+            self._conn.commit()
+            return claimed
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_live_profit_protection(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM live_profit_protection WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_claimed_live_profit_protection(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM live_profit_protection WHERE status = 'CLAIMED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_live_profit_protection_old_sl(
+        self, position_id: str, old_sl_order_id: str, old_sl_price: str, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "UPDATE live_profit_protection SET old_sl_order_id = ?, old_sl_price = ?, "
+            "updated_at = ? WHERE position_id = ?",
+            (old_sl_order_id, old_sl_price, updated_at.isoformat(), position_id),
+        )
+        self._conn.commit()
+
+    def update_live_profit_protection_new_sl(
+        self, position_id: str, new_sl_order_id: str, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "UPDATE live_profit_protection SET new_sl_order_id = ?, updated_at = ? "
+            "WHERE position_id = ?",
+            (new_sl_order_id, updated_at.isoformat(), position_id),
+        )
+        self._conn.commit()
+
+    def set_live_profit_protection_status(
+        self, position_id: str, status: str, updated_at: datetime, last_error: str | None = None
+    ) -> None:
+        self._conn.execute(
+            "UPDATE live_profit_protection SET status = ?, last_error = ?, updated_at = ? "
+            "WHERE position_id = ?",
+            (status, last_error, updated_at.isoformat(), position_id),
         )
         self._conn.commit()
 

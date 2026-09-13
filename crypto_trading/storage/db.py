@@ -205,6 +205,31 @@ CREATE TABLE IF NOT EXISTS live_executions (
     closed_at TEXT
 );
 
+-- LIVE Profit Protection (2026-09-13): one row per LIVE position, created
+-- (claimed) the moment a PP attempt starts - never before. See
+-- docs/superpowers/specs/2026-09-13-live-profit-protection-design.md
+-- "Data model" for the exact status values and their meaning. Idempotency
+-- gate is the position_id primary key itself (INSERT OR IGNORE) - unlike
+-- live_executions' claim, no WHERE EXISTS positions race-guard is needed
+-- here because the caller already verifies the live position itself before
+-- ever calling the claim. old_sl_order_id/old_sl_price and
+-- new_sl_order_id are unknown at claim time - populated by later updates
+-- once the exchange state is observed.
+CREATE TABLE IF NOT EXISTS live_profit_protection (
+    position_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    threshold_pct TEXT NOT NULL,
+    trigger_mark_price TEXT,
+    breakeven_price TEXT,
+    old_sl_order_id TEXT,
+    old_sl_price TEXT,
+    new_sl_client_order_id TEXT NOT NULL,
+    new_sl_order_id TEXT,
+    last_error TEXT,
+    claimed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- Position Guardian (2026-09-04): strictly append-only, shadow-mode-only
 -- observer of an already-open PAPER position, see
 -- docs/superpowers/specs/2026-09-04-position-guardian-design.md.
