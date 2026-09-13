@@ -8,7 +8,9 @@ from crypto_trading.storage.repository import SQLiteRepository
 _NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
 
 
-def _open_position(repo: SQLiteRepository, position_id: str = "pos-1") -> Position:
+def _open_position(
+    repo: SQLiteRepository, position_id: str = "pos-1", opened_at: datetime = _NOW
+) -> Position:
     position = Position(
         position_id=position_id,
         candidate_id=position_id,
@@ -21,14 +23,14 @@ def _open_position(repo: SQLiteRepository, position_id: str = "pos-1") -> Positi
         target=Decimal("52000"),
         size=Decimal("1000"),
         fill_model_version="v1",
-        opened_at=_NOW,
+        opened_at=opened_at,
     )
     event = Event(
         event_id=f"POSITION_OPENED:{position_id}",
         event_type="POSITION_OPENED",
         aggregate_type="position",
         aggregate_id=position_id,
-        occurred_at=_NOW,
+        occurred_at=opened_at,
         run_id="seed",
         schema_version=1,
         payload={},
@@ -62,6 +64,52 @@ def test_find_positions_pending_live_execution_excludes_claimed(tmp_path):
     pending = repo.find_positions_pending_live_execution(limit=10)
 
     assert [p.position_id for p in pending] == ["pos-2"]
+
+
+def test_find_positions_pending_live_execution_returns_newest_first(tmp_path):
+    """2026-09-13 pipeline-queue bugfix: a large, permanently-stale backlog
+    of never-claimed old positions must never crowd a fresh signal out of
+    the LIMIT window. `opened_at DESC` (not ASC) guarantees any genuinely
+    fresh position is always at/near the front of the result set, so a
+    small `limit` (matching real per-tick capacity, never dozens) still
+    sees it - freshness itself is still enforced downstream by
+    _signal_is_fresh()/TTL, this ordering change only controls which
+    candidates are even LOOKED AT within a bounded-size query."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    old = _open_position(repo, "pos-old", opened_at=_NOW - timedelta(hours=6))
+    new = _open_position(repo, "pos-new", opened_at=_NOW)
+
+    pending = repo.find_positions_pending_live_execution(limit=1)
+
+    assert [p.position_id for p in pending] == ["pos-new"]
+
+
+def test_find_positions_pending_live_execution_still_returns_all_within_limit(tmp_path):
+    """The ordering change must not drop or hide any pending position that
+    fits within `limit` - only its ORDER within that window changes."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "pos-old", opened_at=_NOW - timedelta(hours=6))
+    _open_position(repo, "pos-new", opened_at=_NOW)
+
+    pending = repo.find_positions_pending_live_execution(limit=10)
+
+    assert {p.position_id for p in pending} == {"pos-old", "pos-new"}
+
+
+def test_find_positions_pending_live_execution_never_deletes_or_mutates_old_rows(tmp_path):
+    """Requirement: old pending rows must never be deleted or have their
+    history fabricated/altered by this query - it is a pure, read-only
+    SELECT. A position's own row (status, exit_reason, closed_at) must be
+    byte-identical before and after the call."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "pos-old", opened_at=_NOW - timedelta(hours=6))
+
+    repo.find_positions_pending_live_execution(limit=1)
+
+    row = repo.get_position("pos-old")
+    assert row.status == "OPEN_POSITION"
+    assert row.exit_reason is None
+    assert row.closed_at is None
 
 
 def test_mark_live_execution_entry_submitted_transitions_from_claimed(tmp_path):

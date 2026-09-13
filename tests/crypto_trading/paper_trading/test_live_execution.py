@@ -265,6 +265,40 @@ def test_process_pending_positions_never_claims_a_signal_older_than_ttl(tmp_path
     assert connector.calls == []  # never even attempted an order
 
 
+def test_process_pending_positions_old_stale_backlog_never_blocks_a_fresh_signal(tmp_path):
+    """2026-09-13 pipeline-queue bugfix, integration-level proof: a backlog
+    of never-claimed, permanently-stale old positions (larger than the
+    default page size) must never crowd a genuinely fresh, still-within-TTL
+    signal out of being seen and claimed. Reproduces the real incident
+    exactly: N old positions, all already well past TTL, plus 1 fresh one -
+    the fresh one must still be claimed and go ACTIVE in a single tick."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(12):  # more than the default limit=10, matching the real backlog shape
+        _open_position(
+            repo, position_id=f"pos-old-{i}",
+            opened_at=_NOW - timedelta(hours=6),
+            confirmed_at=_NOW - timedelta(hours=6),  # far past any real TTL
+        )
+    _open_position(
+        repo, position_id="pos-fresh",
+        opened_at=_NOW, confirmed_at=_NOW - timedelta(minutes=5),  # well within TTL
+    )
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = _with_ttl(get_settings(), ttl_seconds=1800)
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    fresh_row = repo.get_live_execution("pos-fresh")
+    assert fresh_row is not None and fresh_row["phase"] == "ACTIVE"
+    for i in range(12):
+        assert repo.get_live_execution(f"pos-old-{i}") is None  # never claimed, TTL still enforced
+        old_position = repo.get_position(f"pos-old-{i}")
+        assert old_position.status == "OPEN_POSITION"  # history untouched, not deleted/fabricated-closed
+
+
 def test_process_pending_positions_never_claims_a_very_old_signal_across_repeated_ticks(tmp_path):
     """Spec §17.9 case 4: a multi-day-old signal is never claimed, on this
     tick or any later one - the exclusion is a pure function of (now,

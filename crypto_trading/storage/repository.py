@@ -662,10 +662,25 @@ class SQLiteRepository:
         return dict(row) if row is not None else None
 
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]:
+        """2026-09-13 pipeline-queue fix: `opened_at DESC`, not `ASC`. A
+        never-claimed old position (stale past LIVE's own signal TTL -
+        `_signal_is_fresh()` in live_execution.py - and therefore permanent,
+        since freshness only ever decreases) used to sit in this result
+        forever under ASC ordering, and a large enough backlog of such rows
+        would fully occupy every `limit`-sized page, silently hiding any
+        genuinely fresh position from ever being seen by
+        process_pending_positions() - not just skipped for being stale
+        (that part already worked correctly), but never looked at in the
+        first place. DESC guarantees a fresh position is always at/near the
+        front of the window. Freshness/TTL enforcement itself is unchanged -
+        still decided entirely by _signal_is_fresh() after this query
+        returns; this only changes which candidates are visible within a
+        bounded page. Purely a SELECT: never deletes, closes, or otherwise
+        mutates any row it doesn't return."""
         rows = self._conn.execute(
             "SELECT * FROM positions WHERE status = 'OPEN_POSITION' "
             "AND position_id NOT IN (SELECT position_id FROM live_executions) "
-            "ORDER BY opened_at ASC LIMIT ?",
+            "ORDER BY opened_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [self._row_to_position(row) for row in rows]
