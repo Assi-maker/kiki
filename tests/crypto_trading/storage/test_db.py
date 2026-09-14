@@ -139,6 +139,80 @@ def test_migration_is_idempotent_across_repeated_connections(tmp_path):
     assert "instruments_scanned" in columns
 
 
+def test_guardian_authority_decisions_table_has_intervention_applied_column_on_a_fresh_database(
+    tmp_path,
+):
+    conn = get_connection(tmp_path / "test.db")
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(guardian_authority_decisions)").fetchall()
+    }
+    assert "intervention_applied" in columns
+
+
+def test_migration_adds_intervention_applied_column_to_a_pre_existing_database_without_it(
+    tmp_path,
+):
+    """I2 hardening fix (2026-09-14): guardian_authority_decisions.
+    intervention_applied was added AFTER Guardian Authority's own
+    table-creation code had already shipped to master and started running
+    unconditionally on every app startup (independent of
+    settings.guardian.authority_enabled) - real production databases can
+    already have this table WITHOUT the column. Same migration pattern and
+    same verification style as the runs.instruments_scanned /
+    candidates.reference_price migrations above: build the table via the
+    OLD shape (no intervention_applied column), reopen via get_connection()
+    (a real restart), and prove the migration adds the column without
+    destroying the existing row."""
+    db_path = tmp_path / "pre_existing.db"
+
+    old_conn = sqlite3.connect(db_path)
+    old_conn.execute(
+        "CREATE TABLE guardian_authority_decisions ("
+        "decision_id TEXT PRIMARY KEY, position_id TEXT, candidate_id TEXT NOT NULL, "
+        "decision_type TEXT NOT NULL, decided_at TEXT NOT NULL, reasoning TEXT NOT NULL, "
+        "expected_outcome TEXT NOT NULL, expected_direction TEXT NOT NULL, confidence REAL, "
+        "outcome_status TEXT NOT NULL DEFAULT 'PENDING', actual_exit_reason TEXT, "
+        "actual_pnl_usdt TEXT, expectation_correct BOOLEAN, resolved_at TEXT, old_sl TEXT, "
+        "new_sl TEXT, run_id TEXT NOT NULL)"
+    )
+    old_conn.execute(
+        "INSERT INTO guardian_authority_decisions (decision_id, position_id, candidate_id, "
+        "decision_type, decided_at, reasoning, expected_outcome, expected_direction, "
+        "confidence, run_id) VALUES "
+        "('ga-old-1', 'pos-1', 'cand-1', 'TIGHTEN_SL', '2026-08-01T00:00:00+00:00', "
+        "'reasoning', 'expect favorable', 'favorable', 0.7, 'run-1')"
+    )
+    old_conn.commit()
+    old_conn.close()
+
+    conn = get_connection(db_path)
+
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(guardian_authority_decisions)").fetchall()
+    }
+    assert "intervention_applied" in columns
+
+    row = conn.execute(
+        "SELECT * FROM guardian_authority_decisions WHERE decision_id = 'ga-old-1'"
+    ).fetchone()
+    assert row is not None
+    assert row["decision_type"] == "TIGHTEN_SL"
+    assert row["intervention_applied"] is None
+
+
+def test_migration_intervention_applied_is_idempotent_across_repeated_connections(tmp_path):
+    db_path = tmp_path / "test.db"
+    get_connection(db_path)
+    conn2 = get_connection(db_path)  # second connection must not crash on ALTER TABLE again
+    columns = {
+        row["name"]
+        for row in conn2.execute("PRAGMA table_info(guardian_authority_decisions)").fetchall()
+    }
+    assert "intervention_applied" in columns
+
+
 def test_schema_version_is_recorded(tmp_path):
     conn = get_connection(tmp_path / "test.db")
     row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()

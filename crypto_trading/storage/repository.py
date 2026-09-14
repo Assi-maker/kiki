@@ -261,6 +261,7 @@ class Repository(Protocol):
         run_id: str,
         old_sl: str | None = None,
         new_sl: str | None = None,
+        intervention_applied: bool | None = None,
     ) -> bool: ...
     def get_guardian_authority_decision(self, decision_id: str) -> dict | None: ...
     def find_pending_guardian_authority_decisions(self) -> list[dict]: ...
@@ -272,6 +273,9 @@ class Repository(Protocol):
         actual_pnl_usdt: str,
         expectation_correct: bool | None,
         resolved_at: datetime,
+    ) -> None: ...
+    def mark_guardian_authority_decision_intervention_applied(
+        self, decision_id: str, applied: bool, updated_at: datetime
     ) -> None: ...
     def find_guardian_authority_heuristics(self) -> list[dict]: ...
     def upsert_guardian_authority_heuristic(
@@ -1684,18 +1688,29 @@ class SQLiteRepository:
         run_id: str,
         old_sl: str | None = None,
         new_sl: str | None = None,
+        intervention_applied: bool | None = None,
     ) -> bool:
         # Idempotency gate: decision_id is the PK, so a duplicate call for
         # the same decision (e.g. a restart) can never produce two rows or
         # silently overwrite the original expectation - same INSERT OR
         # IGNORE claim-style shape as claim_live_profit_protection().
+        #
+        # I2 hardening fix (2026-09-14): intervention_applied is purely
+        # additive write-outcome-adjacent metadata (same category as the
+        # already-existing old_sl/new_sl params above) - NOT one of the
+        # requirement-10-protected expectation fields. Defaults to None
+        # ("not yet determined" - see db.py's migration docstring); real
+        # callers pass True (PRE_ENTRY_VETO/CLOSE_EARLY, known-successful at
+        # save time) or leave it None (TIGHTEN_SL, determined moments later
+        # via mark_guardian_authority_decision_intervention_applied below,
+        # once the write attempt's outcome is known).
         try:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO guardian_authority_decisions "
                 "(decision_id, position_id, candidate_id, decision_type, decided_at, "
                 "reasoning, expected_outcome, expected_direction, confidence, "
-                "old_sl, new_sl, run_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "old_sl, new_sl, run_id, intervention_applied) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     decision_id,
                     position_id,
@@ -1709,6 +1724,7 @@ class SQLiteRepository:
                     old_sl,
                     new_sl,
                     run_id,
+                    intervention_applied,
                 ),
             )
             saved = cur.rowcount > 0
@@ -1775,6 +1791,27 @@ class SQLiteRepository:
                 resolved_at.isoformat(),
                 decision_id,
             ),
+        )
+        self._conn.commit()
+
+    def mark_guardian_authority_decision_intervention_applied(
+        self, decision_id: str, applied: bool, updated_at: datetime
+    ) -> None:
+        # I2 hardening fix (2026-09-14): touches ONLY the
+        # intervention_applied column - same surgical-scope discipline as
+        # resolve_guardian_authority_decision immediately above (never
+        # referencing the requirement-10-protected expectation columns).
+        # `updated_at` is accepted for interface consistency with sibling
+        # repo methods but intentionally NOT bound into the UPDATE below -
+        # same precedent as tighten_position_stop_loss's own unused
+        # `updated_at` parameter (Task 4, see that method above): there is
+        # no generic "last updated" column on guardian_authority_decisions
+        # to bind it to, and adding one solely to hold this timestamp would
+        # be scope creep this fix does not need.
+        self._conn.execute(
+            "UPDATE guardian_authority_decisions SET intervention_applied = ? "
+            "WHERE decision_id = ?",
+            (applied, decision_id),
         )
         self._conn.commit()
 

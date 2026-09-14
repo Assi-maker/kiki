@@ -484,6 +484,12 @@ def maybe_open_position_for_candidate(
             expected_direction=expected_direction,
             confidence=confidence,
             run_id=run_id,
+            # I2 hardening fix (2026-09-14): the veto itself IS the
+            # complete, always-successful intervention - no position is
+            # ever opened, known with certainty right here at save time
+            # (unlike TIGHTEN_SL, whose write-attempt outcome is only known
+            # moments later - see guardian/tick.py::process_one_position).
+            intervention_applied=True,
         )
         log_event(
             run_id, event="ga_pre_entry_veto", candidate_id=candidate.candidate_id,
@@ -824,6 +830,18 @@ def update_heuristics_from_resolved_decisions(repo: Repository, now: datetime) -
     group whose sample size and miscalibration clear the thresholds
     documented above.
 
+    I2 hardening fix (2026-09-14): also requires `intervention_applied is
+    True` (well, `bool(...)` - see the guard below for why) on every
+    resolved TIGHTEN_SL row before it may contribute to a group's tally.
+    Without this, a single position sitting above the tighten threshold for
+    many consecutive ticks could satisfy `_MIN_SAMPLE_SIZE` entirely on its
+    own even though only one (or zero) of those ticks produced a real,
+    distinct intervention - every tick's decision row is still saved and
+    kept forever (the audit trail is untouched), but only genuine
+    interventions (a PAPER tighten the DB guard actually accepted, or a
+    LIVE tighten that reached `SL_REPLACED`) now count as a calibration
+    sample. `None`/missing/`False` are all excluded, never crash on it.
+
     Returns the count of heuristic rows upserted in THIS call.
 
     Never mutates `guardian_authority_decisions` - this is a pure read of
@@ -841,6 +859,16 @@ def update_heuristics_from_resolved_decisions(repo: Repository, now: datetime) -
             continue
         if decision["expectation_correct"] is None:
             continue  # defensive - should not happen for TIGHTEN_SL, but never crash/guess on it
+        # I2 hardening fix: SQLite has no native boolean type, so a stored
+        # True round-trips as the Python int 1 (not `True` itself) - same
+        # convention this function already relies on for expectation_correct
+        # below (`correct = bool(decision["expectation_correct"])`). Using
+        # `bool(...)` here (rather than `is True`) correctly treats a
+        # missing key, None, and the stored-False int 0 identically as "not
+        # a real intervention - exclude", and the stored-True int 1 as
+        # "include", without ever raising on a missing key.
+        if not bool(decision.get("intervention_applied")):
+            continue
 
         factors = _reconstruct_tighten_sl_factors(repo, decision)
         if factors is None:

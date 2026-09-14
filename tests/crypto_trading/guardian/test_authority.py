@@ -685,6 +685,40 @@ def test_maybe_open_position_flag_on_veto_never_opens_a_position(tmp_path):
     assert decision["expected_direction"] == "unfavorable"
 
 
+def test_maybe_open_position_flag_on_veto_saves_intervention_applied_true(tmp_path):
+    """I2 hardening fix (2026-09-14): the veto itself IS the complete,
+    always-successful intervention - no position is ever opened, and that
+    outcome is known with certainty at save time (unlike TIGHTEN_SL, whose
+    write-attempt outcome is only known after the fact) - so
+    intervention_applied=True is passed explicitly at save time, never left
+    None/to-be-determined."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-veto-ia-1",
+        description="momentum breakout at a very low candidate_score has historically lost",
+        condition_json=json.dumps(
+            {"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.1}
+        ),
+        adjustment=0.5,
+        confidence=0.8,
+        sample_size=20,
+        updated_at=_NOW,
+    )
+    candidate = _confirmed_candidate(candidate_score=0.05, trigger_reasons=["momentum_breakout"])
+    settings = _settings(GuardianConfig(authority_enabled=True, authority_veto_threshold=0.3))
+
+    with patch("crypto_trading.guardian.authority.open_position_for_candidate"):
+        maybe_open_position_for_candidate(
+            repo, candidate, settings.risk_limits, Decimal("50000"), _NOW, "run-1", settings
+        )
+
+    decisions = repo._conn.execute("SELECT * FROM guardian_authority_decisions").fetchall()
+    assert len(decisions) == 1
+    decision = dict(decisions[0])
+    assert decision["decision_type"] == "PRE_ENTRY_VETO"
+    assert decision["intervention_applied"] == 1
+
+
 # --------------------------------------------------------------------------
 # Task 8: resolve_pending_decisions
 #
@@ -1004,17 +1038,24 @@ def _resolved_tighten_sl(
     factors: dict,
     correct: bool,
     position_id: str = "pos-hc",
+    intervention_applied: bool | None = True,
 ) -> None:
     """Builds ONE resolved TIGHTEN_SL decision + its exactly-matching
     guardian_observations row (same decided_at/observed_at ISO string, per
     ruling (a)) - no real Position/Candidate row is needed, since
-    update_heuristics_from_resolved_decisions never reads either."""
+    update_heuristics_from_resolved_decisions never reads either.
+
+    `intervention_applied` defaults to True (a genuine, distinct
+    intervention) so every pre-existing caller of this helper keeps building
+    rows that count toward update_heuristics_from_resolved_decisions' sample
+    size under the I2 hardening fix's added filter (2026-09-14) - callers
+    proving that filter's exclusion behavior pass False/None explicitly."""
     decided_at = _NOW + timedelta(minutes=idx)
     decision_id = f"ga-hc-{position_id}-{idx}"
     repo.save_guardian_authority_decision(
         decision_id, position_id, f"cand-{position_id}-{idx}", "TIGHTEN_SL", decided_at,
         "reasoning", "expect small favorable move", "favorable", 0.7, "run-1",
-        old_sl="100", new_sl="105",
+        old_sl="100", new_sl="105", intervention_applied=intervention_applied,
     )
     repo.resolve_guardian_authority_decision(
         decision_id,
@@ -1178,6 +1219,79 @@ def test_update_heuristics_excludes_close_early_and_pre_entry_veto(tmp_path):
 
     assert updated == 0
     assert repo.find_guardian_authority_heuristics() == []
+
+
+# --------------------------------------------------------------------------
+# I2 hardening fix (2026-09-14): update_heuristics_from_resolved_decisions
+# must only count TIGHTEN_SL rows whose write-attempt actually took effect
+# (intervention_applied=True) - not every resolved TIGHTEN_SL row, which
+# (pre-fix) could all originate from the SAME position sitting above the
+# tighten threshold for many consecutive ticks with only one (or zero)
+# genuinely distinct interventions among them.
+# --------------------------------------------------------------------------
+
+
+def test_update_heuristics_excludes_rows_where_intervention_was_not_applied(tmp_path):
+    """Proves the filter actually changes behavior, not just that it
+    doesn't crash: without intervention_applied filtering, this fixture's
+    30 intervention_applied=False rows (all correct=True) would exactly
+    cancel out the 30 intervention_applied=True rows (all correct=False),
+    landing correct_rate at 0.5 (deviation 0, below _MIN_MISCALIBRATION) -
+    so NO heuristic would ever be produced. With the filter, only the 30
+    intervention_applied=True rows count -> n=30, correct_rate=0.0,
+    deviation=-0.5, clears both _MIN_SAMPLE_SIZE and _MIN_MISCALIBRATION ->
+    a heuristic IS produced."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl(
+            repo, i, "PROTECT", _MID_FACTORS, correct=False, position_id="pos-ia-true",
+            intervention_applied=True,
+        )
+    for i in range(30):
+        _resolved_tighten_sl(
+            repo, i + 100, "PROTECT", _MID_FACTORS, correct=True, position_id="pos-ia-false",
+            intervention_applied=False,
+        )
+
+    updated = update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
+
+    # _MID_FACTORS' decay values (0.5) fall in each factor's "mid" bucket,
+    # so this fixture (like test_update_heuristics_miscalibrated_group_gets_
+    # negative_adjustment above) produces the state-alone group PLUS one
+    # guardian_state x factor-bucket group per decay factor: 1 + 6 = 7 total.
+    assert updated == 7
+    heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_heuristics()}
+    assert "ga-hc:state:PROTECT" in heuristics
+    state_heuristic = heuristics["ga-hc:state:PROTECT"]
+    assert state_heuristic["adjustment"] < 0  # only the all-wrong True rows counted
+    assert state_heuristic["sample_size"] == 30  # not 60 - the False rows were excluded
+
+
+def test_update_heuristics_excludes_rows_with_none_intervention_applied(tmp_path):
+    """Same proof as above but with intervention_applied=None (the
+    'never marked' / not-yet-determined default) instead of False - both
+    must be excluded identically, and the function must never crash on the
+    missing/None case."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl(
+            repo, i, "WATCH", _MID_FACTORS, correct=False, position_id="pos-ia-true2",
+            intervention_applied=True,
+        )
+    for i in range(30):
+        _resolved_tighten_sl(
+            repo, i + 100, "WATCH", _MID_FACTORS, correct=True, position_id="pos-ia-none",
+            intervention_applied=None,
+        )
+
+    updated = update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
+
+    assert updated == 7  # state-alone + one per decay factor, see comment above
+    heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_heuristics()}
+    assert "ga-hc:state:WATCH" in heuristics
+    state_heuristic = heuristics["ga-hc:state:WATCH"]
+    assert state_heuristic["adjustment"] < 0
+    assert state_heuristic["sample_size"] == 30
 
 
 # =========================================================================

@@ -106,6 +106,101 @@ def test_save_guardian_authority_decision_allows_null_position_id_for_pre_entry_
     assert row["new_sl"] is None
 
 
+def test_save_guardian_authority_decision_intervention_applied_true_round_trips(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-ia-1", None, "cand-1", "PRE_ENTRY_VETO", _NOW,
+        "reasoning", "expect unfavorable", "unfavorable", 0.8, "run-1",
+        intervention_applied=True,
+    )
+
+    row = repo.get_guardian_authority_decision("ga-ia-1")
+    assert row["intervention_applied"] == 1
+
+
+def test_save_guardian_authority_decision_intervention_applied_none_round_trips(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-ia-2", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect favorable", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500", intervention_applied=None,
+    )
+
+    row = repo.get_guardian_authority_decision("ga-ia-2")
+    assert row["intervention_applied"] is None
+
+
+def test_save_guardian_authority_decision_intervention_applied_defaults_to_none_when_not_passed(
+    tmp_path,
+):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-ia-3", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect favorable", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+
+    row = repo.get_guardian_authority_decision("ga-ia-3")
+    assert row["intervention_applied"] is None
+
+
+def test_mark_guardian_authority_decision_intervention_applied_updates_only_that_column(tmp_path):
+    """Same surgical-scope proof style as
+    test_resolve_guardian_authority_decision_never_mutates_the_pre_decision_expectation:
+    read the row before/after and confirm every other field - especially the
+    requirement-10-protected ones (expected_outcome/expected_direction/
+    confidence/decided_at) - is byte-identical, and only intervention_applied
+    changed."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-ia-4", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "decay accelerating", "expect small favorable move", "favorable", 0.65, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+    before = repo.get_guardian_authority_decision("ga-ia-4")
+    assert before["intervention_applied"] is None
+
+    repo.mark_guardian_authority_decision_intervention_applied(
+        "ga-ia-4", True, _NOW + timedelta(minutes=1)
+    )
+
+    after = repo.get_guardian_authority_decision("ga-ia-4")
+    assert after["intervention_applied"] == 1
+    assert after["expected_outcome"] == before["expected_outcome"] == "expect small favorable move"
+    assert after["expected_direction"] == before["expected_direction"] == "favorable"
+    assert after["confidence"] == before["confidence"] == 0.65
+    assert after["decided_at"] == before["decided_at"] == _NOW.isoformat()
+    assert after["reasoning"] == before["reasoning"] == "decay accelerating"
+    assert after["decision_id"] == before["decision_id"] == "ga-ia-4"
+    assert after["position_id"] == before["position_id"] == "pos-1"
+    assert after["candidate_id"] == before["candidate_id"] == "cand-1"
+    assert after["decision_type"] == before["decision_type"] == "TIGHTEN_SL"
+    assert after["outcome_status"] == before["outcome_status"] == "PENDING"
+    assert after["actual_exit_reason"] == before["actual_exit_reason"] is None
+    assert after["actual_pnl_usdt"] == before["actual_pnl_usdt"] is None
+    assert after["expectation_correct"] == before["expectation_correct"] is None
+    assert after["resolved_at"] == before["resolved_at"] is None
+    assert after["old_sl"] == before["old_sl"] == "49000"
+    assert after["new_sl"] == before["new_sl"] == "49500"
+    assert after["run_id"] == before["run_id"] == "run-1"
+
+
+def test_mark_guardian_authority_decision_intervention_applied_false(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-ia-5", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect favorable", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500", intervention_applied=None,
+    )
+
+    repo.mark_guardian_authority_decision_intervention_applied(
+        "ga-ia-5", False, _NOW + timedelta(minutes=1)
+    )
+
+    row = repo.get_guardian_authority_decision("ga-ia-5")
+    assert row["intervention_applied"] == 0
+
+
 def test_find_pending_guardian_authority_decisions_returns_only_pending_rows(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     repo.save_guardian_authority_decision(

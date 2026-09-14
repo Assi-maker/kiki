@@ -580,6 +580,215 @@ def test_authority_live_tightening_exception_does_not_abort_the_rest_of_the_batc
 
 
 # --------------------------------------------------------------------------
+# I2 hardening fix (2026-09-14): guardian_authority_decisions.
+# intervention_applied - tracks whether an already-sanctioned TIGHTEN_SL/
+# CLOSE_EARLY/PRE_ENTRY_VETO write ACTUALLY took effect, so Task 9's
+# self-critique step can count only genuine, distinct interventions rather
+# than every per-tick decision row. See maybe_open_position_for_candidate's
+# own veto-path test for the PRE_ENTRY_VETO case (always True).
+# --------------------------------------------------------------------------
+
+
+def test_authority_close_early_decision_row_has_intervention_applied_true(tmp_path):
+    """CLOSE_EARLY's write (repo.save_guardian_observation with
+    state='EXIT') always succeeds by construction - no partial/no-op path
+    exists - so intervention_applied=True is known and saved at the same
+    time as the decision row itself, in the same call."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _seed_always_on_heuristic(repo, adjustment=0.5)
+    connector = _StubConnector(price="100")
+
+    run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "CLOSE_EARLY"
+    assert decisions[0]["intervention_applied"] == 1
+
+
+def test_authority_tighten_sl_paper_success_marks_intervention_applied_true(tmp_path):
+    """PAPER TIGHTEN_SL path: repo.tighten_position_stop_loss's own returned
+    bool (already captured as `tightened` since the earlier C1/M1 fix) is
+    used directly to mark intervention_applied - a successful guard-passing
+    tighten ends with intervention_applied=True."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)  # stop_loss=90, simulated_fill_entry=100
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+
+    with patch("crypto_trading.guardian.tick.apply_live_sl_tightening") as mock_live_tighten:
+        run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    mock_live_tighten.assert_not_called()
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+    assert decisions[0]["intervention_applied"] == 1
+
+
+def test_authority_tighten_sl_paper_refused_marks_intervention_applied_false(tmp_path):
+    """PAPER TIGHTEN_SL path, DB-level 'only tighten' guard refuses (mocked
+    to return False, same simulation the existing
+    test_authority_tighten_sl_refused_on_paper_position_logs_event uses) ->
+    intervention_applied=False - the write attempt was a genuine no-op."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+
+    with patch.object(repo, "tighten_position_stop_loss", return_value=False):
+        run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+    assert decisions[0]["intervention_applied"] == 0
+
+
+def test_authority_tighten_sl_live_success_marks_intervention_applied_true(tmp_path):
+    """LIVE TIGHTEN_SL path, success case: apply_live_sl_tightening returns
+    None always (no status) - the outcome is determined by reading back the
+    resulting claim row via get_guardian_authority_live_sl_action and
+    checking status == 'SL_REPLACED', the ONLY status that counts as
+    applied."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _make_active_live_execution(repo, "pos-1")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    live_connector = object()
+
+    with (
+        patch("crypto_trading.guardian.tick.apply_live_sl_tightening"),
+        patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings"),
+        patch.object(
+            repo, "get_guardian_authority_live_sl_action",
+            return_value={"status": "SL_REPLACED"},
+        ),
+    ):
+        run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW, live_connector,
+        )
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+    assert decisions[0]["intervention_applied"] == 1
+
+
+def test_authority_tighten_sl_live_non_replaced_status_marks_intervention_applied_false(
+    tmp_path,
+):
+    """LIVE TIGHTEN_SL path, any status other than SL_REPLACED (here
+    ABORTED_INVALID_TIGHTENING, one of authority_live.py's own real
+    vocabulary entries) is conservatively 'not applied' - fail-closed for
+    calibration purposes."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _make_active_live_execution(repo, "pos-1")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    live_connector = object()
+
+    with (
+        patch("crypto_trading.guardian.tick.apply_live_sl_tightening"),
+        patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings"),
+        patch.object(
+            repo, "get_guardian_authority_live_sl_action",
+            return_value={"status": "ABORTED_INVALID_TIGHTENING"},
+        ),
+    ):
+        run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW, live_connector,
+        )
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["intervention_applied"] == 0
+
+
+def test_authority_tighten_sl_live_missing_claim_row_marks_intervention_applied_false(tmp_path):
+    """LIVE TIGHTEN_SL path, no claim row found at all (None) after
+    apply_live_sl_tightening returns - also conservatively 'not applied'."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _make_active_live_execution(repo, "pos-1")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    live_connector = object()
+
+    with (
+        patch("crypto_trading.guardian.tick.apply_live_sl_tightening"),
+        patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings"),
+        patch.object(repo, "get_guardian_authority_live_sl_action", return_value=None),
+    ):
+        run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW, live_connector,
+        )
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["intervention_applied"] == 0
+
+
+def test_authority_tighten_sl_live_exception_marks_intervention_applied_false_without_aborting_batch(
+    tmp_path,
+):
+    """LIVE TIGHTEN_SL path, apply_live_sl_tightening raises: this tick's
+    outcome for pos-1 is not a confirmed success -> intervention_applied=
+    False, AND (same existing behavior as
+    test_authority_live_tightening_exception_does_not_abort_the_rest_of_the_batch,
+    confirmed unregressed here) pos-2's own PAPER tighten still completes
+    normally in the same batch."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo, position_id="pos-1")
+    _seed_candidate_and_position(repo, position_id="pos-2")
+    _make_active_live_execution(repo, "pos-1")  # pos-2 stays pure PAPER
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    live_connector = object()
+
+    with (
+        patch(
+            "crypto_trading.guardian.tick.apply_live_sl_tightening",
+            side_effect=RuntimeError("simulated exchange failure"),
+        ),
+        patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings"),
+    ):
+        observations = run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW, live_connector,
+        )
+
+    decisions = {d["position_id"]: d for d in _decision_rows(repo)}
+    assert decisions["pos-1"]["intervention_applied"] == 0  # LIVE attempt raised
+    assert decisions["pos-2"]["intervention_applied"] == 1  # PAPER path succeeded, batch continued
+    assert len(observations) == 2  # batch continuation not regressed
+
+
+def test_authority_tighten_sl_live_no_connector_skip_marks_intervention_applied_false(tmp_path):
+    """LIVE TIGHTEN_SL path, live_connector is None (the Task 10 diagnostic
+    skip case) - no write was ever attempted, so intervention_applied=
+    False."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _make_active_live_execution(repo, "pos-1")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+
+    with patch("crypto_trading.guardian.tick.apply_live_sl_tightening") as mock_live_tighten:
+        run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW,
+            None,  # live_connector explicitly None
+        )
+
+    mock_live_tighten.assert_not_called()
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["intervention_applied"] == 0
+
+
+# --------------------------------------------------------------------------
 # Task 9 (2026-09-14): self-critique wiring - resolve_pending_decisions and
 # update_heuristics_from_resolved_decisions, gated by
 # settings.guardian.authority_enabled, called once per tick (above the

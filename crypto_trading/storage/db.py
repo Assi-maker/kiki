@@ -442,6 +442,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(_SCHEMA)
     _migrate_runs_add_instruments_scanned(conn)
     _migrate_candidates_add_reference_price(conn)
+    _migrate_guardian_authority_decisions_add_intervention_applied(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -480,6 +481,41 @@ def _migrate_candidates_add_reference_price(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(candidates)").fetchall()}
     if "reference_price" not in columns:
         _add_column_idempotent(conn, "ALTER TABLE candidates ADD COLUMN reference_price TEXT")
+
+
+def _migrate_guardian_authority_decisions_add_intervention_applied(conn: sqlite3.Connection) -> None:
+    """Guardian Authority hardening fix I2 (2026-09-14):
+    guardian_authority_decisions.intervention_applied was added AFTER
+    Guardian Authority's own table-creation code (guardian_authority_
+    decisions itself, see its CREATE TABLE IF NOT EXISTS block above) had
+    already shipped to master and started running unconditionally on every
+    app startup - independent of settings.guardian.authority_enabled - so
+    real databases already have this table WITHOUT the column. Same
+    migration pattern and same reasoning as
+    _migrate_runs_add_instruments_scanned and
+    _migrate_candidates_add_reference_price above: `CREATE TABLE IF NOT
+    EXISTS` alone does nothing to an already-existing table, so an
+    explicit, idempotent `ALTER TABLE` is required, guarded by `PRAGMA
+    table_info` (not "ALTER TABLE ... IF NOT EXISTS", not supported by all
+    SQLite versions) - safe to run on every connection, never destroys
+    existing rows (the new column is simply NULL for them).
+
+    Nullable, no default: NULL means "not yet determined" - relevant only
+    during the brief same-tick window between a TIGHTEN_SL decision's
+    initial save (intervention_applied=None, unknown) and its write-attempt
+    outcome being known a few lines later in the same function call
+    (crypto_trading/guardian/tick.py::process_one_position). Every row has
+    a real True/False value by the time Task 9's self-critique
+    (update_heuristics_from_resolved_decisions) ever reads it."""
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(guardian_authority_decisions)").fetchall()
+    }
+    if "intervention_applied" not in columns:
+        _add_column_idempotent(
+            conn,
+            "ALTER TABLE guardian_authority_decisions ADD COLUMN intervention_applied BOOLEAN",
+        )
 
 
 def _add_column_idempotent(conn: sqlite3.Connection, alter_sql: str) -> None:

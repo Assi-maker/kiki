@@ -115,6 +115,18 @@ def process_one_position(
         )
         if decision != "NO_ACTION":
             decision_id = f"ga:{position.position_id}:{now.isoformat()}"
+            # I2 hardening fix (2026-09-14): CLOSE_EARLY's write
+            # (repo.save_guardian_observation with state="EXIT", below) is
+            # known-successful right here, by construction, with no
+            # partial/no-op path - so intervention_applied=True is saved
+            # immediately. TIGHTEN_SL's write attempt hasn't happened yet at
+            # this point in the function (it's the branch right below) -
+            # its outcome is genuinely unknown until then, so it is saved as
+            # None ("not yet determined") and updated afterward via
+            # repo.mark_guardian_authority_decision_intervention_applied
+            # once the write attempt's real outcome is known (both the
+            # PAPER and LIVE sub-branches below).
+            intervention_applied = True if decision == "CLOSE_EARLY" else None
             repo.save_guardian_authority_decision(
                 decision_id, position.position_id, position.candidate_id, decision, now,
                 # decide_open_position returns a single, already
@@ -129,6 +141,7 @@ def process_one_position(
                 expected_direction=expected_direction, confidence=confidence, run_id=run_id,
                 old_sl=str(position.stop_loss),
                 new_sl=str(proposed_sl) if proposed_sl is not None else None,
+                intervention_applied=intervention_applied,
             )
             if decision == "TIGHTEN_SL":
                 # Same LIVE/PAPER branch Profit Protection itself uses: an
@@ -160,6 +173,10 @@ def process_one_position(
                             position_id=position.position_id, instrument=position.instrument,
                             severity="ERROR",
                         )
+                        # I2 hardening fix: no write was ever attempted.
+                        repo.mark_guardian_authority_decision_intervention_applied(
+                            decision_id, False, now,
+                        )
                     else:
                         # apply_live_sl_tightening is a single-position API
                         # that deliberately lets exceptions propagate (Task
@@ -180,6 +197,34 @@ def process_one_position(
                                 position_id=position.position_id, error_type=type(exc).__name__,
                                 error=str(exc),
                             )
+                            # I2 hardening fix: the attempt failed - not a
+                            # confirmed success, regardless of whatever
+                            # intermediate claim-row state may or may not
+                            # exist.
+                            repo.mark_guardian_authority_decision_intervention_applied(
+                                decision_id, False, now,
+                            )
+                        else:
+                            # I2 hardening fix: apply_live_sl_tightening
+                            # itself always returns None (no status) - read
+                            # back the resulting claim row and check its
+                            # real terminal status. ONLY "SL_REPLACED"
+                            # counts as applied; every other status
+                            # (ABORTED_*/UNCERTAIN_*/REPLACEMENT_PARTIAL/
+                            # CLAIMED/ANOMALY_*/missing row) is
+                            # conservatively "not applied" - fail-closed for
+                            # calibration purposes (see authority_live.py's
+                            # own status vocabulary).
+                            live_action = repo.get_guardian_authority_live_sl_action(
+                                position.position_id
+                            )
+                            applied = (
+                                live_action is not None
+                                and live_action["status"] == "SL_REPLACED"
+                            )
+                            repo.mark_guardian_authority_decision_intervention_applied(
+                                decision_id, applied, now,
+                            )
                 else:
                     tightened = repo.tighten_position_stop_loss(
                         position.position_id, proposed_sl, now
@@ -199,6 +244,12 @@ def process_one_position(
                             old_sl=str(position.stop_loss), new_sl=str(proposed_sl),
                             decision_id=decision_id, severity="ERROR",
                         )
+                    # I2 hardening fix: `tightened` (already captured above
+                    # since the C1/M1 fix) IS the write attempt's real
+                    # outcome - use it directly, no new logic needed.
+                    repo.mark_guardian_authority_decision_intervention_applied(
+                        decision_id, tightened, now,
+                    )
             elif decision == "CLOSE_EARLY":
                 # CLOSE_EARLY writes via the exact same downstream mechanism
                 # the deterministic EXIT state already uses -
