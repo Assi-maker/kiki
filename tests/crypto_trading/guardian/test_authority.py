@@ -1251,6 +1251,35 @@ def test_neither_module_imports_or_calls_position_sizing():
         assert "importlib" not in source
 
 
+def test_neither_module_imports_from_backtest():
+    """Guardrail (task brief's production-isolation checklist: 'never import
+    anything from crypto_trading/backtest/'). authority_live.py already has
+    its own standalone version of this check as one entry in test_authority_
+    live.py's test_module_never_imports_forbidden_production_modules
+    forbidden_prefixes tuple (crypto_trading.backtest); this is the paired
+    assertion that covers authority.py too, using the same AST-based import
+    scan and the same forbidden-prefix-matching style (exact module or any
+    submodule), so both Guardian Authority modules are independently and
+    explicitly checked against this specific item."""
+    import ast
+
+    forbidden_module = "crypto_trading.backtest"
+    for source in (_authority_source(), _authority_live_source()):
+        tree = ast.parse(source)
+        imported_modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_modules.add(alias.name)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module)
+        offenders = [
+            m for m in imported_modules
+            if m == forbidden_module or m.startswith(forbidden_module + ".")
+        ]
+        assert offenders == [], f"imports from crypto_trading.backtest: {offenders}"
+
+
 def test_neither_module_calls_set_leverage_or_references_a_leverage_config_field():
     """Guardrail (spec table: 'Never increases leverage'): no function in
     either module ever calls BingXLiveTradingConnector.set_leverage or
