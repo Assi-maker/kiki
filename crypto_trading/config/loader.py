@@ -193,6 +193,39 @@ class GuardianConfig(BaseModel):
     # plan - it only matters once authority_enabled is later set True.
     authority_veto_threshold: float = 0.3
 
+    # (2026-09-14, Task 7) Same pulled-forward situation as
+    # authority_enabled/authority_veto_threshold above, hit again one task
+    # later: guardian/tick.py::process_one_position has a hard runtime
+    # dependency on these two fields existing NOW (they are threshold
+    # arguments to guardian/authority.py::decide_open_position), even though
+    # Task 10 is still this plan's designated owner of guardian.yaml
+    # documentation and the full production-isolation test suite for the
+    # whole authority_* config surface. Follows the identical precedent Task
+    # 6 already established - only the fields actually read by the task
+    # being built are added here, nothing more.
+    #
+    # authority_tighten_threshold: the summed heuristic score
+    # (guardian/authority.py::decide_open_position) must STRICTLY exceed
+    # this for TIGHTEN_SL to be considered. Deliberately LOWER than
+    # authority_close_threshold below: tightening a stop-loss is a
+    # reversible, safety-increasing action (the position stays open, just
+    # better protected), so it is intentionally cheap to trigger - roughly
+    # one moderate-adjustment heuristic (this plan's own test fixtures use
+    # ~0.15 per heuristic, matching authority_veto_threshold's own docstring
+    # reasoning) is enough to justify tightening on its own.
+    authority_tighten_threshold: float = 0.15
+    # authority_close_threshold: same score, but for CLOSE_EARLY -
+    # decide_open_position's own docstring documents that CLOSE_EARLY is
+    # evaluated FIRST, as "the more severe action", whenever both thresholds
+    # are exceeded. Closing a position early is irreversible (unlike
+    # tightening), so it deliberately requires substantially stronger
+    # accumulated evidence than tightening does - set here to roughly three
+    # moderate-adjustment heuristics agreeing (3 * ~0.15), meaningfully
+    # above authority_tighten_threshold, matching the precedence
+    # decide_open_position already assumes ("in normal configuration
+    # close_threshold >= tighten_threshold").
+    authority_close_threshold: float = 0.45
+
 
 class LiveExecutionConfig(BaseModel):
     # BingX Live execution (2026-09-06) - a tightly bounded, real-money

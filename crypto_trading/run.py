@@ -240,12 +240,25 @@ def _run_detective_forever(runner: AgentRunner, settings: Settings) -> None:
 
 
 def _run_guardian_forever(
-    market_data_connector: BingXMarketDataConnector, runner: AgentRunner, settings: Settings
+    market_data_connector: BingXMarketDataConnector,
+    runner: AgentRunner,
+    settings: Settings,
+    live_connector: BingXLiveTradingConnector | None = None,
 ) -> None:
     """Same thread-bound-connection fix as the other _run_*_forever()
-    functions above."""
+    functions above.
+
+    `live_connector` (2026-09-14, Task 7): the SAME already-constructed
+    `live_connector` main() builds earlier via
+    `build_live_trading_connector_from_env() if is_live_execution_enabled()
+    else None` (used by the discovery thread's pre-entry veto path) - passed
+    straight through here, additively, so Guardian Authority's tick-time
+    TIGHTEN_SL decision can reach BingXLiveTradingConnector.
+    apply_live_sl_tightening for a real LIVE position. Stays None whenever
+    LIVE execution isn't enabled, exactly like every other caller of that
+    same variable."""
     repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
-    guardian_loop.run_forever(repo, market_data_connector, runner, settings)
+    guardian_loop.run_forever(repo, market_data_connector, runner, settings, live_connector)
 
 
 def _run_demo_execution_forever(
@@ -427,7 +440,9 @@ def main() -> None:
         guardian_runner = build_guardian_runner_from_env()
         threads.append(
             threading.Thread(
-                target=_run_guardian_forever, args=(connector, guardian_runner, settings), daemon=True
+                target=_run_guardian_forever,
+                args=(connector, guardian_runner, settings, live_connector),
+                daemon=True,
             )
         )
     else:

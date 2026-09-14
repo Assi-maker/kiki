@@ -275,6 +275,23 @@ def test_get_settings_loads_guardian_authority_enabled_default_false():
     assert isinstance(settings.guardian.authority_veto_threshold, float)
 
 
+def test_get_settings_loads_guardian_authority_tighten_close_thresholds_defaults():
+    """Guardian Authority tick-time decisions (2026-09-14, Task 7): these two
+    fields are pulled forward from Task 10 for the identical reason Task 6
+    already pulled forward authority_enabled/authority_veto_threshold -
+    guardian/tick.py::process_one_position has a hard runtime dependency on
+    them existing now. Both must be floats, and - matching
+    decide_open_position's own documented precedence ("in normal
+    configuration close_threshold >= tighten_threshold", CLOSE_EARLY
+    evaluated first as "the more severe action") - close must be strictly
+    greater than tighten."""
+    settings = get_settings()
+    guardian_cfg = settings.guardian
+    assert isinstance(guardian_cfg.authority_tighten_threshold, float)
+    assert isinstance(guardian_cfg.authority_close_threshold, float)
+    assert guardian_cfg.authority_close_threshold > guardian_cfg.authority_tighten_threshold
+
+
 def test_get_settings_loads_detective_config_from_real_yaml():
     settings = get_settings()
     assert settings.detective.batch_size == 10

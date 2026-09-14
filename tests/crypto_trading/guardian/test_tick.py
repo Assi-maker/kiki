@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from crypto_trading.config.loader import GuardianConfig
 from crypto_trading.guardian.tick import run_guardian_tick_body
@@ -236,3 +237,254 @@ def test_run_guardian_tick_body_reaches_exit_state_even_when_budget_exhausted(tm
     assert observations[0].state == "EXIT"  # deterministic classification, unaffected by budget
     assert observations[0].ai_reasoning is None  # budget exhaustion still blocked the AI narration
     assert observations[0].ai_cost_usd is None
+
+
+# --------------------------------------------------------------------------
+# Task 7 (2026-09-14): Guardian Authority tick-time decision wiring
+# (TIGHTEN_SL / CLOSE_EARLY), gated by settings.guardian.authority_enabled.
+# --------------------------------------------------------------------------
+
+
+def _authority_settings(tighten_threshold=0.15, close_threshold=0.45):
+    """settings.guardian.authority_enabled=True with the two Task-7
+    pulled-forward thresholds set explicitly (rather than relying on the
+    config module's own defaults), so these tests keep working unchanged if
+    Task 10 later retunes the real defaults."""
+    return _settings().model_copy(
+        update={
+            "guardian": GuardianConfig(
+                authority_enabled=True,
+                authority_tighten_threshold=tighten_threshold,
+                authority_close_threshold=close_threshold,
+            )
+        }
+    )
+
+
+def _seed_always_on_heuristic(repo, heuristic_id="h-1", adjustment=0.2):
+    """An "always-on" heuristic (empty condition_json matches every factors
+    dict, per guardian/authority.py's own documented semantics) - the
+    simplest possible deterministic lever to drive evaluate_heuristics'
+    summed score above/below a chosen threshold in these wiring tests,
+    without needing to hand-compute specific factor values."""
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id=heuristic_id,
+        description="always-on test heuristic",
+        condition_json="{}",
+        adjustment=adjustment,
+        confidence=0.8,
+        sample_size=10,
+        updated_at=_NOW,
+    )
+
+
+def _make_active_live_execution(repo, position_id, entry_quantity="10", avg_entry="100"):
+    """Seeds a live_executions row already in phase ACTIVE for an
+    already-seeded position - same claim/update_submitted sequence
+    test_authority_live.py's own _open_active_live_position helper uses,
+    so `repo.get_live_execution(position_id)["phase"] == "ACTIVE"` (the
+    exact check process_one_position uses to route LIVE vs PAPER)."""
+    repo.claim_live_execution(position_id, _NOW, "10", "100", "10")
+    repo.update_live_execution_submitted(
+        position_id, "cid-1", "ex-1", entry_quantity, avg_entry, None, None, _NOW,
+    )
+
+
+def _decision_rows(repo):
+    rows = repo._conn.execute("SELECT * FROM guardian_authority_decisions").fetchall()
+    return [dict(r) for r in rows]
+
+
+def _observation_count(repo, position_id):
+    row = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM guardian_observations WHERE position_id = ?", (position_id,)
+    ).fetchone()
+    return row["n"]
+
+
+def test_authority_flag_off_all_existing_tick_tests_pass_unmodified():
+    """Documentation test: the four tests above this section already ARE
+    the flag-off byte-identical proof (none of them touch
+    settings.guardian.authority_enabled, which defaults to False) - this
+    assertion just makes that explicit and machine-checked so a future
+    change to the default can't silently flip it without a test noticing."""
+    assert _settings().guardian.authority_enabled is False
+
+
+def test_authority_flag_on_no_heuristics_matched_is_no_action(tmp_path):
+    """Flag on, zero heuristics seeded -> evaluate_heuristics' score is 0.0,
+    below both thresholds -> NO_ACTION. Behavior must be unchanged from the
+    flag-off case: the existing guardian_observations write happens exactly
+    as before (same HOLD state, same single row), and no
+    guardian_authority_decisions row is created (per the plan's own "only
+    actual interventions get a row" ruling)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    connector = _StubConnector(price="100")  # unchanged since entry -> HOLD, matches test 1 above
+
+    observations = run_guardian_tick_body(
+        repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW
+    )
+
+    assert len(observations) == 1
+    assert observations[0].state == "HOLD"
+    row = repo.find_latest_guardian_observation("pos-1")
+    assert row["state"] == "HOLD"
+    assert _decision_rows(repo) == []
+
+
+def test_authority_tighten_sl_on_paper_position_calls_tighten_position_stop_loss(tmp_path):
+    """Flag on, a matched heuristic pushes the score (0.2) above
+    authority_tighten_threshold (0.15) but not above
+    authority_close_threshold (0.45) -> TIGHTEN_SL. No ACTIVE
+    live_executions row exists for this position (pure PAPER), so the
+    PAPER-only path (repo.tighten_position_stop_loss) must be used, never
+    apply_live_sl_tightening - proven here by observing the actual effect
+    (positions.stop_loss increases) rather than by mocking, plus a decision
+    row recorded."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)  # stop_loss=90, simulated_fill_entry=100
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+
+    with patch("crypto_trading.guardian.tick.apply_live_sl_tightening") as mock_live_tighten:
+        run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    mock_live_tighten.assert_not_called()
+    position = repo.get_position("pos-1")
+    assert position.stop_loss > Decimal("90")  # tightened
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+    assert decisions[0]["position_id"] == "pos-1"
+
+
+def test_authority_tighten_sl_on_active_live_position_calls_apply_live_sl_tightening(tmp_path):
+    """Same heuristic/score as the PAPER test above, but this position DOES
+    have an ACTIVE live_executions row (repo.get_live_execution(...)["phase"]
+    == "ACTIVE") - the exact same check live_profit_protection.py itself
+    uses to distinguish a real LIVE position. apply_live_sl_tightening must
+    be called instead of the PAPER path (repo.tighten_position_stop_loss),
+    and recover_claimed_live_sl_tightenings must have been called first,
+    exactly once for the whole tick (not once per position - only one
+    position exists in this test, so this also covers the "once per tick"
+    shape; the two-position variant is covered separately below)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _make_active_live_execution(repo, "pos-1")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    live_connector = object()  # never actually touched: apply_live_sl_tightening is mocked below
+
+    with (
+        patch("crypto_trading.guardian.tick.apply_live_sl_tightening") as mock_live_tighten,
+        patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings") as mock_recover,
+    ):
+        run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW, live_connector,
+        )
+
+    mock_recover.assert_called_once_with(repo, live_connector, "run-1", _NOW)
+    mock_live_tighten.assert_called_once()
+    call_args = mock_live_tighten.call_args.args
+    assert call_args[0] is repo
+    assert call_args[1] is live_connector
+    assert call_args[2] == "pos-1"
+    assert call_args[3] == "BTCUSDT"
+    assert call_args[4] > Decimal("90")  # proposed_sl, strictly greater than current stop_loss
+
+    # PAPER path must NOT have run: positions.stop_loss is untouched (LIVE
+    # tightening is applied to the real exchange order, never this column).
+    assert repo.get_position("pos-1").stop_loss == Decimal("90")
+
+
+def test_authority_recover_claimed_live_sl_tightenings_once_per_tick(tmp_path):
+    """Two open positions, both ACTIVE LIVE, both driven to TIGHTEN_SL by
+    the same always-on heuristic - recover_claimed_live_sl_tightenings must
+    still be invoked exactly ONCE for the whole tick (before the
+    per-position loop), never once per position."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo, position_id="pos-1")
+    _seed_candidate_and_position(repo, position_id="pos-2")
+    _make_active_live_execution(repo, "pos-1")
+    _make_active_live_execution(repo, "pos-2")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    live_connector = object()
+
+    with (
+        patch("crypto_trading.guardian.tick.apply_live_sl_tightening"),
+        patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings") as mock_recover,
+    ):
+        run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW, live_connector,
+        )
+
+    mock_recover.assert_called_once_with(repo, live_connector, "run-1", _NOW)
+
+
+def test_authority_close_early_saves_single_exit_observation_and_decision_row(tmp_path):
+    """Flag on, a matched heuristic pushes the score (0.5) above
+    authority_close_threshold (0.45) -> CLOSE_EARLY, evaluated before/
+    instead of TIGHTEN_SL (decide_open_position's own documented
+    precedence). Must write via the exact same mechanism the deterministic
+    EXIT state already uses (repo.save_guardian_observation with
+    state="EXIT") - no new closing code - and must save EXACTLY ONE
+    observation for this position/tick (not the normal end-of-function
+    observation AND the EXIT one)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _seed_always_on_heuristic(repo, adjustment=0.5)
+    connector = _StubConnector(price="100")
+
+    observations = run_guardian_tick_body(
+        repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW
+    )
+
+    assert len(observations) == 1
+    assert observations[0].state == "EXIT"
+    assert observations[0].observation_id.startswith("ga-exit:")
+
+    assert _observation_count(repo, "pos-1") == 1  # no duplicate save
+    row = repo.find_latest_guardian_observation("pos-1")
+    assert row["state"] == "EXIT"
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "CLOSE_EARLY"
+
+
+def test_authority_live_tightening_exception_does_not_abort_the_rest_of_the_batch(tmp_path):
+    """A LIVE tightening attempt that raises must not abort the rest of the
+    tick: pos-1 is ACTIVE LIVE and its apply_live_sl_tightening call raises;
+    pos-2 is a plain PAPER position driven to TIGHTEN_SL by the same
+    heuristic and must still be processed normally (its stop_loss still
+    gets tightened via the PAPER path) despite pos-1's failure."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo, position_id="pos-1")
+    _seed_candidate_and_position(repo, position_id="pos-2")
+    _make_active_live_execution(repo, "pos-1")  # pos-2 stays pure PAPER
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    live_connector = object()
+
+    with (
+        patch(
+            "crypto_trading.guardian.tick.apply_live_sl_tightening",
+            side_effect=RuntimeError("simulated exchange failure"),
+        ) as mock_live_tighten,
+        patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings"),
+    ):
+        observations = run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW, live_connector,
+        )
+
+    mock_live_tighten.assert_called_once()  # only pos-1 is LIVE - raised, but did not propagate
+    # pos-2 (PAPER) was still processed normally despite pos-1's failure.
+    assert repo.get_position("pos-2").stop_loss > Decimal("90")
+    # pos-1's own decision row was still saved (the exception is only in the
+    # LIVE application step, which comes after the decision is recorded).
+    decision_position_ids = {d["position_id"] for d in _decision_rows(repo)}
+    assert decision_position_ids == {"pos-1", "pos-2"}
+    assert len(observations) == 2  # both positions still produced/returned an observation
