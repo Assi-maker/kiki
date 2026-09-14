@@ -247,6 +247,31 @@ class Repository(Protocol):
     def find_detective_analyses(
         self, limit: int, offset: int = 0
     ) -> list[DetectiveAnalysisRecord]: ...
+    def save_guardian_authority_decision(
+        self,
+        decision_id: str,
+        position_id: str | None,
+        candidate_id: str,
+        decision_type: str,
+        decided_at: datetime,
+        reasoning: str,
+        expected_outcome: str,
+        expected_direction: str,
+        confidence: float | None,
+        run_id: str,
+        old_sl: str | None = None,
+        new_sl: str | None = None,
+    ) -> bool: ...
+    def get_guardian_authority_decision(self, decision_id: str) -> dict | None: ...
+    def find_pending_guardian_authority_decisions(self) -> list[dict]: ...
+    def resolve_guardian_authority_decision(
+        self,
+        decision_id: str,
+        actual_exit_reason: str,
+        actual_pnl_usdt: str,
+        expectation_correct: bool,
+        resolved_at: datetime,
+    ) -> None: ...
 
 
 class SQLiteRepository:
@@ -1611,3 +1636,91 @@ class SQLiteRepository:
             data["ai_cost_usd"] = Decimal(data["ai_cost_usd"])
             result.append(DetectiveAnalysisRecord(**data))
         return result
+
+    def save_guardian_authority_decision(
+        self,
+        decision_id: str,
+        position_id: str | None,
+        candidate_id: str,
+        decision_type: str,
+        decided_at: datetime,
+        reasoning: str,
+        expected_outcome: str,
+        expected_direction: str,
+        confidence: float | None,
+        run_id: str,
+        old_sl: str | None = None,
+        new_sl: str | None = None,
+    ) -> bool:
+        # Idempotency gate: decision_id is the PK, so a duplicate call for
+        # the same decision (e.g. a restart) can never produce two rows or
+        # silently overwrite the original expectation - same INSERT OR
+        # IGNORE claim-style shape as claim_live_profit_protection().
+        try:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO guardian_authority_decisions "
+                "(decision_id, position_id, candidate_id, decision_type, decided_at, "
+                "reasoning, expected_outcome, expected_direction, confidence, "
+                "old_sl, new_sl, run_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    decision_id,
+                    position_id,
+                    candidate_id,
+                    decision_type,
+                    decided_at.isoformat(),
+                    reasoning,
+                    expected_outcome,
+                    expected_direction,
+                    confidence,
+                    old_sl,
+                    new_sl,
+                    run_id,
+                ),
+            )
+            saved = cur.rowcount > 0
+            self._conn.commit()
+            return saved
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_guardian_authority_decision(self, decision_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM guardian_authority_decisions WHERE decision_id = ?",
+            (decision_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_pending_guardian_authority_decisions(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_decisions WHERE outcome_status = 'PENDING'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def resolve_guardian_authority_decision(
+        self,
+        decision_id: str,
+        actual_exit_reason: str,
+        actual_pnl_usdt: str,
+        expectation_correct: bool,
+        resolved_at: datetime,
+    ) -> None:
+        # Requirement 10: only the actual-outcome columns and outcome_status/
+        # resolved_at are ever written here - expected_outcome/
+        # expected_direction/confidence/decided_at/reasoning are NEVER
+        # referenced in this UPDATE, so they stay exactly as recorded at
+        # save_guardian_authority_decision() time, immutable by construction.
+        self._conn.execute(
+            "UPDATE guardian_authority_decisions SET outcome_status = 'RESOLVED', "
+            "actual_exit_reason = ?, actual_pnl_usdt = ?, expectation_correct = ?, "
+            "resolved_at = ? WHERE decision_id = ?",
+            (
+                actual_exit_reason,
+                actual_pnl_usdt,
+                expectation_correct,
+                resolved_at.isoformat(),
+                decision_id,
+            ),
+        )
+        self._conn.commit()

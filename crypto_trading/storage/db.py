@@ -308,6 +308,47 @@ CREATE INDEX IF NOT EXISTS idx_pp_shadow_position
     ON profit_protection_shadow_positions(position_id);
 CREATE INDEX IF NOT EXISTS idx_pp_shadow_status
     ON profit_protection_shadow_positions(status);
+
+-- Guardian Authority decisions (2026-09-14): decision-only memory for the
+-- autonomous Guardian Authority extension, see
+-- docs/superpowers/specs/2026-09-14-guardian-authority-design.md "Memory /
+-- self-improvement". Only actual interventions (PRE_ENTRY_VETO, TIGHTEN_SL,
+-- CLOSE_EARLY) get a row - the default outcomes (implicit APPROVE/
+-- NO_ACTION) are never logged here, keeping this table a small decision log
+-- layered on top of Guardian's own existing per-tick guardian_observations,
+-- never a duplicate of it. position_id is NULL for a PRE_ENTRY_VETO (no
+-- position exists yet). expected_outcome/expected_direction/confidence/
+-- decided_at/reasoning are written once, at save time, and are NEVER
+-- updated afterward (spec requirement 10) - resolve_guardian_authority_
+-- decision() only ever sets the actual-outcome columns below plus
+-- outcome_status/resolved_at, so later self-critique compares a genuinely
+-- pre-registered expectation to the real outcome, never a hindsight-biased
+-- one. decision_id is the PK (INSERT OR IGNORE claim-style insert, same
+-- idempotency shape as live_profit_protection's position_id PK).
+CREATE TABLE IF NOT EXISTS guardian_authority_decisions (
+    decision_id TEXT PRIMARY KEY,
+    position_id TEXT,
+    candidate_id TEXT NOT NULL,
+    decision_type TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    reasoning TEXT NOT NULL,
+    expected_outcome TEXT NOT NULL,
+    expected_direction TEXT NOT NULL,
+    confidence REAL,
+    outcome_status TEXT NOT NULL DEFAULT 'PENDING',
+    actual_exit_reason TEXT,
+    actual_pnl_usdt TEXT,
+    expectation_correct BOOLEAN,
+    resolved_at TEXT,
+    old_sl TEXT,
+    new_sl TEXT,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_guardian_authority_decisions_position
+    ON guardian_authority_decisions(position_id);
+CREATE INDEX IF NOT EXISTS idx_guardian_authority_decisions_outcome_status
+    ON guardian_authority_decisions(outcome_status);
 """
 
 
