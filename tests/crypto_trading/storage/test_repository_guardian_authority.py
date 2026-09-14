@@ -178,3 +178,94 @@ def test_resolve_guardian_authority_decision_never_mutates_the_pre_decision_expe
     assert after["actual_pnl_usdt"] == "-1.20"
     assert after["expectation_correct"] == 0
     assert after["resolved_at"] == (_NOW + timedelta(minutes=30)).isoformat()
+
+
+def test_upsert_guardian_authority_heuristic_creates_new_row(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    repo.upsert_guardian_authority_heuristic(
+        "h-momentum-1",
+        "Momentum breakout above 20-day band",
+        '{"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.1}',
+        0.05,
+        0.75,
+        42,
+        _NOW,
+    )
+
+    heuristics = repo.find_guardian_authority_heuristics()
+    assert len(heuristics) == 1
+    assert heuristics[0]["heuristic_id"] == "h-momentum-1"
+    assert heuristics[0]["description"] == "Momentum breakout above 20-day band"
+    assert heuristics[0]["condition_json"] == '{"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.1}'
+    assert heuristics[0]["adjustment"] == 0.05
+    assert heuristics[0]["confidence"] == 0.75
+    assert heuristics[0]["sample_size"] == 42
+    assert heuristics[0]["updated_at"] == _NOW.isoformat()
+
+
+def test_upsert_guardian_authority_heuristic_replaces_existing_row(tmp_path):
+    """Task 2 critical distinction from Task 1: upsert uses INSERT OR REPLACE,
+    not INSERT OR IGNORE. A second upsert with the same heuristic_id but
+    DIFFERENT field values must overwrite the original row, not preserve it.
+    This proves heuristics evolve and are meant to be refined by self-critique."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    # First upsert
+    repo.upsert_guardian_authority_heuristic(
+        "h-momentum-1",
+        "Momentum breakout above 20-day band",
+        '{"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.1}',
+        0.05,
+        0.75,
+        42,
+        _NOW,
+    )
+
+    # Second upsert with same heuristic_id but different values
+    repo.upsert_guardian_authority_heuristic(
+        "h-momentum-1",
+        "Improved momentum rule after backtesting",
+        '{"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.2}',
+        0.08,
+        0.82,
+        127,
+        _NOW + timedelta(hours=1),
+    )
+
+    # Must have exactly one row, with the NEW values (not the old ones)
+    heuristics = repo.find_guardian_authority_heuristics()
+    assert len(heuristics) == 1
+    assert heuristics[0]["heuristic_id"] == "h-momentum-1"
+    assert heuristics[0]["description"] == "Improved momentum rule after backtesting"
+    assert heuristics[0]["condition_json"] == '{"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.2}'
+    assert heuristics[0]["adjustment"] == 0.08
+    assert heuristics[0]["confidence"] == 0.82
+    assert heuristics[0]["sample_size"] == 127
+    assert heuristics[0]["updated_at"] == (_NOW + timedelta(hours=1)).isoformat()
+
+
+def test_find_guardian_authority_heuristics_returns_all_rows(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    repo.upsert_guardian_authority_heuristic(
+        "h-1", "Rule 1", '{"key": "value1"}', 0.01, 0.5, 10, _NOW
+    )
+    repo.upsert_guardian_authority_heuristic(
+        "h-2", "Rule 2", '{"key": "value2"}', -0.02, 0.6, 20, _NOW + timedelta(minutes=1)
+    )
+    repo.upsert_guardian_authority_heuristic(
+        "h-3", "Rule 3", '{"key": "value3"}', 0.03, 0.7, 30, _NOW + timedelta(minutes=2)
+    )
+
+    heuristics = repo.find_guardian_authority_heuristics()
+    assert len(heuristics) == 3
+    ids = {h["heuristic_id"] for h in heuristics}
+    assert ids == {"h-1", "h-2", "h-3"}
+
+
+def test_find_guardian_authority_heuristics_returns_empty_list_when_none_exist(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    heuristics = repo.find_guardian_authority_heuristics()
+    assert heuristics == []

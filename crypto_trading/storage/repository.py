@@ -272,6 +272,17 @@ class Repository(Protocol):
         expectation_correct: bool,
         resolved_at: datetime,
     ) -> None: ...
+    def find_guardian_authority_heuristics(self) -> list[dict]: ...
+    def upsert_guardian_authority_heuristic(
+        self,
+        heuristic_id: str,
+        description: str,
+        condition_json: str,
+        adjustment: float,
+        confidence: float,
+        sample_size: int,
+        updated_at: datetime,
+    ) -> None: ...
 
 
 class SQLiteRepository:
@@ -1721,6 +1732,43 @@ class SQLiteRepository:
                 expectation_correct,
                 resolved_at.isoformat(),
                 decision_id,
+            ),
+        )
+        self._conn.commit()
+
+    def find_guardian_authority_heuristics(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_heuristics"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_guardian_authority_heuristic(
+        self,
+        heuristic_id: str,
+        description: str,
+        condition_json: str,
+        adjustment: float,
+        confidence: float,
+        sample_size: int,
+        updated_at: datetime,
+    ) -> None:
+        # INSERT OR REPLACE: unlike guardian_authority_decisions (which uses
+        # INSERT OR IGNORE for immutable expectations), heuristics evolve and
+        # are meant to be refined. A second upsert with the same heuristic_id
+        # but different field values will overwrite the original row (spec
+        # requirement: heuristics are living rules, continuously refined).
+        self._conn.execute(
+            "INSERT OR REPLACE INTO guardian_authority_heuristics "
+            "(heuristic_id, description, condition_json, adjustment, confidence, "
+            "sample_size, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                heuristic_id,
+                description,
+                condition_json,
+                adjustment,
+                confidence,
+                sample_size,
+                updated_at.isoformat(),
             ),
         )
         self._conn.commit()

@@ -349,6 +349,25 @@ CREATE INDEX IF NOT EXISTS idx_guardian_authority_decisions_position
     ON guardian_authority_decisions(position_id);
 CREATE INDEX IF NOT EXISTS idx_guardian_authority_decisions_outcome_status
     ON guardian_authority_decisions(outcome_status);
+
+-- Guardian Authority heuristics (2026-09-14): self-maintained heuristics
+-- memory for the autonomous Guardian Authority extension, see
+-- docs/superpowers/specs/2026-09-14-guardian-authority-design.md "Memory /
+-- self-improvement". Unlike guardian_authority_decisions (which uses
+-- INSERT OR IGNORE for immutable pre-decision expectations), heuristics
+-- evolve and are overwritten via INSERT OR REPLACE - they are living rules,
+-- continuously refined by self-critique feedback loops. The entire set is
+-- read fresh on every decision (find_guardian_authority_heuristics),
+-- giving the decision logic access to the system's current rule library.
+CREATE TABLE IF NOT EXISTS guardian_authority_heuristics (
+    heuristic_id TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    condition_json TEXT NOT NULL,
+    adjustment REAL NOT NULL,
+    confidence REAL NOT NULL,
+    sample_size INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
