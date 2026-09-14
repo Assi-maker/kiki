@@ -601,6 +601,7 @@ def test_one_candidates_open_failure_does_not_block_the_other_candidates_in_the_
 
     assert [p.position_id for p in opened] == ["healthy-1"]
     assert repo.get_position("healthy-1") is not None
+    assert repo.get_position("broken-1") is None
 
 
 def _single_candidate_snapshot(candidate_id: str, instrument: str, price: str) -> tuple:
@@ -679,4 +680,3 @@ def test_open_positions_for_confirmed_candidates_authority_flag_on_veto_never_op
     assert decision["position_id"] is None
     assert decision["candidate_id"] == "bad-1"
     assert decision["expected_outcome"]
-    assert repo.get_position("broken-1") is None
