@@ -127,6 +127,27 @@ def test_find_pending_guardian_authority_decisions_returns_only_pending_rows(tmp
     assert pending[0]["outcome_status"] == "PENDING"
 
 
+def test_find_resolved_guardian_authority_decisions_returns_only_resolved_rows(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-1", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "reasoning-1", "expect favorable", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+    repo.save_guardian_authority_decision(
+        "ga-2", "pos-2", "cand-2", "CLOSE_EARLY", _NOW,
+        "reasoning-2", "expect unfavorable if left open", "unfavorable", 0.9, "run-1",
+    )
+    repo.resolve_guardian_authority_decision(
+        "ga-2", "GUARDIAN_EXIT", "-5.00", True, _NOW + timedelta(minutes=10)
+    )
+
+    resolved = repo.find_resolved_guardian_authority_decisions()
+
+    assert [row["decision_id"] for row in resolved] == ["ga-2"]
+    assert resolved[0]["outcome_status"] == "RESOLVED"
+
+
 def test_resolve_guardian_authority_decision_sets_actual_outcome_and_status(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     repo.save_guardian_authority_decision(

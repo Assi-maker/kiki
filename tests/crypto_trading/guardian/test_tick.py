@@ -488,3 +488,78 @@ def test_authority_live_tightening_exception_does_not_abort_the_rest_of_the_batc
     decision_position_ids = {d["position_id"] for d in _decision_rows(repo)}
     assert decision_position_ids == {"pos-1", "pos-2"}
     assert len(observations) == 2  # both positions still produced/returned an observation
+
+
+# --------------------------------------------------------------------------
+# Task 9 (2026-09-14): self-critique wiring - resolve_pending_decisions and
+# update_heuristics_from_resolved_decisions, gated by
+# settings.guardian.authority_enabled, called once per tick (above the
+# per-position loop, same shape/placement as
+# recover_claimed_live_sl_tightenings above), with
+# update_heuristics_from_resolved_decisions only called when
+# resolve_pending_decisions actually resolved >= 1 decision this tick.
+# --------------------------------------------------------------------------
+
+
+def test_authority_wiring_calls_resolve_and_update_heuristics_when_something_resolves(tmp_path):
+    """Flag on, a tick that resolves >= 1 decision also calls
+    update_heuristics_from_resolved_decisions in the SAME tick, with the
+    SAME `now`."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    connector = _StubConnector(price="100")
+
+    with (
+        patch(
+            "crypto_trading.guardian.tick.resolve_pending_decisions", return_value=2
+        ) as mock_resolve,
+        patch(
+            "crypto_trading.guardian.tick.update_heuristics_from_resolved_decisions"
+        ) as mock_update,
+    ):
+        run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    mock_resolve.assert_called_once_with(repo, _NOW)
+    mock_update.assert_called_once_with(repo, _NOW)
+
+
+def test_authority_wiring_skips_update_heuristics_when_nothing_resolved(tmp_path):
+    """Flag on, a tick that resolves 0 decisions does NOT call
+    update_heuristics_from_resolved_decisions - re-deriving heuristics from
+    unchanged data would be wasted effort."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    connector = _StubConnector(price="100")
+
+    with (
+        patch(
+            "crypto_trading.guardian.tick.resolve_pending_decisions", return_value=0
+        ) as mock_resolve,
+        patch(
+            "crypto_trading.guardian.tick.update_heuristics_from_resolved_decisions"
+        ) as mock_update,
+    ):
+        run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    mock_resolve.assert_called_once_with(repo, _NOW)
+    mock_update.assert_not_called()
+
+
+def test_authority_wiring_flag_off_never_calls_resolve_or_update_heuristics(tmp_path):
+    """Flag off (default): neither resolve_pending_decisions nor
+    update_heuristics_from_resolved_decisions is ever called - flag-off must
+    remain byte-identical to before this task existed."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    connector = _StubConnector(price="100")
+
+    with (
+        patch("crypto_trading.guardian.tick.resolve_pending_decisions") as mock_resolve,
+        patch(
+            "crypto_trading.guardian.tick.update_heuristics_from_resolved_decisions"
+        ) as mock_update,
+    ):
+        run_guardian_tick_body(repo, connector, _FakeRunner(), _settings(), "run-1", _NOW)
+
+    mock_resolve.assert_not_called()
+    mock_update.assert_not_called()

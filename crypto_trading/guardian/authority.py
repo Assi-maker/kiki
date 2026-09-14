@@ -591,3 +591,293 @@ def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
         resolved_count += 1
 
     return resolved_count
+
+
+# ---------------------------------------------------------------------------
+# Task 9: self-critique / heuristics update
+#
+# --------------------------------------------------------------------------
+# Scope, per this task's own controller ruling (task-9-brief.md, "ruling
+# (b)") - NOT the brief's original illustrative vocabulary
+# --------------------------------------------------------------------------
+# resolve_pending_decisions (above) only ever produces a real, non-null
+# `expectation_correct` for TIGHTEN_SL rows: Task 8 established that
+# CLOSE_EARLY always resolves with `expectation_correct=None` (the realized
+# P/L of the close itself doesn't validly measure the counterfactual its
+# expected_direction predicts), and PRE_ENTRY_VETO never resolves at all
+# (position_id is always None - no position, so no counterfactual outcome
+# is ever observed). So `update_heuristics_from_resolved_decisions` below
+# only ever learns from resolved TIGHTEN_SL rows in practice; CLOSE_EARLY/
+# PRE_ENTRY_VETO rows are filtered out early and never reach the grouping
+# logic. This is a known, accepted, current-state scope limit (see the
+# brief) - not a defect.
+#
+# --------------------------------------------------------------------------
+# Factor reconstruction (ruling (a))
+# --------------------------------------------------------------------------
+# guardian_authority_decisions has no column storing the factors a decision
+# was made from. `_reconstruct_tighten_sl_factors` below reconstructs it via
+# an EXACT join instead: guardian/tick.py::process_one_position computes
+# `factors`/`new_state` once per tick and passes the SAME `now` object to
+# both `save_guardian_authority_decision(decided_at=now, ...)` and that same
+# tick's own `save_guardian_observation(observed_at=now, ...)` - on both the
+# TIGHTEN_SL path (the function's normal end-of-tick observation save) and
+# the CLOSE_EARLY path (the dedicated EXIT observation, built from that same
+# tick's `factors`). So `decided_at.isoformat() == observed_at.isoformat()`
+# EXACTLY for the corresponding pair. This module only ever calls the
+# reconstruction for TIGHTEN_SL rows (see scope note above), but the join
+# itself is not decision-type-specific.
+#
+# --------------------------------------------------------------------------
+# Grouping / bucketing
+# --------------------------------------------------------------------------
+# The real, currently-available factor vocabulary for TIGHTEN_SL decisions
+# is Guardian's own tick-time decay factors (_DECAY_FACTOR_NAMES below, all
+# floats clipped to [0, 1] by guardian/deterministic.py's own `_clip01`) plus
+# `guardian_state` (a small string enum, merged in by ruling (a)'s
+# reconstruction - see `decide_open_position`'s own identical merge above).
+# Per the brief's own ruling, grouping combinations are kept simple - NOT a
+# full cross-product of all 6 factors, which would fragment the (currently
+# tiny) real sample size into meaninglessly small buckets:
+#
+#   1. `guardian_state` alone (4 possible groups: HOLD/WATCH/PROTECT/EXIT).
+#   2. `guardian_state` x ONE decay factor, bucketed into three fixed
+#      terciles (low/mid/high, split at 1/3 and 2/3 - simple, fixed
+#      thresholds; this session's own prior manual historical analysis
+#      never studied these particular decay factors, so there is no
+#      pre-established bucket convention to reuse here, unlike the brief's
+#      illustrative trigger_reasons/candidate_score example assumes).
+#
+# Every resolved TIGHTEN_SL decision with reconstructable factors
+# contributes to 1 + len(_DECAY_FACTOR_NAMES) = 7 groups at once (its own
+# guardian_state group, plus one guardian_state x factor-bucket group per
+# decay factor) - the same trade contributing to several different bucketed
+# views is the same shape Detective's own per-batch bucketed analysis uses.
+#
+# Each group's condition is expressed ENTIRELY in terms of
+# heuristic_condition_matches' own already-documented matching semantics
+# (module docstring above): `{"guardian_state": "PROTECT"}` for a
+# state-alone group, `{"guardian_state": "PROTECT", "momentum_decay_min":
+# 0.6667}` for a high-bucket state x factor group - no new matching
+# semantics are invented.
+#
+# --------------------------------------------------------------------------
+# heuristic_id scheme (must be deterministic per group for idempotent
+# upsert - re-running this function from unchanged data must REPLACE the
+# same row, never create a duplicate)
+# --------------------------------------------------------------------------
+#   State-alone group:        "ga-hc:state:<guardian_state>"
+#   State x factor-bucket:    "ga-hc:state:<guardian_state>:factor:<factor_name>:
+#                              bucket:<low|mid|high>"
+# Built purely from the group's own identity (state name, factor name,
+# bucket label) - never a timestamp, run_id, or random value.
+#
+# --------------------------------------------------------------------------
+# Adjustment sign / magnitude
+# --------------------------------------------------------------------------
+# `adjustment = (correct_rate - 0.5) * _ADJUSTMENT_SCALE` - a poorly
+# calibrated group (correct_rate near 0.0, i.e. TIGHTEN_SL was usually the
+# WRONG call under this condition) gets a NEGATIVE adjustment (discourages
+# future TIGHTEN_SL there); a well-calibrated group (correct_rate near 1.0)
+# gets a POSITIVE adjustment (reinforces tightening there). With
+# `_ADJUSTMENT_SCALE = 1.0` this spans the full [-0.5, +0.5] range at the
+# extremes - comparable in magnitude to this system's own hand-authored
+# heuristic adjustments (0.05-0.5 in the tests/fixtures above) without an
+# arbitrary extra scaling constant.
+#
+# `confidence` (the heuristic's own historical reliability, per the module
+# docstring's "Confidence" section) is `abs(correct_rate - 0.5) * 2`: how
+# FAR the group's correct_rate sits from the uninformative 50% baseline,
+# regardless of direction - a group that is consistently wrong is just as
+# reliable a signal (in the opposite direction) as one that is consistently
+# right. This is independent of `adjustment`'s sign, which carries the
+# direction.
+#
+# --------------------------------------------------------------------------
+# Sample size / miscalibration thresholds
+# --------------------------------------------------------------------------
+# `_MIN_SAMPLE_SIZE = 30` mirrors this codebase's own existing conservative
+# precedent for "is this sample big enough to act on"
+# (config/pipeline.yaml's `min_sample_size_for_calibration: 30`, read by
+# dashboard/api.py) - deliberately conservative for what is, in practice, an
+# even narrower signal than that (only TIGHTEN_SL outcomes, see scope note
+# above), and real accumulated data will initially be very low (this whole
+# feature ships default-OFF and is never activated within this plan - see
+# Global Constraints). `_MIN_MISCALIBRATION = 0.15` (a group's correct_rate
+# must be <= 0.35 or >= 0.65 to bother encoding) mirrors the plan's own
+# authority_tighten_threshold default magnitude - a smaller deviation from
+# 50/50 is not distinguishable from noise at this sample size and isn't
+# worth encoding as a heuristic.
+# --------------------------------------------------------------------------
+
+_MIN_SAMPLE_SIZE = 30
+_MIN_MISCALIBRATION = 0.15
+_ADJUSTMENT_SCALE = 1.0
+
+_DECAY_FACTOR_NAMES = (
+    "time_decay",
+    "momentum_decay",
+    "volume_decay",
+    "funding_decay",
+    "secondary_confirmation_lost",
+    "market_regime",
+)
+
+_BUCKET_LOW_MAX = 1.0 / 3.0
+_BUCKET_HIGH_MIN = 2.0 / 3.0
+
+
+def _reconstruct_tighten_sl_factors(repo: Repository, decision: dict) -> dict | None:
+    """Ruling (a): reconstructs the factors dict a TIGHTEN_SL (or
+    CLOSE_EARLY) decision was genuinely made against, by finding the
+    `guardian_observations` row for the same position whose `observed_at`
+    is EXACTLY equal (ISO string equality) to the decision's `decided_at` -
+    both are written from the same `now` object in the same tick by
+    guardian/tick.py::process_one_position (see module docstring section
+    above). Returns None (never raises) when no such row exists - a
+    decision this function cannot safely reconstruct factors for is simply
+    skipped by the caller, not guessed at."""
+    position_id = decision["position_id"]
+    if position_id is None:
+        return None
+    decided_at = decision["decided_at"]
+    for observation in repo.find_guardian_observations_for_position(position_id):
+        if observation["observed_at"] == decided_at:
+            factors = json.loads(observation["factors"])
+            factors["guardian_state"] = observation["state"]
+            return factors
+    return None
+
+
+def _bucket_for_value(value: float) -> str:
+    """Fixed terciles, split at 1/3 and 2/3 - see module docstring section
+    above for why fixed thresholds (rather than a reused historical
+    convention) are the right call here."""
+    if value < _BUCKET_LOW_MAX:
+        return "low"
+    if value < _BUCKET_HIGH_MIN:
+        return "mid"
+    return "high"
+
+
+def _bucket_condition(factor_name: str, bucket: str) -> dict:
+    """Expresses one tercile bucket entirely in terms of
+    heuristic_condition_matches' own `_min`/`_max` numeric-bound semantics
+    (module docstring above) - both bounds are inclusive per that function,
+    so adjacent buckets touch at the boundary (a heuristic, not a strict
+    mathematical partition - acceptable here, see module docstring)."""
+    if bucket == "low":
+        return {f"{factor_name}_max": _BUCKET_LOW_MAX}
+    if bucket == "mid":
+        return {f"{factor_name}_min": _BUCKET_LOW_MAX, f"{factor_name}_max": _BUCKET_HIGH_MIN}
+    return {f"{factor_name}_min": _BUCKET_HIGH_MIN}
+
+
+def _groups_for_factors(factors: dict) -> list[tuple[str, dict, str]]:
+    """Returns `(heuristic_id, condition, description)` for every group one
+    reconstructed factors dict belongs to - its own `guardian_state` group,
+    plus one `guardian_state` x factor-bucket group per decay factor present
+    in `factors` (module docstring section above). Missing/non-numeric decay
+    factors are skipped for that one factor's group (not fatal - the
+    state-alone group and every other factor's group are unaffected)."""
+    guardian_state = factors.get("guardian_state")
+    if guardian_state is None:
+        return []
+
+    groups: list[tuple[str, dict, str]] = [
+        (
+            f"ga-hc:state:{guardian_state}",
+            {"guardian_state": guardian_state},
+            f"TIGHTEN_SL outcomes while guardian_state={guardian_state}",
+        )
+    ]
+
+    for factor_name in _DECAY_FACTOR_NAMES:
+        if factor_name not in factors:
+            continue
+        try:
+            value = float(factors[factor_name])
+        except (TypeError, ValueError):
+            continue
+        bucket = _bucket_for_value(value)
+        condition = {"guardian_state": guardian_state, **_bucket_condition(factor_name, bucket)}
+        groups.append(
+            (
+                f"ga-hc:state:{guardian_state}:factor:{factor_name}:bucket:{bucket}",
+                condition,
+                f"TIGHTEN_SL outcomes while guardian_state={guardian_state} "
+                f"and {factor_name} is {bucket}",
+            )
+        )
+
+    return groups
+
+
+def update_heuristics_from_resolved_decisions(repo: Repository, now: datetime) -> int:
+    """Self-critique pass (Task 9). Reads ALL resolved decisions (not just
+    newly-resolved ones - "opportunistic, re-derive from all resolved so
+    far" per this plan's own ruling), groups the ones with a usable
+    expectation - in practice only resolved TIGHTEN_SL rows, see the scope
+    note in this module's Task 9 docstring section above - by
+    `guardian_state` and `guardian_state` x decay-factor-bucket, computes
+    each group's `expectation_correct` rate, and upserts a heuristic row per
+    group whose sample size and miscalibration clear the thresholds
+    documented above.
+
+    Returns the count of heuristic rows upserted in THIS call.
+
+    Never mutates `guardian_authority_decisions` - this is a pure read of
+    resolved decisions plus a write of `guardian_authority_heuristics`,
+    exactly like `resolve_pending_decisions` above is a pure read of
+    positions plus a write of `guardian_authority_decisions`.
+    """
+    tallies: dict[str, dict] = {}
+
+    for decision in repo.find_resolved_guardian_authority_decisions():
+        if decision["decision_type"] != "TIGHTEN_SL":
+            # CLOSE_EARLY always resolves with expectation_correct=None
+            # (Task 8's own ruling) and PRE_ENTRY_VETO never resolves at
+            # all - neither ever carries a real expectation to learn from.
+            continue
+        if decision["expectation_correct"] is None:
+            continue  # defensive - should not happen for TIGHTEN_SL, but never crash/guess on it
+
+        factors = _reconstruct_tighten_sl_factors(repo, decision)
+        if factors is None:
+            continue  # no matching observation to reconstruct from - skip, don't guess
+
+        correct = bool(decision["expectation_correct"])
+        for heuristic_id, condition, description in _groups_for_factors(factors):
+            tally = tallies.setdefault(
+                heuristic_id,
+                {"condition": condition, "description": description, "n": 0, "correct": 0},
+            )
+            tally["n"] += 1
+            if correct:
+                tally["correct"] += 1
+
+    updated_count = 0
+    for heuristic_id, tally in tallies.items():
+        n = tally["n"]
+        if n < _MIN_SAMPLE_SIZE:
+            continue
+        correct_rate = tally["correct"] / n
+        deviation = correct_rate - 0.5
+        if abs(deviation) < _MIN_MISCALIBRATION:
+            continue
+
+        adjustment = deviation * _ADJUSTMENT_SCALE
+        confidence = abs(deviation) * 2.0
+
+        repo.upsert_guardian_authority_heuristic(
+            heuristic_id=heuristic_id,
+            description=tally["description"],
+            condition_json=json.dumps(tally["condition"]),
+            adjustment=adjustment,
+            confidence=confidence,
+            sample_size=n,
+            updated_at=now,
+        )
+        updated_count += 1
+
+    return updated_count

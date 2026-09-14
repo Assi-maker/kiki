@@ -264,6 +264,7 @@ class Repository(Protocol):
     ) -> bool: ...
     def get_guardian_authority_decision(self, decision_id: str) -> dict | None: ...
     def find_pending_guardian_authority_decisions(self) -> list[dict]: ...
+    def find_resolved_guardian_authority_decisions(self) -> list[dict]: ...
     def resolve_guardian_authority_decision(
         self,
         decision_id: str,
@@ -1727,6 +1728,16 @@ class SQLiteRepository:
     def find_pending_guardian_authority_decisions(self) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM guardian_authority_decisions WHERE outcome_status = 'PENDING'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_resolved_guardian_authority_decisions(self) -> list[dict]:
+        # Task 9's self-critique step (update_heuristics_from_resolved_
+        # decisions) re-derives from ALL resolved decisions on every run -
+        # same additive, same-shape read as find_pending_guardian_authority_
+        # decisions above, just the opposite outcome_status filter.
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_decisions WHERE outcome_status = 'RESOLVED'"
         ).fetchall()
         return [dict(row) for row in rows]
 

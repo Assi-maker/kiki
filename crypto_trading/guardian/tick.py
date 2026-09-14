@@ -8,7 +8,11 @@ from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.bingx_live_trading import BingXLiveTradingConnector
 from crypto_trading.guardian.ai_context import build_ai_context, should_invoke_ai
-from crypto_trading.guardian.authority import decide_open_position
+from crypto_trading.guardian.authority import (
+    decide_open_position,
+    resolve_pending_decisions,
+    update_heuristics_from_resolved_decisions,
+)
 from crypto_trading.guardian.authority_live import (
     apply_live_sl_tightening,
     recover_claimed_live_sl_tightenings,
@@ -243,6 +247,24 @@ def run_guardian_tick_body(
         # find_claimed_guardian_authority_live_sl_actions() result, no
         # exchange calls) whenever nothing is actually claimed.
         recover_claimed_live_sl_tightenings(repo, live_connector, run_id, now)
+
+    # Guardian Authority self-critique (2026-09-14, Task 9), gated by the
+    # same flag as the tick-time decision block in process_one_position
+    # above. Runs ONCE per tick (not once per position), above the
+    # per-position loop - same placement pattern as
+    # recover_claimed_live_sl_tightenings above. Per this plan's own
+    # cadence ruling: "opportunistic, not a new scheduler - runs as the
+    # last step of the SAME tick that just resolved at least one new
+    # decision". update_heuristics_from_resolved_decisions is only called
+    # when resolve_pending_decisions actually resolved >= 1 decision this
+    # tick - a tick that resolves nothing must not waste effort re-deriving
+    # heuristics from unchanged data. Flag off (default): neither function
+    # is ever called - byte-identical to before this task existed.
+    if settings.guardian.authority_enabled:
+        resolved_count = resolve_pending_decisions(repo, now)
+        if resolved_count >= 1:
+            update_heuristics_from_resolved_decisions(repo, now)
+
     observations = []
     for position in repo.find_open_positions():
         observation = process_one_position(

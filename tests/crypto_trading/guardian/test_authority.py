@@ -15,11 +15,13 @@ from crypto_trading.config.loader import (
     Settings,
 )
 from crypto_trading.guardian.authority import (
+    _reconstruct_tighten_sl_factors,
     decide_open_position,
     decide_pre_entry,
     evaluate_heuristics,
     maybe_open_position_for_candidate,
     resolve_pending_decisions,
+    update_heuristics_from_resolved_decisions,
 )
 from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.schemas.assessments import RiskAssessment
@@ -32,6 +34,7 @@ from crypto_trading.schemas.evidence import (
     PriceVolatilityEvidence,
     VolumeEvidence,
 )
+from crypto_trading.schemas.guardian import GuardianObservation
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import SQLiteRepository
 
@@ -967,3 +970,211 @@ def test_resolve_pending_decisions_returns_count_of_actually_resolved_rows_only(
     assert repo.get_guardian_authority_decision("ga-veto")["outcome_status"] == "PENDING"
     assert repo.get_guardian_authority_decision("ga-r1")["outcome_status"] == "RESOLVED"
     assert repo.get_guardian_authority_decision("ga-r2")["outcome_status"] == "RESOLVED"
+
+
+# ---------------------------------------------------------------------------
+# Task 9: update_heuristics_from_resolved_decisions
+#
+# Controller ruling (see task-9-brief.md, "Two controller rulings you must
+# follow"): TIGHTEN_SL is the ONLY decision_type that ever produces a
+# resolved row with a real, non-null expectation_correct (Task 8's own
+# ruling means CLOSE_EARLY always resolves with expectation_correct=None
+# and PRE_ENTRY_VETO never resolves at all). So every fixture below builds
+# resolved TIGHTEN_SL rows directly (position rows are NOT needed - only
+# the decision row itself plus a guardian_observations row whose
+# observed_at exactly matches decided_at, per ruling (a)'s reconstruction
+# join), and grouping is by guardian_state alone (the simplest group shape)
+# for deterministic, hand-verifiable test assertions.
+# ---------------------------------------------------------------------------
+
+_MID_FACTORS = {
+    "time_decay": 0.5,
+    "momentum_decay": 0.5,
+    "volume_decay": 0.5,
+    "funding_decay": 0.5,
+    "secondary_confirmation_lost": 0.5,
+    "market_regime": 0.5,
+}
+
+
+def _resolved_tighten_sl(
+    repo: SQLiteRepository,
+    idx: int,
+    guardian_state: str,
+    factors: dict,
+    correct: bool,
+    position_id: str = "pos-hc",
+) -> None:
+    """Builds ONE resolved TIGHTEN_SL decision + its exactly-matching
+    guardian_observations row (same decided_at/observed_at ISO string, per
+    ruling (a)) - no real Position/Candidate row is needed, since
+    update_heuristics_from_resolved_decisions never reads either."""
+    decided_at = _NOW + timedelta(minutes=idx)
+    decision_id = f"ga-hc-{position_id}-{idx}"
+    repo.save_guardian_authority_decision(
+        decision_id, position_id, f"cand-{position_id}-{idx}", "TIGHTEN_SL", decided_at,
+        "reasoning", "expect small favorable move", "favorable", 0.7, "run-1",
+        old_sl="100", new_sl="105",
+    )
+    repo.resolve_guardian_authority_decision(
+        decision_id,
+        "target" if correct else "stop_loss",
+        "10.0" if correct else "-10.0",
+        correct,
+        decided_at + timedelta(hours=1),
+    )
+    repo.save_guardian_observation(
+        GuardianObservation(
+            observation_id=f"obs-{decision_id}",
+            position_id=position_id,
+            observed_at=decided_at,
+            state=guardian_state,
+            decay_score=Decimal("0.5"),
+            progress_ratio=Decimal("0.1"),
+            unrealized_pnl=Decimal("10"),
+            factors=factors,
+            run_id="run-1",
+        )
+    )
+
+
+def test_reconstruct_tighten_sl_factors_joins_on_matching_observed_at(tmp_path):
+    """Ruling (a): decided_at == observed_at (exact ISO string equality)
+    reconstructs the factors dict Guardian Authority actually decided
+    against, including the merged guardian_state key - mirrors
+    decide_open_position's own `{**position_factors, "guardian_state":
+    guardian_state}` merge (see that function's docstring)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    decided_at = _NOW
+    repo.save_guardian_authority_decision(
+        "ga-join-1", "pos-join", "cand-join", "TIGHTEN_SL", decided_at,
+        "reasoning", "expect small favorable move", "favorable", 0.7, "run-1",
+        old_sl="100", new_sl="105",
+    )
+    factors = {
+        "time_decay": 0.8, "momentum_decay": 0.2, "volume_decay": 0.1,
+        "funding_decay": 0.05, "secondary_confirmation_lost": 0.0, "market_regime": 0.6,
+    }
+    repo.save_guardian_observation(
+        GuardianObservation(
+            observation_id="obs-join-1", position_id="pos-join", observed_at=decided_at,
+            state="PROTECT", decay_score=Decimal("0.5"), progress_ratio=Decimal("0.1"),
+            unrealized_pnl=Decimal("10"), factors=factors, run_id="run-1",
+        )
+    )
+    decision = repo.get_guardian_authority_decision("ga-join-1")
+
+    reconstructed = _reconstruct_tighten_sl_factors(repo, decision)
+
+    assert reconstructed == {**factors, "guardian_state": "PROTECT"}
+
+
+def test_reconstruct_tighten_sl_factors_returns_none_when_no_matching_observation(tmp_path):
+    """No crash, no spurious match: a decision with zero (or only
+    non-matching) guardian_observations rows for its position reconstructs
+    to None."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-join-2", "pos-join2", "cand-join2", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect small favorable move", "favorable", 0.7, "run-1",
+        old_sl="100", new_sl="105",
+    )
+    decision = repo.get_guardian_authority_decision("ga-join-2")
+
+    assert _reconstruct_tighten_sl_factors(repo, decision) is None
+
+
+def test_update_heuristics_miscalibrated_group_gets_negative_adjustment(tmp_path):
+    """AC1 (brief): all TIGHTEN_SL decisions matching one condition
+    (guardian_state=PROTECT) were wrong -> a heuristic row for that
+    condition with a NEGATIVE adjustment."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl(repo, i, "PROTECT", _MID_FACTORS, correct=False, position_id="pos-hc1")
+
+    updated = update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
+
+    assert updated >= 1
+    heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_heuristics()}
+    assert "ga-hc:state:PROTECT" in heuristics
+    state_heuristic = heuristics["ga-hc:state:PROTECT"]
+    assert state_heuristic["adjustment"] < 0
+    assert state_heuristic["sample_size"] == 30
+    assert json.loads(state_heuristic["condition_json"]) == {"guardian_state": "PROTECT"}
+
+
+def test_update_heuristics_well_calibrated_group_gets_positive_adjustment(tmp_path):
+    """AC2 (brief): a well-calibrated group (high correct rate) produces a
+    heuristic with a POSITIVE adjustment - per the symmetric mapping this
+    implementation chose (correct_rate - 0.5, see module docstring/report)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl(repo, i, "WATCH", _MID_FACTORS, correct=True, position_id="pos-hc2")
+
+    update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
+
+    heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_heuristics()}
+    assert "ga-hc:state:WATCH" in heuristics
+    assert heuristics["ga-hc:state:WATCH"]["adjustment"] > 0
+
+
+def test_update_heuristics_respects_minimum_sample_size_threshold(tmp_path):
+    """AC3 (brief): a group just below the minimum sample size threshold
+    does NOT produce a heuristic; a group at/above it does - tested
+    explicitly at the exact boundary (29 vs 30)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(29):
+        _resolved_tighten_sl(repo, i, "HOLD", _MID_FACTORS, correct=False, position_id="pos-hc3a")
+    for i in range(30):
+        _resolved_tighten_sl(repo, i, "EXIT", _MID_FACTORS, correct=False, position_id="pos-hc3b")
+
+    update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
+
+    heuristic_ids = {h["heuristic_id"] for h in repo.find_guardian_authority_heuristics()}
+    assert "ga-hc:state:HOLD" not in heuristic_ids  # 29 < threshold
+    assert "ga-hc:state:EXIT" in heuristic_ids  # 30 >= threshold
+
+
+def test_update_heuristics_is_idempotent_on_rerun(tmp_path):
+    """AC4 (brief): running twice with the same underlying data upserts the
+    SAME heuristic_id (REPLACE semantics, per Task 2) - same row count, not
+    doubled, and the row reflects the latest computed values (updated_at
+    from the second run)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl(repo, i, "PROTECT", _MID_FACTORS, correct=False, position_id="pos-hc4")
+
+    update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
+    first_count = len(repo.find_guardian_authority_heuristics())
+
+    second_updated_at = _NOW + timedelta(days=2)
+    update_heuristics_from_resolved_decisions(repo, second_updated_at)
+    second_count = len(repo.find_guardian_authority_heuristics())
+
+    assert first_count == second_count
+    heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_heuristics()}
+    assert heuristics["ga-hc:state:PROTECT"]["updated_at"] == second_updated_at.isoformat()
+
+
+def test_update_heuristics_excludes_close_early_and_pre_entry_veto(tmp_path):
+    """AC5 (brief): a resolved CLOSE_EARLY row (expectation_correct=None per
+    Task 8's own ruling) and a PENDING PRE_ENTRY_VETO row (position_id=None,
+    never resolves) must not crash the grouping logic and must not produce
+    any spurious heuristic from None values."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-close-1", "pos-close", "cand-close", "CLOSE_EARLY", _NOW,
+        "reasoning", "expect unfavorable if left open", "unfavorable", 0.9, "run-1",
+    )
+    repo.resolve_guardian_authority_decision(
+        "ga-close-1", "GUARDIAN_EXIT", "5.0", None, _NOW + timedelta(hours=1)
+    )
+    repo.save_guardian_authority_decision(
+        "ga-veto-1", None, "cand-veto", "PRE_ENTRY_VETO", _NOW,
+        "reasoning", "expect unfavorable if opened", "unfavorable", 0.8, "run-1",
+    )
+
+    updated = update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
+
+    assert updated == 0
+    assert repo.find_guardian_authority_heuristics() == []
