@@ -181,7 +181,24 @@ def process_one_position(
                                 error=str(exc),
                             )
                 else:
-                    repo.tighten_position_stop_loss(position.position_id, proposed_sl, now)
+                    tightened = repo.tighten_position_stop_loss(
+                        position.position_id, proposed_sl, now
+                    )
+                    if not tightened:
+                        # Final-review fix C1/M1: this return value used to
+                        # be silently discarded, so a refusal by the DB-level
+                        # "only ever tighten" guard (the independent second
+                        # enforcement layer alongside decide_open_position's
+                        # own upstream check) produced zero visible trace
+                        # anywhere. Same event-naming/severity precedent as
+                        # authority_live.py's sibling
+                        # ga_live_sl_aborted_invalid_tightening.
+                        log_event(
+                            run_id, event="ga_tick_paper_sl_tighten_refused",
+                            position_id=position.position_id, instrument=position.instrument,
+                            old_sl=str(position.stop_loss), new_sl=str(proposed_sl),
+                            decision_id=decision_id, severity="ERROR",
+                        )
             elif decision == "CLOSE_EARLY":
                 # CLOSE_EARLY writes via the exact same downstream mechanism
                 # the deterministic EXIT state already uses -

@@ -360,6 +360,44 @@ def test_authority_tighten_sl_on_paper_position_calls_tighten_position_stop_loss
     assert decisions[0]["position_id"] == "pos-1"
 
 
+def test_authority_tighten_sl_refused_on_paper_position_logs_event(tmp_path):
+    """Final-review fix C1/M1: repo.tighten_position_stop_loss's returned
+    bool was previously discarded at this call site, so a refused
+    tightening (the DB-level "only ever tighten" guard rejecting the
+    proposed value) produced zero visible trace anywhere. Same
+    heuristic/score as the successful-PAPER-tighten test above, but
+    repo.tighten_position_stop_loss itself is mocked to return False
+    (simulating the guard refusing, the same way the review found it could
+    silently happen) - proving the call site now captures the return value
+    and logs a distinct event instead of silently discarding it, matching
+    the existing log_event(...) pattern already used elsewhere in this
+    file (e.g. ga_tick_live_sl_tightening_skipped_no_connector)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)  # stop_loss=90, simulated_fill_entry=100
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+
+    with (
+        patch.object(repo, "tighten_position_stop_loss", return_value=False) as mock_tighten,
+        patch("crypto_trading.guardian.tick.log_event") as mock_log_event,
+    ):
+        run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    mock_tighten.assert_called_once()
+    refusal_events = [
+        call for call in mock_log_event.call_args_list
+        if call.kwargs.get("event") == "ga_tick_paper_sl_tighten_refused"
+    ]
+    assert len(refusal_events) == 1
+    assert refusal_events[0].kwargs["position_id"] == "pos-1"
+
+    # The decision row is still recorded - only the visibility of the
+    # refused DB write itself was the gap being fixed.
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+
+
 def test_authority_tighten_sl_on_active_live_position_calls_apply_live_sl_tightening(tmp_path):
     """Same heuristic/score as the PAPER test above, but this position DOES
     have an ACTIVE live_executions row (repo.get_live_execution(...)["phase"]

@@ -420,3 +420,97 @@ def test_tighten_position_stop_loss_nonexistent_position_returns_false_no_error(
     result = repo.tighten_position_stop_loss("does-not-exist", Decimal("49500"), _NOW)
 
     assert result is False
+
+
+def test_tighten_position_stop_loss_digit_count_boundary_tighten_succeeds(tmp_path):
+    """Final-review fix C1: a genuine tighten whose old/new values differ in
+    digit count (crossing 9 -> 10) must succeed. Under the pre-fix lexicographic
+    TEXT comparison, "10.10" < "9.87" as strings, so this tighten was
+    incorrectly refused."""
+    from decimal import Decimal
+    from crypto_trading.schemas.trade import Position
+    from crypto_trading.schemas.event import Event
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    position = Position(
+        position_id="pos-digit-1",
+        candidate_id="cand-digit-1",
+        instrument="BTCUSDT",
+        direction="LONG",
+        status="OPEN_POSITION",
+        theoretical_entry="50000",
+        simulated_fill_entry="50025",
+        stop_loss="9.87",
+        target="52000",
+        size="5000",
+        fill_model_version="v1",
+        opened_at=_NOW,
+    )
+    event = Event(
+        event_id="POS_OPENED:pos-digit-1",
+        event_type="POSITION_OPENED",
+        aggregate_type="position",
+        aggregate_id="pos-digit-1",
+        occurred_at=_NOW,
+        run_id="run-1",
+        schema_version=1,
+        payload={"instrument": position.instrument},
+    )
+    repo.create_position_with_event(position, event)
+
+    # Tighten from 9.87 to 10.10 (numerically higher, more digits before the
+    # decimal point - a genuine tighten that a lexicographic comparison gets
+    # wrong).
+    result = repo.tighten_position_stop_loss("pos-digit-1", Decimal("10.10"), _NOW)
+
+    assert result is True
+    reloaded = repo.get_position("pos-digit-1")
+    assert reloaded.stop_loss == Decimal("10.10")
+
+
+def test_tighten_position_stop_loss_digit_count_boundary_loosen_is_refused(tmp_path):
+    """Final-review fix C1: a genuine loosening whose old/new values differ in
+    digit count (crossing 100 -> 99) must be refused. Under the pre-fix
+    lexicographic TEXT comparison, "99.00" > "100.00" as strings, so this
+    loosening was incorrectly accepted."""
+    from decimal import Decimal
+    from crypto_trading.schemas.trade import Position
+    from crypto_trading.schemas.event import Event
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    position = Position(
+        position_id="pos-digit-2",
+        candidate_id="cand-digit-2",
+        instrument="ETHUSDT",
+        direction="LONG",
+        status="OPEN_POSITION",
+        theoretical_entry="2500",
+        simulated_fill_entry="2510",
+        stop_loss="100.00",
+        target="2600",
+        size="1.0",
+        fill_model_version="v1",
+        opened_at=_NOW,
+    )
+    event = Event(
+        event_id="POS_OPENED:pos-digit-2",
+        event_type="POSITION_OPENED",
+        aggregate_type="position",
+        aggregate_id="pos-digit-2",
+        occurred_at=_NOW,
+        run_id="run-1",
+        schema_version=1,
+        payload={"instrument": position.instrument},
+    )
+    repo.create_position_with_event(position, event)
+
+    # Try to loosen from 100.00 to 99.00 (numerically lower, fewer digits
+    # before the decimal point - a genuine loosening a lexicographic
+    # comparison gets wrong).
+    result = repo.tighten_position_stop_loss("pos-digit-2", Decimal("99.00"), _NOW)
+
+    assert result is False
+    reloaded = repo.get_position("pos-digit-2")
+    assert reloaded.stop_loss == Decimal("100.00")  # unchanged

@@ -1826,7 +1826,7 @@ class SQLiteRepository:
         try:
             cur = self._conn.execute(
                 "UPDATE positions SET stop_loss = ? WHERE position_id = ? "
-                "AND ? > stop_loss",
+                "AND CAST(? AS REAL) > CAST(stop_loss AS REAL)",
                 (str(new_stop_loss), position_id, str(new_stop_loss)),
             )
             updated = cur.rowcount > 0
