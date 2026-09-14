@@ -269,3 +269,106 @@ def test_find_guardian_authority_heuristics_returns_empty_list_when_none_exist(t
 
     heuristics = repo.find_guardian_authority_heuristics()
     assert heuristics == []
+
+
+def test_tighten_position_stop_loss_strictly_higher_succeeds(tmp_path):
+    """Task 4 AC1: A strictly-higher new stop_loss succeeds and updates the position."""
+    from decimal import Decimal
+    from crypto_trading.schemas.trade import Position
+    from crypto_trading.schemas.event import Event
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    # Create a position with stop_loss = 49000
+    position = Position(
+        position_id="pos-1",
+        candidate_id="cand-1",
+        instrument="BTCUSDT",
+        direction="LONG",
+        status="OPEN_POSITION",
+        theoretical_entry="50000",
+        simulated_fill_entry="50025",
+        stop_loss="49000",
+        target="52000",
+        size="5000",
+        fill_model_version="v1",
+        opened_at=_NOW,
+    )
+    event = Event(
+        event_id="POS_OPENED:pos-1",
+        event_type="POSITION_OPENED",
+        aggregate_type="position",
+        aggregate_id="pos-1",
+        occurred_at=_NOW,
+        run_id="run-1",
+        schema_version=1,
+        payload={"instrument": position.instrument},
+    )
+    repo.create_position_with_event(position, event)
+
+    # Tighten to 49500 (strictly higher)
+    result = repo.tighten_position_stop_loss("pos-1", Decimal("49500"), _NOW)
+
+    assert result is True
+    reloaded = repo.get_position("pos-1")
+    assert reloaded.stop_loss == Decimal("49500")
+
+
+def test_tighten_position_stop_loss_equal_or_lower_is_refused(tmp_path):
+    """Task 4 AC2: An equal-or-lower new stop_loss is REFUSED (returns False, row unchanged)."""
+    from decimal import Decimal
+    from crypto_trading.schemas.trade import Position
+    from crypto_trading.schemas.event import Event
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    # Create a position with stop_loss = 49000
+    position = Position(
+        position_id="pos-2",
+        candidate_id="cand-2",
+        instrument="ETHUSDT",
+        direction="LONG",
+        status="OPEN_POSITION",
+        theoretical_entry="2500",
+        simulated_fill_entry="2510",
+        stop_loss="49000",
+        target="2600",
+        size="1.0",
+        fill_model_version="v1",
+        opened_at=_NOW,
+    )
+    event = Event(
+        event_id="POS_OPENED:pos-2",
+        event_type="POSITION_OPENED",
+        aggregate_type="position",
+        aggregate_id="pos-2",
+        occurred_at=_NOW,
+        run_id="run-1",
+        schema_version=1,
+        payload={"instrument": position.instrument},
+    )
+    repo.create_position_with_event(position, event)
+
+    # Try to loosen to 48500 (strictly lower)
+    result_lower = repo.tighten_position_stop_loss("pos-2", Decimal("48500"), _NOW)
+    assert result_lower is False
+    reloaded = repo.get_position("pos-2")
+    assert reloaded.stop_loss == Decimal("49000")  # unchanged
+
+    # Try to keep equal at 49000
+    result_equal = repo.tighten_position_stop_loss("pos-2", Decimal("49000"), _NOW)
+    assert result_equal is False
+    reloaded = repo.get_position("pos-2")
+    assert reloaded.stop_loss == Decimal("49000")  # unchanged
+
+
+def test_tighten_position_stop_loss_nonexistent_position_returns_false_no_error(tmp_path):
+    """Task 4 AC3: A non-existent position_id returns False, no error."""
+    from decimal import Decimal
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    # Try to tighten a position that doesn't exist
+    result = repo.tighten_position_stop_loss("does-not-exist", Decimal("49500"), _NOW)
+
+    assert result is False

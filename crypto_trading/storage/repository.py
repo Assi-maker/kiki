@@ -283,6 +283,9 @@ class Repository(Protocol):
         sample_size: int,
         updated_at: datetime,
     ) -> None: ...
+    def tighten_position_stop_loss(
+        self, position_id: str, new_stop_loss: Decimal, updated_at: datetime
+    ) -> bool: ...
 
 
 class SQLiteRepository:
@@ -1772,3 +1775,24 @@ class SQLiteRepository:
             ),
         )
         self._conn.commit()
+
+    def tighten_position_stop_loss(
+        self, position_id: str, new_stop_loss: Decimal, updated_at: datetime
+    ) -> bool:
+        """Task 4: Updates positions.stop_loss only if new_stop_loss > stop_loss
+        (enforced in a single atomic WHERE clause to prevent race conditions).
+        Returns True if the update applied, False if the position doesn't exist
+        or the guard condition rejected the tightening (equal-or-lower new SL).
+        """
+        try:
+            cur = self._conn.execute(
+                "UPDATE positions SET stop_loss = ? WHERE position_id = ? "
+                "AND ? > stop_loss",
+                (str(new_stop_loss), position_id, str(new_stop_loss)),
+            )
+            updated = cur.rowcount > 0
+            self._conn.commit()
+            return updated
+        except Exception:
+            self._conn.rollback()
+            raise
