@@ -368,6 +368,37 @@ CREATE TABLE IF NOT EXISTS guardian_authority_heuristics (
     sample_size INTEGER NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Guardian Authority LIVE stop-loss tightening (2026-09-14): one row per
+-- LIVE position, created (claimed) the moment a tightening attempt starts -
+-- never before. Deliberately a SEPARATE table from live_profit_protection
+-- with exactly the same shape and the same idempotency/state-machine
+-- semantics (position_id primary key + INSERT OR IGNORE claim, fields
+-- populated forward as exchange state is observed, one terminal status per
+-- row). The separation is the whole point: LIVE Profit Protection and
+-- Guardian Authority are two independent mechanisms that may both want to
+-- move the SAME position's stop, and neither may ever consume, block or
+-- overwrite the other's claim row - see
+-- crypto_trading/guardian/authority_live.py's module docstring and its
+-- "racing Profit Protection" tests. Column-by-column counterpart of
+-- live_profit_protection, with ONE difference: `new_sl_price` (the
+-- caller-supplied target, always known at claim time, hence NOT NULL)
+-- replaces PP's computed `breakeven_price`/`threshold_pct`/
+-- `trigger_mark_price` trio. old_sl_order_id/old_sl_price and
+-- new_sl_order_id are unknown at claim time - populated by later updates
+-- once the real exchange state is observed.
+CREATE TABLE IF NOT EXISTS guardian_authority_live_sl_actions (
+    position_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    new_sl_price TEXT NOT NULL,
+    old_sl_order_id TEXT,
+    old_sl_price TEXT,
+    new_sl_client_order_id TEXT NOT NULL,
+    new_sl_order_id TEXT,
+    last_error TEXT,
+    claimed_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 

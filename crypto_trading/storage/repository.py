@@ -286,6 +286,24 @@ class Repository(Protocol):
     def tighten_position_stop_loss(
         self, position_id: str, new_stop_loss: Decimal, updated_at: datetime
     ) -> bool: ...
+    def claim_guardian_authority_live_sl_action(
+        self,
+        position_id: str,
+        new_sl_price: str,
+        new_sl_client_order_id: str,
+        claimed_at: datetime,
+    ) -> bool: ...
+    def get_guardian_authority_live_sl_action(self, position_id: str) -> dict | None: ...
+    def find_claimed_guardian_authority_live_sl_actions(self) -> list[dict]: ...
+    def update_guardian_authority_live_sl_action_old_sl(
+        self, position_id: str, old_sl_order_id: str, old_sl_price: str, updated_at: datetime
+    ) -> None: ...
+    def update_guardian_authority_live_sl_action_new_sl(
+        self, position_id: str, new_sl_order_id: str, updated_at: datetime
+    ) -> None: ...
+    def set_guardian_authority_live_sl_action_status(
+        self, position_id: str, status: str, updated_at: datetime, last_error: str | None = None
+    ) -> None: ...
 
 
 class SQLiteRepository:
@@ -1796,3 +1814,88 @@ class SQLiteRepository:
         except Exception:
             self._conn.rollback()
             raise
+
+    # --- Guardian Authority LIVE stop-loss tightening (Task 5) ------------
+    # Deliberate, exact mirror of the claim_/get_/find_claimed_/update_/set_
+    # quintet above for live_profit_protection, against the SEPARATE
+    # guardian_authority_live_sl_actions table. Never merged with PP's
+    # methods and never pointed at PP's table: the two mechanisms must be
+    # able to claim the same position_id independently, each in its own
+    # table, with its own primary key.
+
+    def claim_guardian_authority_live_sl_action(
+        self,
+        position_id: str,
+        new_sl_price: str,
+        new_sl_client_order_id: str,
+        claimed_at: datetime,
+    ) -> bool:
+        # Idempotency gate is the position_id primary key itself (INSERT OR
+        # IGNORE), identical to claim_live_profit_protection: the caller
+        # (crypto_trading/guardian/authority_live.py) verifies the real live
+        # position before ever calling this, so no WHERE EXISTS positions
+        # race-guard is needed. Returns False when a row already exists -
+        # that is the whole concurrency defense against two observations
+        # trying to tighten the same position at once.
+        try:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO guardian_authority_live_sl_actions "
+                "(position_id, status, new_sl_price, new_sl_client_order_id, "
+                "claimed_at, updated_at) VALUES (?, 'CLAIMED', ?, ?, ?, ?)",
+                (
+                    position_id,
+                    new_sl_price,
+                    new_sl_client_order_id,
+                    claimed_at.isoformat(),
+                    claimed_at.isoformat(),
+                ),
+            )
+            claimed = cur.rowcount > 0
+            self._conn.commit()
+            return claimed
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_guardian_authority_live_sl_action(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM guardian_authority_live_sl_actions WHERE position_id = ?",
+            (position_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_claimed_guardian_authority_live_sl_actions(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_live_sl_actions WHERE status = 'CLAIMED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_guardian_authority_live_sl_action_old_sl(
+        self, position_id: str, old_sl_order_id: str, old_sl_price: str, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "UPDATE guardian_authority_live_sl_actions SET old_sl_order_id = ?, "
+            "old_sl_price = ?, updated_at = ? WHERE position_id = ?",
+            (old_sl_order_id, old_sl_price, updated_at.isoformat(), position_id),
+        )
+        self._conn.commit()
+
+    def update_guardian_authority_live_sl_action_new_sl(
+        self, position_id: str, new_sl_order_id: str, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "UPDATE guardian_authority_live_sl_actions SET new_sl_order_id = ?, "
+            "updated_at = ? WHERE position_id = ?",
+            (new_sl_order_id, updated_at.isoformat(), position_id),
+        )
+        self._conn.commit()
+
+    def set_guardian_authority_live_sl_action_status(
+        self, position_id: str, status: str, updated_at: datetime, last_error: str | None = None
+    ) -> None:
+        self._conn.execute(
+            "UPDATE guardian_authority_live_sl_actions SET status = ?, last_error = ?, "
+            "updated_at = ? WHERE position_id = ?",
+            (status, last_error, updated_at.isoformat(), position_id),
+        )
+        self._conn.commit()
