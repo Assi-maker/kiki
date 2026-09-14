@@ -24,3 +24,35 @@ factor_weights:
 # paper_trading/monitoring.py::check_exit_trigger() - Guardian kan därför
 # strukturellt aldrig förlänga en position förbi den absoluta gränsen.
 assisted_exit_enabled: true
+
+# Guardian Authority (2026-09-14, docs/superpowers/plans/
+# 2026-09-14-guardian-authority.md, Task 10): explicit documentation for
+# the four authority_* fields config/loader.py::GuardianConfig has carried
+# as Pydantic defaults since Tasks 6/7 (pulled forward there because the
+# pre-entry veto wrapper and the tick-time TIGHTEN_SL/CLOSE_EARLY decision
+# already had a hard runtime dependency on these fields existing, before
+# Task 10 - this plan's own designated owner of the full config surface -
+# ever ran). Until today, NONE of the four appeared here, so this file
+# never overrode the Pydantic defaults - the feature was inert purely
+# because there was nothing in the running config to turn it on, not
+# because of any code-level gate. The four values below are the EXACT SAME
+# values already in effect as Pydantic defaults (see GuardianConfig) -
+# this is a documentation-only change, zero behavior change: it makes the
+# config surface visible/inspectable the same way every other Guardian
+# field already is in this file, nothing more.
+#
+# authority_enabled: master switch for BOTH integration points (the
+# pre-entry veto hook in guardian/authority.py::
+# maybe_open_position_for_candidate AND the tick-time TIGHTEN_SL/
+# CLOSE_EARLY decision in guardian/tick.py::process_one_position). False
+# here (same "ships inert" discipline as assisted_exit_enabled's own
+# original 2026-09-05 default) - activation is a separate, later, explicit
+# decision, never made within this plan itself.
+# authority_veto_threshold / authority_tighten_threshold /
+# authority_close_threshold: see config/loader.py::GuardianConfig's own
+# docstring comments for the full reasoning behind each threshold's exact
+# magnitude - not repeated here.
+authority_enabled: false
+authority_veto_threshold: "0.3"
+authority_tighten_threshold: "0.15"
+authority_close_threshold: "0.45"

@@ -1178,3 +1178,260 @@ def test_update_heuristics_excludes_close_early_and_pre_entry_veto(tmp_path):
 
     assert updated == 0
     assert repo.find_guardian_authority_heuristics() == []
+
+
+# =========================================================================
+# Task 10: Production isolation / Global Constraints (req-9 checklist)
+# =========================================================================
+# Same discipline as Task 5's own authority_live.py isolation tests (see
+# test_authority_live.py's "18. Production isolation / Global Constraints"
+# section, in particular test_module_never_imports_forbidden_production_
+# modules, which this section reuses/extends rather than reinvents): AST-
+# based import/call scanning where it is practical, plain source-text
+# scanning for forbidden symbol/config-field names where it isn't. Every
+# item below is traced 1:1 to the plan's own Global Constraints list / the
+# spec's "Safety architecture (structural, not policy - traces to
+# requirement 9)" table (docs/superpowers/specs/2026-09-14-guardian-
+# authority-design.md), covering BOTH crypto_trading/guardian/authority.py
+# AND crypto_trading/guardian/authority_live.py - the only two modules in
+# this extension capable of doing anything consequential. (decide_pre_entry/
+# decide_open_position/evaluate_heuristics/etc. are Zero I/O - see
+# authority.py's own module docstring - and so cannot themselves violate
+# any of these; the wrapper (maybe_open_position_for_candidate) and the
+# tick-time/LIVE-SL functions in these same two files are what actually
+# touch the database/exchange, so scanning the two full files covers
+# everything reachable.)
+
+
+def _authority_source() -> str:
+    from pathlib import Path
+
+    import crypto_trading.guardian.authority as module_under_test
+
+    return Path(module_under_test.__file__).read_text(encoding="utf-8")
+
+
+def _authority_live_source() -> str:
+    from pathlib import Path
+
+    import crypto_trading.guardian.authority_live as module_under_test
+
+    return Path(module_under_test.__file__).read_text(encoding="utf-8")
+
+
+def test_neither_module_imports_or_calls_position_sizing():
+    """Guardrail (spec table: 'Never martingales / changes sizing'; plan's
+    own Global Constraints): no function in either module ever imports or
+    calls position_sizing.py. AST-based import scan on both files (authority_
+    live.py already has its own standalone version of this check -
+    test_module_never_imports_forbidden_production_modules below - this is
+    the paired assertion that also covers authority.py), plus a textual
+    scan on both for the module name, the one function this codebase's
+    sizing logic exposes (compute_position_size), and a dynamic-import
+    escape hatch (importlib) that an AST import scan alone would miss."""
+    import ast
+
+    forbidden_module = "crypto_trading.paper_trading.position_sizing"
+    for source in (_authority_source(), _authority_live_source()):
+        tree = ast.parse(source)
+        imported_modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_modules.add(alias.name)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module)
+        offenders = [
+            m for m in imported_modules
+            if m == forbidden_module or m.startswith(forbidden_module + ".")
+        ]
+        assert offenders == [], f"imports position_sizing: {offenders}"
+        assert "position_sizing" not in source
+        assert "compute_position_size" not in source
+        assert "importlib" not in source
+
+
+def test_neither_module_calls_set_leverage_or_references_a_leverage_config_field():
+    """Guardrail (spec table: 'Never increases leverage'): no function in
+    either module ever calls BingXLiveTradingConnector.set_leverage or
+    reads/writes any leverage config field (LiveExecutionConfig.leverage,
+    config/loader.py). `set_leverage` is checked via plain substring - the
+    function name is not ordinary English prose and cannot appear
+    incidentally (same precedent as test_module_never_references_
+    set_leverage below, which already establishes this for authority_
+    live.py alone). The `leverage` CONFIG FIELD is checked via AST
+    attribute/subscript access instead of a substring, deliberately: this
+    module's own docstring legitimately uses the bare English word
+    "leverage" once, in prose describing this very guarantee ("It also
+    never changes leverage..."), which a naive substring scan would
+    incorrectly flag as a violation of the property it is documenting."""
+    import ast
+
+    for source in (_authority_source(), _authority_live_source()):
+        assert "set_leverage" not in source
+
+        tree = ast.parse(source)
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "leverage":
+                offenders.append(f"attribute:.{node.attr}")
+            elif isinstance(node, ast.Subscript):
+                key_node = node.slice
+                if isinstance(key_node, ast.Constant) and key_node.value == "leverage":
+                    offenders.append("subscript:['leverage']")
+        assert offenders == [], f"found leverage config field reference(s): {offenders}"
+
+
+def test_neither_module_reads_or_writes_any_capital_defining_config_field():
+    """Guardrail (spec table: 'Never changes the capital limit'; plan's own
+    Global Constraints): no function in either module reads or writes
+    starting_capital_usdt, max_total_exposure_pct, margin_per_trade_usdt,
+    max_concurrent_positions, or any other capital-defining config field -
+    RiskLimitsConfig's own PAPER-side exposure/sizing fields and
+    LiveExecutionConfig's own LIVE-side sizing fields (config/loader.py).
+    Plain source-text scan: every one of these is a long, specific
+    snake_case identifier, not ordinary English prose, so a substring match
+    cannot false-positive the way the bare word "leverage" would (handled
+    separately, via AST, in the test above)."""
+    capital_fields = (
+        "starting_capital_usdt",
+        "max_total_exposure_pct",
+        "margin_per_trade_usdt",
+        "max_concurrent_positions",
+        "max_position_notional_usdt",
+        "risk_per_trade_pct",
+        "margin_safety_buffer_usdt",
+    )
+    for source in (_authority_source(), _authority_live_source()):
+        offenders = [field for field in capital_fields if field in source]
+        assert offenders == [], f"found capital-defining config field reference(s): {offenders}"
+
+
+def test_neither_module_ever_calls_a_paper_live_demo_entry_claim_method_directly():
+    """Guardrail (spec table: 'Never opens unlimited/additional positions';
+    plan's own Global Constraints): 'no code path that calls
+    open_position_for_candidate, create_position_with_event, or any LIVE/
+    PAPER/Demo entry-claim method' - EXCEPT the one sanctioned exception,
+    Task 6's wrapper (maybe_open_position_for_candidate), which may call
+    open_position_for_candidate, and only ever on the APPROVE branch
+    (already covered at the behavioral level by
+    test_maybe_open_position_flag_on_approve_opens_position_with_no_decision_row
+    and test_maybe_open_position_flag_on_veto_never_opens_a_position above -
+    this test adds the STRUCTURAL guarantee those behavioral tests don't
+    cover: that no OTHER function, in either file, could ever reach that
+    call).
+
+    create_position_with_event and the LIVE/Demo entry-claim repository
+    methods are checked via plain source-text scan (none of these names
+    collides with ordinary prose, and neither module has any legitimate
+    reason to reference them at all - unlike open_position_for_candidate,
+    there is no sanctioned exception for these). open_position_for_candidate
+    itself is checked via AST: every Call to it, anywhere in authority.py,
+    must be lexically nested inside maybe_open_position_for_candidate's own
+    function body; authority_live.py must not reference it at all."""
+    import ast
+
+    forbidden_entry_claim_calls = (
+        "create_position_with_event",
+        "claim_demo_execution",
+        "claim_live_execution",
+    )
+    for source in (_authority_source(), _authority_live_source()):
+        offenders = [name for name in forbidden_entry_claim_calls if name in source]
+        assert offenders == [], f"found forbidden entry-claim reference(s): {offenders}"
+
+    sanctioned_function = "maybe_open_position_for_candidate"
+    tree = ast.parse(_authority_source())
+
+    class _OpenPositionCallVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.function_stack: list[str] = []
+            self.violations: list[str] = []
+
+        def visit_FunctionDef(self, node):
+            self.function_stack.append(node.name)
+            self.generic_visit(node)
+            self.function_stack.pop()
+
+        def visit_Call(self, node):
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name == "open_position_for_candidate":
+                enclosing = self.function_stack[-1] if self.function_stack else "<module level>"
+                if enclosing != sanctioned_function:
+                    self.violations.append(enclosing)
+            self.generic_visit(node)
+
+    visitor = _OpenPositionCallVisitor()
+    visitor.visit(tree)
+    assert visitor.violations == [], (
+        f"open_position_for_candidate called outside the sanctioned wrapper: {visitor.violations}"
+    )
+
+    # authority_live.py has no legitimate reason to ever reference
+    # open_position_for_candidate at all - it only ever tightens an
+    # already-open LIVE position's stop-loss.
+    assert "open_position_for_candidate" not in _authority_live_source()
+
+
+def test_neither_module_contains_a_stop_loss_removal_or_loosening_path():
+    """Guardrail (spec table: 'Never removes/loosens a stop-loss'). The
+    core invariant - a SL write is only ever valid when the new value is
+    strictly closer to entry than the current one - is already deeply
+    tested at the unit level: decide_open_position's own downgrade-to-
+    NO_ACTION safety net (test_decide_open_position_never_returns_invalid_
+    tighten_sl and its _when_current_sl_equals_entry variant above) for
+    authority.py, and _verify_tightening_invariant's independent re-
+    verification (test_authority_live.py's own dedicated tests) for
+    authority_live.py. This test does not re-derive that logic - it is the
+    broad reference-scan companion the brief asks for: confirming neither
+    module contains a textual path shaped like removing or loosening a
+    stop-loss outside those two already-reviewed, invariant-checked
+    mechanisms (e.g. a second, un-gated way to clear or widen a stop)."""
+    forbidden_substrings = (
+        "remove_stop_loss",
+        "clear_stop_loss",
+        "delete_stop_loss",
+        "widen_stop_loss",
+        "loosen_stop_loss",
+        "stop_loss=None",
+        "stop_loss = None",
+        "stop_loss=0",
+    )
+    for source in (_authority_source(), _authority_live_source()):
+        offenders = [s for s in forbidden_substrings if s in source]
+        assert offenders == [], f"found forbidden SL-loosening reference(s): {offenders}"
+
+
+def test_neither_module_ever_writes_to_a_py_or_yaml_file_at_runtime():
+    """Guardrail (spec table: 'Never silently modifies production
+    strategy' - 'this module never writes to any .py or .yaml file under
+    crypto_trading/'). This is more a design property than something a
+    runtime unit test can directly exercise: there is no filesystem call
+    site in either module to instrument/mock an assertion against in the
+    first place (unlike the other guardrails above, which are all "this
+    symbol/call must never appear" checks against real call sites). Per the
+    brief's own guidance for exactly this situation, what IS tested here:
+    an AST scan confirming neither module contains ANY call to the builtin
+    open() or to pathlib.Path's write_text/write_bytes - the only two ways
+    Python code anywhere in this codebase ever writes a file. If neither
+    call form exists in the source at all, the module is structurally
+    incapable of writing to any file (.py/.yaml or otherwise) at runtime;
+    its only writes are the already-audited repo.* calls (SQLite, via the
+    Repository protocol) and, on the LIVE tightening path, the reused,
+    already-reviewed BingXLiveTradingConnector HTTP calls - neither of
+    which is a filesystem write under crypto_trading/."""
+    import ast
+
+    forbidden_attr_calls = {"write_text", "write_bytes"}
+    for source in (_authority_source(), _authority_live_source()):
+        tree = ast.parse(source)
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id == "open":
+                    offenders.append("open()")
+                elif isinstance(func, ast.Attribute) and func.attr in forbidden_attr_calls:
+                    offenders.append(func.attr)
+        assert offenders == [], f"found file-write call(s): {offenders}"

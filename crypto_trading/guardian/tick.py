@@ -138,24 +138,48 @@ def process_one_position(
                 # tighten_position_stop_loss column update.
                 live_row = repo.get_live_execution(position.position_id)
                 if live_row is not None and live_row["phase"] == "ACTIVE":
-                    # apply_live_sl_tightening is a single-position API that
-                    # deliberately lets exceptions propagate (Task 5's own
-                    # docstring: "the caller owns batch isolation"). One
-                    # malformed/failing LIVE tightening attempt must never
-                    # abort the rest of this tick's batch - wrap it here,
-                    # exactly like the existing AI-call try/except pattern
-                    # already used elsewhere in this file, and log+continue.
-                    try:
-                        apply_live_sl_tightening(
-                            repo, live_connector, position.position_id, position.instrument,
-                            proposed_sl, run_id, now,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - one bad LIVE tighten must never block the batch
+                    if live_connector is None:
+                        # Task 10 diagnostic fix (carried forward from Task
+                        # 7's review, Minor/non-blocking): a real
+                        # misconfiguration - LIVE execution disabled at
+                        # startup after some positions were already opened
+                        # LIVE - reaches this branch with live_connector=None.
+                        # Before this fix, that fell straight through to
+                        # apply_live_sl_tightening(repo, None, ...), which
+                        # fails safe (no order placed, no DB write - Task 5's
+                        # own design) but only via a generic AttributeError
+                        # from the try/except below, logged every tick
+                        # forever for that position with no indication of
+                        # WHY. The fail-safe OUTCOME is unchanged by this
+                        # fix (no order is ever placed either way) - this
+                        # only replaces the confusing generic exception with
+                        # a distinct, purpose-built diagnostic event, and
+                        # skips the call entirely rather than attempting it.
                         log_event(
-                            run_id, event="ga_tick_live_sl_tightening_error",
-                            position_id=position.position_id, error_type=type(exc).__name__,
-                            error=str(exc),
+                            run_id, event="ga_tick_live_sl_tightening_skipped_no_connector",
+                            position_id=position.position_id, instrument=position.instrument,
+                            severity="ERROR",
                         )
+                    else:
+                        # apply_live_sl_tightening is a single-position API
+                        # that deliberately lets exceptions propagate (Task
+                        # 5's own docstring: "the caller owns batch
+                        # isolation"). One malformed/failing LIVE tightening
+                        # attempt must never abort the rest of this tick's
+                        # batch - wrap it here, exactly like the existing
+                        # AI-call try/except pattern already used elsewhere
+                        # in this file, and log+continue.
+                        try:
+                            apply_live_sl_tightening(
+                                repo, live_connector, position.position_id, position.instrument,
+                                proposed_sl, run_id, now,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - one bad LIVE tighten must never block the batch
+                            log_event(
+                                run_id, event="ga_tick_live_sl_tightening_error",
+                                position_id=position.position_id, error_type=type(exc).__name__,
+                                error=str(exc),
+                            )
                 else:
                     repo.tighten_position_stop_loss(position.position_id, proposed_sl, now)
             elif decision == "CLOSE_EARLY":

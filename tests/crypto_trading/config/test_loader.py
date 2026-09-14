@@ -292,6 +292,37 @@ def test_get_settings_loads_guardian_authority_tighten_close_thresholds_defaults
     assert guardian_cfg.authority_close_threshold > guardian_cfg.authority_tighten_threshold
 
 
+def test_get_settings_loads_guardian_authority_yaml_documentation_byte_identical():
+    """Task 10: config/guardian.yaml now carries explicit entries for all
+    four authority_* fields (authority_enabled/veto_threshold/
+    tighten_threshold/close_threshold) - previously undocumented there,
+    existing only as Pydantic defaults on GuardianConfig (Tasks 6/7). The
+    values written to the YAML are DELIBERATELY the exact same values
+    already in effect as Pydantic defaults - this is a documentation-only
+    change, and this test is the explicit byte-identical-behavior proof:
+    loading the real, running guardian.yaml must produce EXACTLY the same
+    GuardianConfig values as the bare Pydantic defaults (GuardianConfig's
+    own field declarations in config/loader.py), not just "close enough"
+    or "the right type" (already covered by the two tests directly above -
+    this one pins the exact numbers)."""
+    settings = get_settings()
+    guardian_cfg = settings.guardian
+    assert guardian_cfg.authority_enabled is False
+    assert guardian_cfg.authority_veto_threshold == 0.3
+    assert guardian_cfg.authority_tighten_threshold == 0.15
+    assert guardian_cfg.authority_close_threshold == 0.45
+    # Cross-check directly against the Pydantic model's own bare defaults
+    # (no YAML involved at all) - the two must be identical, proving the
+    # new YAML entries genuinely changed nothing about the resulting config.
+    from crypto_trading.config.loader import GuardianConfig
+
+    bare_defaults = GuardianConfig()
+    assert guardian_cfg.authority_enabled == bare_defaults.authority_enabled
+    assert guardian_cfg.authority_veto_threshold == bare_defaults.authority_veto_threshold
+    assert guardian_cfg.authority_tighten_threshold == bare_defaults.authority_tighten_threshold
+    assert guardian_cfg.authority_close_threshold == bare_defaults.authority_close_threshold
+
+
 def test_get_settings_loads_detective_config_from_real_yaml():
     settings = get_settings()
     assert settings.detective.batch_size == 10

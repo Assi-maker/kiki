@@ -399,6 +399,57 @@ def test_authority_tighten_sl_on_active_live_position_calls_apply_live_sl_tighte
     assert repo.get_position("pos-1").stop_loss == Decimal("90")
 
 
+def test_authority_tighten_sl_on_active_live_position_with_no_connector_skips_with_diagnostic(
+    tmp_path,
+):
+    """Task 10 diagnostic fix: an ACTIVE live_executions row exists (a real
+    LIVE position) but live_connector is None (a real misconfiguration -
+    e.g. LIVE execution disabled at startup after some positions were
+    already opened LIVE). Before this fix, this fell through to
+    apply_live_sl_tightening(repo, None, ...) and failed via a generic
+    AttributeError; now it must be skipped entirely - apply_live_sl_tightening
+    is never even called - with a distinct diagnostic log event instead.
+    The fail-safe OUTCOME is unchanged either way: no order is placed, and
+    the PAPER-only path (repo.tighten_position_stop_loss) must NOT be used
+    as a fallback (this is a LIVE position; silently tightening the local
+    positions.stop_loss column would desync it from the real exchange
+    order, which nothing then re-tightens)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _make_active_live_execution(repo, "pos-1")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+
+    with (
+        patch("crypto_trading.guardian.tick.apply_live_sl_tightening") as mock_live_tighten,
+        patch("crypto_trading.guardian.tick.log_event") as mock_log_event,
+    ):
+        run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW,
+            None,  # live_connector explicitly None
+        )
+
+    mock_live_tighten.assert_not_called()
+    skip_events = [
+        call for call in mock_log_event.call_args_list
+        if call.kwargs.get("event") == "ga_tick_live_sl_tightening_skipped_no_connector"
+    ]
+    assert len(skip_events) == 1
+    assert skip_events[0].kwargs["position_id"] == "pos-1"
+
+    # Neither write path ran: real exchange order untouched (nothing to
+    # assert there directly - connector is never contacted), and the local
+    # positions.stop_loss column is also untouched (no silent PAPER-path
+    # fallback for what is really a LIVE position).
+    assert repo.get_position("pos-1").stop_loss == Decimal("90")
+
+    # The decision row itself is still recorded - only the LIVE application
+    # step is skipped, exactly like the existing exception-handling branch.
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+
+
 def test_authority_recover_claimed_live_sl_tightenings_once_per_tick(tmp_path):
     """Two open positions, both ACTIVE LIVE, both driven to TIGHTEN_SL by
     the same always-on heuristic - recover_claimed_live_sl_tightenings must
