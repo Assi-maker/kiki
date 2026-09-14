@@ -54,10 +54,19 @@ base-rate heuristic). Three requirement kinds, dispatched by key name:
 A missing key in `factors` never satisfies any requirement (fail-closed -
 malformed/incomplete evidence must never accidentally satisfy a
 risk-reducing rule it wasn't actually evidenced for). Malformed
-`condition_json` (invalid JSON) is not caught here and propagates as a
-`json.JSONDecodeError` - heuristics rows are Guardian Authority's own
-internal data, and hiding a parse bug behind a silent no-match would be
-worse than a loud failure during development/tests.
+`condition_json` is not caught here and propagates loudly, in one of two
+ways depending on exactly how it is malformed - heuristics rows are
+Guardian Authority's own internal data, and hiding a parse bug behind a
+silent no-match would be worse than a loud failure during
+development/tests:
+
+1. Syntactically invalid JSON (e.g. `"{not json"`) raises
+   `json.JSONDecodeError` (a `ValueError` subclass) from `json.loads`.
+2. Syntactically *valid* JSON that does not parse to a JSON object - e.g.
+   `"[]"`, `"null"`, `"3"`, `'"x"'` - parses successfully but is not a
+   `dict`, so the subsequent `.items()` call (see
+   `heuristic_condition_matches`) raises `AttributeError` (e.g. `'list'
+   object has no attribute 'items'`) rather than `json.JSONDecodeError`.
 
 This is intentionally a small rule-matching function, not a general
 query language - keep any future extension to this same "few key
@@ -188,7 +197,13 @@ def evaluate_heuristics(factors: dict, heuristics: list[dict]) -> tuple[float, l
     matches `factors` (see module docstring for matching semantics).
     Returns `(total_score, matched_heuristic_ids)` - the ids, in the
     order given in `heuristics`, for use in the decision's `reasoning`
-    text."""
+    text.
+
+    Raises (propagated, not caught - see module docstring
+    "Condition-matching semantics" section for why): `json.JSONDecodeError`
+    if a heuristic's `condition_json` is not syntactically valid JSON;
+    `AttributeError` if it parses to valid JSON that is not a JSON object
+    (e.g. a list, `null`, a number, or a string)."""
     total = 0.0
     matched_ids: list[str] = []
     for heuristic in heuristics:

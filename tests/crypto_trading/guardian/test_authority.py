@@ -188,6 +188,23 @@ def test_empty_condition_matches_universally():
     assert matched == ["h-1"]
 
 
+def test_syntactically_invalid_condition_json_raises_json_decode_error():
+    h = _heuristic()
+    h["condition_json"] = "{not valid json"
+
+    with pytest.raises(json.JSONDecodeError):
+        evaluate_heuristics({}, [h])
+
+
+@pytest.mark.parametrize("non_object_json", ["[]", "null", "3", '"x"'])
+def test_valid_non_object_condition_json_raises_attribute_error(non_object_json):
+    h = _heuristic()
+    h["condition_json"] = non_object_json
+
+    with pytest.raises(AttributeError):
+        evaluate_heuristics({}, [h])
+
+
 # ---------------------------------------------------------------------------
 # decide_pre_entry
 # ---------------------------------------------------------------------------
