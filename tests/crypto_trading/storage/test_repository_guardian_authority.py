@@ -180,6 +180,33 @@ def test_resolve_guardian_authority_decision_never_mutates_the_pre_decision_expe
     assert after["resolved_at"] == (_NOW + timedelta(minutes=30)).isoformat()
 
 
+def test_resolve_guardian_authority_decision_accepts_none_expectation_correct(tmp_path):
+    """Task 8 widening: expectation_correct is now typed `bool | None` (both
+    in the Repository Protocol and SQLiteRepository) so the resolution pass
+    can record CLOSE_EARLY rows whose expectation genuinely cannot be
+    computed (see task-8-brief.md's controller ruling) without lying with a
+    real boolean. Confirm None round-trips as None/SQL NULL on read-back -
+    the existing real-boolean cases above (test_resolve_guardian_authority_
+    decision_sets_actual_outcome_and_status and the immutability test) must
+    still pass unmodified alongside this."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-1", "pos-1", "cand-1", "CLOSE_EARLY", _NOW,
+        "reasoning-1", "expect unfavorable if left open", "unfavorable", 0.9, "run-1",
+    )
+
+    repo.resolve_guardian_authority_decision(
+        "ga-1", "GUARDIAN_EXIT", "1.50", None, _NOW + timedelta(minutes=10)
+    )
+
+    row = repo.get_guardian_authority_decision("ga-1")
+    assert row["outcome_status"] == "RESOLVED"
+    assert row["actual_exit_reason"] == "GUARDIAN_EXIT"
+    assert row["actual_pnl_usdt"] == "1.50"
+    assert row["expectation_correct"] is None
+    assert row["resolved_at"] == (_NOW + timedelta(minutes=10)).isoformat()
+
+
 def test_upsert_guardian_authority_heuristic_creates_new_row(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
 

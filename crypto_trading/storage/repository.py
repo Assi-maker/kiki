@@ -269,7 +269,7 @@ class Repository(Protocol):
         decision_id: str,
         actual_exit_reason: str,
         actual_pnl_usdt: str,
-        expectation_correct: bool,
+        expectation_correct: bool | None,
         resolved_at: datetime,
     ) -> None: ...
     def find_guardian_authority_heuristics(self) -> list[dict]: ...
@@ -1735,7 +1735,7 @@ class SQLiteRepository:
         decision_id: str,
         actual_exit_reason: str,
         actual_pnl_usdt: str,
-        expectation_correct: bool,
+        expectation_correct: bool | None,
         resolved_at: datetime,
     ) -> None:
         # Requirement 10: only the actual-outcome columns and outcome_status/
@@ -1743,6 +1743,16 @@ class SQLiteRepository:
         # expected_direction/confidence/decided_at/reasoning are NEVER
         # referenced in this UPDATE, so they stay exactly as recorded at
         # save_guardian_authority_decision() time, immutable by construction.
+        #
+        # Task 8 widening: expectation_correct is bool | None (was bool) -
+        # purely additive, the DB column already has no NOT NULL constraint.
+        # No special-casing needed here: sqlite3's parameter binding already
+        # converts a Python None to SQL NULL for any placeholder (same as
+        # every other nullable column already written via this module, e.g.
+        # old_sl/new_sl in save_guardian_authority_decision below), and a
+        # Python bool binds as SQL INTEGER 0/1 exactly as before - confirmed
+        # by test_resolve_guardian_authority_decision_accepts_none_
+        # expectation_correct in test_repository_guardian_authority.py.
         self._conn.execute(
             "UPDATE guardian_authority_decisions SET outcome_status = 'RESOLVED', "
             "actual_exit_reason = ?, actual_pnl_usdt = ?, expectation_correct = ?, "

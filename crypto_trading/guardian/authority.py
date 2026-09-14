@@ -141,6 +141,7 @@ from decimal import Decimal
 
 from crypto_trading.config.loader import RiskLimitsConfig, Settings
 from crypto_trading.logging import log_event
+from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.paper_trading.position_opening import open_position_for_candidate
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.trade import Position
@@ -493,3 +494,100 @@ def maybe_open_position_for_candidate(
     return open_position_for_candidate(
         candidate, repo, risk_limits, reference_price, opened_at, run_id
     )
+
+
+def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
+    """Resolution pass (Task 8). NOT part of the pure decision core above
+    (see module docstring) - this is I/O, the same sanctioned kind as
+    `maybe_open_position_for_candidate`: it reads pending decisions and
+    positions and writes resolved outcomes, all via `repo`.
+
+    For every `find_pending_guardian_authority_decisions()` row, looks up
+    its position via `repo.get_position(position_id)`. A position counts as
+    "still open" (skip, leave PENDING, don't touch the row) whenever that
+    call returns `None` or a `Position` whose `status != "CLOSED"` -
+    matching this codebase's own status-check convention used elsewhere
+    (e.g. `dashboard/api.py`, `detective/context.py`,
+    `performance/metrics.py`: `compute_pnl(position) if position.status ==
+    "CLOSED" else None`).
+
+    This single check also handles `PRE_ENTRY_VETO` rows without any
+    special-casing: those always have `position_id=None` (no position was
+    ever opened - that's the whole point of a veto), and
+    `repo.get_position(None)` reliably returns `None` the same way a real
+    missing id would (the underlying `WHERE position_id = ?` query never
+    matches SQL NULL). So PRE_ENTRY_VETO rows are skipped every single time
+    this function runs, forever - a deliberate, permanent scope limit: a
+    veto's correctness is about a counterfactual (what would have happened
+    had the candidate NOT been vetoed) that this task has no market-data
+    infrastructure to evaluate. Not a bug, not a TODO - see task-8-brief.md.
+
+    For a closed position, `actual_exit_reason` is read directly from the
+    `Position`'s own `exit_reason` field, and `actual_pnl_usdt` is
+    `str(compute_pnl(position))` - `compute_pnl` (from
+    `paper_trading.execution`) is reused exactly as-is, never a new PnL
+    formula (this module's own hard rule; see the module docstring's
+    `expected_direction` section for why PnL is never derived any other
+    way here).
+
+    `expectation_correct` is then computed ONLY for `TIGHTEN_SL` rows (the
+    only other decision type that can reach this point - PRE_ENTRY_VETO is
+    always skipped above), via the plan's literal sign-comparison rule:
+    `expected_direction == "favorable"` must correspond to a STRICTLY
+    positive `actual_pnl_usdt` (a P/L of exactly zero counts as NOT
+    favorable) - i.e. `(expected_direction == "favorable") == (actual_pnl
+    > 0)`. `TIGHTEN_SL` is the one decision type for which this comparison
+    is actually valid: it predicts the real forward P/L of the action
+    taken (the position stays open under the tightened stop), so the
+    realized P/L IS the thing the prediction was about.
+
+    `CLOSE_EARLY` rows get `expectation_correct=None` (SQL NULL) instead -
+    deliberately NOT computed, even though the brief's own literal
+    instruction would naively sign-compare here too. Per this module's own
+    `expected_direction` vocabulary (see the docstring section above),
+    `CLOSE_EARLY` always predicts `"unfavorable"`, meaning "continuing to
+    hold would have gone unfavorably" - a counterfactual of INACTION. But
+    the `actual_pnl_usdt` computed here comes from the position that was
+    actually closed early - it measures the outcome of the close itself
+    (typically a small or contained result, precisely because closing
+    early is what limited the damage), never the counterfactual of what
+    would have happened had the position stayed open. Sign-comparing
+    "unfavorable" against that realized P/L would systematically misscore
+    a *correct* early close (one that successfully avoided a worse loss)
+    as a wrong expectation. A true counterfactual would require re-fetching
+    forward price data past the actual exit - a meaningfully bigger task,
+    out of scope here. `actual_exit_reason`/`actual_pnl_usdt` are still
+    real and still filled in (worth keeping for later analysis, e.g. Task
+    9's self-critique step), and the row is still marked `RESOLVED` - only
+    `expectation_correct` is withheld.
+
+    Returns the count of rows actually resolved in THIS call - still-open
+    skips and PRE_ENTRY_VETO skips are not counted.
+    """
+    resolved_count = 0
+    for decision in repo.find_pending_guardian_authority_decisions():
+        position = repo.get_position(decision["position_id"])
+        if position is None or position.status != "CLOSED":
+            continue
+
+        actual_exit_reason = position.exit_reason
+        actual_pnl = compute_pnl(position)
+        actual_pnl_usdt = str(actual_pnl)
+
+        if decision["decision_type"] == "CLOSE_EARLY":
+            expectation_correct = None
+        else:
+            predicted_favorable = decision["expected_direction"] == "favorable"
+            actual_favorable = actual_pnl > _ZERO
+            expectation_correct = predicted_favorable == actual_favorable
+
+        repo.resolve_guardian_authority_decision(
+            decision["decision_id"],
+            actual_exit_reason,
+            actual_pnl_usdt,
+            expectation_correct,
+            now,
+        )
+        resolved_count += 1
+
+    return resolved_count

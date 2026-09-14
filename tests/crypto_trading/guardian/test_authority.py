@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -19,9 +19,12 @@ from crypto_trading.guardian.authority import (
     decide_pre_entry,
     evaluate_heuristics,
     maybe_open_position_for_candidate,
+    resolve_pending_decisions,
 )
+from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.schemas.assessments import RiskAssessment
 from crypto_trading.schemas.candidate import Candidate
+from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import (
     CandidateEvidenceRecord,
     FundingOpenInterestEvidence,
@@ -29,6 +32,7 @@ from crypto_trading.schemas.evidence import (
     PriceVolatilityEvidence,
     VolumeEvidence,
 )
+from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import SQLiteRepository
 
 
@@ -676,3 +680,290 @@ def test_maybe_open_position_flag_on_veto_never_opens_a_position(tmp_path):
     assert decision["candidate_id"] == "cand-1"
     assert decision["expected_outcome"]  # non-null/non-empty
     assert decision["expected_direction"] == "unfavorable"
+
+
+# --------------------------------------------------------------------------
+# Task 8: resolve_pending_decisions
+#
+# Controller ruling (see task-8-brief.md, "A controller ruling you must
+# follow exactly"): the brief's literal instruction - sign-compare
+# expected_direction against actual P/L for every pending decision - is
+# only valid for TIGHTEN_SL. CLOSE_EARLY's expected_direction predicts a
+# counterfactual of inaction that the realized P/L (of the close itself)
+# doesn't measure, so CLOSE_EARLY rows get expectation_correct=None
+# instead. PRE_ENTRY_VETO rows have position_id=None (get_position(None)
+# returns None the same as a real missing position) and are skipped
+# forever - a deliberate, permanent scope limit, not a bug.
+# --------------------------------------------------------------------------
+
+
+def _open_position(
+    repo: SQLiteRepository,
+    position_id: str,
+    fill_entry="50000",
+    stop_loss="49000",
+    target="52000",
+    size="5000",
+) -> Position:
+    position = Position(
+        position_id=position_id,
+        candidate_id=position_id,
+        instrument="BTCUSDT",
+        direction="LONG",
+        status="OPEN_POSITION",
+        theoretical_entry=fill_entry,
+        simulated_fill_entry=fill_entry,
+        stop_loss=stop_loss,
+        target=target,
+        size=size,
+        fill_model_version="v1",
+        opened_at=_NOW,
+    )
+    event = Event(
+        event_id=f"POS_OPENED:{position_id}",
+        event_type="POSITION_OPENED",
+        aggregate_type="position",
+        aggregate_id=position_id,
+        occurred_at=_NOW,
+        run_id="run-1",
+        schema_version=1,
+        payload={"instrument": position.instrument},
+    )
+    repo.create_position_with_event(position, event)
+    return position
+
+
+def _close_position(
+    repo: SQLiteRepository,
+    position_id: str,
+    fill_exit: str,
+    exit_reason="target",
+    fees="1",
+    funding="0",
+    closed_at=None,
+) -> None:
+    closed_at = closed_at or (_NOW + timedelta(hours=1))
+    event = Event(
+        event_id=f"POS_CLOSED:{position_id}",
+        event_type="POSITION_CLOSED",
+        aggregate_type="position",
+        aggregate_id=position_id,
+        occurred_at=closed_at,
+        run_id="run-1",
+        schema_version=1,
+        payload={"exit_reason": exit_reason},
+    )
+    ok = repo.close_position_with_event(
+        position_id,
+        Decimal(fill_exit),
+        Decimal(fill_exit),
+        exit_reason,
+        Decimal(fees),
+        Decimal(funding),
+        closed_at,
+        event,
+    )
+    assert ok is True
+
+
+def test_resolve_pending_decisions_skips_still_open_position(tmp_path):
+    """AC1: a PENDING TIGHTEN_SL decision whose position is still open is
+    left completely untouched - stays PENDING, not resolved."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "pos-1")
+    repo.save_guardian_authority_decision(
+        "ga-1", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect small favorable move", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+
+    count = resolve_pending_decisions(repo, _NOW + timedelta(hours=1))
+
+    assert count == 0
+    row = repo.get_guardian_authority_decision("ga-1")
+    assert row["outcome_status"] == "PENDING"
+    assert row["actual_exit_reason"] is None
+    assert row["actual_pnl_usdt"] is None
+    assert row["expectation_correct"] is None
+    assert row["resolved_at"] is None
+
+
+def test_resolve_pending_decisions_tighten_sl_profitable_close_is_correct(tmp_path):
+    """AC2: TIGHTEN_SL, expected_direction='favorable', position closed
+    profitably -> resolved, expectation_correct=True."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "pos-2")
+    _close_position(repo, "pos-2", fill_exit="51000", exit_reason="target", fees="2", funding="1")
+    closed_position = repo.get_position("pos-2")
+    expected_pnl = compute_pnl(closed_position)
+    assert expected_pnl > 0  # sanity: this scenario really is profitable
+    repo.save_guardian_authority_decision(
+        "ga-2", "pos-2", "cand-2", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect small favorable move", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+    resolved_at = _NOW + timedelta(hours=2)
+
+    count = resolve_pending_decisions(repo, resolved_at)
+
+    assert count == 1
+    row = repo.get_guardian_authority_decision("ga-2")
+    assert row["outcome_status"] == "RESOLVED"
+    assert row["actual_exit_reason"] == "target"
+    assert row["actual_pnl_usdt"] == str(expected_pnl)
+    assert row["expectation_correct"] == 1
+    assert row["resolved_at"] == resolved_at.isoformat()
+
+
+def test_resolve_pending_decisions_tighten_sl_losing_close_is_incorrect(tmp_path):
+    """AC3 (adapted per the controller ruling - see module comment above):
+    same TIGHTEN_SL/expected_direction='favorable' setup, but the position
+    closes at a LOSS -> resolved, expectation_correct=False. Proves the
+    False branch of the sign comparison without inventing an
+    'unfavorable'+TIGHTEN_SL combination Task 3 never actually produces."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "pos-3")
+    _close_position(
+        repo, "pos-3", fill_exit="49000", exit_reason="stop_loss", fees="2", funding="1"
+    )
+    closed_position = repo.get_position("pos-3")
+    expected_pnl = compute_pnl(closed_position)
+    assert expected_pnl < 0  # sanity: this scenario really is a loss
+    repo.save_guardian_authority_decision(
+        "ga-3", "pos-3", "cand-3", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect small favorable move", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+    resolved_at = _NOW + timedelta(hours=2)
+
+    count = resolve_pending_decisions(repo, resolved_at)
+
+    assert count == 1
+    row = repo.get_guardian_authority_decision("ga-3")
+    assert row["outcome_status"] == "RESOLVED"
+    assert row["actual_exit_reason"] == "stop_loss"
+    assert row["actual_pnl_usdt"] == str(expected_pnl)
+    assert row["expectation_correct"] == 0
+    assert row["resolved_at"] == resolved_at.isoformat()
+
+
+def test_resolve_pending_decisions_never_mutates_the_pre_decision_expectation(tmp_path):
+    """Re-run of Task 1's own immutability test, at this integration level:
+    resolve_pending_decisions must never change expected_outcome/
+    expected_direction/confidence/decided_at - assert byte-identical
+    before and after."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "pos-4")
+    _close_position(repo, "pos-4", fill_exit="51000", exit_reason="target", fees="2", funding="1")
+    repo.save_guardian_authority_decision(
+        "ga-4", "pos-4", "cand-4", "TIGHTEN_SL", _NOW,
+        "decay accelerating on weak volume", "expect small favorable move",
+        "favorable", 0.65, "run-1", old_sl="49000", new_sl="49500",
+    )
+    before = repo.get_guardian_authority_decision("ga-4")
+
+    count = resolve_pending_decisions(repo, _NOW + timedelta(hours=2))
+
+    assert count == 1
+    after = repo.get_guardian_authority_decision("ga-4")
+    assert after["expected_outcome"] == before["expected_outcome"] == "expect small favorable move"
+    assert after["expected_direction"] == before["expected_direction"] == "favorable"
+    assert after["confidence"] == before["confidence"] == 0.65
+    assert after["decided_at"] == before["decided_at"] == _NOW.isoformat()
+    assert after["outcome_status"] == "RESOLVED"
+
+
+def test_resolve_pending_decisions_close_early_fills_actuals_but_leaves_expectation_unknown(
+    tmp_path,
+):
+    """AC5: a CLOSE_EARLY decision whose position has closed is resolved
+    (real actual_exit_reason/actual_pnl_usdt filled in) but
+    expectation_correct is explicitly None - per the controller ruling,
+    the realized P/L of the early close itself doesn't validly measure the
+    counterfactual expected_direction='unfavorable' actually predicts."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "pos-5")
+    _close_position(
+        repo, "pos-5", fill_exit="50100", exit_reason="GUARDIAN_EXIT", fees="2", funding="1"
+    )
+    closed_position = repo.get_position("pos-5")
+    expected_pnl = compute_pnl(closed_position)
+    repo.save_guardian_authority_decision(
+        "ga-5", "pos-5", "cand-5", "CLOSE_EARLY", _NOW,
+        "reasoning", "expect unfavorable if left open", "unfavorable", 0.9, "run-1",
+    )
+
+    count = resolve_pending_decisions(repo, _NOW + timedelta(hours=2))
+
+    assert count == 1
+    row = repo.get_guardian_authority_decision("ga-5")
+    assert row["outcome_status"] == "RESOLVED"
+    assert row["actual_exit_reason"] == "GUARDIAN_EXIT"
+    assert row["actual_pnl_usdt"] == str(expected_pnl)
+    assert row["expectation_correct"] is None
+
+
+def test_resolve_pending_decisions_skips_pre_entry_veto_forever(tmp_path):
+    """AC6: a PRE_ENTRY_VETO decision has position_id=None (no position was
+    ever opened). resolve_pending_decisions must never crash on this and
+    must never resolve it - it stays PENDING forever, every time this
+    function runs."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-veto", None, "cand-6", "PRE_ENTRY_VETO", _NOW,
+        "poor historical pattern match", "expect unfavorable if opened", "unfavorable",
+        0.8, "run-1",
+    )
+
+    count_1 = resolve_pending_decisions(repo, _NOW + timedelta(hours=1))
+    count_2 = resolve_pending_decisions(repo, _NOW + timedelta(hours=2))
+
+    assert count_1 == 0
+    assert count_2 == 0
+    row = repo.get_guardian_authority_decision("ga-veto")
+    assert row["outcome_status"] == "PENDING"
+    assert row["resolved_at"] is None
+
+
+def test_resolve_pending_decisions_returns_count_of_actually_resolved_rows_only(tmp_path):
+    """AC7: the returned count reflects only rows actually resolved in this
+    call - not still-open-position skips, not PRE_ENTRY_VETO skips."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    # Still open - skip.
+    _open_position(repo, "pos-open")
+    repo.save_guardian_authority_decision(
+        "ga-open", "pos-open", "cand-open", "TIGHTEN_SL", _NOW,
+        "r", "expect favorable", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+
+    # PRE_ENTRY_VETO - skip forever.
+    repo.save_guardian_authority_decision(
+        "ga-veto", None, "cand-veto", "PRE_ENTRY_VETO", _NOW,
+        "r", "expect unfavorable if opened", "unfavorable", 0.8, "run-1",
+    )
+
+    # Two genuinely resolvable rows.
+    _open_position(repo, "pos-r1")
+    _close_position(repo, "pos-r1", fill_exit="51000", fees="2", funding="1")
+    repo.save_guardian_authority_decision(
+        "ga-r1", "pos-r1", "cand-r1", "TIGHTEN_SL", _NOW,
+        "r", "expect favorable", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+
+    _open_position(repo, "pos-r2")
+    _close_position(repo, "pos-r2", fill_exit="50100", exit_reason="GUARDIAN_EXIT")
+    repo.save_guardian_authority_decision(
+        "ga-r2", "pos-r2", "cand-r2", "CLOSE_EARLY", _NOW,
+        "r", "expect unfavorable if left open", "unfavorable", 0.9, "run-1",
+    )
+
+    count = resolve_pending_decisions(repo, _NOW + timedelta(hours=3))
+
+    assert count == 2
+    assert repo.get_guardian_authority_decision("ga-open")["outcome_status"] == "PENDING"
+    assert repo.get_guardian_authority_decision("ga-veto")["outcome_status"] == "PENDING"
+    assert repo.get_guardian_authority_decision("ga-r1")["outcome_status"] == "RESOLVED"
+    assert repo.get_guardian_authority_decision("ga-r2")["outcome_status"] == "RESOLVED"
