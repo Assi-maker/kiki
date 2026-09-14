@@ -65,7 +65,7 @@ def run_discovery_tick(
     repo.start_run(run_id, "discovery", now)
     try:
         sweep_confirmed_candidates_without_position(
-            repo, connector, settings.risk_limits, now, run_id
+            repo, connector, settings.risk_limits, now, run_id, settings
         )
     except Exception as exc:
         log_event(

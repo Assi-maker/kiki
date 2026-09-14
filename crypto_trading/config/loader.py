@@ -165,6 +165,34 @@ class GuardianConfig(BaseModel):
     # time_limit-gränsen, bara OM en tidigare stängning tillåts alls.
     assisted_exit_enabled: bool = False
 
+    # Guardian Authority pre-entry veto (2026-09-14, docs/superpowers/plans/
+    # 2026-09-14-guardian-authority.md). These two fields are pulled forward
+    # from that plan's own Task 10 (the designated owner of the full config
+    # surface: authority_enabled/veto_threshold/tighten_threshold/
+    # close_threshold, guardian.yaml documentation, and the production-
+    # isolation tests) because Task 6's wrapper (guardian/authority.py::
+    # maybe_open_position_for_candidate) has a hard runtime dependency on
+    # authority_enabled existing now - it cannot be built against a field
+    # that doesn't exist yet. Only the two fields Task 6 actually reads are
+    # added here; Task 10 still owns authority_tighten_threshold/
+    # authority_close_threshold (Task 7/8's tick-time decisions) and the
+    # full isolation-test checklist.
+    #
+    # authority_enabled defaults to False - same "ships inert" discipline as
+    # assisted_exit_enabled above: landing Task 6 changes zero runtime
+    # behavior until a later, separate, explicit activation decision (never
+    # made within this plan itself).
+    authority_enabled: bool = False
+    # veto_threshold: the summed heuristic score (guardian/authority.py::
+    # decide_pre_entry) must STRICTLY exceed this to veto. 0.3 is a
+    # deliberately conservative, unvalidated starting point - roughly two
+    # moderate-adjustment heuristics (the test fixtures in this plan use
+    # ~0.15 per heuristic) must agree before a candidate is vetoed, rather
+    # than a single heuristic acting alone. Like every other Guardian
+    # Authority threshold, this is explicitly NOT tuned/activated by this
+    # plan - it only matters once authority_enabled is later set True.
+    authority_veto_threshold: float = 0.3
+
 
 class LiveExecutionConfig(BaseModel):
     # BingX Live execution (2026-09-06) - a tightly bounded, real-money

@@ -1,10 +1,13 @@
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 from crypto_trading.agents.runner import MockAgentRunner
 from crypto_trading.config.loader import (
     BudgetLimitsConfig,
     DashboardConfig,
+    GuardianConfig,
     NotifyConfig,
     PipelineConfig,
     RiskLimitsConfig,
@@ -39,9 +42,10 @@ from crypto_trading.storage.repository import SQLiteRepository
 _T0 = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
 
 
-def _settings() -> Settings:
+def _settings(guardian: GuardianConfig | None = None) -> Settings:
     return Settings(
         db_path="unused",
+        guardian=guardian if guardian is not None else GuardianConfig(),
         pipeline=PipelineConfig(
             discovery_interval_minutes=60,
             monitoring_interval_seconds=30,
@@ -597,4 +601,82 @@ def test_one_candidates_open_failure_does_not_block_the_other_candidates_in_the_
 
     assert [p.position_id for p in opened] == ["healthy-1"]
     assert repo.get_position("healthy-1") is not None
+
+
+def _single_candidate_snapshot(candidate_id: str, instrument: str, price: str) -> tuple:
+    candidate = _confirmed_candidate_for_instrument(candidate_id, instrument)
+    ticker = Ticker(
+        instrument=instrument, last_price=Decimal(price), price_change=Decimal("0"),
+        price_change_percent=Decimal("0"), high_price=Decimal(price), low_price=Decimal(price),
+        volume=Decimal("100"), quote_volume=Decimal("1000000"), open_price=Decimal(price),
+        ask_price=Decimal(price), ask_qty=Decimal("1"), bid_price=Decimal(price),
+        bid_qty=Decimal("1"), observed_at=_T0,
+    )
+    snapshot = MarketSnapshot(
+        simulated_now=_T0, instruments={}, tickers={instrument: ticker},
+        klines={}, funding_rates={}, data_quality_status={},
+    )
+    return candidate, snapshot
+
+
+def test_open_positions_for_confirmed_candidates_authority_flag_on_approve_opens_as_before(
+    tmp_path,
+):
+    """Task 6 (pre-entry veto wiring): guardian.authority_enabled=True but
+    zero heuristics match -> decide_pre_entry defaults to APPROVE. The
+    position must open exactly as with the flag off, and no
+    guardian_authority_decisions row is saved for an APPROVE (per the
+    plan's own 'only actual interventions get a row' ruling)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate, snapshot = _single_candidate_snapshot("healthy-1", "BTCUSDT", "50000")
+    settings = _settings(GuardianConfig(authority_enabled=True, authority_veto_threshold=0.3))
+
+    opened = _open_positions_for_confirmed_candidates(
+        [candidate], snapshot, repo, settings, run_id="run-1"
+    )
+
+    assert [p.position_id for p in opened] == ["healthy-1"]
+    assert repo.get_position("healthy-1") is not None
+    count = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM guardian_authority_decisions"
+    ).fetchone()["n"]
+    assert count == 0
+
+
+def test_open_positions_for_confirmed_candidates_authority_flag_on_veto_never_opens(tmp_path):
+    """Task 6: a heuristic matching this candidate's own evidence pushes the
+    score past veto_threshold -> PRE_ENTRY_VETO. open_position_for_candidate
+    must never be called (spy assertion), no positions row is created, and a
+    PRE_ENTRY_VETO decision row exists."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-veto-replay",
+        description="price_volatility trigger at high candidate_score has historically lost",
+        condition_json=json.dumps(
+            {"trigger_reasons": ["price_volatility"], "candidate_score_min": 0.5}
+        ),
+        adjustment=0.5, confidence=0.8, sample_size=20, updated_at=_T0,
+    )
+    candidate, snapshot = _single_candidate_snapshot("bad-1", "BTCUSDT", "50000")
+    settings = _settings(GuardianConfig(authority_enabled=True, authority_veto_threshold=0.3))
+
+    with patch(
+        "crypto_trading.guardian.authority.open_position_for_candidate"
+    ) as mock_open:
+        opened = _open_positions_for_confirmed_candidates(
+            [candidate], snapshot, repo, settings, run_id="run-1"
+        )
+
+    assert opened == []
+    mock_open.assert_not_called()
+    assert repo.get_position("bad-1") is None
+    positions_count = repo._conn.execute("SELECT COUNT(*) AS n FROM positions").fetchone()["n"]
+    assert positions_count == 0
+    decisions = repo._conn.execute("SELECT * FROM guardian_authority_decisions").fetchall()
+    assert len(decisions) == 1
+    decision = dict(decisions[0])
+    assert decision["decision_type"] == "PRE_ENTRY_VETO"
+    assert decision["position_id"] is None
+    assert decision["candidate_id"] == "bad-1"
+    assert decision["expected_outcome"]
     assert repo.get_position("broken-1") is None

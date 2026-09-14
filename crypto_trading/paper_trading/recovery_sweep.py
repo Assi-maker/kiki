@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from crypto_trading.config.loader import RiskLimitsConfig
+from crypto_trading.config.loader import RiskLimitsConfig, Settings
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
+from crypto_trading.guardian.authority import maybe_open_position_for_candidate
 from crypto_trading.logging import log_event
 from crypto_trading.paper_trading.position_opening import open_position_for_candidate
 from crypto_trading.schemas.market import Ticker
@@ -17,6 +18,7 @@ def sweep_confirmed_candidates_without_position(
     risk_limits: RiskLimitsConfig,
     now: datetime,
     run_id: str,
+    settings: Settings | None = None,
 ) -> list[Position]:
     """P2 remediation (2026-09-11): forward-only recovery for CONFIRMED
     candidates that never got a PAPER position - e.g. a crash between Gate
@@ -28,6 +30,17 @@ def sweep_confirmed_candidates_without_position(
     tested open_position_for_candidate() - never re-runs Gate/AI/Risk, zero
     new AI cost. Idempotent: open_position_for_candidate() itself refuses to
     create a second position for the same candidate_id.
+
+    `settings` (2026-09-14, Task 6 - Guardian Authority pre-entry veto
+    wiring): optional, additive, threaded through purely so this call site
+    can gate the same maybe_open_position_for_candidate() wrapper
+    replay.py's own immediate-open loop uses - see guardian/authority.py.
+    Defaults to None for backward compatibility with every pre-Task-6
+    caller/test that does not pass it (this function's own signature is a
+    dependency other code/tests already call positionally); when None, this
+    sweep calls open_position_for_candidate() directly, byte-identical to
+    every prior behavior of this function - the wrapper's own
+    authority_enabled gate is never even consulted in that case.
 
     Deliberately forward-only: a one-time activation watermark
     (storage/repository.py's schema_meta key 'recovery_sweep_activated_at')
@@ -55,9 +68,14 @@ def sweep_confirmed_candidates_without_position(
                 error=str(exc),
             )
             continue
-        position = open_position_for_candidate(
-            candidate, repo, risk_limits, ticker.last_price, now, run_id
-        )
+        if settings is not None:
+            position = maybe_open_position_for_candidate(
+                repo, candidate, risk_limits, ticker.last_price, now, run_id, settings
+            )
+        else:
+            position = open_position_for_candidate(
+                candidate, repo, risk_limits, ticker.last_price, now, run_id
+            )
         if position is not None:
             opened.append(position)
             log_event(

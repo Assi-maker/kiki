@@ -1,13 +1,35 @@
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
+from crypto_trading.config.loader import (
+    BudgetLimitsConfig,
+    DashboardConfig,
+    GuardianConfig,
+    NotifyConfig,
+    PipelineConfig,
+    RiskLimitsConfig,
+    Settings,
+)
 from crypto_trading.guardian.authority import (
     decide_open_position,
     decide_pre_entry,
     evaluate_heuristics,
+    maybe_open_position_for_candidate,
 )
+from crypto_trading.schemas.assessments import RiskAssessment
+from crypto_trading.schemas.candidate import Candidate
+from crypto_trading.schemas.evidence import (
+    CandidateEvidenceRecord,
+    FundingOpenInterestEvidence,
+    MomentumBreakoutEvidence,
+    PriceVolatilityEvidence,
+    VolumeEvidence,
+)
+from crypto_trading.storage.repository import SQLiteRepository
 
 
 def _heuristic(
@@ -457,3 +479,200 @@ def test_decide_open_position_valid_tighten_never_exceeds_entry():
     assert decision == "TIGHTEN_SL"
     assert proposed_sl > Decimal("90")
     assert proposed_sl <= Decimal("100")
+
+
+# ---------------------------------------------------------------------------
+# maybe_open_position_for_candidate (Task 6: pre-entry veto wiring)
+# ---------------------------------------------------------------------------
+
+_NOW = datetime(2026, 9, 14, 12, 0, tzinfo=UTC)
+
+
+def _settings(guardian: GuardianConfig | None = None) -> Settings:
+    return Settings(
+        db_path="unused",
+        pipeline=PipelineConfig(
+            discovery_interval_minutes=60,
+            monitoring_interval_seconds=30,
+            top_n=5,
+            cooldown_minutes=60,
+            max_data_age_seconds={
+                "ticker": 3600,
+                "kline": 3600,
+                "funding_rate": 36000,
+                "open_interest": 3600,
+                "contracts": 86400,
+            },
+            min_sample_size_for_calibration=30,
+            calibration_preliminary_sample_size=10,
+            sqlite_busy_timeout_ms=5000,
+            required_fields={
+                "ticker": ["lastPrice"],
+                "kline": ["open"],
+                "funding_rate": ["fundingRate"],
+                "open_interest": ["openInterest"],
+                "contracts": ["symbol"],
+            },
+            screener_timeframes=["1h"],
+            bingx_base_url="https://open-api.bingx.com",
+            bingx_requests_per_second=10,
+            bingx_cache_ttl_seconds=5,
+            bingx_max_retries=3,
+            kline_consistency_tolerance_pct=Decimal("0.5"),
+            eligibility_min_quote_volume_24h_usdt=Decimal("1000000"),
+            eligibility_max_spread_pct=Decimal("0.01"),
+            screener_lookback_periods=3,
+            screener_price_volatility_threshold_pct=Decimal("2.0"),
+            screener_rsi_period=3,
+            screener_rsi_overbought_threshold=Decimal("70"),
+            screener_volume_zscore_threshold=Decimal("2.5"),
+            screener_funding_rate_threshold_pct=Decimal("0.05"),
+            screener_funding_history_limit=10,
+            evidence_change_threshold_for_reanalysis=Decimal("0.15"),
+        ),
+        risk_limits=_risk_limits(),
+        budget_limits=BudgetLimitsConfig(
+            max_candidates_per_discovery_run=10,
+            max_ai_calls_per_discovery_run=70,
+            max_ai_calls_per_day=500,
+            warning_threshold_pct=Decimal("0.8"),
+        ),
+        notify=NotifyConfig(notification_level="important", notify_interval_seconds=60),
+        dashboard=DashboardConfig(host="127.0.0.1", port=8000),
+        guardian=guardian if guardian is not None else GuardianConfig(),
+    )
+
+
+def _risk_limits(**overrides) -> RiskLimitsConfig:
+    defaults = dict(
+        starting_capital_usdt=Decimal("10000"), risk_per_trade_pct=Decimal("0.01"),
+        max_concurrent_positions=5, max_total_exposure_pct=Decimal("1.0"),
+        max_position_notional_usdt=Decimal("1000000"), spread_pct=Decimal("0.0005"),
+        slippage_pct=Decimal("0.0005"), fee_pct=Decimal("0.0004"), max_position_hold_hours=24,
+    )
+    defaults.update(overrides)
+    return RiskLimitsConfig(**defaults)
+
+
+def _evidence(candidate_score=0.05, trigger_reasons=None) -> CandidateEvidenceRecord:
+    placeholder = dict(triggered=True, metric="m", value=1.0, baseline=0.0, threshold=0.5)
+    return CandidateEvidenceRecord(
+        instrument="BTCUSDT", timeframes=["1h"], evaluated_at=_NOW,
+        price_volatility_evidence=PriceVolatilityEvidence(**placeholder),
+        momentum_breakout_evidence=MomentumBreakoutEvidence(**placeholder),
+        volume_evidence=VolumeEvidence(**placeholder),
+        funding_oi_evidence=FundingOpenInterestEvidence(**placeholder),
+        candidate_score=candidate_score,
+        trigger_reasons=trigger_reasons if trigger_reasons is not None else ["momentum_breakout"],
+        data_quality_status="ok", outcome="worth_deeper_analysis",
+    )
+
+
+def _confirmed_candidate(
+    candidate_id="cand-1", candidate_score=0.05, trigger_reasons=None
+) -> Candidate:
+    return Candidate(
+        candidate_id=candidate_id, idempotency_key=f"key-{candidate_id}", instrument="BTCUSDT",
+        discovery_run_id="run-1", evidence_hash="hash-1", status="CONFIRMED",
+        evidence_record=_evidence(candidate_score, trigger_reasons),
+        created_at=_NOW, updated_at=_NOW,
+        risk=RiskAssessment(
+            agent_name="crypto-risk-agent", run_id="run-1", created_at=_NOW, status="ok",
+            suggested_stop_loss="49000", suggested_target="52000",
+            downside="d", liquidity_risk="l", model_risk="m", timing_risk="t",
+        ),
+    )
+
+
+def _decision_count(repo: SQLiteRepository) -> int:
+    row = repo._conn.execute("SELECT COUNT(*) AS n FROM guardian_authority_decisions").fetchone()
+    return row["n"]
+
+
+def test_maybe_open_position_flag_off_is_byte_identical_to_direct_call(tmp_path):
+    """Default OFF (settings.guardian.authority_enabled is False): the
+    wrapper must be a pure passthrough - same Position, no decision row,
+    heuristics never even read (no I/O beyond open_position_for_candidate
+    itself)."""
+    from crypto_trading.paper_trading.position_opening import open_position_for_candidate
+
+    repo_direct = SQLiteRepository(tmp_path / "direct.db")
+    repo_wrapped = SQLiteRepository(tmp_path / "wrapped.db")
+    candidate = _confirmed_candidate()
+    settings = _settings(GuardianConfig(authority_enabled=False))
+
+    direct = open_position_for_candidate(
+        candidate, repo_direct, settings.risk_limits, Decimal("50000"), _NOW, "run-1"
+    )
+    wrapped = maybe_open_position_for_candidate(
+        repo_wrapped, candidate, settings.risk_limits, Decimal("50000"), _NOW, "run-1", settings
+    )
+
+    assert wrapped is not None
+    assert wrapped.model_dump() == direct.model_dump()
+    assert _decision_count(repo_wrapped) == 0
+
+
+def test_maybe_open_position_flag_on_approve_opens_position_with_no_decision_row(tmp_path):
+    """Flag True, zero heuristics match -> decide_pre_entry defaults to
+    APPROVE: position opens exactly as before, and - per the plan's own
+    'only actual interventions get a row' ruling - no decision row is
+    saved for an APPROVE."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _confirmed_candidate()
+    settings = _settings(GuardianConfig(authority_enabled=True, authority_veto_threshold=0.3))
+
+    position = maybe_open_position_for_candidate(
+        repo, candidate, settings.risk_limits, Decimal("50000"), _NOW, "run-1", settings
+    )
+
+    assert position is not None
+    assert position.position_id == "cand-1"
+    assert repo.get_position("cand-1") is not None
+    assert _decision_count(repo) == 0
+
+
+def test_maybe_open_position_flag_on_veto_never_opens_a_position(tmp_path):
+    """Flag True, a matched heuristic pushes the score past veto_threshold
+    -> PRE_ENTRY_VETO: open_position_for_candidate must never be called at
+    all (asserted via spy), no positions row is created, and a
+    PRE_ENTRY_VETO decision row exists with position_id=None and a
+    non-null expected_outcome."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-veto-1",
+        description="momentum breakout at a very low candidate_score has historically lost",
+        condition_json=json.dumps(
+            {"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.1}
+        ),
+        adjustment=0.5,
+        confidence=0.8,
+        sample_size=20,
+        updated_at=_NOW,
+    )
+    candidate = _confirmed_candidate(candidate_score=0.05, trigger_reasons=["momentum_breakout"])
+    settings = _settings(GuardianConfig(authority_enabled=True, authority_veto_threshold=0.3))
+
+    with patch(
+        "crypto_trading.guardian.authority.open_position_for_candidate"
+    ) as mock_open:
+        position = maybe_open_position_for_candidate(
+            repo, candidate, settings.risk_limits, Decimal("50000"), _NOW, "run-1", settings
+        )
+
+    assert position is None
+    mock_open.assert_not_called()
+    assert repo.get_position("cand-1") is None
+    row = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM positions"
+    ).fetchone()
+    assert row["n"] == 0
+
+    decisions = repo._conn.execute("SELECT * FROM guardian_authority_decisions").fetchall()
+    assert len(decisions) == 1
+    decision = dict(decisions[0])
+    assert decision["decision_type"] == "PRE_ENTRY_VETO"
+    assert decision["position_id"] is None
+    assert decision["candidate_id"] == "cand-1"
+    assert decision["expected_outcome"]  # non-null/non-empty
+    assert decision["expected_direction"] == "unfavorable"

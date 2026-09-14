@@ -1,11 +1,24 @@
 """Guardian Authority's pure decision engine (design spec:
-docs/superpowers/specs/2026-09-14-guardian-authority-design.md).
+docs/superpowers/specs/2026-09-14-guardian-authority-design.md), plus
+(2026-09-14, Task 6) the pre-entry veto wiring built on top of it.
 
-Zero I/O. Every input is a plain value/dict/Decimal, every output is a
-plain tuple - no database access, no connector imports, no imports of
-`repository.py`. This is deliberate: it is the module's only genuinely
-novel logic, and keeping it pure makes it exhaustively unit-testable
-without mocking anything (see task-3-brief.md).
+The decision engine below (`evaluate_heuristics`, `decide_pre_entry`,
+`decide_open_position`, and their helpers) is Zero I/O. Every input is a
+plain value/dict/Decimal, every output is a plain tuple - no database
+access, no connector imports. This is deliberate: it is the module's only
+genuinely novel logic, and keeping it pure makes it exhaustively
+unit-testable without mocking anything (see task-3-brief.md).
+
+`maybe_open_position_for_candidate` (bottom of this file, Task 6) is
+NOT part of that pure core - it is the one place in this module that
+performs I/O (reads heuristics, saves a decision row, and - on APPROVE or
+when the flag is off - calls `open_position_for_candidate`). It is kept in
+this same file because the plan's own task brief places it here as "a
+small wrapper in guardian/authority.py", and because Task 10's production-
+isolation checklist explicitly permits this module to call
+`open_position_for_candidate` "only via the wrapper in Task 6" - i.e. this
+function IS that sanctioned exception, not a violation of the pure-core
+discipline above.
 
 --------------------------------------------------------------------------
 Heuristics representation (ratified by the plan, not reinterpreted here)
@@ -123,7 +136,15 @@ this.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from decimal import Decimal
+
+from crypto_trading.config.loader import RiskLimitsConfig, Settings
+from crypto_trading.logging import log_event
+from crypto_trading.paper_trading.position_opening import open_position_for_candidate
+from crypto_trading.schemas.candidate import Candidate
+from crypto_trading.schemas.trade import Position
+from crypto_trading.storage.repository import Repository
 
 _ZERO = Decimal("0")
 
@@ -375,4 +396,100 @@ def decide_open_position(
         "neutral",
         _aggregate_confidence(matched),
         None,
+    )
+
+
+def _pre_entry_factors(candidate: Candidate) -> dict:
+    """The candidate's own evidence, reshaped into the flat factor dict
+    `decide_pre_entry`/`evaluate_heuristics` match heuristic conditions
+    against (see module docstring's "Condition-matching semantics" section).
+
+    Deliberately limited to the fields that are BOTH (a) part of the
+    candidate's own evidence (`Candidate.evidence_record`, i.e. known at
+    pre-entry time - nothing from a later assessment) and (b) part of the
+    exact factor vocabulary this plan's own manual historical analysis
+    already established and documented (`trigger_reasons`, `candidate_score`
+    bucket - see plan doc line 13/265): `instrument` (for potential
+    per-symbol conditioning), `candidate_score`, and `trigger_reasons`.
+    Other vocabulary mentioned alongside those two in the plan (e.g.
+    `rsi_30m` bucket) comes from a later technical/market-data assessment,
+    not from the candidate's own evidence record, and is out of scope for
+    this pre-entry hook - Task 9's self-critique step is what actually
+    decides, from real resolved-decision data, which factors are worth
+    encoding as heuristics; this function only has to expose the ones a
+    heuristic COULD condition on today."""
+    evidence = candidate.evidence_record
+    return {
+        "instrument": candidate.instrument,
+        "candidate_score": evidence.candidate_score,
+        "trigger_reasons": evidence.trigger_reasons,
+    }
+
+
+def maybe_open_position_for_candidate(
+    repo: Repository,
+    candidate: Candidate,
+    risk_limits: RiskLimitsConfig,
+    reference_price: Decimal,
+    opened_at: datetime,
+    run_id: str,
+    settings: Settings,
+) -> Position | None:
+    """Pre-entry veto hook in front of `open_position_for_candidate` (Task
+    6). Ships default OFF: with `settings.guardian.authority_enabled` False
+    (the default), this is a byte-identical passthrough - heuristics are
+    never even read, and the only I/O performed is
+    `open_position_for_candidate`'s own, exactly as before this task
+    existed.
+
+    When enabled, runs `decide_pre_entry` against the candidate's own
+    evidence (`_pre_entry_factors`) and the full, freshly-read heuristics
+    table (per the plan's own ruling: heuristics are read fresh, in full,
+    at the start of every decision - never cached). On `"PRE_ENTRY_VETO"`,
+    saves a decision row (`position_id=None` - no position exists yet, and
+    per Task 1's own design this is explicitly a supported, nullable case)
+    and returns `None` WITHOUT ever calling `open_position_for_candidate` -
+    the one invariant this whole task exists to enforce. On `"APPROVE"`,
+    falls through to call `open_position_for_candidate` exactly as before;
+    per the plan's own "only actual interventions get a row" ruling, no
+    decision row is saved for an APPROVE."""
+    if not settings.guardian.authority_enabled:
+        return open_position_for_candidate(
+            candidate, repo, risk_limits, reference_price, opened_at, run_id
+        )
+
+    heuristics = repo.find_guardian_authority_heuristics()
+    decision, expected_outcome, expected_direction, confidence = decide_pre_entry(
+        _pre_entry_factors(candidate), heuristics, settings.guardian.authority_veto_threshold,
+    )
+
+    if decision == "PRE_ENTRY_VETO":
+        decision_id = f"ga:pre_entry:{candidate.candidate_id}:{opened_at.isoformat()}"
+        repo.save_guardian_authority_decision(
+            decision_id=decision_id,
+            position_id=None,
+            candidate_id=candidate.candidate_id,
+            decision_type="PRE_ENTRY_VETO",
+            decided_at=opened_at,
+            # decide_pre_entry returns a single, already self-explanatory
+            # text (matched-heuristic descriptions baked in by
+            # _build_expected_outcome_text) rather than a separate
+            # matched_ids list the way decide_open_position's own call site
+            # (Task 7/8) does - there is nothing further to say in
+            # `reasoning` that `expected_outcome` doesn't already say, so
+            # both columns intentionally carry the same text here.
+            reasoning=expected_outcome,
+            expected_outcome=expected_outcome,
+            expected_direction=expected_direction,
+            confidence=confidence,
+            run_id=run_id,
+        )
+        log_event(
+            run_id, event="ga_pre_entry_veto", candidate_id=candidate.candidate_id,
+            instrument=candidate.instrument, decision_id=decision_id, confidence=confidence,
+        )
+        return None
+
+    return open_position_for_candidate(
+        candidate, repo, risk_limits, reference_price, opened_at, run_id
     )

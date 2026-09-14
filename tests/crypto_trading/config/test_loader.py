@@ -257,6 +257,24 @@ def test_get_settings_loads_guardian_assisted_exit_activated():
     assert settings.guardian.assisted_exit_enabled is True
 
 
+def test_get_settings_loads_guardian_authority_enabled_default_false():
+    """Guardian Authority pre-entry veto (2026-09-14, docs/superpowers/
+    plans/2026-09-14-guardian-authority.md Task 6): this flag is pulled
+    forward from Task 10 (which is the plan's own designated owner of the
+    full config surface - authority_enabled/veto_threshold/tighten_threshold/
+    close_threshold, plus guardian.yaml documentation and the production-
+    isolation tests) because Task 6's wrapper (guardian/authority.py::
+    maybe_open_position_for_candidate) has a hard runtime dependency on
+    settings.guardian.authority_enabled existing NOW, not later. Only the
+    two fields Task 6 actually reads are added here; Task 10 still owns
+    authority_tighten_threshold/authority_close_threshold and the isolation
+    tests. Must default to False - landing Task 6 changes zero runtime
+    behavior until a later, separate, explicit activation decision."""
+    settings = get_settings()
+    assert settings.guardian.authority_enabled is False
+    assert isinstance(settings.guardian.authority_veto_threshold, float)
+
+
 def test_get_settings_loads_detective_config_from_real_yaml():
     settings = get_settings()
     assert settings.detective.batch_size == 10

@@ -9,10 +9,10 @@ from pydantic import BaseModel
 from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
+from crypto_trading.guardian.authority import maybe_open_position_for_candidate
 from crypto_trading.logging import log_event
 from crypto_trading.orchestrator import run_discovery_cycle
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
-from crypto_trading.paper_trading.position_opening import open_position_for_candidate
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.market import FundingRate, InstrumentMetadata, Kline, Ticker
 from crypto_trading.schemas.trade import Position
@@ -210,9 +210,9 @@ def _open_positions_for_confirmed_candidates(
             continue
         try:
             reference_price = snapshot.tickers[candidate.instrument].last_price
-            position = open_position_for_candidate(
-                candidate, repo, settings.risk_limits, reference_price,
-                snapshot.simulated_now, run_id,
+            position = maybe_open_position_for_candidate(
+                repo, candidate, settings.risk_limits, reference_price,
+                snapshot.simulated_now, run_id, settings,
             )
         except Exception as exc:
             log_event(
