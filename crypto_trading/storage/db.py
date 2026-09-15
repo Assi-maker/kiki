@@ -551,6 +551,64 @@ CREATE TABLE IF NOT EXISTS guardian_authority_shadow_heuristics (
     sample_size INTEGER NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Guardian Authority Live Autonomy (2026-09-15), Task 1: see
+-- docs/superpowers/sdd/2026-09-15-guardian-authority-live-autonomy/
+-- task-1-brief.md. Foundational data table for the fully autonomous
+-- pipeline (LLM proposes candidate heuristics -> out-of-sample validation
+-- -> promotion into the real guardian_authority_heuristics table, zero
+-- human review). This table itself is inert - nothing in
+-- crypto_trading/guardian/authority.py reads it; later tasks build the
+-- propose/validate/promote logic around the CRUD below.
+--
+-- Status lifecycle, same "WHERE-clause status guard, never caller
+-- discipline" convention as guardian_authority_shadow_observations'
+-- OBSERVING -> DECIDED -> RESOLVED chain:
+--   PROPOSED -> VALIDATED | REJECTED   (record_guardian_authority_heuristic_
+--                                       candidate_validation, one-time,
+--                                       WHERE status = 'PROPOSED')
+--   VALIDATED -> PROMOTED              (promote_guardian_authority_
+--                                       heuristic_candidate, one-time,
+--                                       WHERE status = 'VALIDATED')
+--   PROMOTED -> PROMOTED (+ demotion)  (mark_guardian_authority_heuristic_
+--                                       candidate_demoted, one-time via an
+--                                       explicit "AND demoted_at IS NULL"
+--                                       guard since status itself does not
+--                                       change - this is an audit trail
+--                                       only: a promoted heuristic is never
+--                                       deleted or silently reverted to a
+--                                       prior status, only flagged.)
+--
+-- train_sample_size/train_correct_rate/test_sample_size/test_correct_rate/
+-- validated_at are set once, together, by record_guardian_authority_
+-- heuristic_candidate_validation regardless of whether the outcome is
+-- VALIDATED or REJECTED (out-of-sample test numbers matter for a rejected
+-- proposal too - future debugging/reporting). rejected_reason is populated
+-- only on a REJECTED outcome; promoted_at/promoted_heuristic_id only by a
+-- later promote call; demoted_at/demotion_reason only by a later demotion
+-- call. All four column groups stay NULL until their respective
+-- transition, matching guardian_authority_shadow_observations' own
+-- NULL-until-set convention for decision/resolution columns.
+CREATE TABLE IF NOT EXISTS guardian_authority_heuristic_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    proposed_at TEXT NOT NULL,
+    description TEXT NOT NULL,
+    condition_json TEXT NOT NULL,
+    proposed_adjustment REAL NOT NULL,
+    rationale TEXT NOT NULL,
+    status TEXT NOT NULL,
+    train_sample_size INTEGER,
+    train_correct_rate REAL,
+    test_sample_size INTEGER,
+    test_correct_rate REAL,
+    validated_at TEXT,
+    promoted_at TEXT,
+    promoted_heuristic_id TEXT,
+    rejected_reason TEXT,
+    demoted_at TEXT,
+    demotion_reason TEXT,
+    run_id TEXT NOT NULL
+);
 """
 
 

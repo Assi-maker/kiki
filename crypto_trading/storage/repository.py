@@ -398,6 +398,37 @@ class Repository(Protocol):
         updated_at: datetime,
     ) -> bool: ...
     def find_resolved_guardian_authority_pre_entry_shadows(self) -> list[dict]: ...
+    def save_guardian_authority_heuristic_candidate(
+        self,
+        candidate_id: str,
+        description: str,
+        condition_json: str,
+        proposed_adjustment: float,
+        rationale: str,
+        run_id: str,
+        proposed_at: datetime,
+    ) -> bool: ...
+    def get_guardian_authority_heuristic_candidate(self, candidate_id: str) -> dict | None: ...
+    def find_proposed_guardian_authority_heuristic_candidates(self) -> list[dict]: ...
+    def find_validated_guardian_authority_heuristic_candidates(self) -> list[dict]: ...
+    def find_promoted_guardian_authority_heuristic_candidates(self) -> list[dict]: ...
+    def record_guardian_authority_heuristic_candidate_validation(
+        self,
+        candidate_id: str,
+        status: str,
+        train_sample_size: int,
+        train_correct_rate: float,
+        test_sample_size: int,
+        test_correct_rate: float,
+        validated_at: datetime,
+        rejected_reason: str | None = None,
+    ) -> bool: ...
+    def promote_guardian_authority_heuristic_candidate(
+        self, candidate_id: str, promoted_heuristic_id: str, promoted_at: datetime
+    ) -> bool: ...
+    def mark_guardian_authority_heuristic_candidate_demoted(
+        self, candidate_id: str, demoted_at: datetime, demotion_reason: str
+    ) -> bool: ...
 
 
 class SQLiteRepository:
@@ -2401,3 +2432,148 @@ class SQLiteRepository:
             "WHERE status = 'RESOLVED'"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    # --- Guardian Authority Live Autonomy heuristic candidates (Task 1) ---
+    # Foundational data table for the propose -> validate -> promote
+    # pipeline (see docs/superpowers/sdd/2026-09-15-guardian-authority-
+    # live-autonomy/task-1-brief.md and db.py's schema comment for the
+    # full status-lifecycle rationale). Same discipline as every other
+    # status-machine table in this module: INSERT OR IGNORE for the
+    # initial claim, a WHERE-clause status guard on every transition (never
+    # caller discipline), execute()+commit() on every write.
+
+    def save_guardian_authority_heuristic_candidate(
+        self,
+        candidate_id: str,
+        description: str,
+        condition_json: str,
+        proposed_adjustment: float,
+        rationale: str,
+        run_id: str,
+        proposed_at: datetime,
+    ) -> bool:
+        # INSERT OR IGNORE claim-style idempotency, same as
+        # seed_guardian_authority_shadow - a duplicate propose call (e.g. a
+        # retried LLM-proposal run) can never produce two rows or silently
+        # overwrite the original description/condition/adjustment/rationale.
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO guardian_authority_heuristic_candidates "
+            "(candidate_id, proposed_at, description, condition_json, "
+            "proposed_adjustment, rationale, status, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'PROPOSED', ?)",
+            (
+                candidate_id,
+                proposed_at.isoformat(),
+                description,
+                condition_json,
+                proposed_adjustment,
+                rationale,
+                run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_guardian_authority_heuristic_candidate(self, candidate_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM guardian_authority_heuristic_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_proposed_guardian_authority_heuristic_candidates(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_heuristic_candidates WHERE status = 'PROPOSED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_validated_guardian_authority_heuristic_candidates(self) -> list[dict]:
+        # Controller ruling (2026-09-15, added after the brief was written):
+        # same shape as find_proposed_/find_promoted_ above, filtered
+        # WHERE status = 'VALIDATED' - a later promotion task needs this
+        # and it belongs with the rest of this table's CRUD.
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_heuristic_candidates WHERE status = 'VALIDATED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_promoted_guardian_authority_heuristic_candidates(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_heuristic_candidates WHERE status = 'PROMOTED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_guardian_authority_heuristic_candidate_validation(
+        self,
+        candidate_id: str,
+        status: str,
+        train_sample_size: int,
+        train_correct_rate: float,
+        test_sample_size: int,
+        test_correct_rate: float,
+        validated_at: datetime,
+        rejected_reason: str | None = None,
+    ) -> bool:
+        # The ONE write that transitions PROPOSED -> VALIDATED | REJECTED.
+        # WHERE status = 'PROPOSED' makes a second/out-of-order call
+        # structurally a no-op - same one-time-transition discipline as
+        # decide_guardian_authority_shadow's own WHERE status = 'OBSERVING'.
+        # Both outcomes (VALIDATED and REJECTED) set the same train/test
+        # sample-size/correct-rate columns and validated_at together -
+        # rejected_reason is simply NULL on a VALIDATED outcome.
+        cur = self._conn.execute(
+            "UPDATE guardian_authority_heuristic_candidates SET status = ?, "
+            "train_sample_size = ?, train_correct_rate = ?, test_sample_size = ?, "
+            "test_correct_rate = ?, validated_at = ?, rejected_reason = ? "
+            "WHERE candidate_id = ? AND status = 'PROPOSED'",
+            (
+                status,
+                train_sample_size,
+                train_correct_rate,
+                test_sample_size,
+                test_correct_rate,
+                validated_at.isoformat(),
+                rejected_reason,
+                candidate_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def promote_guardian_authority_heuristic_candidate(
+        self, candidate_id: str, promoted_heuristic_id: str, promoted_at: datetime
+    ) -> bool:
+        # The ONE write that transitions VALIDATED -> PROMOTED. WHERE
+        # status = 'VALIDATED' makes a second/out-of-order call (including
+        # one arriving while still PROPOSED, or already PROMOTED)
+        # structurally a no-op - same guard style as promote_...
+        # everywhere else in this module.
+        cur = self._conn.execute(
+            "UPDATE guardian_authority_heuristic_candidates SET status = 'PROMOTED', "
+            "promoted_heuristic_id = ?, promoted_at = ? "
+            "WHERE candidate_id = ? AND status = 'VALIDATED'",
+            (promoted_heuristic_id, promoted_at.isoformat(), candidate_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def mark_guardian_authority_heuristic_candidate_demoted(
+        self, candidate_id: str, demoted_at: datetime, demotion_reason: str
+    ) -> bool:
+        # Audit trail only - status stays 'PROMOTED' forever (a promoted
+        # heuristic is never deleted or silently reverted to a prior
+        # status), so the usual "status changes -> second call is a
+        # no-op" guard doesn't apply here by itself. The explicit
+        # "AND demoted_at IS NULL" clause is what makes THIS transition
+        # one-time despite status never changing - a second demotion call
+        # is still structurally a no-op, same discipline as every other
+        # transition method in this module, just gated on a different
+        # column since status can't be the tell here.
+        cur = self._conn.execute(
+            "UPDATE guardian_authority_heuristic_candidates SET demoted_at = ?, "
+            "demotion_reason = ? "
+            "WHERE candidate_id = ? AND status = 'PROMOTED' AND demoted_at IS NULL",
+            (demoted_at.isoformat(), demotion_reason, candidate_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
