@@ -171,6 +171,33 @@ def test_record_guardian_authority_shadow_tick_is_a_no_op_once_abandoned(tmp_pat
     assert row["last_factors_json"] is None
 
 
+def test_record_guardian_authority_shadow_tick_after_decide_leaves_factors_json_frozen(tmp_path):
+    """Controller ruling for last_factors_json: it keeps updating every tick
+    even after factors_json is frozen by decide_guardian_authority_shadow.
+    Proves the two columns are genuinely independent - factors_json is the
+    one-time snapshot taken at decision time, last_factors_json keeps
+    tracking every subsequent tick regardless of status."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_guardian_authority_shadow(**_seed_kwargs())
+
+    repo.decide_guardian_authority_shadow(
+        "pos-1", "TIGHTEN_SL", _NOW, "expect small favorable move", "favorable",
+        0.7, '{"a": 1}', Decimal("49500"), _NOW,
+    )
+
+    later = _NOW + timedelta(minutes=5)
+    repo.record_guardian_authority_shadow_tick(
+        "pos-1", Decimal("50"), Decimal("-10"), '{"a": 2}', later,
+    )
+
+    row = repo.get_guardian_authority_shadow("pos-1")
+    assert row["status"] == "DECIDED"
+    assert row["factors_json"] == '{"a": 1}'  # frozen at decision time
+    assert row["last_factors_json"] == '{"a": 2}'  # keeps tracking new ticks
+    assert row["mfe"] == "50"
+    assert row["mae"] == "-10"
+
+
 def test_decide_guardian_authority_shadow_transitions_to_decided_and_sets_fields(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     repo.seed_guardian_authority_shadow(**_seed_kwargs())
