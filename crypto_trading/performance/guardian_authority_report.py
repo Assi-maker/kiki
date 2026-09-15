@@ -61,6 +61,30 @@ _NO_TIGHTEN_SL_DATA_YET_NOTE = (
     "applied intervention - intervention_applied is True)."
 )
 
+# Final-review fix (2026-09-15), Important #3: brier_score's forecast
+# variable is `confidence`, which is a signal-STRENGTH score
+# (|2*correct_rate-1|, always >= 0, from Task 9's own self-critique
+# heuristic derivation) - NOT a probability that the outcome will be
+# favorable. A genuinely useful heuristic sitting well above the minimum
+# threshold that ever fires (e.g. true correct_rate=0.70) has
+# confidence=0.40, which alone produces brier_score~=0.30 - WORSE than the
+# "uninformative constant baseline" of 0.25 this module's own code comment
+# names above. Read in isolation (main() prints bare JSON, no other
+# documentation attached at call time), a low-but-not-near-zero brier_score
+# reads as "this heuristic is bad", which is not a safe conclusion from
+# this number alone.
+_BRIER_SCORE_NOTE = (
+    "brier_score's forecast variable is `confidence` (a signal-strength "
+    "score derived as |2*correct_rate-1| from Task 9's self-critique), NOT "
+    "a probability of a favorable outcome - it does not mean what a "
+    "textbook Brier score's forecast probability means. A genuinely useful "
+    "heuristic can have confidence well below 1.0 (by construction, "
+    "confidence=0 at correct_rate=0.5), so a low-but-not-near-zero "
+    "brier_score can still represent a genuinely useful, well-calibrated "
+    "heuristic - do not read this value as 'closer to 0 is always better' "
+    "without also reading win_rate/n_scored alongside it."
+)
+
 
 def _decision_type_entry(rows: list[dict], decision_type: str) -> dict:
     n_pending = sum(1 for d in rows if d["outcome_status"] == "PENDING")
@@ -113,6 +137,21 @@ def _decision_type_entry(rows: list[dict], decision_type: str) -> dict:
             )
             / len(scored)
         )
+        # Final-review fix (2026-09-15), Important #3: see _BRIER_SCORE_NOTE
+        # above for the full reasoning - purely additive labeling, the
+        # brier_score formula/value itself is unchanged.
+        entry["brier_score_note"] = _BRIER_SCORE_NOTE
+        # Final-review fix (2026-09-15), Important #2: visibility-only,
+        # zero gating/threshold-logic change anywhere. n_scored/win_rate/
+        # brier_score can all be satisfied by a single PAPER position alone
+        # (PAPER's never-loosen stop-loss guard accepts a tightening most
+        # ticks) even after the LIVE intervention_applied fix, since that
+        # fix only removes PER-TICK inflation, not cross-position
+        # independence. Computed from the SAME already-`intervention_
+        # applied`-filtered `scored` population n_scored/n_correct/
+        # win_rate/brier_score already use - not a new query, not a new
+        # filter.
+        entry["n_distinct_positions"] = len({d["position_id"] for d in scored})
     else:
         entry["calibration_note"] = _NO_TIGHTEN_SL_DATA_YET_NOTE
 

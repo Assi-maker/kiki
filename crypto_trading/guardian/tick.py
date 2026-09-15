@@ -215,12 +215,36 @@ def process_one_position(
                             # conservatively "not applied" - fail-closed for
                             # calibration purposes (see authority_live.py's
                             # own status vocabulary).
+                            #
+                            # Final-review fix (2026-09-15): the claim row in
+                            # guardian_authority_live_sl_actions is a
+                            # PERMANENT, position-lifetime row keyed by
+                            # position_id ALONE (INSERT OR IGNORE - see
+                            # authority_live.py's apply_live_sl_tightening
+                            # idempotency-gate docstring). Once a position has
+                            # genuinely tightened once, EVERY later tick's
+                            # apply_live_sl_tightening call is a same-position
+                            # no-op that returns without writing anything -
+                            # but a bare status=="SL_REPLACED" check would
+                            # then read back that SAME old terminal row and
+                            # wrongly mark this brand-new decision as applied
+                            # too. Requiring claimed_at to be exactly THIS
+                            # tick's `now` closes that: only the one tick
+                            # whose call actually performed the claim (and
+                            # therefore wrote claimed_at=now) can ever see a
+                            # match. Exact ISO-string equality, same join
+                            # style _reconstruct_tighten_sl_factors uses for
+                            # decided_at/observed_at elsewhere in this
+                            # codebase - claim_guardian_authority_live_sl_action
+                            # writes claimed_at from this exact same `now`
+                            # object.
                             live_action = repo.get_guardian_authority_live_sl_action(
                                 position.position_id
                             )
                             applied = (
                                 live_action is not None
                                 and live_action["status"] == "SL_REPLACED"
+                                and live_action["claimed_at"] == now.isoformat()
                             )
                             repo.mark_guardian_authority_decision_intervention_applied(
                                 decision_id, applied, now,

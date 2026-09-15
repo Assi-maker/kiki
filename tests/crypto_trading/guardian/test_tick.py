@@ -13,6 +13,7 @@ from crypto_trading.schemas.evidence import (
 )
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import SQLiteRepository
+from tests.crypto_trading.guardian.test_authority_live import _SpyConnector
 from tests.crypto_trading.test_market_snapshot import _raw_funding, _raw_kline, _raw_ticker, _settings
 
 _NOW = datetime(2026, 9, 4, 12, 0, tzinfo=UTC)
@@ -650,8 +651,9 @@ def test_authority_tighten_sl_live_success_marks_intervention_applied_true(tmp_p
     """LIVE TIGHTEN_SL path, success case: apply_live_sl_tightening returns
     None always (no status) - the outcome is determined by reading back the
     resulting claim row via get_guardian_authority_live_sl_action and
-    checking status == 'SL_REPLACED', the ONLY status that counts as
-    applied."""
+    checking status == 'SL_REPLACED' AND claimed_at == this tick's `now`
+    (final-review fix, 2026-09-15 - see the claimed_at guard's own comment
+    in tick.py), the ONLY combination that counts as applied."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_candidate_and_position(repo)
     _make_active_live_execution(repo, "pos-1")
@@ -664,7 +666,7 @@ def test_authority_tighten_sl_live_success_marks_intervention_applied_true(tmp_p
         patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings"),
         patch.object(
             repo, "get_guardian_authority_live_sl_action",
-            return_value={"status": "SL_REPLACED"},
+            return_value={"status": "SL_REPLACED", "claimed_at": _NOW.isoformat()},
         ),
     ):
         run_guardian_tick_body(
@@ -675,6 +677,41 @@ def test_authority_tighten_sl_live_success_marks_intervention_applied_true(tmp_p
     assert len(decisions) == 1
     assert decisions[0]["decision_type"] == "TIGHTEN_SL"
     assert decisions[0]["intervention_applied"] == 1
+
+
+def test_authority_tighten_sl_live_stale_claim_row_marks_intervention_applied_false(tmp_path):
+    """Final-review regression (2026-09-15), narrow mocked-boundary
+    companion to the genuine multi-tick lifecycle test above: status ==
+    'SL_REPLACED' alone is NOT enough - if the claim row's claimed_at is
+    from an EARLIER tick (a stale, already-terminal row read back by a
+    later tick that never actually wrote anything this tick), this must be
+    'not applied', not 'applied'. This is precisely the bug the final
+    whole-branch review found: pre-fix, this assertion would have been 1,
+    not 0."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _make_active_live_execution(repo, "pos-1")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    live_connector = object()
+    stale_claimed_at = (_NOW - timedelta(hours=1)).isoformat()  # an earlier tick's claim, not this one's
+
+    with (
+        patch("crypto_trading.guardian.tick.apply_live_sl_tightening"),
+        patch("crypto_trading.guardian.tick.recover_claimed_live_sl_tightenings"),
+        patch.object(
+            repo, "get_guardian_authority_live_sl_action",
+            return_value={"status": "SL_REPLACED", "claimed_at": stale_claimed_at},
+        ),
+    ):
+        run_guardian_tick_body(
+            repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW, live_connector,
+        )
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+    assert decisions[0]["intervention_applied"] == 0
 
 
 def test_authority_tighten_sl_live_non_replaced_status_marks_intervention_applied_false(
@@ -786,6 +823,87 @@ def test_authority_tighten_sl_live_no_connector_skip_marks_intervention_applied_
     decisions = _decision_rows(repo)
     assert len(decisions) == 1
     assert decisions[0]["intervention_applied"] == 0
+
+
+# --------------------------------------------------------------------------
+# Final whole-branch review fix (2026-09-15), Important #1: the LIVE
+# intervention_applied check must also require `claimed_at == this tick's
+# now` - not just `status == "SL_REPLACED"` - because
+# guardian_authority_live_sl_actions is a PERMANENT, position-lifetime claim
+# row (position_id primary key). Without the claimed_at guard, every tick
+# AFTER the one real tightening reads back the SAME old terminal row and
+# gets wrongly marked as a fresh, genuine intervention too. Every test above
+# this section mocks get_guardian_authority_live_sl_action's return value to
+# a CONSTANT status - that mocking pattern is exactly what let this bug
+# through 3 prior per-task reviews, since it can never show a claim row's
+# real, position-lifetime persistence across ticks. This test instead drives
+# the REAL claim-row lifecycle: two real run_guardian_tick_body calls, a
+# real repo, and the same real _SpyConnector fixture
+# tests/crypto_trading/guardian/test_authority_live.py's own
+# apply_live_sl_tightening tests use to reach a genuine SL_REPLACED status -
+# apply_live_sl_tightening and get_guardian_authority_live_sl_action are
+# NEVER mocked here.
+# --------------------------------------------------------------------------
+
+
+def test_authority_tighten_sl_live_intervention_applied_true_only_for_the_claiming_tick(tmp_path):
+    """Tick 1: apply_live_sl_tightening runs for real end to end (claim ->
+    identify old SL -> place+verify new SL -> cancel old SL) and reaches
+    status SL_REPLACED, with claimed_at == tick 1's `now`. Tick 1's own
+    decision row must be intervention_applied=True.
+
+    Tick 2 (a later `now`, same position, same always-on heuristic so
+    decide_open_position again returns TIGHTEN_SL): apply_live_sl_tightening
+    is invoked again for real, but Task 5's own idempotency gate
+    (`get_guardian_authority_live_sl_action(position_id) is not None`) makes
+    it return immediately without writing anything or touching the
+    connector at all - the claim row's claimed_at stays tick 1's timestamp.
+    Tick 2's OWN decision row must be intervention_applied=False. Before the
+    claimed_at guard, tick 2 would have read back tick 1's stale
+    SL_REPLACED row and wrongly marked itself applied too - that is the
+    exact bug this test guards against."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)  # pos-1: stop_loss=90, simulated_fill_entry=100, BTCUSDT
+    _make_active_live_execution(repo, "pos-1", entry_quantity="10", avg_entry="100")
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    connector = _StubConnector(price="100")
+    # Real fixture (not a mock): matches _open_active_live_position's shape
+    # in test_authority_live.py, adapted to this suite's pos-1 (instrument
+    # BTCUSDT, quantity "10"). old SL at 80 is strictly below any proposed
+    # tightened SL (decide_open_position only ever returns TIGHTEN_SL when
+    # its own proposed_sl > current_sl=90), so the tightening invariant
+    # genuinely holds.
+    live_connector = _SpyConnector(
+        positions=[{"symbol": "BTCUSDT", "avgPrice": "100", "markPrice": "100", "positionAmt": "10"}],
+        open_orders=[{"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "80"}],
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+    )
+    tick1_now = _NOW
+    tick2_now = _NOW + timedelta(minutes=5)
+
+    run_guardian_tick_body(
+        repo, connector, _FakeRunner(), _authority_settings(), "run-1", tick1_now, live_connector,
+    )
+    run_guardian_tick_body(
+        repo, connector, _FakeRunner(), _authority_settings(), "run-2", tick2_now, live_connector,
+    )
+
+    # The claim row genuinely reached SL_REPLACED via tick 1 alone, and
+    # tick 2's call was genuinely a no-op (claimed_at unchanged).
+    live_row = repo.get_guardian_authority_live_sl_action("pos-1")
+    assert live_row["status"] == "SL_REPLACED"
+    assert live_row["claimed_at"] == tick1_now.isoformat()
+    # Real end-to-end effect, not just a status flag: the old SL was
+    # cancelled and a new one placed, exactly once.
+    assert live_connector.cancel_calls == ["old-sl-1"]
+    assert len(live_connector.place_calls) == 1
+
+    decisions = {d["decided_at"]: d for d in _decision_rows(repo)}
+    assert len(decisions) == 2
+    assert decisions[tick1_now.isoformat()]["decision_type"] == "TIGHTEN_SL"
+    assert decisions[tick2_now.isoformat()]["decision_type"] == "TIGHTEN_SL"
+    assert decisions[tick1_now.isoformat()]["intervention_applied"] == 1
+    assert decisions[tick2_now.isoformat()]["intervention_applied"] == 0
 
 
 # --------------------------------------------------------------------------
