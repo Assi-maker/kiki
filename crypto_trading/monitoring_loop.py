@@ -7,6 +7,7 @@ from typing import Protocol
 
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
+from crypto_trading.guardian.authority import resolve_pending_pre_entry_shadows
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.paper_trading.guardian_authority_shadow import (
     run_guardian_authority_shadow_tick,
@@ -111,6 +112,27 @@ def run_monitoring_tick(
         except Exception as exc:
             log_event(
                 run_id, event="guardian_authority_shadow_tick_failed",
+                error_type=type(exc).__name__, error=str(exc),
+            )
+        # Task 7 (Guardian Authority Shadow/Observation Mode, 2026-09-15):
+        # resolve Task 6's pre-entry shadow rows against real position
+        # outcomes. Its own small step, in its OWN try/except - kept
+        # separate from run_guardian_authority_shadow_tick's try/except
+        # immediately above (rather than folded into it) so a crash in
+        # either can never be attributed to, or mask, a crash in the
+        # other, matching this function's own existing "each concern gets
+        # its own try/except" discipline (PP experiment vs. shadow tick,
+        # above). Gated by the SAME settings.guardian.authority_shadow_
+        # enabled flag, at the same call site - and, unlike the shadow
+        # tick call, unconditional on `closed` (must run every tick: a
+        # shadow row can become resolvable on any later tick once its
+        # position happens to close, not only the tick it closes on).
+        try:
+            if settings.guardian.authority_shadow_enabled:
+                resolve_pending_pre_entry_shadows(repo, now, run_id)
+        except Exception as exc:
+            log_event(
+                run_id, event="guardian_authority_pre_entry_shadow_resolution_tick_failed",
                 error_type=type(exc).__name__, error=str(exc),
             )
         repo.complete_run(

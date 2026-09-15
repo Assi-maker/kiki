@@ -407,3 +407,126 @@ def test_a_crash_in_guardian_authority_shadow_never_affects_real_position_closin
     assert "guardian_authority_shadow_tick_failed" in caplog.text  # failure is logged
     # and the PP experiment's own failure-handling path was never touched
     assert "profit_protection_experiment_tick_failed" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# resolve_pending_pre_entry_shadows wiring (Guardian Authority Shadow/
+# Observation Mode, 2026-09-15, Task 7). Its own small step, in its own
+# try/except, called right after Task 5's run_guardian_authority_shadow_tick
+# call - kept separate (rather than folded into that same try/except block)
+# so a crash in one can never be attributed to, or mask, a crash in the
+# other, matching this module's own existing "each concern gets its own
+# try/except" discipline (profit protection vs. shadow tick, above). Gated
+# by the SAME settings.guardian.authority_shadow_enabled flag as the shadow
+# tick call, at the same call site.
+# ---------------------------------------------------------------------------
+
+
+def test_run_monitoring_tick_never_resolves_pre_entry_shadows_when_flag_off(
+    tmp_path, monkeypatch
+):
+    """Flag off (default): resolve_pending_pre_entry_shadows must never even
+    be called - proven via a call-recorder spy, not just absent DB effects."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    resolve_spy = _CallRecorder()
+    monkeypatch.setattr(
+        monitoring_loop_module, "resolve_pending_pre_entry_shadows", resolve_spy
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    assert settings.guardian.authority_shadow_enabled is False  # baseline assumption
+
+    run_monitoring_tick(connector, repo, settings)
+
+    assert resolve_spy.calls == []  # never called, not "called but no-op"
+
+
+def test_run_monitoring_tick_resolves_pre_entry_shadows_every_tick_when_flag_on(
+    tmp_path, monkeypatch
+):
+    """Flag on: resolve_pending_pre_entry_shadows must be called exactly
+    once per tick - EVERY tick, not only when something closed this tick,
+    since a shadow row can become resolvable on any later tick once its
+    position happens to close (this fixture closes nothing this tick)."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    resolve_spy = _CallRecorder()
+    monkeypatch.setattr(
+        monitoring_loop_module, "resolve_pending_pre_entry_shadows", resolve_spy
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        # price stays well above the stop-loss - nothing closes this tick
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "50100", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("50100", _ms(now), high="50200", low="50050")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    settings.guardian.authority_shadow_enabled = True
+
+    closed = run_monitoring_tick(connector, repo, settings)
+
+    assert closed == []  # sanity: nothing closed this tick
+    assert len(resolve_spy.calls) == 1  # still called - resolution isn't gated on closes
+    args, kwargs = resolve_spy.calls[0]
+    assert kwargs == {}
+    assert len(args) == 3
+    resolve_repo, resolve_now, resolve_run_id = args
+    assert resolve_repo is repo
+    assert isinstance(resolve_run_id, str) and resolve_run_id
+
+
+def test_a_crash_in_pre_entry_shadow_resolution_never_affects_real_position_closing(
+    tmp_path, monkeypatch, caplog
+):
+    """Mirrors test_a_crash_in_guardian_authority_shadow_never_affects_real_
+    position_closing exactly, but for the pre-entry shadow resolution call -
+    in its OWN try/except, so its failure can never be attributable to, or
+    mask, the shadow tick's own failure handling."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    def _raiser(*args, **kwargs):
+        raise RuntimeError("boom - simulated pre-entry shadow resolution failure")
+
+    monkeypatch.setattr(
+        monitoring_loop_module, "resolve_pending_pre_entry_shadows", _raiser
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    settings.guardian.authority_shadow_enabled = True
+
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        closed = run_monitoring_tick(connector, repo, settings)  # must never raise
+
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "stop_loss"
+    assert closed[0].status == "CLOSED"
+    row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
+    assert row["status"] == "ok"  # the OUTER try/except never even saw the failure
+    assert "guardian_authority_pre_entry_shadow_resolution_tick_failed" in caplog.text
+    # and neither sibling failure-handling path was touched
+    assert "guardian_authority_shadow_tick_failed" not in caplog.text
+    assert "profit_protection_experiment_tick_failed" not in caplog.text

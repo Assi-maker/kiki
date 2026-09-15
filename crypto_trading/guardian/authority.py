@@ -579,6 +579,96 @@ def maybe_record_pre_entry_shadow(
         )
 
 
+def resolve_pending_pre_entry_shadows(repo: Repository, now: datetime, run_id: str) -> int:
+    """Task 7 (Guardian Authority Shadow/Observation Mode, 2026-09-15):
+    resolution pass for Task 6's pre-entry shadow rows
+    (`guardian_authority_shadow_pre_entry_observations`). Placed here, next
+    to `maybe_record_pre_entry_shadow` and mirroring `resolve_pending_
+    decisions`' own shape immediately below, rather than in `paper_trading/
+    guardian_authority_shadow.py` - that module's own resolution logic
+    (`_resolve_on_close`) is about the tick-time shadow table
+    (`guardian_authority_shadow_observations`, one row per OPEN position,
+    advanced every tick against live candles), a structurally different
+    table/lifecycle from this one (one row per CANDIDATE at pre-entry time,
+    with nothing to advance tick-over-tick - just wait for the real
+    position, if any, to eventually close). Keeping pre-entry save+resolve
+    side by side in this module mirrors this module's own existing split:
+    `guardian_authority_decisions` <-> `resolve_pending_decisions`,
+    `guardian_authority_shadow_pre_entry_observations` <-> this function.
+
+    Per Task 2's own controller ruling (see db.py's schema comment and this
+    module's own `maybe_record_pre_entry_shadow` docstring): `position_id`
+    is always `candidate_id` in this codebase, and Task 6 saved
+    `shadow_id == candidate_id` - so `shadow_id` doubles as the position
+    lookup key directly. There is no separate "link" step to perform here.
+
+    For every row returned by `find_pending_guardian_authority_pre_entry_
+    shadows()` (unfiltered, `status='PENDING'`), looks up `repo.
+    get_position(row["shadow_id"])`:
+    - `None` -> not yet resolvable. This is the normal, common case, for
+      either of two indistinguishable (and not worth distinguishing)
+      reasons: the real Gate rejected the candidate for unrelated reasons
+      (a position will never exist for it), or a position simply hasn't
+      been opened yet by the time this tick runs. Skip, leave PENDING,
+      never an error.
+    - a `Position` whose `status != "CLOSED"` (i.e. still
+      `"OPEN_POSITION"`) -> not resolvable yet either. Skip, leave PENDING,
+      try again next tick.
+    - a `Position` whose `status == "CLOSED"` -> resolve now, using the
+      SAME `compute_pnl` (from `paper_trading.execution`) this module
+      already reuses everywhere else it needs a position's real P/L
+      (`resolve_pending_decisions` below, and - the precedent this task's
+      brief points at - `profit_protection_experiment.py`'s own backfill
+      step) - never a second, reimplemented PnL formula - and the
+      position's own real `exit_reason`/`closed_at`.
+
+    `resolve_guardian_authority_pre_entry_shadow`'s own `WHERE status =
+    'PENDING'` guard (Task 2) makes a second/out-of-order call on an
+    already-resolved row a structural no-op - this function does not
+    duplicate that check itself, the same "trust the DB guard" discipline
+    `resolve_pending_decisions` below already relies on.
+
+    Each row is processed in its own `try`/`except` - unlike `resolve_
+    pending_decisions` below, which has no per-row isolation - per this
+    task's own explicit requirement: one malformed/unexpected row (e.g. a
+    position record that fails to load, a transient DB error) must never
+    abort resolution of every OTHER pending row in the same batch. A
+    caught failure is logged via `log_event` (event
+    `guardian_authority_pre_entry_shadow_resolve_row_failed`) and that row
+    is simply left PENDING to retry on a later tick - same per-item
+    isolation pattern already used by `run_guardian_authority_shadow_tick`
+    and `run_profit_protection_experiment_tick`'s own advance loops.
+
+    Returns the count of rows actually resolved in THIS call - never-opened
+    skips and still-open skips are not counted."""
+    resolved_count = 0
+    for row in repo.find_pending_guardian_authority_pre_entry_shadows():
+        shadow_id = row.get("shadow_id")
+        try:
+            position = repo.get_position(row["shadow_id"])
+            if position is None or position.status != "CLOSED":
+                continue
+
+            repo.resolve_guardian_authority_pre_entry_shadow(
+                shadow_id=row["shadow_id"],
+                actual_exit_reason=position.exit_reason,
+                actual_pnl_usdt=compute_pnl(position),
+                actual_closed_at=position.closed_at,
+                updated_at=now,
+            )
+            resolved_count += 1
+        except Exception as exc:
+            log_event(
+                run_id,
+                event="guardian_authority_pre_entry_shadow_resolve_row_failed",
+                shadow_id=shadow_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
+    return resolved_count
+
+
 def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
     """Resolution pass (Task 8). NOT part of the pure decision core above
     (see module docstring) - this is I/O, the same sanctioned kind as

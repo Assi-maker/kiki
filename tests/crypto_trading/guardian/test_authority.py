@@ -24,6 +24,7 @@ from crypto_trading.guardian.authority import (
     maybe_open_position_for_candidate,
     maybe_record_pre_entry_shadow,
     resolve_pending_decisions,
+    resolve_pending_pre_entry_shadows,
     update_heuristics_from_resolved_decisions,
 )
 from crypto_trading.paper_trading.execution import compute_pnl
@@ -857,6 +858,170 @@ def test_maybe_record_pre_entry_shadow_never_raises_and_logs_on_internal_failure
     _, kwargs = mock_log_event.call_args
     assert kwargs["event"] == "guardian_authority_pre_entry_shadow_failed"
     assert kwargs["candidate_id"] == "cand-shadow-3"
+
+
+# ---------------------------------------------------------------------------
+# resolve_pending_pre_entry_shadows (Guardian Authority Shadow/Observation
+# Mode, 2026-09-15, Task 7: resolve pre-entry shadow rows against real
+# position outcomes). Per Task 2's own ruling, shadow_id == candidate_id ==
+# position_id always in this codebase - there is no separate "link" step,
+# shadow_id IS the position lookup key.
+# ---------------------------------------------------------------------------
+
+
+def _save_pre_entry_shadow(
+    repo: SQLiteRepository,
+    shadow_id: str,
+    shadow_decision: str = "APPROVE",
+    expected_direction: str = "neutral",
+) -> None:
+    ok = repo.save_guardian_authority_pre_entry_shadow(
+        shadow_id=shadow_id,
+        candidate_id=shadow_id,
+        instrument="BTCUSDT",
+        shadow_decision=shadow_decision,
+        expected_outcome="APPROVE: no heuristics matched.",
+        expected_direction=expected_direction,
+        confidence=1.0,
+        factors_json=json.dumps({"instrument": "BTCUSDT"}),
+        run_id="run-1",
+        created_at=_NOW,
+    )
+    assert ok is True
+
+
+def test_resolve_pending_pre_entry_shadows_never_opened_stays_pending_forever(tmp_path):
+    """A candidate whose real position never opens (the real Gate rejected
+    it for unrelated reasons - get_position(shadow_id) returns None
+    forever) must stay PENDING across repeated ticks, and must never
+    crash."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _save_pre_entry_shadow(repo, "cand-never-opened")
+
+    count_1 = resolve_pending_pre_entry_shadows(repo, _NOW + timedelta(hours=1), "run-2")
+    count_2 = resolve_pending_pre_entry_shadows(repo, _NOW + timedelta(hours=2), "run-2")
+
+    assert count_1 == 0
+    assert count_2 == 0
+    row = repo.get_guardian_authority_pre_entry_shadow("cand-never-opened")
+    assert row["status"] == "PENDING"
+    assert row["actual_exit_reason"] is None
+
+
+def test_resolve_pending_pre_entry_shadows_open_position_stays_pending(tmp_path):
+    """A candidate whose position opened but has not closed yet stays
+    PENDING - not resolvable this tick, try again later."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "cand-still-open")
+    _save_pre_entry_shadow(repo, "cand-still-open")
+
+    count = resolve_pending_pre_entry_shadows(repo, _NOW + timedelta(hours=1), "run-2")
+
+    assert count == 0
+    row = repo.get_guardian_authority_pre_entry_shadow("cand-still-open")
+    assert row["status"] == "PENDING"
+
+
+def test_resolve_pending_pre_entry_shadows_resolves_with_real_pnl_and_exit_reason(tmp_path):
+    """A candidate whose position closes resolves correctly with the REAL
+    compute_pnl-computed P/L (not a guessed value) and the real
+    exit_reason/closed_at."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "cand-closed-1")
+    closed_at = _NOW + timedelta(hours=2)
+    _close_position(
+        repo, "cand-closed-1", fill_exit="51000", exit_reason="target",
+        fees="2", funding="1", closed_at=closed_at,
+    )
+    _save_pre_entry_shadow(repo, "cand-closed-1")
+    position = repo.get_position("cand-closed-1")
+    expected_pnl = compute_pnl(position)
+
+    resolved_at = _NOW + timedelta(hours=3)
+    count = resolve_pending_pre_entry_shadows(repo, resolved_at, "run-2")
+
+    assert count == 1
+    row = repo.get_guardian_authority_pre_entry_shadow("cand-closed-1")
+    assert row["status"] == "RESOLVED"
+    assert row["actual_exit_reason"] == "target"
+    assert Decimal(row["actual_pnl_usdt"]) == expected_pnl
+    assert row["actual_closed_at"] == closed_at.isoformat()
+    assert row["updated_at"] == resolved_at.isoformat()
+
+
+def test_resolve_pending_pre_entry_shadows_is_idempotent(tmp_path):
+    """A second tick after resolution is a no-op - WHERE status='PENDING'
+    (Task 2) already enforces this at the DB level; this confirms it holds
+    end-to-end through resolve_pending_pre_entry_shadows too."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "cand-closed-2")
+    _close_position(repo, "cand-closed-2", fill_exit="49500", exit_reason="stop_loss")
+    _save_pre_entry_shadow(repo, "cand-closed-2")
+
+    first_count = resolve_pending_pre_entry_shadows(repo, _NOW + timedelta(hours=1), "run-2")
+    row_after_first = repo.get_guardian_authority_pre_entry_shadow("cand-closed-2")
+
+    second_count = resolve_pending_pre_entry_shadows(repo, _NOW + timedelta(hours=5), "run-2")
+    row_after_second = repo.get_guardian_authority_pre_entry_shadow("cand-closed-2")
+
+    assert first_count == 1
+    assert second_count == 0  # already RESOLVED - no-op
+    assert row_after_second == row_after_first  # untouched by the second call
+
+
+def test_resolve_pending_pre_entry_shadows_isolates_one_failing_row(tmp_path):
+    """One malformed/failing row must never block resolution of the others
+    in the same batch - mirrors the per-shadow try/except isolation pattern
+    already used in run_guardian_authority_shadow_tick/run_profit_
+    protection_experiment_tick's own advance loops."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "cand-bad")
+    _close_position(repo, "cand-bad", fill_exit="51000", exit_reason="target")
+    _save_pre_entry_shadow(repo, "cand-bad")
+    _open_position(repo, "cand-good")
+    _close_position(repo, "cand-good", fill_exit="52000", exit_reason="target")
+    _save_pre_entry_shadow(repo, "cand-good")
+
+    real_compute_pnl = compute_pnl
+
+    def _flaky_compute_pnl(position):
+        if position.position_id == "cand-bad":
+            raise RuntimeError("boom - simulated malformed position")
+        return real_compute_pnl(position)
+
+    with patch(
+        "crypto_trading.guardian.authority.compute_pnl", side_effect=_flaky_compute_pnl
+    ), patch("crypto_trading.guardian.authority.log_event") as mock_log_event:
+        count = resolve_pending_pre_entry_shadows(repo, _NOW + timedelta(hours=1), "run-2")
+
+    assert count == 1  # only cand-good resolved
+    bad_row = repo.get_guardian_authority_pre_entry_shadow("cand-bad")
+    good_row = repo.get_guardian_authority_pre_entry_shadow("cand-good")
+    assert bad_row["status"] == "PENDING"  # left untouched, will retry later
+    assert good_row["status"] == "RESOLVED"
+
+    assert mock_log_event.call_count == 1
+    _, kwargs = mock_log_event.call_args
+    assert kwargs["shadow_id"] == "cand-bad"
+    assert kwargs["error_type"] == "RuntimeError"
+
+
+def test_resolve_pending_pre_entry_shadows_returns_count_of_actually_resolved_rows_only(
+    tmp_path,
+):
+    """The returned count reflects only rows actually resolved in this
+    call - not never-opened skips, not still-open skips."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _save_pre_entry_shadow(repo, "cand-never")  # never opens - skip
+    _open_position(repo, "cand-open-skip")
+    _save_pre_entry_shadow(repo, "cand-open-skip")  # still open - skip
+    _open_position(repo, "cand-resolvable")
+    _close_position(repo, "cand-resolvable", fill_exit="51000")
+    _save_pre_entry_shadow(repo, "cand-resolvable")  # closed - resolves
+
+    count = resolve_pending_pre_entry_shadows(repo, _NOW + timedelta(hours=1), "run-2")
+
+    assert count == 1
 
 
 # --------------------------------------------------------------------------
