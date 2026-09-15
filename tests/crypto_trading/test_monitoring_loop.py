@@ -530,3 +530,133 @@ def test_a_crash_in_pre_entry_shadow_resolution_never_affects_real_position_clos
     # and neither sibling failure-handling path was touched
     assert "guardian_authority_shadow_tick_failed" not in caplog.text
     assert "profit_protection_experiment_tick_failed" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# update_shadow_heuristics_from_resolved_shadow_observations wiring
+# (Guardian Authority Shadow/Observation Mode, 2026-09-15, Task 8). Its own
+# small step, in its own try/except, called right after Task 7's
+# resolve_pending_pre_entry_shadows call above - kept separate for the same
+# "each concern gets its own try/except" reason the two blocks above are
+# separate from each other. Gated by the SAME settings.guardian.authority_
+# shadow_enabled flag, called UNCONDITIONALLY every tick (this task's own
+# documented cadence choice - see monitoring_loop.py's comment at the call
+# site for why: run_guardian_authority_shadow_tick resolves shadows
+# internally without exposing a resolved-this-tick count).
+# ---------------------------------------------------------------------------
+
+
+def test_run_monitoring_tick_never_self_critiques_shadow_heuristics_when_flag_off(
+    tmp_path, monkeypatch
+):
+    """Flag off (default): update_shadow_heuristics_from_resolved_shadow_
+    observations must never even be called - proven via a call-recorder
+    spy, not just absent DB effects."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    spy = _CallRecorder()
+    monkeypatch.setattr(
+        monitoring_loop_module,
+        "update_shadow_heuristics_from_resolved_shadow_observations",
+        spy,
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    assert settings.guardian.authority_shadow_enabled is False  # baseline assumption
+
+    run_monitoring_tick(connector, repo, settings)
+
+    assert spy.calls == []  # never called, not "called but no-op"
+
+
+def test_run_monitoring_tick_self_critiques_shadow_heuristics_every_tick_when_flag_on(
+    tmp_path, monkeypatch
+):
+    """Flag on: update_shadow_heuristics_from_resolved_shadow_observations
+    must be called exactly once per tick - EVERY tick, unconditionally (this
+    task's documented cadence choice), not only when something resolved
+    this tick (this fixture closes/resolves nothing this tick)."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    spy = _CallRecorder()
+    monkeypatch.setattr(
+        monitoring_loop_module,
+        "update_shadow_heuristics_from_resolved_shadow_observations",
+        spy,
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        # price stays well above the stop-loss - nothing closes this tick
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "50100", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("50100", _ms(now), high="50200", low="50050")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    settings.guardian.authority_shadow_enabled = True
+
+    closed = run_monitoring_tick(connector, repo, settings)
+
+    assert closed == []  # sanity: nothing closed this tick
+    assert len(spy.calls) == 1  # still called - not gated on closes/resolutions
+    args, kwargs = spy.calls[0]
+    assert kwargs == {}
+    assert len(args) == 2
+    call_repo, call_now = args
+    assert call_repo is repo
+
+
+def test_a_crash_in_shadow_self_critique_never_affects_real_position_closing(
+    tmp_path, monkeypatch, caplog
+):
+    """Mirrors the two crash-isolation tests above exactly, but for the
+    shadow self-critique call - in its OWN try/except, so its failure can
+    never be attributable to, or mask, either sibling's failure handling."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    def _raiser(*args, **kwargs):
+        raise RuntimeError("boom - simulated shadow self-critique failure")
+
+    monkeypatch.setattr(
+        monitoring_loop_module,
+        "update_shadow_heuristics_from_resolved_shadow_observations",
+        _raiser,
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    settings.guardian.authority_shadow_enabled = True
+
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        closed = run_monitoring_tick(connector, repo, settings)  # must never raise
+
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "stop_loss"
+    assert closed[0].status == "CLOSED"
+    row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
+    assert row["status"] == "ok"  # the OUTER try/except never even saw the failure
+    assert "guardian_authority_shadow_self_critique_failed" in caplog.text
+    # and neither sibling failure-handling path was touched
+    assert "guardian_authority_shadow_tick_failed" not in caplog.text
+    assert "guardian_authority_pre_entry_shadow_resolution_tick_failed" not in caplog.text
+    assert "profit_protection_experiment_tick_failed" not in caplog.text

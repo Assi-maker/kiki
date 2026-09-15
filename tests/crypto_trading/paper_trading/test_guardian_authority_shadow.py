@@ -1,8 +1,10 @@
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.config.loader import GuardianConfig
+from crypto_trading.guardian.authority import decide_open_position, decide_pre_entry
 from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.paper_trading.guardian_authority_shadow import (
     _position_factors,
@@ -10,6 +12,7 @@ from crypto_trading.paper_trading.guardian_authority_shadow import (
     advance_shadow,
     run_guardian_authority_shadow_tick,
     seed_shadow_for_position,
+    update_shadow_heuristics_from_resolved_shadow_observations,
 )
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.guardian import GuardianObservation
@@ -657,3 +660,236 @@ def test_tick_never_writes_to_positions_or_real_guardian_authority_decisions_tab
         "SELECT * FROM guardian_authority_heuristics"
     ).fetchall()
     assert len(real_heuristics_only_the_always_on_one) == 1  # the one WE seeded, untouched/unadded-to
+
+
+# ---------------------------------------------------------------------------
+# Task 8: update_shadow_heuristics_from_resolved_shadow_observations
+#
+# Same fixture-building approach as guardian/authority.py's own Task 9 test
+# suite (test_authority.py) - resolved rows are built directly via the
+# repo's own state-machine methods (seed -> decide -> resolve), not through
+# a full run_guardian_authority_shadow_tick(), for deterministic,
+# hand-verifiable sample sizes at exactly the _MIN_SAMPLE_SIZE boundary.
+# ---------------------------------------------------------------------------
+
+_MID_FACTORS = {
+    "time_decay": 0.5,
+    "momentum_decay": 0.5,
+    "volume_decay": 0.5,
+    "funding_decay": 0.5,
+    "secondary_confirmation_lost": 0.5,
+    "market_regime": 0.5,
+}
+
+
+def _resolved_tighten_sl_shadow(
+    repo, idx: int, guardian_state: str, factors: dict, correct: bool, prefix: str = "shd"
+) -> None:
+    """Builds ONE resolved (status='RESOLVED') shadow row with
+    shadow_decision='TIGHTEN_SL' and a real expectation_correct - the only
+    row shape update_shadow_heuristics_from_resolved_shadow_observations
+    tallies. shadow_id/position_id are unique per row (shadow_id is this
+    table's PRIMARY KEY, 1:1 with position_id) so 30 rows means 30 distinct
+    positions, exactly like the real Task 9 fixture's own distinct
+    decision_ids per row."""
+    position_id = f"{prefix}-{idx}"
+    now = _NOW + timedelta(minutes=idx)
+    factors_json = json.dumps({**factors, "guardian_state": guardian_state})
+    repo.seed_guardian_authority_shadow(
+        shadow_id=position_id, position_id=position_id, candidate_id=position_id,
+        instrument="BTCUSDT", opened_at=now, created_at=now, run_id="run-1",
+    )
+    repo.decide_guardian_authority_shadow(
+        shadow_id=position_id, decision="TIGHTEN_SL", decided_at=now,
+        expected_outcome="expect small favorable move", expected_direction="favorable",
+        confidence=0.7, factors_json=factors_json, proposed_new_sl=Decimal("105"),
+        updated_at=now,
+    )
+    repo.resolve_guardian_authority_shadow_decided(
+        shadow_id=position_id,
+        actual_exit_reason="target" if correct else "stop_loss",
+        actual_pnl_usdt=Decimal("10") if correct else Decimal("-10"),
+        actual_closed_at=now + timedelta(hours=1),
+        expectation_correct=correct,
+        prediction_error=0.0,
+        updated_at=now,
+    )
+
+
+def _resolved_close_early_shadow(repo, idx: int, guardian_state: str, factors: dict, prefix: str = "ce") -> None:
+    """A resolved CLOSE_EARLY shadow row - per Task 8's own ruling (reused
+    here verbatim for the shadow table), CLOSE_EARLY always resolves with
+    expectation_correct=None (no counterfactual-of-inaction mechanism), so
+    this must never be tallied."""
+    position_id = f"{prefix}-{idx}"
+    now = _NOW + timedelta(minutes=idx)
+    factors_json = json.dumps({**factors, "guardian_state": guardian_state})
+    repo.seed_guardian_authority_shadow(
+        shadow_id=position_id, position_id=position_id, candidate_id=position_id,
+        instrument="BTCUSDT", opened_at=now, created_at=now, run_id="run-1",
+    )
+    repo.decide_guardian_authority_shadow(
+        shadow_id=position_id, decision="CLOSE_EARLY", decided_at=now,
+        expected_outcome="expect unfavorable if left open", expected_direction="unfavorable",
+        confidence=0.9, factors_json=factors_json, proposed_new_sl=None,
+        updated_at=now,
+    )
+    repo.resolve_guardian_authority_shadow_decided(
+        shadow_id=position_id, actual_exit_reason="GUARDIAN_EXIT",
+        actual_pnl_usdt=Decimal("5"), actual_closed_at=now + timedelta(hours=1),
+        expectation_correct=None, prediction_error=None, updated_at=now,
+    )
+
+
+def _resolved_no_action_shadow(repo, idx: int, guardian_state: str, prefix: str = "na") -> None:
+    """A resolved NO_ACTION shadow row (position closed while the shadow
+    was still OBSERVING) - resolve_guardian_authority_shadow_no_action
+    always leaves expectation_correct as SQL NULL, so this must never be
+    tallied either."""
+    position_id = f"{prefix}-{idx}"
+    now = _NOW + timedelta(minutes=idx)
+    repo.seed_guardian_authority_shadow(
+        shadow_id=position_id, position_id=position_id, candidate_id=position_id,
+        instrument="BTCUSDT", opened_at=now, created_at=now, run_id="run-1",
+    )
+    repo.resolve_guardian_authority_shadow_no_action(
+        shadow_id=position_id,
+        factors_json=json.dumps({"guardian_state": guardian_state}),
+        actual_exit_reason="target", actual_pnl_usdt=Decimal("10"),
+        actual_closed_at=now + timedelta(hours=1), updated_at=now,
+    )
+
+
+def test_update_shadow_heuristics_miscalibrated_group_gets_negative_adjustment(tmp_path):
+    """Mirrors test_update_heuristics_miscalibrated_group_gets_negative_
+    adjustment in test_authority.py: 30 resolved TIGHTEN_SL shadow rows, all
+    wrong, under one guardian_state -> a SHADOW heuristic row with a
+    NEGATIVE adjustment, written to the shadow table only."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl_shadow(repo, i, "PROTECT", _MID_FACTORS, correct=False, prefix="shd-neg")
+
+    updated = update_shadow_heuristics_from_resolved_shadow_observations(repo, _NOW + timedelta(days=1))
+
+    assert updated == 1
+    shadow_heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_shadow_heuristics()}
+    assert "ga-hc:state:PROTECT" in shadow_heuristics
+    heuristic = shadow_heuristics["ga-hc:state:PROTECT"]
+    assert heuristic["adjustment"] < 0
+    assert heuristic["sample_size"] == 30
+    assert json.loads(heuristic["condition_json"]) == {"guardian_state": "PROTECT"}
+    # Must never touch the REAL heuristics table.
+    assert repo.find_guardian_authority_heuristics() == []
+
+
+def test_update_shadow_heuristics_well_calibrated_group_gets_positive_adjustment(tmp_path):
+    """Mirrors the real function's own positive-adjustment test."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl_shadow(repo, i, "WATCH", _MID_FACTORS, correct=True, prefix="shd-pos")
+
+    update_shadow_heuristics_from_resolved_shadow_observations(repo, _NOW + timedelta(days=1))
+
+    shadow_heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_shadow_heuristics()}
+    assert "ga-hc:state:WATCH" in shadow_heuristics
+    assert shadow_heuristics["ga-hc:state:WATCH"]["adjustment"] > 0
+    assert repo.find_guardian_authority_heuristics() == []
+
+
+def test_update_shadow_heuristics_respects_minimum_sample_size_threshold(tmp_path):
+    """Boundary test: 29 resolved TIGHTEN_SL shadow rows for one state does
+    NOT produce a heuristic; 30 for another state does."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(29):
+        _resolved_tighten_sl_shadow(repo, i, "HOLD", _MID_FACTORS, correct=False, prefix="shd-29")
+    for i in range(30):
+        _resolved_tighten_sl_shadow(repo, i, "EXIT", _MID_FACTORS, correct=False, prefix="shd-30")
+
+    update_shadow_heuristics_from_resolved_shadow_observations(repo, _NOW + timedelta(days=1))
+
+    heuristic_ids = {h["heuristic_id"] for h in repo.find_guardian_authority_shadow_heuristics()}
+    assert "ga-hc:state:HOLD" not in heuristic_ids  # 29 < threshold
+    assert "ga-hc:state:EXIT" in heuristic_ids  # 30 >= threshold
+
+
+def test_update_shadow_heuristics_is_idempotent_on_rerun(tmp_path):
+    """Same idempotent-REPLACE proof as the real function's own test."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl_shadow(repo, i, "PROTECT", _MID_FACTORS, correct=False, prefix="shd-idem")
+
+    update_shadow_heuristics_from_resolved_shadow_observations(repo, _NOW + timedelta(days=1))
+    first_count = len(repo.find_guardian_authority_shadow_heuristics())
+
+    second_updated_at = _NOW + timedelta(days=2)
+    update_shadow_heuristics_from_resolved_shadow_observations(repo, second_updated_at)
+    second_count = len(repo.find_guardian_authority_shadow_heuristics())
+
+    assert first_count == second_count
+    shadow_heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_shadow_heuristics()}
+    assert shadow_heuristics["ga-hc:state:PROTECT"]["updated_at"] == second_updated_at.isoformat()
+
+
+def test_update_shadow_heuristics_excludes_close_early_and_no_action_rows(tmp_path):
+    """CLOSE_EARLY and NO_ACTION shadow rows both resolve with
+    expectation_correct=None (no counterfactual to learn from, same Task 8
+    ruling as the real table) - neither may contribute to any tally, and
+    together with < _MIN_SAMPLE_SIZE genuine rows nothing crosses the
+    threshold, so no heuristic is produced at all."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(40):
+        _resolved_close_early_shadow(repo, i, "EXIT", _MID_FACTORS, prefix="ce-excl")
+    for i in range(40):
+        _resolved_no_action_shadow(repo, i, "HOLD", prefix="na-excl")
+
+    updated = update_shadow_heuristics_from_resolved_shadow_observations(repo, _NOW + timedelta(days=1))
+
+    assert updated == 0
+    assert repo.find_guardian_authority_shadow_heuristics() == []
+
+
+def test_update_shadow_heuristics_isolation_shadow_data_has_zero_effect_on_real_engine(tmp_path):
+    """THE isolation proof (task-8-brief.md's HARD REQUIREMENT): seed a
+    strongly miscalibrated shadow heuristic via
+    update_shadow_heuristics_from_resolved_shadow_observations (guaranteed
+    to produce a heuristic that, if it ever leaked into the real engine,
+    would flip decide_open_position's decision away from its NO_ACTION
+    default and decide_pre_entry's away from APPROVE), then call the REAL
+    decide_open_position/decide_pre_entry with an EMPTY real-heuristics
+    table and assert the decision is still the plain default - i.e. the
+    shadow heuristics genuinely have zero effect on the real engine, not
+    merely 'the function wasn't called'."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(30):
+        _resolved_tighten_sl_shadow(repo, i, "PROTECT", _MID_FACTORS, correct=False, prefix="shd-iso")
+
+    updated = update_shadow_heuristics_from_resolved_shadow_observations(repo, _NOW + timedelta(days=1))
+    assert updated == 1  # sanity: the shadow heuristic really was written
+    shadow_heuristic = repo.find_guardian_authority_shadow_heuristics()[0]
+    assert abs(shadow_heuristic["adjustment"]) > 0  # a real, non-zero learned adjustment exists
+
+    # The REAL heuristics table is untouched/empty - decide_open_position
+    # and decide_pre_entry only ever read find_guardian_authority_heuristics().
+    real_heuristics = repo.find_guardian_authority_heuristics()
+    assert real_heuristics == []
+
+    decision, _, _, _, proposed_sl = decide_open_position(
+        position_factors=_MID_FACTORS,
+        guardian_state="PROTECT",  # exact same condition the shadow heuristic matches
+        current_sl=Decimal("49000"),
+        entry=Decimal("50000"),
+        heuristics=real_heuristics,
+        tighten_threshold=0.15,
+        close_threshold=0.45,
+    )
+    assert decision == "NO_ACTION"
+    assert proposed_sl is None
+
+    pre_entry_decision, _, pre_entry_direction, pre_entry_confidence = decide_pre_entry(
+        candidate_evidence={"guardian_state": "PROTECT", **_MID_FACTORS},
+        heuristics=real_heuristics,
+        veto_threshold=0.15,
+    )
+    assert pre_entry_decision == "APPROVE"
+    assert pre_entry_direction == "neutral"
+    assert pre_entry_confidence == 1.0

@@ -524,6 +524,33 @@ CREATE TABLE IF NOT EXISTS guardian_authority_shadow_pre_entry_observations (
 
 CREATE INDEX IF NOT EXISTS idx_ga_shadow_pre_entry_status
     ON guardian_authority_shadow_pre_entry_observations(status);
+
+-- Guardian Authority shadow self-critique heuristics (2026-09-15, Task 8):
+-- see docs/superpowers/sdd/2026-09-15-guardian-authority-shadow/
+-- task-8-brief.md. Schema-IDENTICAL to guardian_authority_heuristics above
+-- (same columns, same types, same INSERT OR REPLACE upsert semantics - see
+-- Repository.upsert_guardian_authority_shadow_heuristic) but a completely
+-- SEPARATE table: this is what a future human would see Guardian Authority
+-- WOULD have learned from the shadow/observation-mode data above, derived
+-- purely by reading guardian_authority_shadow_observations (never the real
+-- guardian_authority_decisions table). The real decision engine
+-- (evaluate_heuristics / decide_pre_entry / decide_open_position, all in
+-- crypto_trading/guardian/authority.py) calls ONLY
+-- repo.find_guardian_authority_heuristics() - it has no knowledge this
+-- table exists and must never be given a code path to read it. The
+-- separation IS the safety property: a bug that accidentally made the real
+-- engine read this table instead of (or in addition to) the real one is
+-- structurally impossible to introduce via a shared table + a flag, because
+-- there is no shared table.
+CREATE TABLE IF NOT EXISTS guardian_authority_shadow_heuristics (
+    heuristic_id TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    condition_json TEXT NOT NULL,
+    adjustment REAL NOT NULL,
+    confidence REAL NOT NULL,
+    sample_size INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 

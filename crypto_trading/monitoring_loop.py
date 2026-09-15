@@ -11,6 +11,7 @@ from crypto_trading.guardian.authority import resolve_pending_pre_entry_shadows
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.paper_trading.guardian_authority_shadow import (
     run_guardian_authority_shadow_tick,
+    update_shadow_heuristics_from_resolved_shadow_observations,
 )
 from crypto_trading.paper_trading.monitoring_catchup import run_monitoring_catchup
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
@@ -133,6 +134,35 @@ def run_monitoring_tick(
         except Exception as exc:
             log_event(
                 run_id, event="guardian_authority_pre_entry_shadow_resolution_tick_failed",
+                error_type=type(exc).__name__, error=str(exc),
+            )
+        # Task 8 (Guardian Authority Shadow/Observation Mode, 2026-09-15):
+        # self-critique-from-shadow-data - derives heuristics from Task 5's
+        # (tick-time) resolved shadow rows, into the SEPARATE `guardian_
+        # authority_shadow_heuristics` table (never the real one). Its own
+        # try/except and own log_event name, same "each concern gets its
+        # own try/except" discipline as the two blocks above, gated by the
+        # SAME settings.guardian.authority_shadow_enabled flag.
+        #
+        # Cadence: called UNCONDITIONALLY every tick (rather than the real
+        # Task 9's own opportunistic "only if >= 1 new resolution this
+        # tick" cadence, guardian/tick.py) - deliberately, not an oversight:
+        # run_guardian_authority_shadow_tick above resolves shadows
+        # internally (its own step 3) without returning a resolved-this-
+        # tick count, and threading one out would mean touching Task 5's
+        # already-shipped function signature for a cadence optimization
+        # this task does not need. The cost of a no-op call (an empty/
+        # unchanged find_resolved_guardian_authority_shadows() scan plus
+        # in-memory grouping) is negligible at this feature's data scale -
+        # it ships default-OFF and is never activated within this plan,
+        # same "real accumulated data will initially be very low" reasoning
+        # the real Task 9's own threshold comments already documented.
+        try:
+            if settings.guardian.authority_shadow_enabled:
+                update_shadow_heuristics_from_resolved_shadow_observations(repo, now)
+        except Exception as exc:
+            log_event(
+                run_id, event="guardian_authority_shadow_self_critique_failed",
                 error_type=type(exc).__name__, error=str(exc),
             )
         repo.complete_run(

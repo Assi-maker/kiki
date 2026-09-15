@@ -362,6 +362,17 @@ class Repository(Protocol):
     ) -> bool: ...
     def abandon_guardian_authority_shadow(self, shadow_id: str, abandoned_at: datetime) -> None: ...
     def find_resolved_guardian_authority_shadows(self) -> list[dict]: ...
+    def find_guardian_authority_shadow_heuristics(self) -> list[dict]: ...
+    def upsert_guardian_authority_shadow_heuristic(
+        self,
+        heuristic_id: str,
+        description: str,
+        condition_json: str,
+        adjustment: float,
+        confidence: float,
+        sample_size: int,
+        updated_at: datetime,
+    ) -> None: ...
     def save_guardian_authority_pre_entry_shadow(
         self,
         shadow_id: str,
@@ -2228,6 +2239,48 @@ class SQLiteRepository:
             "SELECT * FROM guardian_authority_shadow_observations WHERE status = 'RESOLVED'"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def find_guardian_authority_shadow_heuristics(self) -> list[dict]:
+        # Task 8 (self-critique-from-shadow-data): unfiltered SELECT *,
+        # same shape as find_guardian_authority_heuristics above, but
+        # against the SEPARATE guardian_authority_shadow_heuristics table -
+        # never read by the real decision engine (evaluate_heuristics /
+        # decide_pre_entry / decide_open_position), only by
+        # update_shadow_heuristics_from_resolved_shadow_observations and,
+        # later, reporting.
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_shadow_heuristics"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_guardian_authority_shadow_heuristic(
+        self,
+        heuristic_id: str,
+        description: str,
+        condition_json: str,
+        adjustment: float,
+        confidence: float,
+        sample_size: int,
+        updated_at: datetime,
+    ) -> None:
+        # Same INSERT OR REPLACE semantics as upsert_guardian_authority_
+        # heuristic above (heuristics evolve, refining an existing row on
+        # a re-run is correct) - targeting the separate shadow table only.
+        self._conn.execute(
+            "INSERT OR REPLACE INTO guardian_authority_shadow_heuristics "
+            "(heuristic_id, description, condition_json, adjustment, confidence, "
+            "sample_size, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                heuristic_id,
+                description,
+                condition_json,
+                adjustment,
+                confidence,
+                sample_size,
+                updated_at.isoformat(),
+            ),
+        )
+        self._conn.commit()
 
     def save_guardian_authority_pre_entry_shadow(
         self,

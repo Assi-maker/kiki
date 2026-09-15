@@ -55,7 +55,13 @@ from datetime import datetime
 from decimal import Decimal
 
 from crypto_trading.config.loader import Settings
-from crypto_trading.guardian.authority import decide_open_position
+from crypto_trading.guardian.authority import (
+    _ADJUSTMENT_SCALE,
+    _MIN_MISCALIBRATION,
+    _MIN_SAMPLE_SIZE,
+    _groups_for_factors,
+    decide_open_position,
+)
 from crypto_trading.logging import log_event
 from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.schemas.trade import Position
@@ -315,3 +321,100 @@ def run_guardian_authority_shadow_tick(
         if shadow is None or shadow["status"] not in ("OBSERVING", "DECIDED"):
             continue
         _resolve_on_close(repo, shadow, position, now)
+
+
+def update_shadow_heuristics_from_resolved_shadow_observations(repo: Repository, now: datetime) -> int:
+    """Self-critique-from-shadow-data (Task 8, 2026-09-15,
+    docs/superpowers/sdd/2026-09-15-guardian-authority-shadow/
+    task-8-brief.md). Answers "what would GODFATHER have learned from its
+    own hypothetical decisions" without ANY of it ever reaching the real
+    decision engine.
+
+    This is the shadow-only counterpart of guardian/authority.py's own
+    Task 9 `update_heuristics_from_resolved_decisions` - same grouping,
+    threshold and adjustment/confidence logic (reused via direct import,
+    never re-implemented - `_groups_for_factors`,
+    `_MIN_SAMPLE_SIZE`/`_MIN_MISCALIBRATION`/`_ADJUSTMENT_SCALE`), adapted
+    only in WHERE it reads from and WHERE it writes to:
+
+    - Reads `repo.find_resolved_guardian_authority_shadows()` - this
+      module's own tick-time shadow table (`guardian_authority_shadow_
+      observations`, built by Task 4/seed_shadow_for_position/
+      advance_shadow above) - NEVER `find_resolved_guardian_authority_
+      decisions()` (the real table).
+    - Writes via `repo.upsert_guardian_authority_shadow_heuristic(...)` to
+      the SEPARATE `guardian_authority_shadow_heuristics` table - NEVER
+      `upsert_guardian_authority_heuristic` (the real one).
+
+    No `_reconstruct_tighten_sl_factors`/`intervention_applied` filtering
+    is needed here (unlike the real function): each shadow row already
+    carries its own immutable `factors_json`, set once by
+    `decide_guardian_authority_shadow` above, and this table guarantees
+    exactly one row per position (shadow_id = position_id, 1:1) - there is
+    no per-tick inflation of the kind the real `guardian_authority_
+    decisions` table can have, so nothing needs reconstructing or
+    filtering by intervention.
+
+    Scope (same ruling as the real Task 9's own scope note, reused
+    verbatim for the shadow table): only `shadow_decision == "TIGHTEN_SL"`
+    rows carry a real expectation to learn from. `CLOSE_EARLY` always
+    resolves with `expectation_correct = None` (`_resolve_on_close`
+    above), and a position that closed while still `OBSERVING` resolves
+    to `shadow_decision == "NO_ACTION"` with `expectation_correct` also
+    `None` (`resolve_guardian_authority_shadow_no_action` - no
+    counterfactual-of-inaction mechanism exists for either shape) - both
+    are excluded here exactly as the real function excludes `CLOSE_EARLY`/
+    `PRE_ENTRY_VETO`.
+
+    Never mutates `guardian_authority_shadow_observations` - pure read of
+    resolved shadows plus a write of `guardian_authority_shadow_
+    heuristics`, same "read one table, write a different one" shape as the
+    real function's own read of `guardian_authority_decisions` plus write
+    of `guardian_authority_heuristics`.
+
+    Returns the count of shadow-heuristic rows upserted in THIS call.
+    """
+    tallies: dict[str, dict] = {}
+
+    for shadow in repo.find_resolved_guardian_authority_shadows():
+        if shadow["shadow_decision"] != "TIGHTEN_SL":
+            continue
+        if shadow["expectation_correct"] is None:
+            continue  # CLOSE_EARLY / NO_ACTION - no real expectation to learn from
+
+        factors = json.loads(shadow["factors_json"])
+        correct = bool(shadow["expectation_correct"])
+        for heuristic_id, condition, description in _groups_for_factors(factors):
+            tally = tallies.setdefault(
+                heuristic_id,
+                {"condition": condition, "description": description, "n": 0, "correct": 0},
+            )
+            tally["n"] += 1
+            if correct:
+                tally["correct"] += 1
+
+    updated_count = 0
+    for heuristic_id, tally in tallies.items():
+        n = tally["n"]
+        if n < _MIN_SAMPLE_SIZE:
+            continue
+        correct_rate = tally["correct"] / n
+        deviation = correct_rate - 0.5
+        if abs(deviation) < _MIN_MISCALIBRATION:
+            continue
+
+        adjustment = deviation * _ADJUSTMENT_SCALE
+        confidence = abs(deviation) * 2.0
+
+        repo.upsert_guardian_authority_shadow_heuristic(
+            heuristic_id=heuristic_id,
+            description=tally["description"],
+            condition_json=json.dumps(tally["condition"]),
+            adjustment=adjustment,
+            confidence=confidence,
+            sample_size=n,
+            updated_at=now,
+        )
+        updated_count += 1
+
+    return updated_count
