@@ -637,35 +637,39 @@ def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
 # --------------------------------------------------------------------------
 # Grouping / bucketing
 # --------------------------------------------------------------------------
-# The real, currently-available factor vocabulary for TIGHTEN_SL decisions
-# is Guardian's own tick-time decay factors (_DECAY_FACTOR_NAMES below, all
-# floats clipped to [0, 1] by guardian/deterministic.py's own `_clip01`) plus
-# `guardian_state` (a small string enum, merged in by ruling (a)'s
-# reconstruction - see `decide_open_position`'s own identical merge above).
-# Per the brief's own ruling, grouping combinations are kept simple - NOT a
-# full cross-product of all 6 factors, which would fragment the (currently
-# tiny) real sample size into meaninglessly small buckets:
+# I1 hardening fix (2026-09-14): grouping is `guardian_state` alone (4
+# possible groups: HOLD/WATCH/PROTECT/EXIT) - and NOTHING else. This section
+# previously also described a second group kind, `guardian_state` x ONE
+# decay factor bucketed into fixed terciles (low/mid/high), which has been
+# removed entirely (dead code `_DECAY_FACTOR_NAMES`, `_bucket_for_value`,
+# `_bucket_condition`, `_BUCKET_LOW_MAX`, `_BUCKET_HIGH_MIN` all deleted).
 #
-#   1. `guardian_state` alone (4 possible groups: HOLD/WATCH/PROTECT/EXIT).
-#   2. `guardian_state` x ONE decay factor, bucketed into three fixed
-#      terciles (low/mid/high, split at 1/3 and 2/3 - simple, fixed
-#      thresholds; this session's own prior manual historical analysis
-#      never studied these particular decay factors, so there is no
-#      pre-established bucket convention to reuse here, unlike the brief's
-#      illustrative trigger_reasons/candidate_score example assumes).
+# Rationale: a decay factor is NOT independent evidence from
+# `guardian_state` - `guardian_state` is ITSELF derived from a weighted
+# combination of exactly those same factors (`compute_decay_score` ->
+# `classify_guardian_state`, in guardian/deterministic.py). So a condition
+# like "guardian_state=PROTECT AND momentum_decay is high" was a
+# near-tautological restatement of "guardian_state=PROTECT," not
+# independent confirming evidence - the two groups were correlated by
+# construction, not orthogonal. Under the pre-fix grouping, a single
+# resolved TIGHTEN_SL decision contributed to up to 7 groups at once (its
+# own guardian_state group, plus one guardian_state x factor-bucket group
+# per decay factor), letting one learned pattern's adjustment apply itself
+# up to 7x to the same future decision (multi-heuristic co-firing).
 #
-# Every resolved TIGHTEN_SL decision with reconstructable factors
-# contributes to 1 + len(_DECAY_FACTOR_NAMES) = 7 groups at once (its own
-# guardian_state group, plus one guardian_state x factor-bucket group per
-# decay factor) - the same trade contributing to several different bucketed
-# views is the same shape Detective's own per-batch bucketed analysis uses.
+# Collapsing to state-alone makes multi-heuristic co-firing from
+# self-critique-derived heuristics STRUCTURALLY IMPOSSIBLE going forward: a
+# decision carries exactly one `guardian_state` value, and heuristic_ids are
+# now 1:1 with state values, so at most ONE self-critique-derived heuristic
+# can ever match any single future decision - not just "improved," provably
+# eliminated. A single well-supported state-alone heuristic (n>=30,
+# |deviation|>=0.15) can still legitimately drive escalation on its own
+# merit - that IS "sufficient independent support," not the bug being fixed.
 #
-# Each group's condition is expressed ENTIRELY in terms of
+# The group's condition is expressed entirely in terms of
 # heuristic_condition_matches' own already-documented matching semantics
-# (module docstring above): `{"guardian_state": "PROTECT"}` for a
-# state-alone group, `{"guardian_state": "PROTECT", "momentum_decay_min":
-# 0.6667}` for a high-bucket state x factor group - no new matching
-# semantics are invented.
+# (module docstring above): `{"guardian_state": "PROTECT"}` - no new
+# matching semantics are invented.
 #
 # --------------------------------------------------------------------------
 # heuristic_id scheme (must be deterministic per group for idempotent
@@ -673,10 +677,8 @@ def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
 # same row, never create a duplicate)
 # --------------------------------------------------------------------------
 #   State-alone group:        "ga-hc:state:<guardian_state>"
-#   State x factor-bucket:    "ga-hc:state:<guardian_state>:factor:<factor_name>:
-#                              bucket:<low|mid|high>"
-# Built purely from the group's own identity (state name, factor name,
-# bucket label) - never a timestamp, run_id, or random value.
+# Built purely from the group's own identity (the state name) - never a
+# timestamp, run_id, or random value.
 #
 # --------------------------------------------------------------------------
 # Adjustment sign / magnitude
@@ -720,18 +722,6 @@ _MIN_SAMPLE_SIZE = 30
 _MIN_MISCALIBRATION = 0.15
 _ADJUSTMENT_SCALE = 1.0
 
-_DECAY_FACTOR_NAMES = (
-    "time_decay",
-    "momentum_decay",
-    "volume_decay",
-    "funding_decay",
-    "secondary_confirmation_lost",
-    "market_regime",
-)
-
-_BUCKET_LOW_MAX = 1.0 / 3.0
-_BUCKET_HIGH_MIN = 2.0 / 3.0
-
 
 def _reconstruct_tighten_sl_factors(repo: Repository, decision: dict) -> dict | None:
     """Ruling (a): reconstructs the factors dict a TIGHTEN_SL (or
@@ -755,68 +745,31 @@ def _reconstruct_tighten_sl_factors(repo: Repository, decision: dict) -> dict | 
     return None
 
 
-def _bucket_for_value(value: float) -> str:
-    """Fixed terciles, split at 1/3 and 2/3 - see module docstring section
-    above for why fixed thresholds (rather than a reused historical
-    convention) are the right call here."""
-    if value < _BUCKET_LOW_MAX:
-        return "low"
-    if value < _BUCKET_HIGH_MIN:
-        return "mid"
-    return "high"
-
-
-def _bucket_condition(factor_name: str, bucket: str) -> dict:
-    """Expresses one tercile bucket entirely in terms of
-    heuristic_condition_matches' own `_min`/`_max` numeric-bound semantics
-    (module docstring above) - both bounds are inclusive per that function,
-    so adjacent buckets touch at the boundary (a heuristic, not a strict
-    mathematical partition - acceptable here, see module docstring)."""
-    if bucket == "low":
-        return {f"{factor_name}_max": _BUCKET_LOW_MAX}
-    if bucket == "mid":
-        return {f"{factor_name}_min": _BUCKET_LOW_MAX, f"{factor_name}_max": _BUCKET_HIGH_MIN}
-    return {f"{factor_name}_min": _BUCKET_HIGH_MIN}
-
-
 def _groups_for_factors(factors: dict) -> list[tuple[str, dict, str]]:
-    """Returns `(heuristic_id, condition, description)` for every group one
-    reconstructed factors dict belongs to - its own `guardian_state` group,
-    plus one `guardian_state` x factor-bucket group per decay factor present
-    in `factors` (module docstring section above). Missing/non-numeric decay
-    factors are skipped for that one factor's group (not fatal - the
-    state-alone group and every other factor's group are unaffected)."""
+    """Returns `(heuristic_id, condition, description)` for the one group
+    a reconstructed factors dict belongs to: its own `guardian_state`
+    group. I1 hardening fix (2026-09-14): previously also produced one
+    `guardian_state` x decay-factor-tercile group per decay factor (up to
+    7 groups total per decision) - removed because a decay factor is not
+    independent evidence from guardian_state (guardian_state is itself
+    derived from a weighted combination of exactly those factors via
+    compute_decay_score -> classify_guardian_state), so co-firing them
+    let a single learned pattern apply its adjustment up to 7x. Collapsing
+    to state-alone makes multi-heuristic co-firing structurally
+    impossible: a decision carries exactly one guardian_state value, and
+    heuristic_ids are now 1:1 with state values, so at most one
+    self-critique-derived heuristic can ever match any one future
+    decision."""
     guardian_state = factors.get("guardian_state")
     if guardian_state is None:
         return []
-
-    groups: list[tuple[str, dict, str]] = [
+    return [
         (
             f"ga-hc:state:{guardian_state}",
             {"guardian_state": guardian_state},
             f"TIGHTEN_SL outcomes while guardian_state={guardian_state}",
         )
     ]
-
-    for factor_name in _DECAY_FACTOR_NAMES:
-        if factor_name not in factors:
-            continue
-        try:
-            value = float(factors[factor_name])
-        except (TypeError, ValueError):
-            continue
-        bucket = _bucket_for_value(value)
-        condition = {"guardian_state": guardian_state, **_bucket_condition(factor_name, bucket)}
-        groups.append(
-            (
-                f"ga-hc:state:{guardian_state}:factor:{factor_name}:bucket:{bucket}",
-                condition,
-                f"TIGHTEN_SL outcomes while guardian_state={guardian_state} "
-                f"and {factor_name} is {bucket}",
-            )
-        )
-
-    return groups
 
 
 def update_heuristics_from_resolved_decisions(repo: Repository, now: datetime) -> int:
@@ -825,7 +778,9 @@ def update_heuristics_from_resolved_decisions(repo: Repository, now: datetime) -
     far" per this plan's own ruling), groups the ones with a usable
     expectation - in practice only resolved TIGHTEN_SL rows, see the scope
     note in this module's Task 9 docstring section above - by
-    `guardian_state` and `guardian_state` x decay-factor-bucket, computes
+    `guardian_state` alone (I1 hardening fix, 2026-09-14 - see
+    `_groups_for_factors` and the module docstring's "Grouping / bucketing"
+    section for why decay-factor x state groups were removed), computes
     each group's `expectation_correct` rate, and upserts a heuristic row per
     group whose sample size and miscalibration clear the thresholds
     documented above.

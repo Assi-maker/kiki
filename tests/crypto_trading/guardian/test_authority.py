@@ -15,6 +15,7 @@ from crypto_trading.config.loader import (
     Settings,
 )
 from crypto_trading.guardian.authority import (
+    _groups_for_factors,
     _reconstruct_tighten_sl_factors,
     decide_open_position,
     decide_pre_entry,
@@ -1255,11 +1256,11 @@ def test_update_heuristics_excludes_rows_where_intervention_was_not_applied(tmp_
 
     updated = update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
 
-    # _MID_FACTORS' decay values (0.5) fall in each factor's "mid" bucket,
-    # so this fixture (like test_update_heuristics_miscalibrated_group_gets_
-    # negative_adjustment above) produces the state-alone group PLUS one
-    # guardian_state x factor-bucket group per decay factor: 1 + 6 = 7 total.
-    assert updated == 7
+    # I1 hardening fix (2026-09-14): _groups_for_factors now produces only
+    # the state-alone group (decay-factor x state groups were removed - see
+    # module docstring section and _groups_for_factors' own docstring), so
+    # exactly 1 heuristic row is produced regardless of _MID_FACTORS' values.
+    assert updated == 1
     heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_heuristics()}
     assert "ga-hc:state:PROTECT" in heuristics
     state_heuristic = heuristics["ga-hc:state:PROTECT"]
@@ -1286,12 +1287,69 @@ def test_update_heuristics_excludes_rows_with_none_intervention_applied(tmp_path
 
     updated = update_heuristics_from_resolved_decisions(repo, _NOW + timedelta(days=1))
 
-    assert updated == 7  # state-alone + one per decay factor, see comment above
+    # I1 hardening fix (2026-09-14): state-alone group only, see comment above.
+    assert updated == 1
     heuristics = {h["heuristic_id"]: h for h in repo.find_guardian_authority_heuristics()}
     assert "ga-hc:state:WATCH" in heuristics
     state_heuristic = heuristics["ga-hc:state:WATCH"]
     assert state_heuristic["adjustment"] < 0
     assert state_heuristic["sample_size"] == 30
+
+
+# --------------------------------------------------------------------------
+# I1 hardening fix (2026-09-14): multi-heuristic co-firing eliminated.
+# _groups_for_factors collapsed to guardian_state-alone groups only (see
+# module docstring "Grouping / bucketing" section and _groups_for_factors'
+# own docstring for the full rationale) - a decay-factor value can no
+# longer, on its own or in combination with guardian_state, select a
+# second/third/... group for the same decision. These tests prove this is
+# now STRUCTURALLY IMPOSSIBLE (true for every factor dict, not just one
+# fixture that happens to produce 1), not merely "improved".
+# --------------------------------------------------------------------------
+
+
+def test_groups_for_factors_never_produces_more_than_one_group():
+    """Varies decay-factor values across the full 0-1 range for a fixed
+    guardian_state - including 0.0/1.0 and the exact old tercile boundaries
+    (1/3, 2/3) that used to select different low/mid/high buckets - and
+    asserts every resulting group list has length exactly 1 with the
+    state-alone heuristic_id/condition. Under the pre-I1 code each of these
+    factor dicts would have produced a DIFFERENT number/shape of groups (up
+    to 7); under I1 they all collapse to the same single group."""
+    factor_variants = [
+        {  # all zero (old "low" bucket for every factor)
+            "time_decay": 0.0, "momentum_decay": 0.0, "volume_decay": 0.0,
+            "funding_decay": 0.0, "secondary_confirmation_lost": 0.0, "market_regime": 0.0,
+        },
+        {  # all mid (0.5, previously used by _MID_FACTORS fixtures)
+            "time_decay": 0.5, "momentum_decay": 0.5, "volume_decay": 0.5,
+            "funding_decay": 0.5, "secondary_confirmation_lost": 0.5, "market_regime": 0.5,
+        },
+        {  # all one (old "high" bucket for every factor)
+            "time_decay": 1.0, "momentum_decay": 1.0, "volume_decay": 1.0,
+            "funding_decay": 1.0, "secondary_confirmation_lost": 1.0, "market_regime": 1.0,
+        },
+        {  # mixed values straddling the old tercile boundaries exactly
+            "time_decay": 1.0 / 3.0, "momentum_decay": 2.0 / 3.0, "volume_decay": 0.2,
+            "funding_decay": 0.8, "secondary_confirmation_lost": 0.4, "market_regime": 0.6,
+        },
+        {},  # no decay factors reconstructable at all - guardian_state only
+    ]
+    for factors in factor_variants:
+        factors_with_state = {**factors, "guardian_state": "PROTECT"}
+        groups = _groups_for_factors(factors_with_state)
+        assert len(groups) == 1
+        heuristic_id, condition, description = groups[0]
+        assert heuristic_id == "ga-hc:state:PROTECT"
+        assert condition == {"guardian_state": "PROTECT"}
+        assert description == "TIGHTEN_SL outcomes while guardian_state=PROTECT"
+
+
+def test_groups_for_factors_returns_empty_list_when_guardian_state_missing():
+    """No guardian_state means no group at all - never a bare/partial
+    factor-bucket group (there is nothing left to produce one from)."""
+    assert _groups_for_factors({"time_decay": 0.5, "momentum_decay": 0.9}) == []
+    assert _groups_for_factors({}) == []
 
 
 # =========================================================================
