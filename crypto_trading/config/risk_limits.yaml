@@ -37,7 +37,19 @@ max_total_exposure_pct: "1.00"
 # annars större raw_size) - vid breda stop-avstånd där raw_size redan är
 # under 1000 är denna gräns overksam, risk_per_trade_pct-garantin gäller
 # fortfarande obruten.
-max_position_notional_usdt: "1000"
+#
+# Sänkt 1000 -> 500 (2026-09-13, explicit användarkrav, PAPER-only
+# exposure/sizing-utredning): produktionsdata visade poolen 100 % fylld
+# av exakt 10 positioner à 1000 USDT (10000/1000), medan
+# max_concurrent_positions=20 tillät dubbelt så många CONFIRMED-kandidater
+# in i pipelinen - resten fick size=0 (19 av 20 stängda Profit Protection-
+# shadow-rader sedan aktivering var blocked_by_exposure). Total pool
+# (max_total_exposure_pct/starting_capital_usdt) och
+# max_concurrent_positions är OFÖRÄNDRADE - detta gör bara samma 10000
+# USDT-pool kompatibel med upp till 20 samtidiga icke-nollstora positioner
+# (10000/500=20) istället för 10, utan att öka total PAPER-exponering.
+# Rör ALDRIG risk_per_trade_pct eller sizing-formeln.
+max_position_notional_usdt: "500"
 spread_pct: "0.0005"
 slippage_pct: "0.0005"
 fee_pct: "0.0004"
