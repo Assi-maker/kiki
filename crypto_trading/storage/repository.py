@@ -362,6 +362,30 @@ class Repository(Protocol):
     ) -> bool: ...
     def abandon_guardian_authority_shadow(self, shadow_id: str, abandoned_at: datetime) -> None: ...
     def find_resolved_guardian_authority_shadows(self) -> list[dict]: ...
+    def save_guardian_authority_pre_entry_shadow(
+        self,
+        shadow_id: str,
+        candidate_id: str,
+        instrument: str,
+        shadow_decision: str,
+        expected_outcome: str,
+        expected_direction: str,
+        confidence: float,
+        factors_json: str,
+        run_id: str,
+        created_at: datetime,
+    ) -> bool: ...
+    def get_guardian_authority_pre_entry_shadow(self, shadow_id: str) -> dict | None: ...
+    def find_pending_guardian_authority_pre_entry_shadows(self) -> list[dict]: ...
+    def resolve_guardian_authority_pre_entry_shadow(
+        self,
+        shadow_id: str,
+        actual_exit_reason: str,
+        actual_pnl_usdt: Decimal,
+        actual_closed_at: datetime,
+        updated_at: datetime,
+    ) -> bool: ...
+    def find_resolved_guardian_authority_pre_entry_shadows(self) -> list[dict]: ...
 
 
 class SQLiteRepository:
@@ -2202,5 +2226,113 @@ class SQLiteRepository:
         # Consumed by Task 9 and Task 10 (self-critique / reporting).
         rows = self._conn.execute(
             "SELECT * FROM guardian_authority_shadow_observations WHERE status = 'RESOLVED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_guardian_authority_pre_entry_shadow(
+        self,
+        shadow_id: str,
+        candidate_id: str,
+        instrument: str,
+        shadow_decision: str,
+        expected_outcome: str,
+        expected_direction: str,
+        confidence: float,
+        factors_json: str,
+        run_id: str,
+        created_at: datetime,
+    ) -> bool:
+        # Single-shot INSERT OR IGNORE, same claim-style idempotency as
+        # seed_guardian_authority_shadow - a duplicate save call (e.g. a
+        # retried candidate-confirm) can never produce two rows or silently
+        # overwrite the original decision. Pre-entry has no separate "decide"
+        # step (unlike the tick-time table): every decision-shaped column is
+        # set here, at once, immutable from then on. shadow_id IS
+        # candidate_id (controller simplification - see db.py's schema
+        # comment) - no position_id column, no link step. created_at is
+        # reused for updated_at too, same convention as seed_guardian_
+        # authority_shadow's own created_at/updated_at pairing.
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO guardian_authority_shadow_pre_entry_observations "
+            "(shadow_id, candidate_id, instrument, shadow_decision, expected_outcome, "
+            "expected_direction, confidence, factors_json, status, created_at, "
+            "updated_at, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)",
+            (
+                shadow_id,
+                candidate_id,
+                instrument,
+                shadow_decision,
+                expected_outcome,
+                expected_direction,
+                confidence,
+                factors_json,
+                created_at.isoformat(),
+                created_at.isoformat(),
+                run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_guardian_authority_pre_entry_shadow(self, shadow_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM guardian_authority_shadow_pre_entry_observations "
+            "WHERE shadow_id = ?",
+            (shadow_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_pending_guardian_authority_pre_entry_shadows(self) -> list[dict]:
+        # No position_id filter - shadow_id already IS the position_id a
+        # real position would use (controller simplification), so there is
+        # no separate NULL/non-NULL link state to filter on here. A later
+        # task's resolution logic checks repo.get_position(shadow_id)
+        # itself to find out whether a real position exists yet.
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_shadow_pre_entry_observations "
+            "WHERE status = 'PENDING'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def resolve_guardian_authority_pre_entry_shadow(
+        self,
+        shadow_id: str,
+        actual_exit_reason: str,
+        actual_pnl_usdt: Decimal,
+        actual_closed_at: datetime,
+        updated_at: datetime,
+    ) -> bool:
+        # WHERE status = 'PENDING' makes a second/out-of-order resolve call
+        # a structural no-op - same one-time-transition discipline as every
+        # other resolve method in this module. expectation_correct is
+        # deliberately never referenced here: per the design spec and the
+        # controller's Task 8-aligned ruling, both APPROVE and
+        # PRE_ENTRY_VETO shadow rows have no counterfactual to score, so the
+        # column stays NULL forever, by construction, for every row of this
+        # table.
+        cur = self._conn.execute(
+            "UPDATE guardian_authority_shadow_pre_entry_observations "
+            "SET status = 'RESOLVED', actual_exit_reason = ?, actual_pnl_usdt = ?, "
+            "actual_closed_at = ?, updated_at = ? "
+            "WHERE shadow_id = ? AND status = 'PENDING'",
+            (
+                actual_exit_reason,
+                str(actual_pnl_usdt),
+                actual_closed_at.isoformat(),
+                updated_at.isoformat(),
+                shadow_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def find_resolved_guardian_authority_pre_entry_shadows(self) -> list[dict]:
+        # Consumed by Task 10's report only (Task 9's self-critique is
+        # TIGHTEN_SL-only, same scope note as the real Task 9 - pre-entry
+        # shadow rows never feed self-critique).
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_shadow_pre_entry_observations "
+            "WHERE status = 'RESOLVED'"
         ).fetchall()
         return [dict(row) for row in rows]

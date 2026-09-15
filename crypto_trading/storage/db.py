@@ -468,6 +468,62 @@ CREATE INDEX IF NOT EXISTS idx_ga_shadow_position
     ON guardian_authority_shadow_observations(position_id);
 CREATE INDEX IF NOT EXISTS idx_ga_shadow_status
     ON guardian_authority_shadow_observations(status);
+
+-- Guardian Authority shadow/observation mode (2026-09-15), pre-entry half:
+-- see docs/superpowers/specs/2026-09-15-guardian-authority-shadow-design.md
+-- "guardian_authority_shadow_pre_entry_observations". Purely observational
+-- counterpart of decide_pre_entry - logs what GODFATHER's pre-entry veto
+-- WOULD have decided (APPROVE/PRE_ENTRY_VETO) for a CONFIRMED candidate,
+-- WITHOUT ever blocking the real open (the real veto path is completely
+-- separate and untouched by this table). Much simpler than the tick-time
+-- table above: no per-tick concern, no state machine beyond a single
+-- PENDING -> RESOLVED transition - pre-entry is evaluated exactly once, at
+-- the same call site maybe_open_position_for_candidate already hooks, so
+-- one INSERT at confirm time sets every decision-shaped column at once
+-- (shadow_decision/expected_outcome/expected_direction/confidence/
+-- factors_json - all immutable from then on, same requirement-10 spirit as
+-- guardian_authority_decisions' own expectation columns).
+--
+-- Controller simplification (2026-09-15, superseding the original design
+-- doc's `position_id` column + `link_guardian_authority_pre_entry_shadow_
+-- to_position` method): position_id is always exactly candidate_id in this
+-- codebase (position_opening.py: `position_id=candidate.candidate_id`), so
+-- shadow_id simply IS candidate_id - which is also, by construction, what
+-- the real position's position_id will be if one ever opens. No separate
+-- position_id column exists; a later task resolves a shadow row by calling
+-- repo.get_position(shadow_id) directly. find_pending_guardian_authority_
+-- pre_entry_shadows() therefore returns every PENDING row unfiltered (no
+-- "position_id IS NOT NULL" filter is needed or possible).
+--
+-- expectation_correct stays NULL forever for every row of this table (both
+-- APPROVE and PRE_ENTRY_VETO) - matches Task 8's own real-path ruling that
+-- PRE_ENTRY_VETO (and, symmetrically, APPROVE) have no counterfactual to
+-- score: a veto never actually blocks the real open, so there is no
+-- non-entry outcome to compare against. resolve_guardian_authority_pre_
+-- entry_shadow() has no expectation_correct parameter and never writes to
+-- this column - it exists purely for schema symmetry with the sibling
+-- shadow/decisions tables and stays NULL by construction.
+CREATE TABLE IF NOT EXISTS guardian_authority_shadow_pre_entry_observations (
+    shadow_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    shadow_decision TEXT NOT NULL,
+    expected_outcome TEXT NOT NULL,
+    expected_direction TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    factors_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    actual_exit_reason TEXT,
+    actual_pnl_usdt TEXT,
+    actual_closed_at TEXT,
+    expectation_correct BOOLEAN,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ga_shadow_pre_entry_status
+    ON guardian_authority_shadow_pre_entry_observations(status);
 """
 
 
