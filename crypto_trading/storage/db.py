@@ -460,7 +460,8 @@ CREATE TABLE IF NOT EXISTS guardian_authority_shadow_observations (
     expectation_correct BOOLEAN,
     prediction_error REAL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    run_id TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_ga_shadow_position

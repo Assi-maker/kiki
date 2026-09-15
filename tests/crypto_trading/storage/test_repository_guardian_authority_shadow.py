@@ -20,7 +20,7 @@ _NOW = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
 def _seed_kwargs(**overrides) -> dict:
     defaults = dict(
         shadow_id="pos-1", position_id="pos-1", candidate_id="cand-1",
-        instrument="BTCUSDT", opened_at=_NOW, created_at=_NOW,
+        instrument="BTCUSDT", opened_at=_NOW, created_at=_NOW, run_id="run-1",
     )
     defaults.update(overrides)
     return defaults
@@ -40,7 +40,7 @@ def test_guardian_authority_shadow_observations_table_exists(tmp_path):
         "expected_direction", "confidence", "factors_json", "proposed_new_sl",
         "mfe", "mae", "last_factors_json", "actual_exit_reason",
         "actual_pnl_usdt", "actual_closed_at", "expectation_correct",
-        "prediction_error", "created_at", "updated_at",
+        "prediction_error", "created_at", "updated_at", "run_id",
     }
 
 
@@ -57,6 +57,7 @@ def test_seed_guardian_authority_shadow_creates_a_row_with_observing_status(tmp_
     assert row["status"] == "OBSERVING"
     assert row["mfe"] == "0"
     assert row["mae"] == "0"
+    assert row["run_id"] == "run-1"
     # All decision/resolution fields NULL at seed time.
     for field in (
         "shadow_decision", "decided_at", "expected_outcome", "expected_direction",

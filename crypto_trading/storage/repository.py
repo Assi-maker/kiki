@@ -317,6 +317,7 @@ class Repository(Protocol):
         instrument: str,
         opened_at: datetime,
         created_at: datetime,
+        run_id: str,
     ) -> bool: ...
     def get_guardian_authority_shadow(self, shadow_id: str) -> dict | None: ...
     def find_open_guardian_authority_shadows(self) -> list[dict]: ...
@@ -2018,6 +2019,7 @@ class SQLiteRepository:
         instrument: str,
         opened_at: datetime,
         created_at: datetime,
+        run_id: str,
     ) -> bool:
         # Same INSERT OR IGNORE claim-style idempotency as
         # seed_profit_protection_shadow - a duplicate seed call (e.g. a
@@ -2026,11 +2028,12 @@ class SQLiteRepository:
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO guardian_authority_shadow_observations "
             "(shadow_id, position_id, candidate_id, instrument, opened_at, status, "
-            "mfe, mae, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, 'OBSERVING', '0', '0', ?, ?)",
+            "mfe, mae, created_at, updated_at, run_id) "
+            "VALUES (?, ?, ?, ?, ?, 'OBSERVING', '0', '0', ?, ?, ?)",
             (
                 shadow_id, position_id, candidate_id, instrument,
                 opened_at.isoformat(), created_at.isoformat(), created_at.isoformat(),
+                run_id,
             ),
         )
         self._conn.commit()
