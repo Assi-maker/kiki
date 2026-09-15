@@ -423,3 +423,26 @@ def test_find_resolved_guardian_authority_shadows_returns_only_resolved_rows(tmp
 
     resolved_ids = {row["shadow_id"] for row in repo.find_resolved_guardian_authority_shadows()}
     assert resolved_ids == {"a"}
+
+
+def test_find_abandoned_guardian_authority_shadows_returns_only_abandoned_rows(tmp_path):
+    """Task 9 fix round 1: find_open_guardian_authority_shadows() and
+    find_resolved_guardian_authority_shadows() together silently dropped
+    ABANDONED rows from every downstream report count - this method closes
+    that gap, same simple SELECT-by-status shape as find_resolved_
+    guardian_authority_shadows just above."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.seed_guardian_authority_shadow(**_seed_kwargs(shadow_id="a", position_id="a"))
+    repo.seed_guardian_authority_shadow(**_seed_kwargs(shadow_id="b", position_id="b"))
+    repo.seed_guardian_authority_shadow(**_seed_kwargs(shadow_id="c", position_id="c"))
+
+    repo.abandon_guardian_authority_shadow("a", _NOW)  # abandoned from OBSERVING
+    repo.decide_guardian_authority_shadow(
+        "b", "TIGHTEN_SL", _NOW, "expect favorable", "favorable",
+        0.7, '{"rsi": 55}', Decimal("49500"), _NOW,
+    )
+    repo.abandon_guardian_authority_shadow("b", _NOW)  # abandoned from DECIDED
+    # c stays OBSERVING - never abandoned
+
+    abandoned_ids = {row["shadow_id"] for row in repo.find_abandoned_guardian_authority_shadows()}
+    assert abandoned_ids == {"a", "b"}

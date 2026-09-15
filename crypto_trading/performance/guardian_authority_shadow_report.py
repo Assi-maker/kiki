@@ -28,8 +28,19 @@ Section shapes:
 - `tick_time_shadow`: one entry per `NO_ACTION`/`TIGHTEN_SL`/`CLOSE_EARLY`,
   read from `guardian_authority_shadow_observations`
   (`find_open_guardian_authority_shadows` + `find_resolved_guardian_
-  authority_shadows`). Every row of that table maps to EXACTLY ONE of the
-  three buckets, with no row ever left uncounted:
+  authority_shadows` + `find_abandoned_guardian_authority_shadows`). The
+  table has FOUR statuses, not three: `OBSERVING`, `DECIDED`, `RESOLVED`,
+  and `ABANDONED` (set by `abandon_guardian_authority_shadow` when a
+  shadow's real position vanishes from `open_positions` mid-observation -
+  see `guardian_authority_shadow.py::run_guardian_authority_shadow_tick`'s
+  stranded-shadow handling; this is a real, production-reachable path, not
+  a theoretical one). Task 9 fix round 1: an earlier version of this
+  module and this docstring claimed every row mapped to exactly one of
+  three pending/resolved buckets with "no row ever left uncounted" - that
+  was false, ABANDONED rows were silently excluded from every count.
+  Corrected shape: every row maps to EXACTLY ONE of the three pending/
+  resolved buckets below, OR is counted separately via that same type's
+  own `n_abandoned` - no row is ever left out of the report:
     * a row still `OBSERVING` (no hypothetical decision registered yet) is
       "pending NO_ACTION" - the only state that type can be pending in,
       since `shadow_decision = 'NO_ACTION'` is only ever set at
@@ -44,6 +55,17 @@ Section shapes:
       `resolve_guardian_authority_shadow_no_action`, or whatever it was
       `DECIDED` as, via `resolve_guardian_authority_shadow_decided`) -
       "resolved <type>".
+    * an `ABANDONED` row (fires from either `OBSERVING` or `DECIDED`, and
+      never touches `shadow_decision` - see `abandon_guardian_authority_
+      shadow`'s own WHERE clause) is counted under `n_abandoned` on
+      exactly one type's entry: `shadow_decision IS NULL` (abandoned while
+      still `OBSERVING`, no decision was ever registered) counts under
+      `NO_ACTION`'s `n_abandoned`; a non-NULL `shadow_decision` (abandoned
+      after `DECIDED`, before it could ever resolve) counts under that
+      decision type's own `n_abandoned`. `n_abandoned` is reported
+      separately from `n_total`/`n_pending`/`n_resolved` - an abandoned
+      row was never a real pending or resolved outcome, and is never
+      folded into those counts, but it is always visible.
   For `TIGHTEN_SL` specifically, once resolved+scored rows exist:
   `n_scored`/`n_correct`/`win_rate`/`brier_score`/`brier_score_note`/
   `n_distinct_positions` - same formulas as the real report's own
@@ -147,13 +169,25 @@ _PRE_ENTRY_SHADOW_NOTE = (
 )
 
 
-def _tick_time_shadow_type_entry(rows: list[dict], decision_type: str) -> dict:
+def _tick_time_shadow_type_entry(
+    rows: list[dict], abandoned_rows: list[dict], decision_type: str
+) -> dict:
     if decision_type == "NO_ACTION":
         pending = [d for d in rows if d["status"] == "OBSERVING"]
+        # abandon_guardian_authority_shadow never touches shadow_decision
+        # (see its own WHERE clause) - a row abandoned while still
+        # OBSERVING never reached a decision, so shadow_decision is still
+        # NULL. That is this type's own abandoned bucket, same as how
+        # OBSERVING is this type's own pending bucket above.
+        abandoned = [d for d in abandoned_rows if d["shadow_decision"] is None]
     else:
         pending = [
             d for d in rows if d["status"] == "DECIDED" and d["shadow_decision"] == decision_type
         ]
+        # A row abandoned after being DECIDED still carries the real
+        # shadow_decision decide_guardian_authority_shadow set (abandon
+        # never touches it) - counted under that same type here.
+        abandoned = [d for d in abandoned_rows if d["shadow_decision"] == decision_type]
     resolved = [
         d for d in rows if d["status"] == "RESOLVED" and d["shadow_decision"] == decision_type
     ]
@@ -162,6 +196,11 @@ def _tick_time_shadow_type_entry(rows: list[dict], decision_type: str) -> dict:
         "n_total": len(pending) + len(resolved),
         "n_pending": len(pending),
         "n_resolved": len(resolved),
+        # Task 9 fix round 1: reported separately, never folded into
+        # n_total/n_pending/n_resolved above - an abandoned row was never
+        # a real pending or resolved outcome (same "separate, not silent"
+        # precedent as profit_protection_report.py's own n_abandoned).
+        "n_abandoned": len(abandoned),
     }
 
     if decision_type in _TICK_SHADOW_CALIBRATION_NOTE_BY_TYPE:
@@ -174,7 +213,9 @@ def _tick_time_shadow_type_entry(rows: list[dict], decision_type: str) -> dict:
     # CLOSE_EARLY - see that function's own docstring). No
     # intervention_applied-style filter: unlike the real
     # guardian_authority_decisions table, this table has no such column
-    # and needs none - see module docstring.
+    # and needs none - see module docstring. (ABANDONED rows are excluded
+    # here on purpose, same as they're excluded from `resolved` above -
+    # they are counted, visibly, via n_abandoned instead, never silently.)
     scored = [d for d in resolved if d.get("expectation_correct") is not None]
     if scored:
         n_correct = sum(1 for d in scored if d["expectation_correct"])
@@ -210,8 +251,9 @@ def _pre_entry_shadow_type_entry(rows: list[dict], decision_type: str) -> dict:
 
 def build_report(repo: Repository) -> dict:
     tick_rows = repo.find_open_guardian_authority_shadows() + repo.find_resolved_guardian_authority_shadows()
+    abandoned_rows = repo.find_abandoned_guardian_authority_shadows()
     tick_time_shadow = {
-        decision_type: _tick_time_shadow_type_entry(tick_rows, decision_type)
+        decision_type: _tick_time_shadow_type_entry(tick_rows, abandoned_rows, decision_type)
         for decision_type in _TICK_SHADOW_DECISION_TYPES
     }
 

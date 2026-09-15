@@ -76,6 +76,10 @@ def _save_pre_entry(repo, shadow_id, decision, confidence=0.8):
     )
 
 
+def _abandon(repo, shadow_id):
+    repo.abandon_guardian_authority_shadow(shadow_id, _NOW)
+
+
 def _resolve_pre_entry(repo, shadow_id, pnl="10"):
     repo.resolve_guardian_authority_pre_entry_shadow(
         shadow_id=shadow_id,
@@ -263,6 +267,51 @@ def test_pre_entry_shadow_counts_no_win_rate_or_brier(tmp_path):
     assert "calibration_note" in veto
     assert "win_rate" not in veto
     assert "brier_score" not in veto
+
+
+def test_abandoned_shadows_counted_separately_not_silently_dropped(tmp_path):
+    """ABANDONED is a fourth, real status on this table (set by
+    `abandon_guardian_authority_shadow` when a shadow's real position
+    vanishes from `open_positions` mid-observation - see
+    `guardian_authority_shadow.py::run_guardian_authority_shadow_tick`'s
+    stranded-shadow handling). It must never be silently excluded from
+    every count in this report the way an earlier version of this module
+    did. A row abandoned while still OBSERVING never reached a decision
+    (shadow_decision stays NULL) and is counted under NO_ACTION's own
+    n_abandoned; a row abandoned after DECIDED carries a real
+    shadow_decision and is counted under that same type's n_abandoned -
+    same mapping the pending/resolved buckets already use."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    # Abandoned while still OBSERVING (no decision ever registered).
+    _seed(repo, shadow_id="pos-1")
+    _abandon(repo, "pos-1")
+
+    # Abandoned after being DECIDED as TIGHTEN_SL (position vanished
+    # before it could ever resolve).
+    _seed(repo, shadow_id="pos-2")
+    _decide(repo, "pos-2", "TIGHTEN_SL")
+    _abandon(repo, "pos-2")
+
+    # Abandoned after being DECIDED as CLOSE_EARLY.
+    _seed(repo, shadow_id="pos-3")
+    _decide(repo, "pos-3", "CLOSE_EARLY", expected_direction="unfavorable")
+    _abandon(repo, "pos-3")
+
+    report = build_report(repo)
+    by_type = report["tick_time_shadow"]
+
+    assert by_type["NO_ACTION"]["n_abandoned"] == 1
+    assert by_type["TIGHTEN_SL"]["n_abandoned"] == 1
+    assert by_type["CLOSE_EARLY"]["n_abandoned"] == 1
+
+    # Abandoned rows are never a real pending or resolved outcome - they
+    # must not leak into n_total/n_pending/n_resolved.
+    assert by_type["NO_ACTION"]["n_total"] == 0
+    assert by_type["NO_ACTION"]["n_pending"] == 0
+    assert by_type["NO_ACTION"]["n_resolved"] == 0
+    assert by_type["TIGHTEN_SL"]["n_total"] == 0
+    assert by_type["CLOSE_EARLY"]["n_total"] == 0
 
 
 def test_active_shadow_heuristics_count(tmp_path):

@@ -362,6 +362,7 @@ class Repository(Protocol):
     ) -> bool: ...
     def abandon_guardian_authority_shadow(self, shadow_id: str, abandoned_at: datetime) -> None: ...
     def find_resolved_guardian_authority_shadows(self) -> list[dict]: ...
+    def find_abandoned_guardian_authority_shadows(self) -> list[dict]: ...
     def find_guardian_authority_shadow_heuristics(self) -> list[dict]: ...
     def upsert_guardian_authority_shadow_heuristic(
         self,
@@ -2237,6 +2238,17 @@ class SQLiteRepository:
         # Consumed by Task 9 and Task 10 (self-critique / reporting).
         rows = self._conn.execute(
             "SELECT * FROM guardian_authority_shadow_observations WHERE status = 'RESOLVED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_abandoned_guardian_authority_shadows(self) -> list[dict]:
+        # Task 9 fix round 1: ABANDONED (set by abandon_guardian_authority_
+        # shadow, above) is a fourth, real, production-reachable status on
+        # this table - a plain read, same SELECT-by-status shape as
+        # find_resolved_guardian_authority_shadows just above, so the
+        # report can count these rows instead of silently dropping them.
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_shadow_observations WHERE status = 'ABANDONED'"
         ).fetchall()
         return [dict(row) for row in rows]
 
