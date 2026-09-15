@@ -56,3 +56,11 @@ authority_enabled: false
 authority_veto_threshold: "0.3"
 authority_tighten_threshold: "0.15"
 authority_close_threshold: "0.45"
+# Guardian Authority Shadow/Observation Mode (2026-09-15, docs/superpowers/
+# plans/2026-09-15-guardian-authority-shadow.md, Task 3): separate,
+# independent boolean flag that gates ONLY the new shadow-observation code
+# paths from this plan. This is a completely distinct flag from
+# authority_enabled above - they have NO interaction between them. Setting
+# authority_shadow_enabled changes zero behavior until a later, separate,
+# explicit activation decision.
+authority_shadow_enabled: false

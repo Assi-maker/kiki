@@ -183,6 +183,16 @@ class GuardianConfig(BaseModel):
     # behavior until a later, separate, explicit activation decision (never
     # made within this plan itself).
     authority_enabled: bool = False
+    # Guardian Authority Shadow/Observation Mode (2026-09-15, docs/superpowers/
+    # plans/2026-09-15-guardian-authority-shadow.md, Task 3): separate,
+    # independent boolean flag that gates ONLY the new shadow-observation code
+    # paths from this plan. This is a completely distinct flag from
+    # authority_enabled - they have NO interaction, and setting one does not
+    # affect the behavior controlled by the other. authority_shadow_enabled
+    # gates only shadow-mode observation/logging; authority_enabled gates the
+    # pre-entry veto and tick-time decisions. Defaults to False - ships inert,
+    # activation is a separate, later, explicit decision.
+    authority_shadow_enabled: bool = False
     # veto_threshold: the summed heuristic score (guardian/authority.py::
     # decide_pre_entry) must STRICTLY exceed this to veto. 0.3 is a
     # deliberately conservative, unvalidated starting point - roughly two

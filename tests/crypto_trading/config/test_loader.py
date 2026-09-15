@@ -323,6 +323,39 @@ def test_get_settings_loads_guardian_authority_yaml_documentation_byte_identical
     assert guardian_cfg.authority_close_threshold == bare_defaults.authority_close_threshold
 
 
+def test_get_settings_loads_guardian_authority_shadow_enabled_default_false():
+    """Guardian Authority Shadow/Observation Mode (2026-09-15,
+    docs/superpowers/plans/2026-09-15-guardian-authority-shadow.md Task 3):
+    add the authority_shadow_enabled flag to gate only the new shadow-
+    observation code paths from this plan, separate and independent from
+    authority_enabled. Must default to False - landing this config flag
+    changes zero runtime behavior until a later, separate, explicit
+    activation decision."""
+    settings = get_settings()
+    assert settings.guardian.authority_shadow_enabled is False
+
+
+def test_get_settings_loads_guardian_authority_shadow_yaml_documentation_byte_identical():
+    """Task 3: config/guardian.yaml now carries an explicit entry for
+    authority_shadow_enabled. The value written to YAML is DELIBERATELY the
+    exact same value already in effect as Pydantic default (GuardianConfig's
+    own field declaration in config/loader.py) - this is a documentation-only
+    change, and this test is the explicit byte-identical-behavior proof:
+    loading the real, running guardian.yaml must produce EXACTLY the same
+    GuardianConfig.authority_shadow_enabled value as the bare Pydantic
+    default, not just "close enough" or "the right type"."""
+    settings = get_settings()
+    guardian_cfg = settings.guardian
+    assert guardian_cfg.authority_shadow_enabled is False
+    # Cross-check directly against the Pydantic model's own bare defaults
+    # (no YAML involved at all) - the two must be identical, proving the
+    # new YAML entry genuinely changed nothing about the resulting config.
+    from crypto_trading.config.loader import GuardianConfig
+
+    bare_defaults = GuardianConfig()
+    assert guardian_cfg.authority_shadow_enabled == bare_defaults.authority_shadow_enabled
+
+
 def test_get_settings_loads_detective_config_from_real_yaml():
     settings = get_settings()
     assert settings.detective.batch_size == 10
