@@ -6,4 +6,4 @@
 # tested thresholds (+1.0%/+1.5%) are NOT configurable here - they are a
 # frozen constant, FROZEN_THRESHOLDS_PCT, in
 # paper_trading/profit_protection_experiment.py (spec G9).
-enabled: false
+enabled: true
