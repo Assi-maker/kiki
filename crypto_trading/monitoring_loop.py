@@ -8,6 +8,9 @@ from typing import Protocol
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.logging import log_event, new_run_id
+from crypto_trading.paper_trading.guardian_authority_shadow import (
+    run_guardian_authority_shadow_tick,
+)
 from crypto_trading.paper_trading.monitoring_catchup import run_monitoring_catchup
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
 from crypto_trading.paper_trading.profit_protection_experiment import (
@@ -98,6 +101,16 @@ def run_monitoring_tick(
         except Exception as exc:
             log_event(
                 run_id, event="profit_protection_experiment_tick_failed",
+                error_type=type(exc).__name__, error=str(exc),
+            )
+        try:
+            if settings.guardian.authority_shadow_enabled:
+                run_guardian_authority_shadow_tick(
+                    repo, open_positions, closed, price_lookup, now, settings, run_id
+                )
+        except Exception as exc:
+            log_event(
+                run_id, event="guardian_authority_shadow_tick_failed",
                 error_type=type(exc).__name__, error=str(exc),
             )
         repo.complete_run(

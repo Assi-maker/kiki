@@ -248,3 +248,162 @@ def test_a_crash_in_the_profit_protection_experiment_never_affects_real_position
     row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
     assert row["status"] == "ok"  # the OUTER try/except never even saw the failure
     assert "profit_protection_experiment_tick_failed" in caplog.text  # (c) failure is logged
+
+
+class _CallRecorder:
+    """Records every call's positional/keyword args, byte-for-byte, so
+    tests can assert object identity (e.g. `is`) on the arguments a mock
+    received - a plain `unittest.mock.Mock` would work too, but a bespoke
+    recorder keeps the assertion below (same `open_positions` object
+    reference) unambiguous and dependency-free."""
+
+    def __init__(self):
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
+def test_run_monitoring_tick_never_calls_guardian_authority_shadow_when_flag_off(
+    tmp_path, monkeypatch
+):
+    """Guardian Authority shadow mode defaults off (GuardianConfig.
+    authority_shadow_enabled = False). This proves flag-off behavior is
+    byte-identical to before this wiring existed: the function is never
+    even called (proven via a call-recorder spy, not just by checking for
+    absent rows afterwards - a spy catches the function being called and
+    happening to no-op internally, which absence-of-rows alone cannot)."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    shadow_spy = _CallRecorder()
+    monkeypatch.setattr(
+        monitoring_loop_module, "run_guardian_authority_shadow_tick", shadow_spy
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    assert settings.guardian.authority_shadow_enabled is False  # baseline assumption
+
+    run_monitoring_tick(connector, repo, settings)
+
+    assert shadow_spy.calls == []  # never called, not "called but no-op"
+    rows = repo._conn.execute(
+        "SELECT COUNT(*) FROM guardian_authority_shadow_observations"
+    ).fetchone()[0]
+    assert rows == 0  # no new DB writes
+
+
+def test_run_monitoring_tick_calls_guardian_authority_shadow_once_with_pre_close_snapshot(
+    tmp_path, monkeypatch
+):
+    """Flag-on: proves (1) run_guardian_authority_shadow_tick is called
+    exactly once per tick, (2) with the same 7 positional arguments
+    run_profit_protection_experiment_tick receives at the same call site,
+    and (3) - the critical integration requirement confirmed by Task 4's
+    reviewer - the `open_positions` object it receives is the EXACT SAME
+    object (`is`, not just `==`) as the one the PP experiment call
+    received: the PRE-close snapshot captured before
+    close_triggered_positions runs, not a post-close-filtered list. If
+    monitoring_loop ever passed a different/rebuilt list to one call than
+    the other, this identity assertion (not just an equality check, which
+    a coincidentally-equal-but-rebuilt list could also pass) would fail."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    pp_spy = _CallRecorder()
+    shadow_spy = _CallRecorder()
+    monkeypatch.setattr(
+        monitoring_loop_module, "run_profit_protection_experiment_tick", pp_spy
+    )
+    monkeypatch.setattr(
+        monitoring_loop_module, "run_guardian_authority_shadow_tick", shadow_spy
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    settings.guardian.authority_shadow_enabled = True
+
+    run_monitoring_tick(connector, repo, settings)
+
+    assert len(pp_spy.calls) == 1
+    assert len(shadow_spy.calls) == 1  # exactly once per tick
+
+    pp_args, pp_kwargs = pp_spy.calls[0]
+    shadow_args, shadow_kwargs = shadow_spy.calls[0]
+    assert pp_kwargs == {}
+    assert shadow_kwargs == {}
+    assert len(pp_args) == 7
+    assert len(shadow_args) == 7
+
+    pp_repo, pp_open_positions, pp_closed, pp_price_lookup, pp_now, pp_settings, pp_run_id = (
+        pp_args
+    )
+    (
+        shadow_repo, shadow_open_positions, shadow_closed, shadow_price_lookup,
+        shadow_now, shadow_settings, shadow_run_id,
+    ) = shadow_args
+
+    assert shadow_repo is pp_repo is repo
+    # the critical pre-close-snapshot requirement: SAME object, not equal-by-value
+    assert shadow_open_positions is pp_open_positions
+    assert shadow_closed is pp_closed
+    assert shadow_price_lookup is pp_price_lookup
+    assert shadow_now == pp_now
+    assert shadow_settings is pp_settings is settings
+    assert shadow_run_id == pp_run_id
+
+
+def test_a_crash_in_guardian_authority_shadow_never_affects_real_position_closing(
+    tmp_path, monkeypatch, caplog
+):
+    """Mirrors test_a_crash_in_the_profit_protection_experiment_never_affects_
+    real_position_closing exactly, but for the Guardian Authority shadow
+    call - in its OWN try/except, so its failure can never be attributable
+    to, or mask, the Profit Protection experiment's own failure handling."""
+    import crypto_trading.monitoring_loop as monitoring_loop_module
+
+    def _raiser(*args, **kwargs):
+        raise RuntimeError("boom - simulated guardian authority shadow failure")
+
+    monkeypatch.setattr(
+        monitoring_loop_module, "run_guardian_authority_shadow_tick", _raiser
+    )
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"))
+    now = datetime.now(UTC)
+    connector = _MonitoringStubConnector(
+        tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "48000", "10000000", _ms(now))},
+        klines={"BTCUSDT": [_raw_kline("48000", _ms(now), high="48500", low="48000")]},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+
+    settings = _settings()
+    settings.guardian.authority_shadow_enabled = True
+
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        closed = run_monitoring_tick(connector, repo, settings)  # must never raise
+
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "stop_loss"
+    assert closed[0].status == "CLOSED"
+    row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'monitoring'").fetchone()
+    assert row["status"] == "ok"  # the OUTER try/except never even saw the failure
+    assert "guardian_authority_shadow_tick_failed" in caplog.text  # failure is logged
+    # and the PP experiment's own failure-handling path was never touched
+    assert "profit_protection_experiment_tick_failed" not in caplog.text
