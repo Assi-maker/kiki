@@ -294,3 +294,125 @@ def test_authority_flag_on_veto_never_opens_a_position(tmp_path):
     assert decision["position_id"] is None
     assert decision["candidate_id"] == "cand-1"
     assert decision["expected_outcome"]
+
+
+# ---------------------------------------------------------------------------
+# Guardian Authority Shadow/Observation Mode (2026-09-15, Task 6: pre-entry
+# shadow hook) - the maybe_record_pre_entry_shadow sibling call wired into
+# sweep_confirmed_candidates_without_position.
+# ---------------------------------------------------------------------------
+
+
+def _shadow_row_count(repo: SQLiteRepository) -> int:
+    row = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM guardian_authority_shadow_pre_entry_observations"
+    ).fetchone()
+    return row["n"]
+
+
+def test_shadow_flag_off_records_nothing(tmp_path):
+    """Default OFF (authority_shadow_enabled is False, the default): the
+    real position still opens exactly as before, and zero shadow rows are
+    ever written - decide_pre_entry is never even called for the shadow
+    path (spy assertion)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _confirmed_candidate()
+    repo.set_recovery_sweep_activated_at_if_missing(_NOW - timedelta(minutes=10))
+    _seed_confirmed_candidate(repo, candidate, confirmed_at=_NOW - timedelta(minutes=5))
+    connector = _TickerStubConnector(tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "50000")})
+    settings = _settings(GuardianConfig(authority_shadow_enabled=False))
+
+    with patch("crypto_trading.guardian.authority.decide_pre_entry") as mock_decide:
+        opened = sweep_confirmed_candidates_without_position(
+            repo, connector, _risk_limits(), _NOW, "run-1", settings,
+        )
+
+    assert len(opened) == 1
+    assert repo.get_position("cand-1") is not None
+    mock_decide.assert_not_called()
+    assert _shadow_row_count(repo) == 0
+
+
+def test_shadow_flag_on_records_row_matching_decide_pre_entry(tmp_path):
+    """Flag True: a shadow row is saved whose shadow_decision/
+    expected_direction/confidence match what decide_pre_entry independently
+    computes for the same candidate evidence + heuristics - not just 'a row
+    exists'. The real position still opens exactly as with the flag off
+    (authority_enabled itself stays default-off here - shadow observation
+    never changes the real outcome)."""
+    from crypto_trading.guardian.authority import _pre_entry_factors, decide_pre_entry
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-shadow-sweep-1",
+        description="price_volatility trigger at high candidate_score has historically lost",
+        condition_json=json.dumps(
+            {"trigger_reasons": ["price_volatility"], "candidate_score_min": 0.5}
+        ),
+        adjustment=0.5, confidence=0.8, sample_size=20, updated_at=_NOW,
+    )
+    candidate = _confirmed_candidate()  # candidate_score=0.8, trigger_reasons=["price_volatility"]
+    repo.set_recovery_sweep_activated_at_if_missing(_NOW - timedelta(minutes=10))
+    _seed_confirmed_candidate(repo, candidate, confirmed_at=_NOW - timedelta(minutes=5))
+    connector = _TickerStubConnector(tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "50000")})
+    settings = _settings(
+        GuardianConfig(authority_shadow_enabled=True, authority_veto_threshold=0.3)
+    )
+    expected = decide_pre_entry(
+        _pre_entry_factors(candidate),
+        repo.find_guardian_authority_heuristics(),
+        settings.guardian.authority_veto_threshold,
+    )
+    expected_decision, expected_outcome, expected_direction, expected_confidence = expected
+    assert expected_decision == "PRE_ENTRY_VETO"  # sanity: heuristic must fire
+
+    opened = sweep_confirmed_candidates_without_position(
+        repo, connector, _risk_limits(), _NOW, "run-1", settings,
+    )
+
+    # Real path unaffected: authority_enabled is default-off, so the
+    # candidate still opens a real position regardless of the shadow decision.
+    assert len(opened) == 1
+    assert repo.get_position("cand-1") is not None
+
+    assert _shadow_row_count(repo) == 1
+    row = repo.get_guardian_authority_pre_entry_shadow("cand-1")
+    assert row is not None
+    assert row["shadow_decision"] == expected_decision
+    assert row["expected_direction"] == expected_direction
+    assert row["confidence"] == expected_confidence
+    assert row["expected_outcome"] == expected_outcome
+
+
+def test_shadow_exception_does_not_block_real_position_open(tmp_path):
+    """A genuine internal failure in the shadow path (here: a malformed
+    condition_json on a heuristic row in the real heuristics table -
+    evaluate_heuristics' own documented json.JSONDecodeError) must never
+    prevent the real maybe_open_position_for_candidate call from running or
+    its result from being used. authority_enabled stays default-off here so
+    the real path's own passthrough branch never touches the heuristics
+    table at all - isolating this to a pure shadow-path failure."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-shadow-sweep-malformed-1",
+        description="malformed on purpose",
+        condition_json="{not valid json",
+        adjustment=0.5, confidence=0.8, sample_size=20, updated_at=_NOW,
+    )
+    candidate = _confirmed_candidate()
+    repo.set_recovery_sweep_activated_at_if_missing(_NOW - timedelta(minutes=10))
+    _seed_confirmed_candidate(repo, candidate, confirmed_at=_NOW - timedelta(minutes=5))
+    connector = _TickerStubConnector(tickers={"BTCUSDT": _raw_ticker("BTCUSDT", "50000")})
+    settings = _settings(
+        GuardianConfig(
+            authority_enabled=False, authority_shadow_enabled=True, authority_veto_threshold=0.3,
+        )
+    )
+
+    opened = sweep_confirmed_candidates_without_position(
+        repo, connector, _risk_limits(), _NOW, "run-1", settings,
+    )  # must not raise
+
+    assert len(opened) == 1
+    assert repo.get_position("cand-1") is not None
+    assert _shadow_row_count(repo) == 0  # the shadow save itself never completed

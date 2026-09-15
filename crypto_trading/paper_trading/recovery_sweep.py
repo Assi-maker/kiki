@@ -4,7 +4,10 @@ from datetime import datetime
 
 from crypto_trading.config.loader import RiskLimitsConfig, Settings
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
-from crypto_trading.guardian.authority import maybe_open_position_for_candidate
+from crypto_trading.guardian.authority import (
+    maybe_open_position_for_candidate,
+    maybe_record_pre_entry_shadow,
+)
 from crypto_trading.logging import log_event
 from crypto_trading.paper_trading.position_opening import open_position_for_candidate
 from crypto_trading.schemas.market import Ticker
@@ -82,4 +85,17 @@ def sweep_confirmed_candidates_without_position(
                 run_id, event="recovery_sweep_position_opened",
                 candidate_id=candidate.candidate_id, position_id=position.position_id,
             )
+        # Task 6 (Guardian Authority Shadow/Observation Mode, 2026-09-15):
+        # purely observational sibling call, placed AFTER `position` has
+        # already been used (the append/log_event above) so that even a
+        # hypothetical violation of maybe_record_pre_entry_shadow's own
+        # "never raises" guarantee could not retroactively affect whether
+        # this candidate's real position was opened/returned. Only reachable
+        # when `settings is not None` - the same gate the real
+        # maybe_open_position_for_candidate call above is already behind
+        # (maybe_record_pre_entry_shadow has a hard, non-optional dependency
+        # on a real Settings object, matching this function's own existing
+        # settings-threading convention documented above).
+        if settings is not None:
+            maybe_record_pre_entry_shadow(candidate, repo, settings, run_id, now)
     return opened

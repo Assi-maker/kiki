@@ -680,3 +680,121 @@ def test_open_positions_for_confirmed_candidates_authority_flag_on_veto_never_op
     assert decision["position_id"] is None
     assert decision["candidate_id"] == "bad-1"
     assert decision["expected_outcome"]
+
+
+# ---------------------------------------------------------------------------
+# Guardian Authority Shadow/Observation Mode (2026-09-15, Task 6: pre-entry
+# shadow hook) - the maybe_record_pre_entry_shadow sibling call wired into
+# _open_positions_for_confirmed_candidates.
+# ---------------------------------------------------------------------------
+
+
+def _shadow_row_count(repo: SQLiteRepository) -> int:
+    row = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM guardian_authority_shadow_pre_entry_observations"
+    ).fetchone()
+    return row["n"]
+
+
+def test_open_positions_shadow_flag_off_records_nothing(tmp_path):
+    """Default OFF (authority_shadow_enabled is False, the default): the
+    real position still opens exactly as before, and zero shadow rows are
+    ever written - decide_pre_entry is never even called for the shadow
+    path (spy assertion)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate, snapshot = _single_candidate_snapshot("healthy-1", "BTCUSDT", "50000")
+    settings = _settings(GuardianConfig(authority_shadow_enabled=False))
+
+    with patch("crypto_trading.guardian.authority.decide_pre_entry") as mock_decide:
+        opened = _open_positions_for_confirmed_candidates(
+            [candidate], snapshot, repo, settings, run_id="run-1"
+        )
+
+    assert [p.position_id for p in opened] == ["healthy-1"]
+    assert repo.get_position("healthy-1") is not None
+    mock_decide.assert_not_called()
+    assert _shadow_row_count(repo) == 0
+
+
+def test_open_positions_shadow_flag_on_records_row_matching_decide_pre_entry(tmp_path):
+    """Flag True: a shadow row is saved whose shadow_decision/
+    expected_direction/confidence match what decide_pre_entry independently
+    computes for the same candidate evidence + heuristics - not just 'a row
+    exists'. The real position still opens exactly as with the flag off
+    (authority_enabled itself stays default-off here - shadow observation
+    never changes the real outcome)."""
+    from crypto_trading.guardian.authority import _pre_entry_factors, decide_pre_entry
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-shadow-replay-1",
+        description="price_volatility trigger at high candidate_score has historically lost",
+        condition_json=json.dumps(
+            {"trigger_reasons": ["price_volatility"], "candidate_score_min": 0.5}
+        ),
+        adjustment=0.5, confidence=0.8, sample_size=20, updated_at=_T0,
+    )
+    candidate, snapshot = _single_candidate_snapshot("shadow-1", "BTCUSDT", "50000")
+    # _single_candidate_snapshot -> _confirmed_candidate_for_instrument uses
+    # candidate_score=0.8, trigger_reasons=["price_volatility"] (see fixture
+    # below) - matches the heuristic above, so decide_pre_entry independently
+    # computes PRE_ENTRY_VETO for these exact inputs.
+    settings = _settings(
+        GuardianConfig(authority_shadow_enabled=True, authority_veto_threshold=0.3)
+    )
+    expected = decide_pre_entry(
+        _pre_entry_factors(candidate),
+        repo.find_guardian_authority_heuristics(),
+        settings.guardian.authority_veto_threshold,
+    )
+    expected_decision, expected_outcome, expected_direction, expected_confidence = expected
+    assert expected_decision == "PRE_ENTRY_VETO"  # sanity: heuristic must fire
+
+    opened = _open_positions_for_confirmed_candidates(
+        [candidate], snapshot, repo, settings, run_id="run-1"
+    )
+
+    # Real path unaffected: authority_enabled is default-off, so the
+    # candidate still opens a real position regardless of what the shadow
+    # decision says.
+    assert [p.position_id for p in opened] == ["shadow-1"]
+    assert repo.get_position("shadow-1") is not None
+
+    assert _shadow_row_count(repo) == 1
+    row = repo.get_guardian_authority_pre_entry_shadow("shadow-1")
+    assert row is not None
+    assert row["shadow_decision"] == expected_decision
+    assert row["expected_direction"] == expected_direction
+    assert row["confidence"] == expected_confidence
+    assert row["expected_outcome"] == expected_outcome
+
+
+def test_open_positions_shadow_exception_does_not_block_real_position_open(tmp_path):
+    """A genuine internal failure in the shadow path (here: a malformed
+    condition_json on a heuristic row in the real heuristics table -
+    evaluate_heuristics' own documented json.JSONDecodeError) must never
+    prevent the real maybe_open_position_for_candidate call from running or
+    its result from being used. authority_enabled stays default-off here so
+    the real path's own passthrough branch never touches the heuristics
+    table at all - isolating this to a pure shadow-path failure."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-shadow-malformed-1",
+        description="malformed on purpose",
+        condition_json="{not valid json",
+        adjustment=0.5, confidence=0.8, sample_size=20, updated_at=_T0,
+    )
+    candidate, snapshot = _single_candidate_snapshot("shadow-2", "BTCUSDT", "50000")
+    settings = _settings(
+        GuardianConfig(
+            authority_enabled=False, authority_shadow_enabled=True, authority_veto_threshold=0.3,
+        )
+    )
+
+    opened = _open_positions_for_confirmed_candidates(
+        [candidate], snapshot, repo, settings, run_id="run-1"
+    )  # must not raise
+
+    assert [p.position_id for p in opened] == ["shadow-2"]
+    assert repo.get_position("shadow-2") is not None
+    assert _shadow_row_count(repo) == 0  # the shadow save itself never completed

@@ -502,6 +502,83 @@ def maybe_open_position_for_candidate(
     )
 
 
+def maybe_record_pre_entry_shadow(
+    candidate: Candidate,
+    repo: Repository,
+    settings: Settings,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Pre-entry SHADOW observation (2026-09-15, Guardian Authority Shadow/
+    Observation Mode, Task 6). Purely observational sibling of
+    `maybe_open_position_for_candidate` above - logs what `decide_pre_entry`
+    WOULD have decided for `candidate`, without ever influencing whether the
+    candidate actually opens. Gated by `settings.guardian.
+    authority_shadow_enabled`, a flag completely independent of `settings.
+    guardian.authority_enabled` (the real pre-entry veto's own flag) - the
+    two have no interaction, and this function's own behavior is identical
+    regardless of whether the real veto is on, off, approving, or vetoing.
+
+    Ships default OFF: with the flag False (the default), this is a
+    zero-I/O no-op (the first line returns before `_pre_entry_factors`,
+    `repo.find_guardian_authority_heuristics()`, or `decide_pre_entry` are
+    ever touched).
+
+    When enabled, builds the exact same candidate evidence
+    (`_pre_entry_factors`) and reads the exact same, real heuristics table
+    (`repo.find_guardian_authority_heuristics()`) the real veto path itself
+    reads - reusing the real table is safe here specifically because this
+    function only ever READS it, never writes to it, so it cannot corrupt or
+    bias what the real veto path later sees. Calls the real, unmodified
+    `decide_pre_entry` and saves its full output via `repo.
+    save_guardian_authority_pre_entry_shadow`. `shadow_id` and `candidate_id`
+    are both `candidate.candidate_id` (Task 2's own ruling: `position_id ==
+    candidate_id` always in this codebase, so `shadow_id` doubles as the
+    future position_id lookup key a later resolution pass would use).
+
+    MUST NEVER RAISE - this is the one invariant this whole function exists
+    to guarantee, belt-and-suspenders on top of the fact that callers only
+    ever invoke this as a sibling call AFTER the real
+    `maybe_open_position_for_candidate` result has already been used (see
+    replay.py/recovery_sweep.py call sites), so a raise here could never
+    actually reach back and undo a real position open - but nothing about
+    this function's own body is trusted to honor that on its own merits: any
+    exception anywhere in the body below (a malformed heuristic row's
+    `condition_json`, a malformed candidate evidence field, a database
+    error) is caught here and logged via `log_event` (event
+    `guardian_authority_pre_entry_shadow_failed`), never propagated."""
+    if not settings.guardian.authority_shadow_enabled:
+        return
+
+    try:
+        candidate_evidence = _pre_entry_factors(candidate)
+        heuristics = repo.find_guardian_authority_heuristics()
+        decision, expected_outcome, expected_direction, confidence = decide_pre_entry(
+            candidate_evidence, heuristics, settings.guardian.authority_veto_threshold,
+        )
+        repo.save_guardian_authority_pre_entry_shadow(
+            shadow_id=candidate.candidate_id,
+            candidate_id=candidate.candidate_id,
+            instrument=candidate.instrument,
+            shadow_decision=decision,
+            expected_outcome=expected_outcome,
+            expected_direction=expected_direction,
+            confidence=confidence,
+            factors_json=json.dumps(candidate_evidence),
+            run_id=run_id,
+            created_at=now,
+        )
+    except Exception as exc:
+        log_event(
+            run_id,
+            event="guardian_authority_pre_entry_shadow_failed",
+            candidate_id=candidate.candidate_id,
+            instrument=candidate.instrument,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+
+
 def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
     """Resolution pass (Task 8). NOT part of the pure decision core above
     (see module docstring) - this is I/O, the same sanctioned kind as

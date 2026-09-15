@@ -9,7 +9,10 @@ from pydantic import BaseModel
 from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
-from crypto_trading.guardian.authority import maybe_open_position_for_candidate
+from crypto_trading.guardian.authority import (
+    maybe_open_position_for_candidate,
+    maybe_record_pre_entry_shadow,
+)
 from crypto_trading.logging import log_event
 from crypto_trading.orchestrator import run_discovery_cycle
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
@@ -222,6 +225,17 @@ def _open_positions_for_confirmed_candidates(
             continue
         if position is not None:
             opened.append(position)
+        # Task 6 (Guardian Authority Shadow/Observation Mode, 2026-09-15):
+        # purely observational sibling call, placed AFTER `position` has
+        # already been used (the append above) so that even a hypothetical
+        # violation of maybe_record_pre_entry_shadow's own "never raises"
+        # guarantee could not retroactively affect whether this candidate's
+        # real position was opened/returned - it is a genuine no-op on the
+        # real code path in every respect but timing. Never gated behind a
+        # branch that could be skipped while maybe_open_position_for_
+        # candidate still proceeds - this candidate's real outcome is fully
+        # decided by this point either way.
+        maybe_record_pre_entry_shadow(candidate, repo, settings, run_id, snapshot.simulated_now)
     return opened
 
 

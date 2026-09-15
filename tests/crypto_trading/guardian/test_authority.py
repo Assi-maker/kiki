@@ -16,11 +16,13 @@ from crypto_trading.config.loader import (
 )
 from crypto_trading.guardian.authority import (
     _groups_for_factors,
+    _pre_entry_factors,
     _reconstruct_tighten_sl_factors,
     decide_open_position,
     decide_pre_entry,
     evaluate_heuristics,
     maybe_open_position_for_candidate,
+    maybe_record_pre_entry_shadow,
     resolve_pending_decisions,
     update_heuristics_from_resolved_decisions,
 )
@@ -718,6 +720,143 @@ def test_maybe_open_position_flag_on_veto_saves_intervention_applied_true(tmp_pa
     decision = dict(decisions[0])
     assert decision["decision_type"] == "PRE_ENTRY_VETO"
     assert decision["intervention_applied"] == 1
+
+
+# ---------------------------------------------------------------------------
+# maybe_record_pre_entry_shadow (Guardian Authority Shadow/Observation Mode,
+# 2026-09-15, Task 6: pre-entry shadow hook)
+# ---------------------------------------------------------------------------
+
+
+def _shadow_row(repo: SQLiteRepository, candidate_id: str) -> dict | None:
+    return repo.get_guardian_authority_pre_entry_shadow(candidate_id)
+
+
+def _shadow_row_count(repo: SQLiteRepository) -> int:
+    row = repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM guardian_authority_shadow_pre_entry_observations"
+    ).fetchone()
+    return row["n"]
+
+
+def test_maybe_record_pre_entry_shadow_flag_off_is_a_complete_noop(tmp_path):
+    """Default OFF (authority_shadow_enabled is False, the default): zero
+    rows saved, and decide_pre_entry is never even called - the function
+    returns on its very first line, before any I/O (heuristics read
+    included)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _confirmed_candidate()
+    settings = _settings(GuardianConfig(authority_shadow_enabled=False))
+
+    with patch("crypto_trading.guardian.authority.decide_pre_entry") as mock_decide:
+        maybe_record_pre_entry_shadow(candidate, repo, settings, "run-1", _NOW)
+
+    mock_decide.assert_not_called()
+    assert _shadow_row_count(repo) == 0
+
+
+def test_maybe_record_pre_entry_shadow_flag_on_approve_matches_decide_pre_entry(tmp_path):
+    """Flag True, zero heuristics match -> decide_pre_entry independently
+    computes APPROVE/neutral/1.0. The saved shadow row's shadow_decision/
+    expected_direction/confidence must match that independently-computed
+    tuple exactly, not just 'a row exists'."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _confirmed_candidate(candidate_id="cand-shadow-1")
+    settings = _settings(GuardianConfig(authority_shadow_enabled=True, authority_veto_threshold=0.3))
+
+    expected_decision, expected_outcome, expected_direction, expected_confidence = decide_pre_entry(
+        _pre_entry_factors(candidate),
+        repo.find_guardian_authority_heuristics(),
+        settings.guardian.authority_veto_threshold,
+    )
+    assert expected_decision == "APPROVE"  # sanity: zero heuristics in this fresh repo
+
+    maybe_record_pre_entry_shadow(candidate, repo, settings, "run-1", _NOW)
+
+    assert _shadow_row_count(repo) == 1
+    row = _shadow_row(repo, "cand-shadow-1")
+    assert row is not None
+    assert row["shadow_decision"] == expected_decision
+    assert row["expected_direction"] == expected_direction
+    assert row["confidence"] == pytest.approx(expected_confidence)
+    assert row["expected_outcome"] == expected_outcome
+    assert row["candidate_id"] == "cand-shadow-1"
+    assert row["instrument"] == "BTCUSDT"
+    assert row["run_id"] == "run-1"
+    assert json.loads(row["factors_json"]) == _pre_entry_factors(candidate)
+
+
+def test_maybe_record_pre_entry_shadow_flag_on_veto_matches_decide_pre_entry(tmp_path):
+    """Same cross-check as above, but with a heuristic present that pushes
+    the summed score past veto_threshold -> decide_pre_entry independently
+    computes PRE_ENTRY_VETO/unfavorable/<weighted confidence>. Proves the
+    shadow row reflects the REAL decide_pre_entry output for these inputs,
+    not a hardcoded/default value."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-shadow-veto-1",
+        description="momentum breakout at a very low candidate_score has historically lost",
+        condition_json=json.dumps(
+            {"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.1}
+        ),
+        adjustment=0.5,
+        confidence=0.8,
+        sample_size=20,
+        updated_at=_NOW,
+    )
+    candidate = _confirmed_candidate(
+        candidate_id="cand-shadow-2", candidate_score=0.05, trigger_reasons=["momentum_breakout"]
+    )
+    settings = _settings(GuardianConfig(authority_shadow_enabled=True, authority_veto_threshold=0.3))
+
+    expected_decision, expected_outcome, expected_direction, expected_confidence = decide_pre_entry(
+        _pre_entry_factors(candidate),
+        repo.find_guardian_authority_heuristics(),
+        settings.guardian.authority_veto_threshold,
+    )
+    assert expected_decision == "PRE_ENTRY_VETO"  # sanity: the heuristic above must fire
+
+    maybe_record_pre_entry_shadow(candidate, repo, settings, "run-1", _NOW)
+
+    assert _shadow_row_count(repo) == 1
+    row = _shadow_row(repo, "cand-shadow-2")
+    assert row is not None
+    assert row["shadow_decision"] == "PRE_ENTRY_VETO" == expected_decision
+    assert row["expected_direction"] == "unfavorable" == expected_direction
+    assert row["confidence"] == pytest.approx(expected_confidence)
+    assert row["expected_outcome"] == expected_outcome
+
+
+def test_maybe_record_pre_entry_shadow_never_raises_and_logs_on_internal_failure(tmp_path):
+    """A genuine internal failure (here: a malformed condition_json on a
+    heuristic row already in the REAL heuristics table - the same
+    json.JSONDecodeError evaluate_heuristics' own docstring documents as
+    propagated, not caught, at that layer) must be caught inside
+    maybe_record_pre_entry_shadow itself: the function must not raise, must
+    save no shadow row, and must log the failure via log_event under event
+    'guardian_authority_pre_entry_shadow_failed'."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-malformed-1",
+        description="malformed on purpose",
+        condition_json="{not valid json",
+        adjustment=0.5,
+        confidence=0.8,
+        sample_size=20,
+        updated_at=_NOW,
+    )
+    candidate = _confirmed_candidate(candidate_id="cand-shadow-3")
+    settings = _settings(GuardianConfig(authority_shadow_enabled=True, authority_veto_threshold=0.3))
+
+    with patch("crypto_trading.guardian.authority.log_event") as mock_log_event:
+        result = maybe_record_pre_entry_shadow(candidate, repo, settings, "run-1", _NOW)  # must not raise
+
+    assert result is None
+    assert _shadow_row_count(repo) == 0
+    assert mock_log_event.call_count == 1
+    _, kwargs = mock_log_event.call_args
+    assert kwargs["event"] == "guardian_authority_pre_entry_shadow_failed"
+    assert kwargs["candidate_id"] == "cand-shadow-3"
 
 
 # --------------------------------------------------------------------------
