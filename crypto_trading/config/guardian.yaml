@@ -57,10 +57,19 @@ authority_veto_threshold: "0.3"
 authority_tighten_threshold: "0.15"
 authority_close_threshold: "0.45"
 # Guardian Authority Shadow/Observation Mode (2026-09-15, docs/superpowers/
-# plans/2026-09-15-guardian-authority-shadow.md, Task 3): separate,
-# independent boolean flag that gates ONLY the new shadow-observation code
-# paths from this plan. This is a completely distinct flag from
-# authority_enabled above - they have NO interaction between them. Setting
-# authority_shadow_enabled changes zero behavior until a later, separate,
-# explicit activation decision.
-authority_shadow_enabled: false
+# plans/2026-09-15-guardian-authority-shadow.md, Task 11 activation):
+# separate, independent boolean flag that gates ONLY the new shadow-
+# observation code paths from this plan. This is a completely distinct flag
+# from authority_enabled above - they have NO interaction between them.
+# ACTIVATED 2026-09-15 after all 10 code tasks + final whole-branch review
+# (no Critical findings; 3 Important findings fixed, re-reviewed clean) -
+# real PAPER positions are unaffected: no write to positions/
+# guardian_authority_decisions/guardian_authority_heuristics, no
+# open_position_for_candidate/tighten_position_stop_loss/cancel_order/
+# place_stop_loss_order/set_leverage call anywhere in the new code
+# (grep-provable, independently re-verified by the final review). This
+# turns ON hypothetical PAPER decision logging (incl. hypothetical
+# NO_ACTION) so real data accumulates for future human-reviewed evaluation -
+# it does NOT make Guardian Authority act on anything for real; authority_
+# enabled above stays false, LIVE stays completely untouched.
+authority_shadow_enabled: true
