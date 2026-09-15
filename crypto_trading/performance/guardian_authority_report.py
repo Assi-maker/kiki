@@ -57,7 +57,8 @@ _CALIBRATION_NOTE_BY_TYPE = {
 
 _NO_TIGHTEN_SL_DATA_YET_NOTE = (
     "No TIGHTEN_SL decisions have been scored yet (no resolved decisions "
-    "of this type with a non-null expectation_correct)."
+    "of this type with a non-null expectation_correct AND a genuine "
+    "applied intervention - intervention_applied is True)."
 )
 
 
@@ -75,15 +76,43 @@ def _decision_type_entry(rows: list[dict], decision_type: str) -> dict:
         return entry
 
     # TIGHTEN_SL - the only type for which expectation_correct is ever
-    # non-null (Task 8/9's own ruling). Only compute a real rate where it
-    # is actually non-null for at least one row; otherwise show why not,
-    # rather than a misleading 0%/bare null.
-    scored = [d for d in rows if d.get("expectation_correct") is not None]
+    # non-null (Task 8/9's own ruling). Only compute real figures where a
+    # row is both scored (non-null expectation_correct) AND a genuine
+    # applied intervention (intervention_applied is True, added by the I2
+    # hardening fix) - excludes decisions that were never actually applied
+    # to the live stop-loss, e.g. a failed write. SQLite round-trips a
+    # stored True as Python int 1, not the True singleton, hence bool(...)
+    # rather than `is True`. Otherwise show why not, rather than a
+    # misleading 0%/bare null.
+    scored = [
+        d
+        for d in rows
+        if d.get("expectation_correct") is not None and bool(d.get("intervention_applied"))
+    ]
     if scored:
         n_correct = sum(1 for d in scored if d["expectation_correct"])
         entry["n_scored"] = len(scored)
         entry["n_correct"] = n_correct
-        entry["calibration_rate"] = n_correct / len(scored)
+        entry["win_rate"] = n_correct / len(scored)
+        # I3 hardening fix (2026-09-15): a genuine Brier score, computed
+        # entirely from already-persisted data - zero new schema. For
+        # TIGHTEN_SL, expected_direction is a documented constant
+        # ("favorable"), so expectation_correct == actual_favorable
+        # exactly, letting brier_component reduce to
+        # (confidence - (1.0 if expectation_correct else 0.0)) ** 2 per
+        # decision. 0 = perfect calibration, 0.25 = uninformative constant
+        # baseline, 1 = maximally miscalibrated. Evaluates whether the
+        # VARYING confidence signal is well-calibrated, not just whether
+        # TIGHTEN_SL wins on average (win_rate above). Same filtered
+        # population as win_rate, per the controller's population-
+        # consistency ruling - both describe the same set of decisions.
+        entry["brier_score"] = (
+            sum(
+                (d["confidence"] - (1.0 if d["expectation_correct"] else 0.0)) ** 2
+                for d in scored
+            )
+            / len(scored)
+        )
     else:
         entry["calibration_note"] = _NO_TIGHTEN_SL_DATA_YET_NOTE
 

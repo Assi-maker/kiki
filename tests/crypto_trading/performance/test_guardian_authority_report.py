@@ -1,5 +1,7 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from crypto_trading.performance.guardian_authority_report import build_report
 from crypto_trading.storage.repository import SQLiteRepository
 
@@ -24,9 +26,11 @@ def test_empty_db_produces_valid_report_with_zero_counts_and_notes(tmp_path):
         assert entry["n_pending"] == 0
         assert entry["n_resolved"] == 0
     assert "calibration_note" in report["decision_types"]["PRE_ENTRY_VETO"]
-    assert "calibration_rate" not in report["decision_types"]["PRE_ENTRY_VETO"]
+    assert "win_rate" not in report["decision_types"]["PRE_ENTRY_VETO"]
+    assert "brier_score" not in report["decision_types"]["PRE_ENTRY_VETO"]
     assert "calibration_note" in report["decision_types"]["CLOSE_EARLY"]
-    assert "calibration_rate" not in report["decision_types"]["CLOSE_EARLY"]
+    assert "win_rate" not in report["decision_types"]["CLOSE_EARLY"]
+    assert "brier_score" not in report["decision_types"]["CLOSE_EARLY"]
 
 
 def test_mixed_decisions_produce_correct_counts_and_calibration_only_for_tighten_sl(tmp_path):
@@ -46,7 +50,7 @@ def test_mixed_decisions_produce_correct_counts_and_calibration_only_for_tighten
     repo.save_guardian_authority_decision(
         "tighten-1", "pos-1", "cand-3", "TIGHTEN_SL", _NOW,
         "decay", "expect small favorable move", "favorable", 0.7, "run-1",
-        old_sl="49000", new_sl="49500",
+        old_sl="49000", new_sl="49500", intervention_applied=True,
     )
     repo.resolve_guardian_authority_decision(
         "tighten-1", "stop_loss", "120", True, _NOW,
@@ -54,7 +58,7 @@ def test_mixed_decisions_produce_correct_counts_and_calibration_only_for_tighten
     repo.save_guardian_authority_decision(
         "tighten-2", "pos-2", "cand-4", "TIGHTEN_SL", _NOW,
         "decay", "expect small favorable move", "favorable", 0.65, "run-1",
-        old_sl="48000", new_sl="48500",
+        old_sl="48000", new_sl="48500", intervention_applied=True,
     )
     repo.resolve_guardian_authority_decision(
         "tighten-2", "stop_loss", "-40", False, _NOW,
@@ -88,7 +92,8 @@ def test_mixed_decisions_produce_correct_counts_and_calibration_only_for_tighten
     assert veto["n_pending"] == 2
     assert veto["n_resolved"] == 0
     assert "calibration_note" in veto
-    assert "calibration_rate" not in veto
+    assert "win_rate" not in veto
+    assert "brier_score" not in veto
 
     tighten = by_type["TIGHTEN_SL"]
     assert tighten["n_total"] == 3
@@ -96,7 +101,12 @@ def test_mixed_decisions_produce_correct_counts_and_calibration_only_for_tighten
     assert tighten["n_resolved"] == 2
     assert tighten["n_scored"] == 2
     assert tighten["n_correct"] == 1
-    assert tighten["calibration_rate"] == 1 / 2
+    assert tighten["win_rate"] == 1 / 2
+    # Hand-computed: tighten-1 confidence=0.7, expectation_correct=True ->
+    # (0.7 - 1.0) ** 2 = 0.09. tighten-2 confidence=0.65,
+    # expectation_correct=False -> (0.65 - 0.0) ** 2 = 0.4225.
+    # mean = (0.09 + 0.4225) / 2 = 0.25625.
+    assert tighten["brier_score"] == pytest.approx(0.25625)
     assert "calibration_note" not in tighten
 
     close_early = by_type["CLOSE_EARLY"]
@@ -104,7 +114,43 @@ def test_mixed_decisions_produce_correct_counts_and_calibration_only_for_tighten
     assert close_early["n_pending"] == 1
     assert close_early["n_resolved"] == 1
     assert "calibration_note" in close_early
-    assert "calibration_rate" not in close_early
+    assert "win_rate" not in close_early
+    assert "brier_score" not in close_early
+
+
+def test_tighten_sl_without_genuine_intervention_excluded_from_win_rate_and_brier(tmp_path):
+    """A resolved, scored (non-null expectation_correct) TIGHTEN_SL decision
+    that was never a genuine applied intervention (intervention_applied is
+    False or still None - e.g. the tighten write itself failed or was never
+    attempted) must NOT count toward n_scored/win_rate/brier_score. An
+    unfiltered computation over this fixture would show win_rate=1.0 (the
+    lone resolved+scored row is "correct") and brier_score=0.0 (perfect
+    calibration) - the filtered computation must instead fall back to the
+    calibration_note branch, proving intervention_applied actually changes
+    this report's output, not just I2's own already-reviewed authority.py
+    test."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+
+    # intervention_applied left at its default (None) - never actually
+    # applied to the live stop-loss, e.g. the write attempt failed.
+    repo.save_guardian_authority_decision(
+        "tighten-unapplied", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "decay", "expect small favorable move", "favorable", 0.9, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+    repo.resolve_guardian_authority_decision(
+        "tighten-unapplied", "stop_loss", "120", True, _NOW,
+    )
+
+    report = build_report(repo)
+    tighten = report["decision_types"]["TIGHTEN_SL"]
+
+    assert tighten["n_total"] == 1
+    assert tighten["n_resolved"] == 1
+    assert "n_scored" not in tighten
+    assert "win_rate" not in tighten
+    assert "brier_score" not in tighten
+    assert "calibration_note" in tighten
 
 
 def test_active_heuristics_count(tmp_path):
