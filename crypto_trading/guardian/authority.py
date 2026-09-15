@@ -465,6 +465,16 @@ def maybe_open_position_for_candidate(
     )
 
     if decision == "PRE_ENTRY_VETO":
+        # Task 2 (2026-09-15, Guardian Authority Live Autonomy): a second,
+        # duplicate, side-effect-free evaluate_heuristics call purely to
+        # recover the matched_ids decide_pre_entry already computed
+        # internally (and discarded after building its own expected_outcome
+        # text). No guardian_state merge here - unlike decide_open_position,
+        # decide_pre_entry matches directly against the candidate's own
+        # evidence. Costs one extra cheap pure-function call per real
+        # decision; does not touch decide_pre_entry/evaluate_heuristics
+        # themselves.
+        _, matched_ids = evaluate_heuristics(_pre_entry_factors(candidate), heuristics)
         decision_id = f"ga:pre_entry:{candidate.candidate_id}:{opened_at.isoformat()}"
         repo.save_guardian_authority_decision(
             decision_id=decision_id,
@@ -490,6 +500,7 @@ def maybe_open_position_for_candidate(
             # (unlike TIGHTEN_SL, whose write-attempt outcome is only known
             # moments later - see guardian/tick.py::process_one_position).
             intervention_applied=True,
+            matched_heuristic_ids_json=json.dumps(matched_ids),
         )
         log_event(
             run_id, event="ga_pre_entry_veto", candidate_id=candidate.candidate_id,

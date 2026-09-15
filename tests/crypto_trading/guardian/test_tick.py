@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
@@ -904,6 +905,81 @@ def test_authority_tighten_sl_live_intervention_applied_true_only_for_the_claimi
     assert decisions[tick2_now.isoformat()]["decision_type"] == "TIGHTEN_SL"
     assert decisions[tick1_now.isoformat()]["intervention_applied"] == 1
     assert decisions[tick2_now.isoformat()]["intervention_applied"] == 0
+
+
+# --------------------------------------------------------------------------
+# Task 2 (2026-09-15, Guardian Authority Live Autonomy):
+# matched_heuristic_ids_json - a forward-tracking column recording exactly
+# which heuristic_ids evaluate_heuristics matched to produce this real
+# TIGHTEN_SL/CLOSE_EARLY decision, so a later task can measure each
+# heuristic's own real-world track record. Captured via a second, duplicate,
+# side-effect-free evaluate_heuristics call at this orchestration layer -
+# decide_open_position itself is untouched (see guardian/authority.py's own
+# equivalent PRE_ENTRY_VETO tests for the sibling proof).
+# --------------------------------------------------------------------------
+
+
+def test_authority_tighten_sl_records_both_matched_heuristic_ids(tmp_path):
+    """Two genuinely-matching always-on heuristics (h-1 + h-2, adjustments
+    0.1 + 0.1 = 0.2) push the score above authority_tighten_threshold (0.15)
+    but not above authority_close_threshold (0.45) -> TIGHTEN_SL. Both
+    heuristic_ids must be recorded, in the order find_guardian_authority_
+    heuristics returned them (same order evaluate_heuristics itself iterates
+    in)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _seed_always_on_heuristic(repo, heuristic_id="h-1", adjustment=0.1)
+    _seed_always_on_heuristic(repo, heuristic_id="h-2", adjustment=0.1)
+    connector = _StubConnector(price="100")
+
+    with patch("crypto_trading.guardian.tick.apply_live_sl_tightening"):
+        run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+    assert json.loads(decisions[0]["matched_heuristic_ids_json"]) == ["h-1", "h-2"]
+
+
+def test_authority_close_early_records_both_matched_heuristic_ids(tmp_path):
+    """Two genuinely-matching always-on heuristics (h-1 + h-2, adjustments
+    0.3 + 0.2 = 0.5) push the score above authority_close_threshold (0.45)
+    -> CLOSE_EARLY. Both heuristic_ids must be recorded."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _seed_always_on_heuristic(repo, heuristic_id="h-1", adjustment=0.3)
+    _seed_always_on_heuristic(repo, heuristic_id="h-2", adjustment=0.2)
+    connector = _StubConnector(price="100")
+
+    run_guardian_tick_body(repo, connector, _FakeRunner(), _authority_settings(), "run-1", _NOW)
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "CLOSE_EARLY"
+    assert json.loads(decisions[0]["matched_heuristic_ids_json"]) == ["h-1", "h-2"]
+
+
+def test_authority_decision_with_zero_matched_heuristics_records_empty_list(tmp_path):
+    """Not a decision shape that occurs under normal (non-negative)
+    threshold configuration - decide_open_position's score is a sum of
+    matched heuristics' own adjustments, so a strictly-positive score
+    normally requires at least one match. This proves the zero-matched case
+    is nonetheless handled gracefully (an empty list, never a crash or
+    None-where-a-list-was-expected) by using a deliberately negative
+    authority_tighten_threshold, which a zero-heuristics/score=0.0 tick
+    still exceeds."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)  # zero heuristics seeded
+    connector = _StubConnector(price="100")
+    settings = _authority_settings(tighten_threshold=-1.0, close_threshold=0.45)
+
+    with patch("crypto_trading.guardian.tick.apply_live_sl_tightening"):
+        run_guardian_tick_body(repo, connector, _FakeRunner(), settings, "run-1", _NOW)
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+    assert decisions[0]["matched_heuristic_ids_json"] == "[]"
 
 
 # --------------------------------------------------------------------------

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from decimal import Decimal
 
@@ -10,6 +11,7 @@ from crypto_trading.connectors.bingx_live_trading import BingXLiveTradingConnect
 from crypto_trading.guardian.ai_context import build_ai_context, should_invoke_ai
 from crypto_trading.guardian.authority import (
     decide_open_position,
+    evaluate_heuristics,
     resolve_pending_decisions,
     update_heuristics_from_resolved_decisions,
 )
@@ -114,6 +116,16 @@ def process_one_position(
             )
         )
         if decision != "NO_ACTION":
+            # Task 2 (2026-09-15, Guardian Authority Live Autonomy): a
+            # second, duplicate, side-effect-free evaluate_heuristics call
+            # purely to recover the matched_ids decide_open_position already
+            # computed internally (and discarded after building its own
+            # expected_outcome text) - reconstructed identically to
+            # decide_open_position's own internal merge (factors +
+            # guardian_state), so the SAME heuristics match. Costs one extra
+            # cheap pure-function call per real decision; does not touch
+            # decide_open_position/evaluate_heuristics themselves.
+            _, matched_ids = evaluate_heuristics({**factors, "guardian_state": new_state}, heuristics)
             decision_id = f"ga:{position.position_id}:{now.isoformat()}"
             # I2 hardening fix (2026-09-14): CLOSE_EARLY's write
             # (repo.save_guardian_observation with state="EXIT", below) is
@@ -142,6 +154,7 @@ def process_one_position(
                 old_sl=str(position.stop_loss),
                 new_sl=str(proposed_sl) if proposed_sl is not None else None,
                 intervention_applied=intervention_applied,
+                matched_heuristic_ids_json=json.dumps(matched_ids),
             )
             if decision == "TIGHTEN_SL":
                 # Same LIVE/PAPER branch Profit Protection itself uses: an

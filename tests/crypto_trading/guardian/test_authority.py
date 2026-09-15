@@ -723,6 +723,86 @@ def test_maybe_open_position_flag_on_veto_saves_intervention_applied_true(tmp_pa
     assert decision["intervention_applied"] == 1
 
 
+# --------------------------------------------------------------------------
+# Task 2 (2026-09-15, Guardian Authority Live Autonomy):
+# matched_heuristic_ids_json - a forward-tracking column recording exactly
+# which heuristic_ids evaluate_heuristics matched to produce this real
+# PRE_ENTRY_VETO decision, so a later task can measure each heuristic's own
+# real-world track record. Captured via a second, duplicate, side-effect-
+# free evaluate_heuristics call at this orchestration layer -
+# decide_pre_entry itself is untouched.
+# --------------------------------------------------------------------------
+
+
+def test_maybe_open_position_flag_on_veto_records_both_matched_heuristic_ids(tmp_path):
+    """Two genuinely-matching heuristics (h-veto-mh-1 + h-veto-mh-2, each
+    matching the candidate's own trigger_reasons/candidate_score, adjustments
+    0.2 + 0.2 = 0.4) push the score above authority_veto_threshold (0.3) ->
+    PRE_ENTRY_VETO. Both heuristic_ids must be recorded, in the order
+    find_guardian_authority_heuristics returned them."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-veto-mh-1",
+        description="momentum breakout at a very low candidate_score has historically lost",
+        condition_json=json.dumps(
+            {"trigger_reasons": ["momentum_breakout"], "candidate_score_max": 0.1}
+        ),
+        adjustment=0.2,
+        confidence=0.8,
+        sample_size=20,
+        updated_at=_NOW,
+    )
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="h-veto-mh-2",
+        description="a second, independently-agreeing heuristic on the same pattern",
+        condition_json=json.dumps({"instrument": "BTCUSDT"}),
+        adjustment=0.2,
+        confidence=0.8,
+        sample_size=20,
+        updated_at=_NOW,
+    )
+    candidate = _confirmed_candidate(candidate_score=0.05, trigger_reasons=["momentum_breakout"])
+    settings = _settings(GuardianConfig(authority_enabled=True, authority_veto_threshold=0.3))
+
+    with patch("crypto_trading.guardian.authority.open_position_for_candidate"):
+        maybe_open_position_for_candidate(
+            repo, candidate, settings.risk_limits, Decimal("50000"), _NOW, "run-1", settings
+        )
+
+    decisions = repo._conn.execute("SELECT * FROM guardian_authority_decisions").fetchall()
+    assert len(decisions) == 1
+    decision = dict(decisions[0])
+    assert decision["decision_type"] == "PRE_ENTRY_VETO"
+    assert json.loads(decision["matched_heuristic_ids_json"]) == ["h-veto-mh-1", "h-veto-mh-2"]
+
+
+def test_maybe_open_position_flag_on_veto_with_zero_matched_heuristics_records_empty_list(
+    tmp_path,
+):
+    """Not a decision shape that occurs under normal (non-negative)
+    threshold configuration - decide_pre_entry's score is a sum of matched
+    heuristics' own adjustments, so a strictly-positive score normally
+    requires at least one match. This proves the zero-matched case is
+    nonetheless handled gracefully (an empty list, never a crash or
+    None-where-a-list-was-expected) by using a deliberately negative
+    authority_veto_threshold, which a zero-heuristics/score=0.0 candidate
+    still exceeds."""
+    repo = SQLiteRepository(tmp_path / "t.db")  # zero heuristics seeded
+    candidate = _confirmed_candidate(candidate_score=0.05, trigger_reasons=["momentum_breakout"])
+    settings = _settings(GuardianConfig(authority_enabled=True, authority_veto_threshold=-1.0))
+
+    with patch("crypto_trading.guardian.authority.open_position_for_candidate"):
+        maybe_open_position_for_candidate(
+            repo, candidate, settings.risk_limits, Decimal("50000"), _NOW, "run-1", settings
+        )
+
+    decisions = repo._conn.execute("SELECT * FROM guardian_authority_decisions").fetchall()
+    assert len(decisions) == 1
+    decision = dict(decisions[0])
+    assert decision["decision_type"] == "PRE_ENTRY_VETO"
+    assert decision["matched_heuristic_ids_json"] == "[]"
+
+
 # ---------------------------------------------------------------------------
 # maybe_record_pre_entry_shadow (Guardian Authority Shadow/Observation Mode,
 # 2026-09-15, Task 6: pre-entry shadow hook)

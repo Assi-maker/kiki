@@ -262,6 +262,7 @@ class Repository(Protocol):
         old_sl: str | None = None,
         new_sl: str | None = None,
         intervention_applied: bool | None = None,
+        matched_heuristic_ids_json: str | None = None,
     ) -> bool: ...
     def get_guardian_authority_decision(self, decision_id: str) -> dict | None: ...
     def find_pending_guardian_authority_decisions(self) -> list[dict]: ...
@@ -1809,6 +1810,7 @@ class SQLiteRepository:
         old_sl: str | None = None,
         new_sl: str | None = None,
         intervention_applied: bool | None = None,
+        matched_heuristic_ids_json: str | None = None,
     ) -> bool:
         # Idempotency gate: decision_id is the PK, so a duplicate call for
         # the same decision (e.g. a restart) can never produce two rows or
@@ -1824,13 +1826,23 @@ class SQLiteRepository:
         # save time) or leave it None (TIGHTEN_SL, determined moments later
         # via mark_guardian_authority_decision_intervention_applied below,
         # once the write attempt's outcome is known).
+        #
+        # Task 2 (2026-09-15, Guardian Authority Live Autonomy):
+        # matched_heuristic_ids_json is likewise purely additive forward-
+        # tracking metadata - a JSON-encoded list of the heuristic_ids
+        # evaluate_heuristics matched to reach this decision, captured by
+        # the orchestration layer's own second, duplicate evaluate_heuristics
+        # call (see guardian/tick.py::process_one_position and
+        # guardian/authority.py::maybe_open_position_for_candidate). Defaults
+        # to None ("not recorded") - distinct from the JSON string "[]"
+        # ("recorded, genuinely zero heuristics matched").
         try:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO guardian_authority_decisions "
                 "(decision_id, position_id, candidate_id, decision_type, decided_at, "
                 "reasoning, expected_outcome, expected_direction, confidence, "
-                "old_sl, new_sl, run_id, intervention_applied) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "old_sl, new_sl, run_id, intervention_applied, matched_heuristic_ids_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     decision_id,
                     position_id,
@@ -1845,6 +1857,7 @@ class SQLiteRepository:
                     new_sl,
                     run_id,
                     intervention_applied,
+                    matched_heuristic_ids_json,
                 ),
             )
             saved = cur.rowcount > 0

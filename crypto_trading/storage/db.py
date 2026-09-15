@@ -653,6 +653,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_runs_add_instruments_scanned(conn)
     _migrate_candidates_add_reference_price(conn)
     _migrate_guardian_authority_decisions_add_intervention_applied(conn)
+    _migrate_guardian_authority_decisions_add_matched_heuristic_ids_json(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -725,6 +726,42 @@ def _migrate_guardian_authority_decisions_add_intervention_applied(conn: sqlite3
         _add_column_idempotent(
             conn,
             "ALTER TABLE guardian_authority_decisions ADD COLUMN intervention_applied BOOLEAN",
+        )
+
+
+def _migrate_guardian_authority_decisions_add_matched_heuristic_ids_json(
+    conn: sqlite3.Connection,
+) -> None:
+    """Task 2 (2026-09-15, Guardian Authority Live Autonomy):
+    guardian_authority_decisions.matched_heuristic_ids_json - a forward-
+    tracking column recording exactly which heuristic_ids evaluate_
+    heuristics matched to produce a real TIGHTEN_SL/CLOSE_EARLY/
+    PRE_ENTRY_VETO decision, so a later task can measure each real
+    heuristic's own real-world track record once it starts acting for real.
+    Added AFTER Guardian Authority's own table-creation code (including the
+    intervention_applied migration above) had already shipped to master and
+    started running unconditionally on every app startup - real production
+    databases can already have this table WITHOUT the column. Same migration
+    pattern and same reasoning as
+    _migrate_guardian_authority_decisions_add_intervention_applied above:
+    `CREATE TABLE IF NOT EXISTS` alone does nothing to an already-existing
+    table, so an explicit, idempotent `ALTER TABLE` is required, guarded by
+    `PRAGMA table_info` (not "ALTER TABLE ... IF NOT EXISTS", not supported
+    by all SQLite versions) - safe to run on every connection, never
+    destroys existing rows (the new column is simply NULL for them).
+
+    Nullable, no default: NULL means "not recorded" (e.g. rows saved before
+    this migration ran, or by a caller that never passed the new keyword
+    param) - distinct from a JSON-encoded empty list `"[]"`, which means
+    "recorded, and genuinely zero heuristics matched"."""
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(guardian_authority_decisions)").fetchall()
+    }
+    if "matched_heuristic_ids_json" not in columns:
+        _add_column_idempotent(
+            conn,
+            "ALTER TABLE guardian_authority_decisions ADD COLUMN matched_heuristic_ids_json TEXT",
         )
 
 

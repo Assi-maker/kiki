@@ -144,6 +144,33 @@ def test_save_guardian_authority_decision_intervention_applied_defaults_to_none_
     assert row["intervention_applied"] is None
 
 
+def test_save_guardian_authority_decision_matched_heuristic_ids_json_round_trips(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-mh-1", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect favorable", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+        matched_heuristic_ids_json='["h-1", "h-2"]',
+    )
+
+    row = repo.get_guardian_authority_decision("ga-mh-1")
+    assert row["matched_heuristic_ids_json"] == '["h-1", "h-2"]'
+
+
+def test_save_guardian_authority_decision_matched_heuristic_ids_json_defaults_to_none_when_not_passed(
+    tmp_path,
+):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_decision(
+        "ga-mh-2", "pos-1", "cand-1", "TIGHTEN_SL", _NOW,
+        "reasoning", "expect favorable", "favorable", 0.7, "run-1",
+        old_sl="49000", new_sl="49500",
+    )
+
+    row = repo.get_guardian_authority_decision("ga-mh-2")
+    assert row["matched_heuristic_ids_json"] is None
+
+
 def test_mark_guardian_authority_decision_intervention_applied_updates_only_that_column(tmp_path):
     """Same surgical-scope proof style as
     test_resolve_guardian_authority_decision_never_mutates_the_pre_decision_expectation:
