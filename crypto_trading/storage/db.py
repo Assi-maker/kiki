@@ -399,6 +399,74 @@ CREATE TABLE IF NOT EXISTS guardian_authority_live_sl_actions (
     claimed_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Guardian Authority shadow/observation mode (2026-09-15), tick-time half:
+-- see docs/superpowers/specs/2026-09-15-guardian-authority-shadow-design.md.
+-- Purely observational counterpart to guardian_authority_decisions - logs
+-- GODFATHER's HYPOTHETICAL open-position decisions (TIGHTEN_SL/CLOSE_EARLY/
+-- NO_ACTION), including hypothetical NO_ACTION, for a PAPER position,
+-- WITHOUT ever reading from or writing to real position/order state. This
+-- is what closes the cold-start deadlock discovered post-merge: real
+-- Guardian Authority (authority_enabled) never logs NO_ACTION, so with zero
+-- learned heuristics no data ever accumulates to learn from. Modeled
+-- directly on profit_protection_shadow_positions (same shadow-table state-
+-- machine shape: one row per real PAPER position, OBSERVING -> DECIDED ->
+-- RESOLVED, or ABANDONED on orphan), using guardian_authority_decisions'
+-- own field names for the decision-shaped columns so a reader who already
+-- knows one table reads the other for free. shadow_id = position_id (1:1 -
+-- unlike PP shadow's multi-threshold shadow_id shape, GODFATHER has no
+-- parallel-threshold concept).
+--
+-- shadow_decision/decided_at/expected_outcome/expected_direction/
+-- confidence/factors_json/proposed_new_sl are set ONCE, together, by
+-- decide_guardian_authority_shadow() at the first tick the hypothetical
+-- decision is not NO_ACTION (OBSERVING -> DECIDED, requirement-10-style
+-- immutable-once-set discipline, same as guardian_authority_decisions'
+-- own expected_outcome/expected_direction/confidence/decided_at/reasoning).
+-- If a position closes while still OBSERVING (hypothetical NO_ACTION for
+-- its entire life), resolve_guardian_authority_shadow_no_action() sets
+-- those same decision fields (decision-only subset) retroactively, at
+-- close time, straight to RESOLVED - so every row ends up with a decision
+-- recorded, even the ones GODFATHER never would have logged for real.
+--
+-- last_factors_json is the ONE column updated on EVERY tick (alongside
+-- mfe/mae) regardless of decision state - a fresh factors snapshot is
+-- always available for resolve_guardian_authority_shadow_no_action's own
+-- factors_json parameter to be populated from, even for a position that
+-- never got a real hypothetical intervention. This is deliberately a
+-- SEPARATE column from the immutable, decision-time factors_json above -
+-- last_factors_json keeps changing after decide_guardian_authority_shadow
+-- has already frozen factors_json.
+CREATE TABLE IF NOT EXISTS guardian_authority_shadow_observations (
+    shadow_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    opened_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    shadow_decision TEXT,
+    decided_at TEXT,
+    expected_outcome TEXT,
+    expected_direction TEXT,
+    confidence REAL,
+    factors_json TEXT,
+    proposed_new_sl TEXT,
+    mfe TEXT NOT NULL DEFAULT '0',
+    mae TEXT NOT NULL DEFAULT '0',
+    last_factors_json TEXT,
+    actual_exit_reason TEXT,
+    actual_pnl_usdt TEXT,
+    actual_closed_at TEXT,
+    expectation_correct BOOLEAN,
+    prediction_error REAL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ga_shadow_position
+    ON guardian_authority_shadow_observations(position_id);
+CREATE INDEX IF NOT EXISTS idx_ga_shadow_status
+    ON guardian_authority_shadow_observations(status);
 """
 
 

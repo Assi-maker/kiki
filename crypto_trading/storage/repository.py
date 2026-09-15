@@ -309,6 +309,58 @@ class Repository(Protocol):
     def set_guardian_authority_live_sl_action_status(
         self, position_id: str, status: str, updated_at: datetime, last_error: str | None = None
     ) -> None: ...
+    def seed_guardian_authority_shadow(
+        self,
+        shadow_id: str,
+        position_id: str,
+        candidate_id: str,
+        instrument: str,
+        opened_at: datetime,
+        created_at: datetime,
+    ) -> bool: ...
+    def get_guardian_authority_shadow(self, shadow_id: str) -> dict | None: ...
+    def find_open_guardian_authority_shadows(self) -> list[dict]: ...
+    def record_guardian_authority_shadow_tick(
+        self,
+        shadow_id: str,
+        mfe: Decimal,
+        mae: Decimal,
+        factors_json: str,
+        updated_at: datetime,
+    ) -> None: ...
+    def decide_guardian_authority_shadow(
+        self,
+        shadow_id: str,
+        decision: str,
+        decided_at: datetime,
+        expected_outcome: str,
+        expected_direction: str,
+        confidence: float,
+        factors_json: str,
+        proposed_new_sl: Decimal | None,
+        updated_at: datetime,
+    ) -> bool: ...
+    def resolve_guardian_authority_shadow_no_action(
+        self,
+        shadow_id: str,
+        factors_json: str,
+        actual_exit_reason: str,
+        actual_pnl_usdt: Decimal,
+        actual_closed_at: datetime,
+        updated_at: datetime,
+    ) -> bool: ...
+    def resolve_guardian_authority_shadow_decided(
+        self,
+        shadow_id: str,
+        actual_exit_reason: str,
+        actual_pnl_usdt: Decimal,
+        actual_closed_at: datetime,
+        expectation_correct: bool | None,
+        prediction_error: float | None,
+        updated_at: datetime,
+    ) -> bool: ...
+    def abandon_guardian_authority_shadow(self, shadow_id: str, abandoned_at: datetime) -> None: ...
+    def find_resolved_guardian_authority_shadows(self) -> list[dict]: ...
 
 
 class SQLiteRepository:
@@ -1957,3 +2009,195 @@ class SQLiteRepository:
             (status, last_error, updated_at.isoformat(), position_id),
         )
         self._conn.commit()
+
+    def seed_guardian_authority_shadow(
+        self,
+        shadow_id: str,
+        position_id: str,
+        candidate_id: str,
+        instrument: str,
+        opened_at: datetime,
+        created_at: datetime,
+    ) -> bool:
+        # Same INSERT OR IGNORE claim-style idempotency as
+        # seed_profit_protection_shadow - a duplicate seed call (e.g. a
+        # retried tick) can never produce two rows or silently overwrite
+        # the original opened_at/instrument/candidate_id.
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO guardian_authority_shadow_observations "
+            "(shadow_id, position_id, candidate_id, instrument, opened_at, status, "
+            "mfe, mae, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'OBSERVING', '0', '0', ?, ?)",
+            (
+                shadow_id, position_id, candidate_id, instrument,
+                opened_at.isoformat(), created_at.isoformat(), created_at.isoformat(),
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_guardian_authority_shadow(self, shadow_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM guardian_authority_shadow_observations WHERE shadow_id = ?",
+            (shadow_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_open_guardian_authority_shadows(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_shadow_observations "
+            "WHERE status IN ('OBSERVING', 'DECIDED')"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_guardian_authority_shadow_tick(
+        self,
+        shadow_id: str,
+        mfe: Decimal,
+        mae: Decimal,
+        factors_json: str,
+        updated_at: datetime,
+    ) -> None:
+        # Same open-only guard as record_profit_protection_tick's own
+        # WHERE status = 'OPEN', widened to this table's two open statuses
+        # (OBSERVING/DECIDED) - a tick arriving after RESOLVED/ABANDONED is
+        # a structural no-op, mfe/mae/last_factors_json stay frozen at
+        # whatever they were at resolution/abandonment.
+        self._conn.execute(
+            "UPDATE guardian_authority_shadow_observations SET mfe = ?, mae = ?, "
+            "last_factors_json = ?, updated_at = ? "
+            "WHERE shadow_id = ? AND status IN ('OBSERVING', 'DECIDED')",
+            (str(mfe), str(mae), factors_json, updated_at.isoformat(), shadow_id),
+        )
+        self._conn.commit()
+
+    def decide_guardian_authority_shadow(
+        self,
+        shadow_id: str,
+        decision: str,
+        decided_at: datetime,
+        expected_outcome: str,
+        expected_direction: str,
+        confidence: float,
+        factors_json: str,
+        proposed_new_sl: Decimal | None,
+        updated_at: datetime,
+    ) -> bool:
+        # The ONE write that transitions OBSERVING -> DECIDED. WHERE
+        # status = 'OBSERVING' makes a second call structurally a no-op -
+        # it changes nothing and returns False - same requirement-10-style
+        # one-time-transition discipline as guardian_authority_decisions'
+        # own save_guardian_authority_decision (there via INSERT OR IGNORE
+        # on a PK; here via a status-guarded UPDATE since the row already
+        # exists from seed_guardian_authority_shadow).
+        cur = self._conn.execute(
+            "UPDATE guardian_authority_shadow_observations SET status = 'DECIDED', "
+            "shadow_decision = ?, decided_at = ?, expected_outcome = ?, "
+            "expected_direction = ?, confidence = ?, factors_json = ?, "
+            "proposed_new_sl = ?, updated_at = ? "
+            "WHERE shadow_id = ? AND status = 'OBSERVING'",
+            (
+                decision,
+                decided_at.isoformat(),
+                expected_outcome,
+                expected_direction,
+                confidence,
+                factors_json,
+                str(proposed_new_sl) if proposed_new_sl is not None else None,
+                updated_at.isoformat(),
+                shadow_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def resolve_guardian_authority_shadow_no_action(
+        self,
+        shadow_id: str,
+        factors_json: str,
+        actual_exit_reason: str,
+        actual_pnl_usdt: Decimal,
+        actual_closed_at: datetime,
+        updated_at: datetime,
+    ) -> bool:
+        # Fires only for a position that closed while still OBSERVING
+        # (never decided) - WHERE status = 'OBSERVING' makes this
+        # structurally exclusive with decide_guardian_authority_shadow:
+        # whichever transition happens first wins, the other becomes a
+        # no-op. One write sets the decision-only subset (shadow_decision/
+        # expected_direction/confidence/factors_json - no decided_at/
+        # expected_outcome/proposed_new_sl, since no decision was ever
+        # actually registered contemporaneously) AND the baseline fields
+        # AND status = 'RESOLVED', all at once.
+        cur = self._conn.execute(
+            "UPDATE guardian_authority_shadow_observations SET status = 'RESOLVED', "
+            "shadow_decision = 'NO_ACTION', expected_direction = 'neutral', "
+            "confidence = 1.0, factors_json = ?, actual_exit_reason = ?, "
+            "actual_pnl_usdt = ?, actual_closed_at = ?, updated_at = ? "
+            "WHERE shadow_id = ? AND status = 'OBSERVING'",
+            (
+                factors_json,
+                actual_exit_reason,
+                str(actual_pnl_usdt),
+                actual_closed_at.isoformat(),
+                updated_at.isoformat(),
+                shadow_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def resolve_guardian_authority_shadow_decided(
+        self,
+        shadow_id: str,
+        actual_exit_reason: str,
+        actual_pnl_usdt: Decimal,
+        actual_closed_at: datetime,
+        expectation_correct: bool | None,
+        prediction_error: float | None,
+        updated_at: datetime,
+    ) -> bool:
+        # Fires only for a position that closed AFTER a shadow decision was
+        # already registered - WHERE status = 'DECIDED' is the mirror-image
+        # guard of resolve_guardian_authority_shadow_no_action's own WHERE
+        # status = 'OBSERVING'. Never touches shadow_decision/decided_at/
+        # expected_outcome/expected_direction/confidence/factors_json/
+        # proposed_new_sl - those stay exactly as decide_guardian_authority_
+        # shadow set them, immutable by construction (same surgical-scope
+        # discipline as resolve_guardian_authority_decision).
+        cur = self._conn.execute(
+            "UPDATE guardian_authority_shadow_observations SET status = 'RESOLVED', "
+            "actual_exit_reason = ?, actual_pnl_usdt = ?, actual_closed_at = ?, "
+            "expectation_correct = ?, prediction_error = ?, updated_at = ? "
+            "WHERE shadow_id = ? AND status = 'DECIDED'",
+            (
+                actual_exit_reason,
+                str(actual_pnl_usdt),
+                actual_closed_at.isoformat(),
+                expectation_correct,
+                prediction_error,
+                updated_at.isoformat(),
+                shadow_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def abandon_guardian_authority_shadow(self, shadow_id: str, abandoned_at: datetime) -> None:
+        # Same orphan-handling semantics as abandon_profit_protection_
+        # shadow: a no-op if the shadow is not currently OBSERVING/DECIDED,
+        # same guard style as close_profit_protection_shadow's own WHERE
+        # status = 'OPEN'.
+        self._conn.execute(
+            "UPDATE guardian_authority_shadow_observations SET status = 'ABANDONED', "
+            "updated_at = ? WHERE shadow_id = ? AND status IN ('OBSERVING', 'DECIDED')",
+            (abandoned_at.isoformat(), shadow_id),
+        )
+        self._conn.commit()
+
+    def find_resolved_guardian_authority_shadows(self) -> list[dict]:
+        # Consumed by Task 9 and Task 10 (self-critique / reporting).
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_shadow_observations WHERE status = 'RESOLVED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
