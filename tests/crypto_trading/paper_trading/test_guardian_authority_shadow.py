@@ -508,7 +508,140 @@ def test_tick_transitions_to_decided_on_tick_n_and_stays_decided_through_later_t
         assert row["proposed_new_sl"] == first_proposed_sl
 
 
-def test_tick_abandons_shadow_when_position_vanishes_from_open_positions(tmp_path):
+def test_tick_abandons_shadow_when_position_is_genuinely_absent(tmp_path):
+    """True orphan: `repo.get_position()` returns None (the position row
+    itself is gone, not merely missing from THIS tick's `open_positions`
+    snapshot) - the only case that legitimately warrants ABANDONED, per the
+    final whole-branch review's Important #2 ruling (see
+    test_tick_resolves_restart_recovery_closed_position_instead_of_
+    abandoning below for the other, previously-mishandled case: a position
+    absent from open_positions because it was already CLOSED)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    position = _seed_real_position(repo)
+    _seed_observation(repo, "pos-1", state="HOLD", factors={})
+    settings = _settings_with_shadow(enabled=True)
+    price_lookup = {"BTCUSDT": (Decimal("49700"), Decimal("50300"), Decimal("50000"), Decimal("0"))}
+    run_guardian_authority_shadow_tick(repo, [position], [], price_lookup, _NOW, settings, "run-1")
+    assert _shadow_row(repo)["status"] == "OBSERVING"
+
+    # Simulate genuine absence: the position row itself no longer exists
+    # (repo.get_position("pos-1") -> None), not just excluded from this
+    # tick's open_positions list.
+    repo._conn.execute("DELETE FROM positions WHERE position_id = ?", ("pos-1",))
+    repo._conn.commit()
+
+    later = _NOW + timedelta(minutes=1)
+    run_guardian_authority_shadow_tick(repo, [], [], {}, later, settings, "run-2")
+
+    row = _shadow_row(repo)
+    assert row["status"] == "ABANDONED"
+
+
+def _close_real_position_outside_this_tick(
+    repo, position: Position, exit_reason="stop_loss", pnl_favorable=True, closed_at=_NOW
+) -> Position:
+    """Closes the REAL position row directly via `close_position_with_event`
+    - the same repo method `position_closing.py::close_triggered_positions`
+    calls internally - WITHOUT going through `run_guardian_authority_shadow_
+    tick`'s own `closed_positions` parameter. Models exactly what
+    `monitoring_catchup.py`'s restart-recovery pass does: it closes a
+    position itself, before the next tick's own `open_positions`/
+    `closed_positions` lists are ever built, so that tick's lists mention
+    the position in NEITHER list."""
+    simulated_fill_exit = (
+        position.simulated_fill_entry * Decimal("1.02")
+        if pnl_favorable
+        else position.simulated_fill_entry * Decimal("0.98")
+    )
+    fees = Decimal("2")
+    funding = Decimal("0")
+    repo.close_position_with_event(
+        position_id=position.position_id,
+        theoretical_exit=position.theoretical_entry,
+        simulated_fill_exit=simulated_fill_exit,
+        exit_reason=exit_reason,
+        fees=fees,
+        funding=funding,
+        closed_at=closed_at,
+        event=Event(
+            event_id=f"POSITION_CLOSED:{position.position_id}", event_type="POSITION_CLOSED",
+            aggregate_type="position", aggregate_id=position.position_id,
+            occurred_at=closed_at, run_id="catchup-run", schema_version=1,
+            payload={"exit_reason": exit_reason},
+        ),
+    )
+    return repo.get_position(position.position_id)
+
+
+def test_tick_resolves_restart_recovery_closed_position_instead_of_abandoning(tmp_path):
+    """Important #2 (final whole-branch review, fix required): a position
+    closed by monitoring_catchup.py's own restart-recovery pass appears in
+    NEITHER this tick's `open_positions` NOR its `closed_positions` -
+    before the fix, the orphan branch would unconditionally ABANDON this
+    shadow, permanently losing the NO_ACTION/TIGHTEN_SL/CLOSE_EARLY
+    observation. After the fix, the tick must look the real position up,
+    find it CLOSED, and resolve it via the same `_resolve_on_close` the
+    normal step-3 loop uses - never abandon a position that genuinely
+    closed."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    position = _seed_real_position(repo)
+    _seed_observation(repo, "pos-1", state="HOLD", factors={})
+    settings = _settings_with_shadow(enabled=True)
+    price_lookup = {"BTCUSDT": (Decimal("49700"), Decimal("50300"), Decimal("50000"), Decimal("0"))}
+    run_guardian_authority_shadow_tick(repo, [position], [], price_lookup, _NOW, settings, "run-1")
+    assert _shadow_row(repo)["status"] == "OBSERVING"
+
+    # monitoring_catchup.py's own restart-recovery pass closes the position
+    # BEFORE this next tick's open_positions/closed_positions are built.
+    closed_position = _close_real_position_outside_this_tick(
+        repo, position, exit_reason="target", pnl_favorable=True, closed_at=_NOW + timedelta(minutes=1)
+    )
+    assert closed_position.status == "CLOSED"
+
+    later = _NOW + timedelta(minutes=5)
+    run_guardian_authority_shadow_tick(repo, [], [], {}, later, settings, "run-2")
+
+    row = _shadow_row(repo)
+    assert row["status"] == "RESOLVED"
+    assert row["shadow_decision"] == "NO_ACTION"
+    assert row["actual_exit_reason"] == "target"
+    assert Decimal(row["actual_pnl_usdt"]) == compute_pnl(closed_position)
+
+
+def test_tick_resolves_restart_recovery_closed_decided_position_instead_of_abandoning(tmp_path):
+    """Same scenario as above, but for a shadow that already transitioned
+    to DECIDED (TIGHTEN_SL) before the restart-recovery close - proves the
+    fix reuses the exact same `_resolve_on_close` dispatch (not a
+    duplicated/parallel resolution path) regardless of shadow status."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    position = _seed_real_position(repo)
+    _seed_observation(repo, "pos-1", state="WATCH", factors={})
+    _seed_always_on_heuristic(repo, adjustment=0.2)
+    settings = _settings_with_shadow(enabled=True)
+    price_lookup = {"BTCUSDT": (Decimal("49700"), Decimal("50300"), Decimal("50000"), Decimal("0"))}
+    run_guardian_authority_shadow_tick(repo, [position], [], price_lookup, _NOW, settings, "run-1")
+    assert _shadow_row(repo)["shadow_decision"] == "TIGHTEN_SL"
+
+    closed_position = _close_real_position_outside_this_tick(
+        repo, position, exit_reason="target", pnl_favorable=True, closed_at=_NOW + timedelta(minutes=1)
+    )
+
+    later = _NOW + timedelta(minutes=5)
+    run_guardian_authority_shadow_tick(repo, [], [], {}, later, settings, "run-2")
+
+    row = _shadow_row(repo)
+    assert row["status"] == "RESOLVED"
+    assert row["shadow_decision"] == "TIGHTEN_SL"  # immutable, set at decide time
+    assert bool(row["expectation_correct"]) is True
+
+
+def test_tick_leaves_shadow_alone_when_real_position_is_still_open_but_absent_from_snapshot(tmp_path):
+    """Neither a true orphan (position is NOT None) nor a resolvable close
+    (position is NOT CLOSED) - must be left exactly as-is, to be retried on
+    a later tick, never abandoned and never resolved. This scenario cannot
+    happen in real production (open_positions is always derived from a live
+    find_open_positions() query, so a still-OPEN_POSITION row can never be
+    absent from it) - included only to pin the third branch's behavior."""
     repo = SQLiteRepository(tmp_path / "t.db")
     position = _seed_real_position(repo)
     _seed_observation(repo, "pos-1", state="HOLD", factors={})
@@ -518,10 +651,13 @@ def test_tick_abandons_shadow_when_position_vanishes_from_open_positions(tmp_pat
     assert _shadow_row(repo)["status"] == "OBSERVING"
 
     later = _NOW + timedelta(minutes=1)
+    # position row still exists, still OPEN_POSITION - just absent from
+    # this tick's own open_positions list.
     run_guardian_authority_shadow_tick(repo, [], [], {}, later, settings, "run-2")
 
     row = _shadow_row(repo)
-    assert row["status"] == "ABANDONED"
+    assert row["status"] == "OBSERVING"  # neither abandoned nor resolved
+    assert repo.get_position("pos-1").status == "OPEN_POSITION"
 
 
 def test_tick_does_not_abandon_for_a_merely_transient_missing_candle(tmp_path):
@@ -636,6 +772,56 @@ def test_tick_resolves_closed_position_decided_end_to_end(tmp_path):
     assert row["status"] == "RESOLVED"
     assert row["shadow_decision"] == "TIGHTEN_SL"  # immutable, set at decide time
     assert bool(row["expectation_correct"]) is True
+
+
+def test_tick_isolates_one_closed_positions_resolution_failure_from_the_rest(tmp_path, monkeypatch, caplog):
+    """Important #3 (final whole-branch review, fix required, compounds #2):
+    step 3's resolve loop must have the SAME per-item try/except isolation
+    as step 2's advance loop and Task 7's own resolve_pending_pre_entry_
+    shadows - one malformed/failing closed position's resolution must never
+    abort resolution of every OTHER position closed in the same tick."""
+    import crypto_trading.paper_trading.guardian_authority_shadow as ga_shadow_module
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    position_1 = _seed_real_position(repo, position_id="pos-1", instrument="BTCUSDT")
+    position_2 = _seed_real_position(repo, position_id="pos-2", instrument="ETHUSDT")
+    _seed_observation(repo, "pos-1", state="HOLD", factors={})
+    _seed_observation(repo, "pos-2", state="HOLD", factors={})
+    settings = _settings_with_shadow(enabled=True)
+    price_lookup = {
+        "BTCUSDT": (Decimal("49700"), Decimal("50300"), Decimal("50000"), Decimal("0")),
+        "ETHUSDT": (Decimal("49900"), Decimal("50100"), Decimal("50000"), Decimal("0")),
+    }
+    run_guardian_authority_shadow_tick(
+        repo, [position_1, position_2], [], price_lookup, _NOW, settings, "run-1"
+    )
+    assert _shadow_row(repo, "pos-1")["status"] == "OBSERVING"
+    assert _shadow_row(repo, "pos-2")["status"] == "OBSERVING"
+
+    real_resolve_on_close = ga_shadow_module._resolve_on_close
+
+    def _flaky_resolve_on_close(repo_arg, shadow, position, now):
+        if position.position_id == "pos-1":
+            raise ValueError("boom")
+        return real_resolve_on_close(repo_arg, shadow, position, now)
+
+    monkeypatch.setattr(ga_shadow_module, "_resolve_on_close", _flaky_resolve_on_close)
+
+    closed_1 = _closed_position(position_1, exit_reason="stop_loss")
+    closed_2 = _closed_position(position_2, exit_reason="target")
+    later = _NOW + timedelta(minutes=1)
+
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        ga_shadow_module.run_guardian_authority_shadow_tick(
+            repo, [position_1, position_2], [closed_1, closed_2], {}, later, settings, "run-2"
+        )  # must not raise despite pos-1's resolution always failing
+
+    row_1 = _shadow_row(repo, "pos-1")
+    row_2 = _shadow_row(repo, "pos-2")
+    assert row_1["status"] == "OBSERVING"  # untouched by the failed resolution, retryable next tick
+    assert row_2["status"] == "RESOLVED"  # the OTHER shadow still resolved normally
+    assert "guardian_authority_shadow_resolve_failed" in caplog.text
+    assert "pos-1" in caplog.text
 
 
 def test_tick_never_writes_to_positions_or_real_guardian_authority_decisions_tables(tmp_path):

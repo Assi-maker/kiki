@@ -35,11 +35,38 @@ touched, is correctly excluded; a genuinely NEW call, even one added deep
 inside an old function, is correctly caught. (Newly created files, where
 every line is "added" by construction, reduce to an ordinary whole-file
 scan under this same mechanism - no special-casing needed.)
+
+**Final whole-branch review Important #4 fix (2026-09-15, HEAD 7561929):**
+the ORIGINAL version of this file derived its scan universe (the file lists
+below) via a live `git diff --name-only eb19335..HEAD` at collection time,
+and checked the 6 pure-decision functions' byte-identity via `git show
+eb19335:<path>`. Both break the moment this branch merges: the diff range
+`eb19335..HEAD` keeps growing to include every subsequent unrelated commit
+on the target branch, which (a) breaks the pinned production-file-list
+equality assert as soon as anything else touches any of the same paths,
+and (b) starts "policing" brand new, unrelated future code as if it were
+part of this plan. Fixed by severing both mechanisms from git history
+entirely: `PRODUCTION_FILES`/`ALL_TOUCHED_PY_FILES` below are now the
+literal, hardcoded scan universe itself (recorded once, by hand, from that
+same `git diff --name-only eb19335..HEAD` at authoring time - not merely a
+sanity-check constant compared against a live git computation anymore),
+and the 6 functions' byte-identity check now compares a hardcoded SHA-256
+hash of each function's AST source (also recorded once, from the live file,
+at authoring time) against a freshly-computed hash of that function's
+CURRENT source read straight off disk - never `git show`. Both tripwires
+are now fully self-contained: they detect a real future violation without
+depending on `eb19335`, or any other specific commit, still existing or
+resolving cleanly. (`_added_line_numbers` below, and every item 1/2/5/6
+check built on it, is UNCHANGED by this fix - it restricts each of these
+same hardcoded, now-fixed-forever file paths to only the lines THIS plan
+added, which remains valid indefinitely since `eb19335` stays a permanent,
+resolvable ancestor commit in this repository's history.)
 """
 
 from __future__ import annotations
 
 import ast
+import hashlib
 import re
 import subprocess
 from pathlib import Path
@@ -51,43 +78,54 @@ BASE_SHA = "eb19335"  # the master commit this plan's branch forked from
 
 
 # ---------------------------------------------------------------------------
-# git-diff plumbing: independently re-derive, not trust, what this plan
-# touched and which exact lines it added.
+# Explicit, hardcoded scan universe (see module docstring's Important #4
+# fix note) - recorded once, by hand, from `git diff --name-only
+# eb19335..HEAD` at authoring time (2026-09-15, HEAD 7561929). This IS the
+# scan universe now, not a value derived from a live git computation - so
+# it can never silently grow to include a future unrelated commit's files
+# once this branch merges.
 # ---------------------------------------------------------------------------
 
-
-def _git_diff_name_only(base: str = BASE_SHA, head: str = "HEAD") -> list[str]:
-    out = subprocess.run(
-        ["git", "diff", "--name-only", f"{base}..{head}"],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    ).stdout
-    return [line.strip() for line in out.splitlines() if line.strip()]
-
-
-_TOUCHED_FILES = _git_diff_name_only()
-
-# Item 6 / task brief: "Files this plan touched" re-derived independently
-# (not trusted from any implementer's own claim or from the task brief's
-# own reference list) - every production .py file this plan's diff
-# touches, used as the scan universe for items 1, 2, 4 and 5 below.
-PRODUCTION_FILES = sorted(
-    f for f in _TOUCHED_FILES
-    if f.startswith("crypto_trading/") and f.endswith(".py")
-)
+# Item 6 / task brief: "Files this plan touched" - every production .py
+# file this plan's diff touches, used as the scan universe for items 1, 2,
+# 4 and 5 below.
+PRODUCTION_FILES = [
+    "crypto_trading/config/loader.py",
+    "crypto_trading/guardian/authority.py",
+    "crypto_trading/monitoring_loop.py",
+    "crypto_trading/paper_trading/guardian_authority_shadow.py",
+    "crypto_trading/paper_trading/recovery_sweep.py",
+    "crypto_trading/paper_trading/replay.py",
+    "crypto_trading/performance/guardian_authority_shadow_report.py",
+    "crypto_trading/storage/db.py",
+    "crypto_trading/storage/repository.py",
+]
 
 # All touched .py files, production AND test - the scan universe for item
 # 6's broader, unrestricted re-check.
-ALL_TOUCHED_PY_FILES = sorted(f for f in _TOUCHED_FILES if f.endswith(".py"))
+ALL_TOUCHED_PY_FILES = [
+    *PRODUCTION_FILES,
+    "tests/crypto_trading/config/test_loader.py",
+    "tests/crypto_trading/guardian/test_authority.py",
+    "tests/crypto_trading/guardian/test_authority_shadow_isolation.py",
+    "tests/crypto_trading/paper_trading/test_guardian_authority_shadow.py",
+    "tests/crypto_trading/paper_trading/test_recovery_sweep.py",
+    "tests/crypto_trading/paper_trading/test_replay.py",
+    "tests/crypto_trading/performance/test_guardian_authority_shadow_report.py",
+    "tests/crypto_trading/storage/test_repository_guardian_authority_pre_entry_shadow.py",
+    "tests/crypto_trading/storage/test_repository_guardian_authority_shadow.py",
+    "tests/crypto_trading/test_monitoring_loop.py",
+]
 
 
 def test_production_files_list_is_not_empty_and_matches_expected_shape():
-    """Sanity check on the scan universe itself: if this were empty (e.g.
-    a wrong BASE_SHA, or the worktree not actually containing this plan's
-    commits), every other test below would vacuously pass while checking
-    nothing. Pin the exact expected file set (independently re-derived via
-    `git diff --stat` at authoring time) so a change in what this plan
-    touches is visible here rather than silently shrinking every other
-    check's coverage."""
+    """Sanity check on the scan universe itself: if this were empty, every
+    other test below would vacuously pass while checking nothing. Pins the
+    exact expected file set (see module docstring's Important #4 fix note -
+    this is now the hardcoded scan universe itself, not a value re-derived
+    from git) and confirms every listed path genuinely exists on disk, so a
+    typo or an accidentally-removed file is caught here rather than
+    silently shrinking every other check's coverage."""
     assert PRODUCTION_FILES == [
         "crypto_trading/config/loader.py",
         "crypto_trading/guardian/authority.py",
@@ -99,7 +137,27 @@ def test_production_files_list_is_not_empty_and_matches_expected_shape():
         "crypto_trading/storage/db.py",
         "crypto_trading/storage/repository.py",
     ]
-    assert "crypto_trading/config/guardian.yaml" in _TOUCHED_FILES
+    assert (REPO_ROOT / "crypto_trading/config/guardian.yaml").is_file()
+    for path in PRODUCTION_FILES:
+        assert (REPO_ROOT / path).is_file(), f"{path} does not exist on disk"
+
+
+def test_hardcoded_scan_universe_is_internally_consistent_and_self_contained():
+    """Replaces the OLD `git diff --stat`-based independent reconfirmation
+    (removed per the module docstring's Important #4 fix - there is no
+    longer a live git computation to reconfirm against). Self-contained
+    consistency checks on the two hardcoded scan-universe constants
+    instead: every listed path exists on disk, PRODUCTION_FILES is a
+    genuine subset of ALL_TOUCHED_PY_FILES, and ALL_TOUCHED_PY_FILES
+    contains at least one touched test file - so item 6's broader scan
+    below actually has something beyond PRODUCTION_FILES to scan."""
+    assert PRODUCTION_FILES, "PRODUCTION_FILES must not be empty"
+    assert ALL_TOUCHED_PY_FILES, "ALL_TOUCHED_PY_FILES must not be empty"
+    for path in ALL_TOUCHED_PY_FILES:
+        assert (REPO_ROOT / path).is_file(), f"{path} does not exist on disk"
+    assert set(PRODUCTION_FILES) <= set(ALL_TOUCHED_PY_FILES)
+    test_files = [f for f in ALL_TOUCHED_PY_FILES if f.startswith("tests/")]
+    assert test_files, "expected at least one touched test file in the scan universe"
 
 
 _HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -341,22 +399,43 @@ _PURE_DECISION_FUNCTIONS = (
     "_groups_for_factors",
 )
 
+AUTHORITY_PATH = "crypto_trading/guardian/authority.py"
 
-def _function_source_at(revision: str, path: str, function_name: str) -> str:
-    source = subprocess.run(
-        ["git", "show", f"{revision}:{path}"],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    ).stdout
-    tree = ast.parse(source, filename=f"{revision}:{path}")
+# Recorded once (2026-09-15, HEAD 7561929, final whole-branch review's
+# Important #4 fix - see module docstring): SHA-256 of each function's AST
+# source segment, read straight from the live authority.py at authoring
+# time (the exact same extraction `_current_function_source` below performs
+# at test time). Replaces the OLD `git show eb19335:<path>` byte-identity
+# comparison, which depended on `eb19335` remaining resolvable and the diff
+# range never growing - this hash comparison depends on neither: it detects
+# a future accidental modification to any of these 6 functions purely from
+# the function's own current source, with no git history involved at all.
+_EXPECTED_FUNCTION_SOURCE_SHA256 = {
+    "evaluate_heuristics": "b7351e34af0b2e9943533463aa20b3f304fca235c9251e6bf720e40a82ea2c69",
+    "decide_pre_entry": "509a88b5326b7b757a59d6510e7ca132abd32e19bcb6952dd68fe9abd8461cbf",
+    "decide_open_position": "b4d761d049fc7e0e1fd193cb7529b11b36dcdb640950425acd931c7a131f80fd",
+    "heuristic_condition_matches": "119661ae444769f018a634a95bef8d3a8a9d613e669f15304819bdd16248276f",
+    "_compute_proposed_new_sl": "a580c0ce176dd6acc6cb74d7c7cbaf79d3d8e9146c0887a56d7f2c6222dd4c57",
+    "_groups_for_factors": "7bbefa709200c067b26f0d09b0e43493e1815f8a5aa60a1084f4c900edde4efc",
+}
+
+
+def _current_function_source(path: str, function_name: str) -> str:
+    """`function_name`'s CURRENT source segment, read straight from the
+    live file on disk via `_read` (never `git show` - see module
+    docstring's Important #4 fix note)."""
+    source = _read(path)
+    tree = ast.parse(source, filename=path)
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
             segment = ast.get_source_segment(source, node)
-            assert segment is not None, f"could not extract source for {function_name} @ {revision}"
+            assert segment is not None, f"could not extract source for {function_name}"
             return segment
-    raise AssertionError(f"function {function_name} not found in {path} @ {revision}")
+    raise AssertionError(f"function {function_name} not found in {path}")
 
 
-AUTHORITY_PATH = "crypto_trading/guardian/authority.py"
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @pytest.mark.parametrize("function_name", _PURE_DECISION_FUNCTIONS)
@@ -369,25 +448,31 @@ def test_pure_decision_function_is_byte_identical_to_base(function_name):
     the plan's own Task 8/9 addition to that same "never touch" set (it is
     reused unmodified by the shadow self-critique function, exactly as
     the pure decision functions are reused unmodified by the shadow
-    observation functions). Direct source-segment diff between base commit
-    eb19335 and HEAD - zero hunks, not merely 'behaves the same'."""
-    base_source = _function_source_at(BASE_SHA, AUTHORITY_PATH, function_name)
-    head_source = _function_source_at("HEAD", AUTHORITY_PATH, function_name)
-    assert head_source == base_source, (
-        f"{function_name} changed between {BASE_SHA} and HEAD - Global Constraint violation"
+    observation functions). Compares a SHA-256 hash of the function's
+    CURRENT source (read from the live file, never `git show`) against the
+    hash recorded at authoring time (see _EXPECTED_FUNCTION_SOURCE_SHA256
+    above) - self-contained, survives this branch merging, never merely
+    'behaves the same'."""
+    current_source = _current_function_source(AUTHORITY_PATH, function_name)
+    current_hash = _sha256(current_source)
+    assert current_hash == _EXPECTED_FUNCTION_SOURCE_SHA256[function_name], (
+        f"{function_name} changed since its hash was recorded - Global Constraint violation"
     )
 
 
 def test_byte_identical_check_genuinely_detects_a_real_change():
     """Confirms the comparison in the test above is not vacuously true
-    (e.g. two empty strings, or a helper that silently no-ops). Deliberately
-    compares evaluate_heuristics' base-commit source against a mutated copy
-    of itself (one character appended) and confirms the assertion that
-    passes above would fail here - i.e. the mechanism can actually tell
-    two different function bodies apart."""
-    base_source = _function_source_at(BASE_SHA, AUTHORITY_PATH, "evaluate_heuristics")
-    mutated = base_source + "  # tampered\n"
-    assert mutated != base_source
+    (e.g. two equal empty strings, or a hash constant that matches
+    anything). Deliberately hashes evaluate_heuristics' CURRENT source
+    against a mutated copy of itself (one character appended) and confirms
+    the two hashes differ - i.e. the mechanism can actually tell two
+    different function bodies apart - then confirms the mutated hash does
+    NOT equal the recorded expected hash either, the exact failure mode the
+    real test above would hit if evaluate_heuristics were ever modified."""
+    current_source = _current_function_source(AUTHORITY_PATH, "evaluate_heuristics")
+    mutated = current_source + "  # tampered\n"
+    assert _sha256(mutated) != _sha256(current_source)
+    assert _sha256(mutated) != _EXPECTED_FUNCTION_SOURCE_SHA256["evaluate_heuristics"]
 
 
 def test_authority_py_has_exactly_167_insertions_and_zero_deletions():
@@ -677,28 +762,14 @@ def test_authority_enabled_scan_genuinely_catches_a_new_reference():
 
 
 # ---------------------------------------------------------------------------
-# Item 6: independently re-run `git diff --stat` (not trusted from any
-# implementer's own claim) and confirm the 6 forbidden-call patterns are
-# genuinely absent as new call sites across the FULL diff - every touched
-# file, production AND test, not just PRODUCTION_FILES.
+# Item 6: confirm the 6 forbidden-call patterns are genuinely absent as new
+# call sites across the FULL hardcoded scan universe - every touched file,
+# production AND test, not just PRODUCTION_FILES (see module docstring's
+# Important #4 fix note: the file set itself is no longer re-derived from a
+# live `git diff --stat`, but the per-file NEW-lines-only restriction below
+# still uses `_added_line_numbers`, which remains valid indefinitely - see
+# that note for why).
 # ---------------------------------------------------------------------------
-
-
-def test_diff_stat_independently_reconfirms_the_full_touched_file_set():
-    """Re-run `git diff --stat` fresh (this test does not reuse the
-    module-level _TOUCHED_FILES computed at import time via any cached
-    assumption about its content - it re-invokes git itself) and print/
-    assert the file count matches what test_production_files_list_is_
-    not_empty_and_matches_expected_shape already pinned for production
-    files, PLUS confirm test files were touched too (so the broader scan
-    below actually has something to scan)."""
-    files = _git_diff_name_only()
-    assert files, "git diff --stat reports zero touched files - wrong BASE_SHA?"
-    py_files = [f for f in files if f.endswith(".py")]
-    test_files = [f for f in py_files if f.startswith("tests/")]
-    prod_files = [f for f in py_files if f.startswith("crypto_trading/")]
-    assert test_files, "expected this plan to have touched at least one test file"
-    assert prod_files == PRODUCTION_FILES
 
 
 def test_full_diff_has_zero_new_call_sites_of_the_six_forbidden_functions_anywhere():

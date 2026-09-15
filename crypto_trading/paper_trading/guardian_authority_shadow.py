@@ -239,11 +239,18 @@ def run_guardian_authority_shadow_tick(
     """Top-level orchestrator, mirroring `run_profit_protection_experiment_
     tick`'s exact structure: (1) seed every open position not yet seeded,
     (2) advance every open shadow whose position is still open and has a
-    candle this tick, abandoning any whose position vanished from
-    `open_positions` (same stranded-shadow handling as Profit Protection's
-    own, same per-shadow try/except isolation, same log_event on failure),
-    (3) resolve every shadow (OBSERVING or DECIDED) whose position appears
-    in `closed_positions` this tick. Called from the same place
+    candle this tick; for a shadow whose position is absent from
+    `open_positions`, look the real position up directly and either resolve
+    it (already CLOSED - e.g. monitoring_catchup.py's restart-recovery pass
+    closed it before this tick's own open_positions/closed_positions lists
+    were built) or abandon it (genuinely absent, `repo.get_position()`
+    returns `None` - a true orphan) or leave it alone to retry next tick
+    (still open, just inconsistently absent from this tick's snapshot - not
+    reachable in real production); same per-shadow try/except isolation,
+    same log_event on failure. (3) resolve every shadow (OBSERVING or
+    DECIDED) whose position appears in `closed_positions` this tick, each
+    in its own try/except (same isolation discipline as step 2 and Task 7's
+    own `resolve_pending_pre_entry_shadows`). Called from the same place
     `run_profit_protection_experiment_tick` is called (monitoring loop,
     after `close_triggered_positions`), wrapped in the caller's own
     try/except - this function itself only needs to guard against writing
@@ -276,11 +283,54 @@ def run_guardian_authority_shadow_tick(
     close_threshold = settings.guardian.authority_close_threshold
     for shadow in repo.find_open_guardian_authority_shadows():
         if shadow["position_id"] not in open_position_ids:
-            # Same "unhooked catch-up path" stranded-shadow handling as
-            # profit_protection_experiment.py's own orchestrator: a shadow
-            # can never legitimately still be OBSERVING/DECIDED once its
-            # real position has left find_open_positions().
-            repo.abandon_guardian_authority_shadow(shadow["shadow_id"], now)
+            # A position absent from THIS tick's open_positions is not
+            # always a true orphan: monitoring_catchup.py's own restart-
+            # recovery pass closes positions itself, via the SAME
+            # close_position_with_event/close_triggered_positions
+            # machinery, BEFORE this tick's own open_positions/
+            # closed_positions lists are ever built - such a position
+            # never appears in EITHER list this tick, even though it
+            # genuinely, resolvably closed. Look the real position up
+            # directly rather than assume "absent from open_positions"
+            # means "gone":
+            #   - repo.get_position() returns None -> a true orphan (the
+            #     position row itself does not exist) -> abandon, same as
+            #     before.
+            #   - position.status == "CLOSED" -> a restart-recovery-closed
+            #     position -> resolve it via the SAME _resolve_on_close
+            #     the normal step-3 loop below uses (never a duplicated
+            #     resolution path), instead of losing the observation.
+            #   - anything else (still open, just inconsistently absent
+            #     from this tick's own snapshot - not reachable in real
+            #     production, where open_positions is always a live
+            #     find_open_positions() query) -> leave it alone, retry
+            #     next tick, never guess.
+            try:
+                real_position = repo.get_position(shadow["position_id"])
+                if real_position is None:
+                    repo.abandon_guardian_authority_shadow(shadow["shadow_id"], now)
+                elif (
+                    real_position.status == "CLOSED"
+                    and real_position.exit_reason is not None
+                    and real_position.fees is not None
+                    and real_position.funding is not None
+                ):
+                    _resolve_on_close(repo, shadow, real_position, now)
+            except Exception as exc:
+                # Same per-item isolation discipline as the advance loop
+                # below (and Task 7's own resolve_pending_pre_entry_
+                # shadows): a single malformed/failing orphan lookup must
+                # never abort processing of every OTHER shadow this tick.
+                # Deliberately does NOT fall back to abandon() on failure -
+                # the row is simply left as-is to retry next tick, so a
+                # transient error never permanently loses the observation.
+                log_event(
+                    run_id,
+                    event="guardian_authority_shadow_orphan_resolve_failed",
+                    shadow_id=shadow["shadow_id"],
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
             continue
         if shadow["instrument"] not in price_lookup:
             continue  # position genuinely still open - just no candle this tick
@@ -313,14 +363,31 @@ def run_guardian_authority_shadow_tick(
             continue
 
     # 3) Resolve whatever closed this same tick (read-only against
-    # `positions` - matches Profit Protection's own backfill step).
+    # `positions` - matches Profit Protection's own backfill step). Each
+    # position is resolved in its own try/except - same per-item isolation
+    # discipline as step 2's advance loop above and Task 7's own resolve_
+    # pending_pre_entry_shadows (authority.py): one malformed/failing
+    # position's resolution must never abort resolution of every OTHER
+    # position closed in the same tick (which would otherwise, per the
+    # orphan-branch fix above, silently convert them into permanently-lost
+    # ABANDONED rows on a later tick instead of being retried).
     for position in closed_positions:
-        if position.exit_reason is None or position.fees is None or position.funding is None:
-            continue  # defensive - close_triggered_positions always sets these
-        shadow = repo.get_guardian_authority_shadow(position.position_id)
-        if shadow is None or shadow["status"] not in ("OBSERVING", "DECIDED"):
+        try:
+            if position.exit_reason is None or position.fees is None or position.funding is None:
+                continue  # defensive - close_triggered_positions always sets these
+            shadow = repo.get_guardian_authority_shadow(position.position_id)
+            if shadow is None or shadow["status"] not in ("OBSERVING", "DECIDED"):
+                continue
+            _resolve_on_close(repo, shadow, position, now)
+        except Exception as exc:
+            log_event(
+                run_id,
+                event="guardian_authority_shadow_resolve_failed",
+                shadow_id=position.position_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             continue
-        _resolve_on_close(repo, shadow, position, now)
 
 
 def update_shadow_heuristics_from_resolved_shadow_observations(repo: Repository, now: datetime) -> int:
