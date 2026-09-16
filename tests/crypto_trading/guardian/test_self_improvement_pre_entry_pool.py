@@ -97,6 +97,7 @@ def _seed_closed_position(
     candidate_score=0.9,
     trigger_reasons=("momentum_breakout",),
     with_candidate=True,
+    size=_SIZE,
 ):
     """One REAL closed position plus (unless `with_candidate=False`) the real
     candidate row its pre-entry evidence lives in. Nothing here is Guardian
@@ -140,7 +141,7 @@ def _seed_closed_position(
             simulated_fill_entry=_ENTRY,
             stop_loss=Decimal("90"),
             target=Decimal("120"),
-            size=_SIZE,
+            size=size,
             fill_model_version="v1",
             opened_at=opened_at,
         ),
@@ -268,6 +269,28 @@ def test_pre_entry_veto_evidence_pool_skips_a_closed_row_without_a_closed_at(tmp
     _seed_closed_position(repo, "dated", _BASE + timedelta(minutes=1), _LOSS_EXIT)
     repo._conn.execute("UPDATE positions SET closed_at = NULL WHERE position_id = 'undated'")
     repo._conn.commit()
+
+    pool = _pre_entry_veto_evidence_pool(repo)
+
+    assert len(pool) == 1
+    assert pool[0][0] == (_BASE + timedelta(minutes=1)).isoformat()
+
+
+def test_pre_entry_veto_evidence_pool_excludes_exposure_blocked_zero_size_positions(tmp_path):
+    """Review fix (round 1): a position whose `size` was pushed to 0 by the
+    max_total_exposure_pct cap never had real market exposure, so it has no
+    real realized outcome to counterfactual against - and `compute_pnl` on
+    it returns `0 - fees - funding`, which this pool's own `<= 0` rule would
+    otherwise score as "a veto would have been correct". Every such row
+    would land on the SAME side of the boolean, and they cluster
+    non-randomly (whatever the exposure cap happened to block), so they
+    would push any condition that matches them toward VALIDATED on an
+    outcome that never happened. Excluded via the SAME, unmodified
+    `_is_blocked_by_exposure` four other modules already apply to outcome
+    statistics on an explicit 2026-09-03 user ruling."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_closed_position(repo, "blocked", _BASE, _BREAKEVEN_EXIT, size=Decimal("0"))
+    _seed_closed_position(repo, "real", _BASE + timedelta(minutes=1), _LOSS_EXIT)
 
     pool = _pre_entry_veto_evidence_pool(repo)
 

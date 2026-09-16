@@ -70,6 +70,7 @@ from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
 from crypto_trading.detective.stats import (
+    _is_blocked_by_exposure,
     compute_breakdown_by_signal_type,
     compute_guardian_exit_effectiveness,
 )
@@ -259,9 +260,20 @@ def _closed_position_entry_outcomes(
     uses, so what the model reasons about and what it is later graded
     against are the same view of the same data. A position whose candidate
     record is missing is omitted (the same skip the pool applies), never
-    emitted with guessed factors."""
+    emitted with guessed factors.
+
+    Review fix (round 1): exposure-blocked (`size == 0`) positions are
+    excluded here too, via the SAME unmodified `_is_blocked_by_exposure`.
+    Without it this list would contradict the very statistics sitting next
+    to it in the same prompt - `historical_signal_type_breakdown` and
+    `historical_guardian_exit_effectiveness` are built by detective/stats.py,
+    which already excludes those rows on the explicit 2026-09-03 user ruling
+    - and it would show the model a `pnl_usdt` of roughly zero for a trade
+    that never had any market exposure at all."""
     outcomes: list[dict] = []
     for position in positions:
+        if _is_blocked_by_exposure(position):
+            continue
         candidate = candidates_by_id.get(position.candidate_id)
         if candidate is None:
             continue
@@ -700,13 +712,15 @@ def _tighten_sl_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
 #   as legitimate evidence here, not a new methodology invented for this
 #   task.
 #
-# Two rows are skipped rather than guessed at: a CLOSED row with no
+# Three rows are skipped rather than guessed at: a CLOSED row with no
 # `closed_at` (defensive - it has no place in a chronological split; no
 # production path produces one, since close_position_with_event sets status
-# and closed_at in the same UPDATE), and a position whose candidate record is
+# and closed_at in the same UPDATE), a position whose candidate record is
 # missing or corrupt (`_safe_get_candidate` returning None) - the exact
 # mirror of the TIGHTEN_SL pool skipping a decision whose observation row
-# cannot be reconstructed.
+# cannot be reconstructed - and an exposure-blocked, zero-size position,
+# which has no real realized outcome at all (see the skip's own comment in
+# the function below for why that one matters most here).
 #
 # Statistical machinery: NONE is added or forked here. `_split_pool_
 # chronologically`, `_split_stats` and `_validation_outcome` are already
@@ -736,9 +750,35 @@ def _pre_entry_veto_evidence_pool(repo: Repository) -> list[tuple[str, dict, boo
     start and why it is neither circular nor fabricated."""
     pool: list[tuple[str, dict, bool]] = []
 
+    # Deliberately unwindowed, unlike `_build_context`'s own bounded loop
+    # above: this is an aggregate statistical read (like every other
+    # consumer of `find_closed_positions`), and truncating it to the most
+    # recent N rows would silently move the train/test boundary and change
+    # the very statistics the promotion bar is computed from. The prompt
+    # side is bounded because a prompt has a cost and a context limit; a
+    # validation pool has neither.
     for position in repo.find_closed_positions():
         if position.closed_at is None:
             continue  # defensive - nothing to place in a chronological split
+        if _is_blocked_by_exposure(position):
+            # Review fix (round 1). A position whose `size` was pushed to 0
+            # by the max_total_exposure_pct cap never had real market
+            # exposure, so it has no real realized outcome to
+            # counterfactual against - and `compute_pnl` on it returns
+            # `0 - fees - funding`, which this pool's own `<= 0` rule would
+            # score as "a veto would have been correct". Every such row
+            # would land on that SAME side of the boolean, and they cluster
+            # non-randomly (whatever the cap happened to block), so they
+            # would push any condition matching them toward VALIDATED on an
+            # outcome that never happened - the one thing the design
+            # addendum's "every factor and every PnL value is the
+            # position's own real, persisted data" forbids. Excluded via
+            # the SAME unmodified helper detective/stats.py,
+            # paper_track_report.py, profit_protection_report.py and
+            # repository.py already apply to outcome statistics (explicit
+            # 2026-09-03 user ruling: such rows "would incorrectly be
+            # counted as break-even trades").
+            continue
         candidate = _safe_get_candidate(repo, position.candidate_id)
         if candidate is None:
             continue  # missing/corrupt entry evidence - skip, never guess

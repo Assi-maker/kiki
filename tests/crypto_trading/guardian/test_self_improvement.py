@@ -34,6 +34,10 @@ from crypto_trading.schemas.assessments import (
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.guardian import GuardianObservation
 from crypto_trading.storage.repository import SQLiteRepository
+from tests.crypto_trading.guardian.test_self_improvement_pre_entry_pool import (
+    _BREAKEVEN_EXIT,
+    _seed_closed_position,
+)
 from tests.crypto_trading.guardian.test_tick import _seed_candidate_and_position
 from tests.crypto_trading.test_market_snapshot import _settings
 
@@ -447,6 +451,32 @@ def test_propose_candidate_heuristics_context_carries_real_pre_entry_evidence_an
         "trigger_reasons",
     ]
     assert "guardian_state" not in context["pre_entry_factor_names"]
+
+
+def test_propose_candidate_heuristics_context_excludes_exposure_blocked_positions(tmp_path):
+    """Review fix (round 1): a size-0, exposure-blocked position has no real
+    realized outcome and is already excluded from
+    `historical_signal_type_breakdown`/`historical_guardian_exit_
+    effectiveness` (detective/stats.py, 2026-09-03 user ruling). Including
+    it in the raw entry-outcome list would hand the model two mutually
+    inconsistent views of the same trade history - and a "pnl_usdt" of
+    roughly zero that no real trade ever produced."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)  # one REAL closed position
+    _seed_closed_position(
+        repo,
+        "blocked-by-exposure",
+        _NOW - timedelta(hours=2),
+        _BREAKEVEN_EXIT,
+        size=Decimal("0"),
+    )
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment()})
+
+    propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+
+    outcomes = runner.calls[0][1]["closed_position_entry_outcomes"]
+    assert len(outcomes) == 1
+    assert outcomes[0]["closed_at"] == (_NOW - timedelta(hours=1)).isoformat()
 
 
 # --------------------------------------------------------------------------
