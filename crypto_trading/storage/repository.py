@@ -430,6 +430,10 @@ class Repository(Protocol):
     def mark_guardian_authority_heuristic_candidate_demoted(
         self, candidate_id: str, demoted_at: datetime, demotion_reason: str
     ) -> bool: ...
+    def get_guardian_authority_strategist_last_proposed_date(self) -> str | None: ...
+    def set_guardian_authority_strategist_last_proposed_date(
+        self, date_iso: str, updated_at: datetime
+    ) -> None: ...
 
 
 class SQLiteRepository:
@@ -2590,3 +2594,45 @@ class SQLiteRepository:
         )
         self._conn.commit()
         return cur.rowcount > 0
+
+    # --- GODFATHER Strategist once-per-UTC-day proposal watermark (Task 3) ---
+    # Same schema_meta key-value store, and the same "the watermark IS the
+    # state" idea, as get/set_recovery_sweep_activated_at_if_missing and
+    # get/set_profit_protection_activated_at_if_missing above - but
+    # deliberately NOT their INSERT OR IGNORE first-writer-wins semantics.
+    # Those two are once-EVER activation timestamps whose whole point is that
+    # the first value is authoritative forever; this one is a rolling
+    # once-per-DAY gate that must genuinely move forward each day, so it is
+    # INSERT OR REPLACE. Using INSERT OR IGNORE here would freeze the
+    # watermark at the first day it was ever written and silently block every
+    # future day's proposal forever - the exact opposite of the intent.
+    #
+    # Two rows are written, not one:
+    #   'godfather_strategist_last_proposed_date'       -> 'YYYY-MM-DD' (the
+    #       gate key itself; the ONLY value the getter returns and the only
+    #       one guardian/self_improvement.py compares against)
+    #   'godfather_strategist_last_proposed_updated_at' -> full ISO timestamp
+    #       (audit only - the exact instant the watermark advanced, which the
+    #       calendar date alone cannot express). Never read by the gate.
+
+    def get_guardian_authority_strategist_last_proposed_date(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = "
+            "'godfather_strategist_last_proposed_date'"
+        ).fetchone()
+        return row["value"] if row is not None else None
+
+    def set_guardian_authority_strategist_last_proposed_date(
+        self, date_iso: str, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES "
+            "('godfather_strategist_last_proposed_date', ?)",
+            (date_iso,),
+        )
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES "
+            "('godfather_strategist_last_proposed_updated_at', ?)",
+            (updated_at.isoformat(),),
+        )
+        self._conn.commit()

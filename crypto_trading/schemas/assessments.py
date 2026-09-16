@@ -65,6 +65,44 @@ class QAAssessment(AssessmentBase):
     violations: list[str]
 
 
+class ProposedHeuristic(BaseModel):
+    """ONE candidate heuristic proposed by the GODFATHER Strategist role
+    (2026-09-15, Guardian Authority Live Autonomy, Task 3 - the PROPOSE step
+    of propose -> validate -> promote -> track/demote).
+
+    `condition` is a plain dict in exactly the shape
+    `guardian/authority.py::heuristic_condition_matches` already consumes
+    (see that module's "Condition-matching semantics" docstring section:
+    `"<name>_max"`/`"<name>_min"` numeric bounds, list-membership, equality,
+    AND across keys, fail-closed on a missing factor). It is persisted
+    verbatim as `guardian_authority_heuristic_candidates.condition_json` and
+    is never rewritten/normalized on the way in - the later, independent
+    validation step evaluates it through that same unmodified matcher, so a
+    condition the matcher cannot satisfy simply collects zero samples and is
+    rejected there rather than silently "fixed" here.
+
+    `adjustment` mirrors `guardian_authority_heuristics.adjustment`: signed,
+    positive reinforces the decision the heuristic conditions on, negative
+    discourages it. Carries ZERO effect on any real decision while the row
+    sits in the candidates table - only promotion (a separate, later step)
+    ever copies a candidate into the live heuristics table."""
+
+    description: str
+    condition: dict
+    adjustment: float
+    rationale: str
+
+
+class GodfatherStrategistAssessment(AssessmentBase):
+    """Output of `.claude/agents/crypto-godfather-strategist.md`. An EMPTY
+    `proposed_heuristics` list with `status="ok"` is a fully valid, expected
+    and often-correct answer ("the supplied history does not support a
+    confident pattern") - never treated as a failure by
+    guardian/self_improvement.py::propose_candidate_heuristics."""
+
+    proposed_heuristics: list[ProposedHeuristic]
+
+
 class OpportunityScreenAssessment(AssessmentBase):
     """Billig förscreening (kostnadsoptimering 2026-09-02) - körs INNAN den
     fulla 7-rollskedjan, på en separat, billigare modell (t.ex. Haiku 4.5).
