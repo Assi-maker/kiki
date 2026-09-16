@@ -1,25 +1,26 @@
-"""Guardian Authority self-improvement, steps 1-2 of 4: PROPOSE + VALIDATE
-(design spec:
+"""Guardian Authority self-improvement, steps 1-3 of 4: PROPOSE + VALIDATE
++ PROMOTE (design spec:
 docs/superpowers/specs/2026-09-15-guardian-authority-live-autonomy-design.md,
 "What 'self-improvement' concretely means here").
 
 The full pipeline is propose -> validate -> promote -> track/demote. THIS
-module proposes (`propose_candidate_heuristics`, Task 3) and validates
-out-of-sample (`validate_pending_heuristic_candidates`, Task 4); promotion
-into the real table and forward-performance tracking/demotion are later
-tasks. Everything Task 3 writes lands in one place -
-`guardian_authority_heuristic_candidates`, status `PROPOSED` - a table the
-real decision engine never reads, and Task 4 only ever moves a row from
-`PROPOSED` to `VALIDATED` or `REJECTED` in that SAME table, via the
+module proposes (`propose_candidate_heuristics`, Task 3), validates
+out-of-sample (`validate_pending_heuristic_candidates`, Task 4) and promotes
+(`promote_validated_heuristic_candidates`, Task 5); forward-performance
+tracking/demotion is a later task. Everything Task 3 writes lands in one
+place - `guardian_authority_heuristic_candidates`, status `PROPOSED` - a
+table the real decision engine never reads, and Task 4 only ever moves a row
+from `PROPOSED` to `VALIDATED` or `REJECTED` in that SAME table, via the
 existing, unmodified `record_guardian_authority_heuristic_candidate_
 validation`. `evaluate_heuristics` reads `guardian_authority_heuristics` (a
-different table), and nothing in this module can write there: the only
-write path into that table anywhere in this plan is the existing, unmodified
-`upsert_guardian_authority_heuristic`, called by the later promotion step
-after an independent out-of-sample validation clears a candidate. So an LLM
-that hallucinates a confident-sounding rule cannot influence a single real
-trade from here - it can only queue a hypothesis for a statistical test it
-has no way to reach.
+different table), and the ONLY way anything from this module reaches it is
+Task 5's single call to the existing, unmodified `upsert_guardian_authority_
+heuristic`, made only for a row an independent out-of-sample validation has
+already moved to `VALIDATED`. So an LLM that hallucinates a confident-
+sounding rule cannot influence a single real trade from here - it can only
+queue a hypothesis for a statistical test it has no way to reach, and its
+own proposed numbers are discarded even if that test clears (see Task 5's
+section below).
 
 Isolation (design spec, Global Constraints): this module never imports
 `position_sizing.py`, never references `set_leverage`, and never imports
@@ -75,6 +76,7 @@ from crypto_trading.detective.stats import (
     compute_guardian_exit_effectiveness,
 )
 from crypto_trading.guardian.authority import (
+    _ADJUSTMENT_SCALE,
     _MIN_MISCALIBRATION,
     _MIN_SAMPLE_SIZE,
     _pre_entry_factors,
@@ -933,3 +935,207 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
             processed += 1
 
     return processed
+
+
+# ---------------------------------------------------------------------------
+# Task 5 (2026-09-15, Guardian Authority Live Autonomy): PROMOTION - step 3 of
+# 4 (propose -> validate -> PROMOTE -> track/demote), and the one and only
+# point in this whole plan where anything crosses from the isolated candidates
+# table into the REAL `guardian_authority_heuristics` table the live decision
+# core reads on every single decision.
+#
+# --------------------------------------------------------------------------
+# What is written, and where every number comes from
+# --------------------------------------------------------------------------
+# The write itself is the existing, unmodified, already-reviewed
+# `repo.upsert_guardian_authority_heuristic` - the same narrow path
+# authority.py's own self-critique pass has always used, called here from
+# exactly ONE new call site (the plan's own Global Constraint: a candidate can
+# reach that table by no other route, and this task adds no second route).
+#
+# - `heuristic_id`: `f"ga-llm:{candidate_id}"` - deterministic, so a repeated
+#   promotion of the same candidate can only ever REPLACE its own row, never
+#   accumulate near-duplicates, and so a reader can tell at a glance which
+#   family a live heuristic belongs to (`ga-hc:state:*` = authority.py's
+#   self-critique pass, `ga-llm:*` = this pipeline). The prefix is also what
+#   makes the co-firing cap below grep/count-provable.
+# - `adjustment`/`confidence`: derived from the candidate's own TEST-split
+#   numbers with the SAME formulas `update_heuristics_from_resolved_decisions`
+#   uses (`deviation = test_correct_rate - 0.5`, `adjustment = deviation *
+#   _ADJUSTMENT_SCALE`, `confidence = abs(deviation) * 2.0` - the constant
+#   imported from authority.py, never re-derived), then scaled by the
+#   co-firing cap below. TEST, never train: the held-out numbers are what
+#   earned the promotion and are the only ones that describe the rule's real,
+#   out-of-sample strength.
+# - NEVER `proposed_adjustment`. That column is the proposing model's own
+#   informational rationale, kept for audit only - the live table's numbers
+#   are measured from real outcomes, not asserted by the proposer. This is
+#   the single most important property of this function: an LLM cannot set
+#   the strength of its own rule, only nominate a condition for measurement.
+# - `condition_json`: the candidate's own string, verbatim - not re-parsed
+#   and re-serialized, so what the live table matches on is byte-identical to
+#   what validation measured.
+# - `sample_size`: `test_sample_size`, matching the split the adjustment and
+#   confidence come from (the row would otherwise advertise a sample size
+#   that never produced its own numbers).
+#
+# --------------------------------------------------------------------------
+# R3 - the co-firing cap (design spec "Addendum (2026-09-16)", R3)
+# --------------------------------------------------------------------------
+# `evaluate_heuristics` (frozen, unmodifiable by this plan) SUMS the
+# adjustment of every matching heuristic. The self-critique family is safe
+# from that by construction - `_groups_for_factors`' own I1 hardening makes
+# `ga-hc:state:*` ids 1:1 with `guardian_state`, so at most one can ever match
+# one decision. This family has no such structure: conditions are written by
+# a model, over a shared factor vocabulary, and nothing stops N of them from
+# matching the same decision and summing to N times a single rule's worth -
+# the exact multi-heuristic escalation I1 closed.
+#
+# Chosen mechanism (Cap B in the brief's taxonomy - an evaluation-time
+# contribution cap achieved entirely by what gets WRITTEN, with zero changes
+# to `evaluate_heuristics`): **every live `ga-llm:*` heuristic's stored
+# `adjustment` is its own earned adjustment divided by the number of live
+# `ga-llm:*` heuristics.** Each promotion pass rewrites the whole live family
+# with the new divisor, so the invariant holds continuously, not just at the
+# moment of a promotion.
+#
+# The bound this buys, stated exactly: with M live rows, each storing
+# `raw_i / M`, the sum over ANY subset that co-fires on ANY factors dict is at
+# most `sum_i |raw_i| / M`, which is the family's MEAN magnitude and therefore
+# `<= max_i |raw_i|` - the strongest single member's own full worth. In other
+# words the family contributes an AVERAGE, never a sum: promoting more
+# heuristics can never make the family louder than its single loudest member,
+# which is precisely "multiple heuristics can never escalate a decision merely
+# by co-firing". It is provable from this diff alone by counting: every
+# `ga-llm:*` row in the table is written by the one loop below, and that loop
+# divides by the number of rows it writes.
+#
+# Why this and not Cap A (a hard cap on the promoted count):
+# - A per-`target_decision_type` count cap would NOT be provable. The real
+#   heuristics table has no `target_decision_type` column and
+#   `evaluate_heuristics` reads every row in it, so a PRE_ENTRY_VETO-targeted
+#   condition and a TIGHTEN_SL-targeted one can still co-fire on one factors
+#   dict (trivially so for an empty/permissive condition); proving they cannot
+#   would require reasoning about the model's conditions staying disjoint -
+#   the one thing the brief explicitly forbids relying on.
+# - A GLOBAL count cap of 1 would be provable, but it freezes the pipeline at
+#   a single live LLM-authored rule forever (a second one can only ever exist
+#   after the first degrades enough for Task 6 to demote it), which is a much
+#   larger amputation of the self-improvement the spec is built around.
+# The divisor here is likewise the WHOLE live family, across both target
+# decision types, for exactly the first reason above - a per-target divisor
+# would leave the cross-type overlap unproven.
+#
+# The cost, stated honestly: an individual heuristic gets quieter as the
+# family grows (with 4 live rules, a lone matching rule contributes a quarter
+# of its earned strength, below `authority_tighten_threshold`'s 0.15 default
+# for any realistic deviation). The family speaks at full strength only when
+# its members AGREE on a decision. That is the conservative direction the
+# user asked for - a quiet heuristic can only fail to intervene, never
+# over-intervene - and Task 6's demotions free the divisor back up as weak
+# rules are retired.
+#
+# Two ordering details the cap depends on:
+# - Already-live rows are rewritten (downward, to the new, larger divisor)
+#   BEFORE the newly promoted ones are added, so even the transient state in
+#   the middle of the loop is never louder than the bound.
+# - A DEMOTED candidate (Task 6 sets `demoted_at` and upserts its heuristic to
+#   `adjustment = 0.0`) is skipped entirely: never counted in the divisor (it
+#   contributes nothing to any sum) and, more importantly, never rewritten -
+#   rescaling it would resurrect a rule that forward performance already
+#   retired.
+#
+# Error handling follows `validate_pending_heuristic_candidates`' precedent
+# directly above (no blanket try/except): this is a pure DB-in/DB-out batch
+# step with no AI call, no budget gate and no watermark, structurally the same
+# kind of function as `update_heuristics_from_resolved_decisions`, which
+# likewise lets a failure propagate to its caller rather than silently
+# half-promoting.
+# ---------------------------------------------------------------------------
+
+# The live-heuristic id prefix that IS this family - see the R3 section above.
+_LLM_HEURISTIC_ID_PREFIX = "ga-llm:"
+
+
+def _llm_heuristic_id(candidate_id: str) -> str:
+    return f"{_LLM_HEURISTIC_ID_PREFIX}{candidate_id}"
+
+
+def _live_promoted_llm_candidates(repo: Repository) -> list[dict]:
+    """The promoted candidates whose real heuristic row is still live: not
+    demoted, and carrying a `ga-llm:*` heuristic id (the only ids this
+    function ever writes - the prefix check keeps the co-firing divisor
+    provably about THIS family and nothing else)."""
+    return [
+        row
+        for row in repo.find_promoted_guardian_authority_heuristic_candidates()
+        if row["demoted_at"] is None
+        and str(row["promoted_heuristic_id"] or "").startswith(_LLM_HEURISTIC_ID_PREFIX)
+    ]
+
+
+def _write_llm_heuristic(
+    repo: Repository, candidate: dict, heuristic_id: str, family_size: int, now: datetime
+) -> None:
+    """THE single call site this task adds to `upsert_guardian_authority_
+    heuristic` - shared by the newly-promoted rows and by the rescale of the
+    already-live ones deliberately, so that the plan's "exactly one new write
+    path into the real table" constraint stays literally true and every
+    `ga-llm:*` row in existence provably carries the same
+    `raw / family_size` scaling. See the Task 5 module section above for
+    where each value comes from and why `family_size` divides the
+    adjustment (and only the adjustment - `confidence` describes how sure the
+    test split is about the rule itself, which co-firing does not change)."""
+    deviation = float(candidate["test_correct_rate"]) - 0.5
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id=heuristic_id,
+        description=candidate["description"],
+        condition_json=candidate["condition_json"],
+        adjustment=deviation * _ADJUSTMENT_SCALE / family_size,
+        confidence=abs(deviation) * 2.0,
+        sample_size=int(candidate["test_sample_size"]),
+        updated_at=now,
+    )
+
+
+def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> int:
+    """Promotion gate (Task 5). Writes every currently-`VALIDATED` candidate
+    into the real `guardian_authority_heuristics` table via the existing,
+    unmodified `upsert_guardian_authority_heuristic`, then transitions its
+    candidate row `VALIDATED -> PROMOTED` via Task 1's own one-time,
+    `WHERE status = 'VALIDATED'`-guarded `promote_guardian_authority_
+    heuristic_candidate`. Returns the number of candidates actually promoted
+    by THIS call (a row some concurrent/earlier call already promoted is a
+    structural no-op and is not counted - same idempotency discipline as the
+    two functions above).
+
+    Every already-live `ga-llm:*` heuristic is rewritten in the same pass
+    with the new family divisor, which is what keeps the R3 co-firing cap
+    true continuously rather than only at the instant of a promotion; see
+    the Task 5 module section above for the mechanism and its proof."""
+    validated = repo.find_validated_guardian_authority_heuristic_candidates()
+    if not validated:
+        # Nothing to promote means nothing to rescale either: the live family
+        # is unchanged, so its existing divisor is still correct.
+        return 0
+
+    # Sorted by candidate_id purely for deterministic write order - the
+    # values written do not depend on it. Already-live rows first: see the
+    # ordering note in the module section above.
+    live = sorted(_live_promoted_llm_candidates(repo), key=lambda row: row["candidate_id"])
+    incoming = sorted(validated, key=lambda row: row["candidate_id"])
+    family_size = len(live) + len(incoming)
+
+    for row in live:
+        _write_llm_heuristic(repo, row, row["promoted_heuristic_id"], family_size, now)
+
+    promoted = 0
+    for row in incoming:
+        heuristic_id = _llm_heuristic_id(row["candidate_id"])
+        _write_llm_heuristic(repo, row, heuristic_id, family_size, now)
+        if repo.promote_guardian_authority_heuristic_candidate(
+            row["candidate_id"], heuristic_id, now
+        ):
+            promoted += 1
+
+    return promoted
