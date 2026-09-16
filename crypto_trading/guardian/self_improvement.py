@@ -1032,8 +1032,24 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
 # for any realistic deviation). The family speaks at full strength only when
 # its members AGREE on a decision. That is the conservative direction the
 # user asked for - a quiet heuristic can only fail to intervene, never
-# over-intervene - and Task 6's demotions free the divisor back up as weak
-# rules are retired.
+# over-intervene.
+#
+# And one asymmetry in that cost that must NOT be glossed over (review
+# finding, Task 5): Task 6's demotion frees a divisor slot only for a
+# heuristic that has actually FIRED and resolved. Its TIGHTEN_SL
+# forward-tracking counts only resolved decisions with
+# `intervention_applied` true, so a TIGHTEN_SL-targeted member that this
+# rescale has diluted below `authority_tighten_threshold` can never fire
+# again, can therefore never accumulate a single forward sample, and can
+# therefore never be demoted through that path - an absorbing state. It is a
+# SAFE absorbing state (a silent heuristic cannot over-intervene), but it
+# means the TIGHTEN_SL half of this family can only ever grow, never shrink,
+# via demotion. PRE_ENTRY_VETO-targeted members do not have this problem:
+# their forward-tracking uses the closed-position counterfactual pool
+# (Task 4B's `_pre_entry_veto_evidence_pool`), which measures a condition
+# against real closed positions whether or not the heuristic ever fired. The
+# accepted resolution is a TIGHTEN_SL-specific cardinality cap in Task 6's
+# own scope, not a change here.
 #
 # Two ordering details the cap depends on:
 # - Already-live rows are rewritten (downward, to the new, larger divisor)
