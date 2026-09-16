@@ -331,29 +331,160 @@ def test_the_forward_sample_size_floor_is_genuinely_enforced(tmp_path):
     assert _heuristics_by_id(repo)[heuristic_id]["sample_size"] == 15
 
 
-def test_the_forward_correct_rate_bar_is_strict_and_sits_exactly_at_0_40(tmp_path):
-    """A forward record of exactly 8/20 = 0.40 is NOT demoted - the bar is
-    "meaningfully below the 0.5 baseline", enforced with a strict `<`, not a
-    `<=` that would retire a heuristic sitting precisely on the line. Moving
-    a single outcome from correct to incorrect (7/20 = 0.35) is what crosses
-    it."""
+def test_the_forward_bar_is_an_adverse_deviation_of_0_10_from_the_baseline(tmp_path):
+    """The bar is "the forward record has moved 0.10 against this heuristic's
+    own direction", not "not perfect". Pinned tightly, and deliberately NOT
+    on the knife edge: for a positive-adjustment heuristic 41/100 = 0.41 (a
+    deviation of -0.09) survives and 39/100 = 0.39 (-0.11) does not, which
+    brackets the bar at 0.10 to within 0.01 without depending on how a
+    deviation of exactly -0.10 rounds in IEEE-754."""
     repo = SQLiteRepository(tmp_path / "t.db")
     heuristic_id = _seed_promoted_heuristic(repo, "cand-1", condition=_STATE_CONDITION)
 
     _seed_forward_tighten_sl_record(
-        repo, heuristic_id, count=20, correct_count=8, first_decided_at=_FORWARD_START
+        repo, heuristic_id, count=100, correct_count=41, first_decided_at=_FORWARD_START
     )
     assert track_and_demote_underperforming_heuristics(repo, _NOW) == 0
     assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == pytest.approx(0.4)
 
-    # `fwd-0007` was the 8th and last correct row; re-resolving it wrong
-    # takes the rate to 7/20 = 0.35 without changing the sample size at all.
-    repo.resolve_guardian_authority_decision(
-        "fwd-0007", "stop_loss", "-1", False, _PROMOTED_AT + timedelta(minutes=30)
-    )
+    # `fwd-0039`/`fwd-0040` were among the 41 correct rows; re-resolving two
+    # of them wrong takes the rate to 39/100 without changing the sample size.
+    for decision_id in ("fwd-0039", "fwd-0040"):
+        repo.resolve_guardian_authority_decision(
+            decision_id, "stop_loss", "-1", False, _PROMOTED_AT + timedelta(hours=5)
+        )
     assert track_and_demote_underperforming_heuristics(repo, _NOW) == 1
     assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == 0.0
-    assert _heuristics_by_id(repo)[heuristic_id]["sample_size"] == 20
+    assert _heuristics_by_id(repo)[heuristic_id]["sample_size"] == 100
+
+
+# --------------------------------------------------------------------------
+# Direction-awareness (controller ruling, 2026-09-16)
+#
+# A promoted heuristic's stored adjustment can legitimately be NEGATIVE: a
+# candidate whose held-out split said "under this condition the action was
+# usually the WRONG call" is promoted with a negative adjustment, i.e. a rule
+# that pushes AWAY from the action. For such a rule a LOW forward correct_rate
+# is CONFIRMING evidence, not disconfirming - the flat `correct_rate < 0.4`
+# bar this replaced would have retired it for continuing to be right.
+#
+# Each pair below is deliberately built so that the ONLY difference from an
+# existing positive-adjustment fixture above is the promoted direction, and
+# the verdict flips with it.
+# --------------------------------------------------------------------------
+def test_a_negative_adjustment_tighten_sl_heuristic_is_not_demoted_for_being_right(tmp_path):
+    """Promoted at test_correct_rate 0.1 (adjustment -0.4): "tightening under
+    this condition is usually the wrong call". Its forward record is the
+    SAME 20-interventions-at-0.25 fixture that demotes the positive-adjustment
+    heuristic at the top of this file - and here it must NOT demote, because
+    0.25 is exactly what a rule arguing against tightening predicted. Under
+    the old flat `correct_rate < 0.4` bar this heuristic was retired for being
+    right; that is the bug this test pins closed."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(
+        repo, "cand-1", condition=_STATE_CONDITION, test_correct_rate=0.1
+    )
+    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == pytest.approx(-0.4)
+
+    _seed_forward_tighten_sl_record(
+        repo, heuristic_id, count=20, correct_count=5, first_decided_at=_FORWARD_START
+    )
+
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 0
+    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == pytest.approx(-0.4)
+    assert repo.get_guardian_authority_heuristic_candidate("cand-1")["demoted_at"] is None
+
+
+def test_a_negative_adjustment_tighten_sl_heuristic_is_demoted_when_forward_evidence_reverses(
+    tmp_path,
+):
+    """The same heuristic, genuinely contradicted: 16 of 20 forward
+    interventions it co-fired on turned out CORRECT (0.8), i.e. tightening
+    under this condition is now usually right - the opposite of what the rule
+    argues. That is real disconfirmation and it is retired."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(
+        repo, "cand-1", condition=_STATE_CONDITION, test_correct_rate=0.1
+    )
+
+    _seed_forward_tighten_sl_record(
+        repo, heuristic_id, count=20, correct_count=16, first_decided_at=_FORWARD_START
+    )
+
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 1
+    row = _heuristics_by_id(repo)[heuristic_id]
+    assert row["adjustment"] == 0.0
+    assert row["sample_size"] == 20
+    candidate = repo.get_guardian_authority_heuristic_candidate("cand-1")
+    assert candidate["demoted_at"] == _NOW.isoformat()
+    assert "-0.4000" in candidate["demotion_reason"]  # the direction it contradicted
+
+
+def test_a_negative_adjustment_pre_entry_veto_heuristic_is_not_demoted_for_being_right(tmp_path):
+    """Promoted at test_correct_rate 0.1 (adjustment -0.4): "positions
+    matching this condition usually WIN, so do not veto here". The forward
+    fixture is byte-for-byte the one that demotes the positive-adjustment veto
+    heuristic above (20 forward positions, 16 profitable -> veto-correct 0.2);
+    the only thing that differs is the promoted direction, and the verdict
+    flips with it."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(
+        repo,
+        "veto-1",
+        condition=_VETO_CONDITION,
+        target_decision_type="PRE_ENTRY_VETO",
+        test_correct_rate=0.1,
+    )
+    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == pytest.approx(-0.4)
+
+    for index in range(20):
+        _seed_closed_position(
+            repo,
+            f"fwd-{index:04d}",
+            _PROMOTED_AT + timedelta(minutes=index + 1),
+            _LOSS_EXIT if index < 4 else _WIN_EXIT,
+        )
+
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 0
+    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == pytest.approx(-0.4)
+    assert repo.get_guardian_authority_heuristic_candidate("veto-1")["demoted_at"] is None
+
+
+def test_a_negative_adjustment_pre_entry_veto_heuristic_is_demoted_when_forward_evidence_reverses(
+    tmp_path,
+):
+    """The same "do not veto here" heuristic, genuinely contradicted: 16 of
+    20 forward positions matching its condition actually LOST money, so a veto
+    would have been correct 0.8 of the time - the opposite of what the rule
+    argues. Retired, via the closed-position pool and not the
+    resolved-decisions mechanism (asserted)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(
+        repo,
+        "veto-1",
+        condition=_VETO_CONDITION,
+        target_decision_type="PRE_ENTRY_VETO",
+        test_correct_rate=0.1,
+    )
+
+    for index in range(20):
+        _seed_closed_position(
+            repo,
+            f"fwd-{index:04d}",
+            _PROMOTED_AT + timedelta(minutes=index + 1),
+            _WIN_EXIT if index < 4 else _LOSS_EXIT,
+        )
+
+    assert repo.find_resolved_guardian_authority_decisions() == []
+
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 1
+    row = _heuristics_by_id(repo)[heuristic_id]
+    assert row["adjustment"] == 0.0
+    assert row["sample_size"] == 20
+    candidate = repo.get_guardian_authority_heuristic_candidate("veto-1")
+    assert candidate["demoted_at"] == _NOW.isoformat()
+    assert "PRE_ENTRY_VETO" in candidate["demotion_reason"]
+    assert "-0.4000" in candidate["demotion_reason"]
 
 
 def test_an_already_demoted_candidate_is_never_reprocessed(tmp_path):

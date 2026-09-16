@@ -1348,22 +1348,80 @@ def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> i
 # opportunity that promotion can re-earn, while demoting too late costs real
 # capital.
 #
-# `_FORWARD_MAX_CORRECT_RATE = 0.4` is a strict `<`, i.e. a forward deviation
-# of at least -0.10 from the uninformative 0.5 baseline. It is deliberately
-# NOT "anything below what got it promoted" (a rule that merely regressed to
-# ~0.5 is uninformative, not harmful - it contributes noise, and Cap B already
-# bounds how loud that noise can be) and deliberately NOT 0.5 itself (which
-# would retire half the family on a coin flip). It sits inside
+# `_FORWARD_ADVERSE_DEVIATION = 0.10` is how far the forward evidence must
+# have moved AGAINST the heuristic's own prediction before it is retired. It is
+# deliberately NOT "anything below what got it promoted" (a rule that merely
+# regressed toward 0.5 is uninformative, not harmful - it contributes noise,
+# and Cap B already bounds how loud that noise can be) and deliberately NOT 0
+# (which would retire half the family on a coin flip). It sits inside
 # `_MIN_MISCALIBRATION`'s own 0.15 floor rather than at it: a heuristic that
-# has crossed all the way to a 0.35 correct_rate is already MORE miscalibrated
-# than the bar it had to clear to be promoted at all, which would be a late
-# canary, not an early one. 0.10 is the same order of magnitude as that
-# established floor - "meaningfully below 0.5, not merely not-perfect" - while
-# firing one step sooner.
+# has crossed all the way to a 0.15 adverse deviation is already MORE
+# miscalibrated, in the wrong direction, than the bar it had to clear to be
+# promoted at all - which would be a late canary, not an early one. 0.10 is
+# the same order of magnitude as that established floor - "meaningfully
+# against it, not merely not-perfect" - while firing one step sooner.
 #
-# Both constants are shared by both tracks: there is no reason to hold the two
-# decision types to different bars, and two sets of numbers would be two
-# things to keep in agreement forever.
+# --------------------------------------------------------------------------
+# WHY THE BAR IS SIGN-AWARE, AND NOT A FLAT `correct_rate < 0.4` (controller
+# ruling, 2026-09-16, after Task 6's first implementation)
+# --------------------------------------------------------------------------
+# A promoted heuristic's stored `adjustment` carries a DIRECTION, and it can
+# legitimately be negative. `promote_validated_heuristic_candidates` derives it
+# as `(test_correct_rate - 0.5) * _ADJUSTMENT_SCALE / family_size`, exactly as
+# `update_heuristics_from_resolved_decisions` has always done, so a candidate
+# whose held-out split said "under this condition the action was usually the
+# WRONG call" is promoted with a NEGATIVE adjustment - a rule that pushes AWAY
+# from the action. That is a first-class, intended outcome on both tracks: a
+# TIGHTEN_SL heuristic can be promoted to discourage tightening, and a
+# PRE_ENTRY_VETO heuristic can be promoted to discourage vetoing.
+#
+# A flat "forward correct_rate below 0.4 -> demote" silently assumes every
+# promoted heuristic points the positive way, and gets the negative ones
+# exactly backwards. For a negative-adjustment heuristic a LOW forward
+# correct_rate is not disconfirming evidence at all - it is CONFIRMING
+# evidence: the rule argued against the action, the action happened anyway
+# because the rest of the family outvoted it, and the action turning out badly
+# is precisely what the rule predicted. The flat bar would retire it for
+# continuing to be right, and (worse) retire it fastest exactly when it is most
+# right.
+#
+# So the bar is stated in terms of AGREEMENT with the heuristic's own
+# direction, the same way every other calibration judgement in this pipeline
+# already is (Task 4/4B's train/test sign-agreement check; Task 5's
+# deviation-sign-derives-adjustment-sign rule):
+#
+#     forward_deviation = forward_correct_rate - 0.5
+#     promoted_sign     = +1 if stored adjustment > 0 else -1
+#     demote  <=>  sample_size >= 15
+#                  and promoted_sign * forward_deviation <= -0.10
+#
+# `promoted_sign * forward_deviation` is the forward evidence expressed in the
+# heuristic's OWN direction: positive means the forward record agrees with what
+# the rule predicted, negative means it has swung the other way. Reading off
+# the two cases:
+#   - positive adjustment -> demote when forward_correct_rate <= 0.40
+#     (identical to the flat rule this replaced - no behaviour change at all
+#     for the family's positive half);
+#   - negative adjustment -> demote when forward_correct_rate >= 0.60, i.e.
+#     only when the forward evidence genuinely contradicts it.
+#
+# The sign is read from the heuristic's REAL stored adjustment (the value
+# `evaluate_heuristics` actually sums), not re-derived from the candidate's
+# `test_correct_rate` - they provably agree, since the divisor and
+# `_ADJUSTMENT_SCALE` are both positive, but the live row is the thing actually
+# acting on capital and is therefore what "which way does this rule push"
+# should mean. A live, undemoted `ga-llm:*` row can never store exactly 0.0
+# (validation's `_MIN_MISCALIBRATION = 0.15` floor guarantees
+# `|test_correct_rate - 0.5| >= 0.15` before promotion is possible at all), so
+# the `> 0 else -1` split has no meaningful third case; a row whose heuristic
+# is missing from the table entirely is skipped rather than guessed at, since
+# its direction is unknowable and there is nothing live to silence anyway.
+#
+# Both constants are shared by both tracks: the sign-blindness this ruling
+# fixed was present on BOTH (a PRE_ENTRY_VETO candidate whose condition
+# correlates with real WINS is promoted negative, to push away from vetoing
+# there, and has the identical failure mode), and there is no reason to hold
+# the two decision types to different bars.
 #
 # --------------------------------------------------------------------------
 # The two writes, and why their ORDER is binding (2026-09-16 addendum)
@@ -1406,9 +1464,11 @@ def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> i
 # ---------------------------------------------------------------------------
 
 # The canary thresholds - see the section above for why each is what it is,
-# and why neither is the validation threshold of the same name.
+# why neither is the validation threshold of the same name, and why the
+# deviation bar is measured in the heuristic's OWN direction rather than as a
+# flat correct_rate floor.
 _FORWARD_MIN_SAMPLE_SIZE = 15
-_FORWARD_MAX_CORRECT_RATE = 0.4
+_FORWARD_ADVERSE_DEVIATION = 0.1
 
 
 def _outcome_stats(outcomes: list[bool]) -> tuple[int, float]:
@@ -1472,8 +1532,10 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
     `mark_guardian_authority_heuristic_candidate_demoted` FIRST, then the
     zeroing `upsert_guardian_authority_heuristic` (the order is binding; see
     the Task 6 module section above) - when that record reaches
-    `_FORWARD_MIN_SAMPLE_SIZE` samples at a correct_rate below
-    `_FORWARD_MAX_CORRECT_RATE`.
+    `_FORWARD_MIN_SAMPLE_SIZE` samples AND has deviated at least
+    `_FORWARD_ADVERSE_DEVIATION` from the 0.5 baseline in the direction
+    OPPOSITE to the heuristic's own stored adjustment (see the module section
+    for why the bar is sign-aware and not a flat correct_rate floor).
 
     Returns the number of heuristics actually demoted by THIS call. A row
     some concurrent/earlier call already demoted is a structural no-op via
@@ -1487,12 +1549,20 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
     if not live:
         return 0
 
-    # Read once per call, not once per heuristic: both are whole-table
+    # Read once per call, not once per heuristic: all three are whole-table
     # aggregate reads, and every heuristic on a given track is measured
     # against the same underlying evidence (only the window and the
     # attribution/condition filter differ per heuristic). The veto pool is
     # built lazily because a family with no PRE_ENTRY_VETO members should not
     # pay for a full `find_closed_positions()` scan.
+    #
+    # `find_guardian_authority_heuristics` (existing, unmodified - read only,
+    # never written by this module) is what supplies each rule's own DIRECTION:
+    # the sign of the adjustment `evaluate_heuristics` actually sums.
+    live_adjustments = {
+        row["heuristic_id"]: float(row["adjustment"])
+        for row in repo.find_guardian_authority_heuristics()
+    }
     resolved_decisions: list[dict] | None = None
     veto_pool: list[tuple[str, dict, bool]] | None = None
 
@@ -1506,6 +1576,12 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
             # no production path produces this. A row without a promotion
             # timestamp has no forward window to measure, and demoting on an
             # unmeasurable record is the one thing this step must not do.
+            continue
+        if heuristic_id not in live_adjustments:
+            # Defensive - promotion writes the heuristic row before it marks
+            # the candidate PROMOTED, so a PROMOTED candidate always has one.
+            # Without it there is no direction to judge the forward record
+            # against, and nothing live to silence either.
             continue
 
         target = _target_decision_type(candidate)
@@ -1536,13 +1612,23 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
 
         if sample_size < _FORWARD_MIN_SAMPLE_SIZE:
             continue
-        if correct_rate >= _FORWARD_MAX_CORRECT_RATE:
+
+        # The forward evidence expressed in the heuristic's OWN direction:
+        # positive means it agrees with what the rule predicted, negative
+        # means the record has swung the other way. See the module section
+        # above for why a flat correct_rate floor is wrong here.
+        promoted_adjustment = live_adjustments[heuristic_id]
+        promoted_sign = 1 if promoted_adjustment > 0 else -1
+        agreement = promoted_sign * (correct_rate - 0.5)
+        if agreement > -_FORWARD_ADVERSE_DEVIATION:
             continue
 
         reason = (
-            f"forward correct_rate {correct_rate:.4f} < {_FORWARD_MAX_CORRECT_RATE} "
-            f"over n={sample_size} forward {target} samples since "
-            f"promoted_at={promoted_at}"
+            f"forward correct_rate {correct_rate:.4f} deviates "
+            f"{agreement:+.4f} in the direction of this heuristic's own "
+            f"adjustment {promoted_adjustment:+.4f} (bar: "
+            f"{-_FORWARD_ADVERSE_DEVIATION}) over n={sample_size} forward "
+            f"{target} samples since promoted_at={promoted_at}"
         )
 
         # ORDER IS BINDING - mark first, zero second. See the module section
@@ -1572,6 +1658,8 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
             target_decision_type=target,
             forward_sample_size=sample_size,
             forward_correct_rate=correct_rate,
+            promoted_adjustment=promoted_adjustment,
+            forward_agreement=agreement,
             demotion_reason=reason,
         )
         demoted += 1
