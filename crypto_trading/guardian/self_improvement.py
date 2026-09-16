@@ -76,11 +76,13 @@ from crypto_trading.detective.stats import (
 from crypto_trading.guardian.authority import (
     _MIN_MISCALIBRATION,
     _MIN_SAMPLE_SIZE,
+    _pre_entry_factors,
     _reconstruct_tighten_sl_factors,
     heuristic_condition_matches,
 )
 from crypto_trading.guardian.tick import _budget_allows_one_more_call, _utc_day_start
 from crypto_trading.logging import log_event
+from crypto_trading.paper_trading.execution import compute_pnl
 from crypto_trading.schemas.assessments import GodfatherStrategistAssessment
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
@@ -237,6 +239,45 @@ def _most_recent_rows(rows: list[dict], timestamp_key: str) -> list[dict]:
     return ordered[:_MAX_EVIDENCE_ROWS]
 
 
+def _closed_position_entry_outcomes(
+    positions: list[Position], candidates_by_id: dict[str, Candidate]
+) -> list[dict]:
+    """Task 4B: real pre-entry evidence paired with the real outcome it led
+    to, for the already-windowed closed positions.
+
+    Why this exists: a `PRE_ENTRY_VETO` proposal may only condition on
+    `_pre_entry_factors`' own three fields, and before this task the context
+    evidenced exactly ONE of them - `trigger_reasons`, indirectly, through
+    Detective's `historical_signal_type_breakdown` grouping key. A model
+    told "never invent a factor name, never cite evidence you were not
+    given" therefore had no legitimate basis for a condition on
+    `candidate_score` or `instrument` at all. This is the minimal fix: the
+    SAME rows, the SAME candidate lookups and the SAME
+    `_MAX_EVIDENCE_ROWS` window `_build_context` already performed - no
+    additional database read of any kind - reshaped through the same
+    unmodified `_pre_entry_factors`/`compute_pnl` the validation pool itself
+    uses, so what the model reasons about and what it is later graded
+    against are the same view of the same data. A position whose candidate
+    record is missing is omitted (the same skip the pool applies), never
+    emitted with guessed factors."""
+    outcomes: list[dict] = []
+    for position in positions:
+        candidate = candidates_by_id.get(position.candidate_id)
+        if candidate is None:
+            continue
+        outcomes.append(
+            {
+                "closed_at": position.closed_at.isoformat() if position.closed_at else None,
+                "factors": _pre_entry_factors(candidate),
+                # str(), not float(): the same Decimal-preserving discipline
+                # detective/stats.py already applies to money in a prompt.
+                "pnl_usdt": str(compute_pnl(position)),
+                "exit_reason": position.exit_reason,
+            }
+        )
+    return outcomes
+
+
 def _most_recent_closed_positions(positions: list[Position]) -> list[Position]:
     """Positions counterpart of `_most_recent_rows`. `closed_at` is a
     nullable datetime here rather than a string, and sorting a mix of
@@ -273,10 +314,13 @@ def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
         if candidate is not None:
             candidates_by_id[position.candidate_id] = candidate
 
+    entry_outcomes = _closed_position_entry_outcomes(closed_positions, candidates_by_id)
+
     return {
         "run_id": run_id,
         "resolved_shadow_decisions": shadows,
         "resolved_real_decisions": reals,
+        "closed_position_entry_outcomes": entry_outcomes,
         "historical_signal_type_breakdown": compute_breakdown_by_signal_type(
             closed_positions, candidates_by_id
         ),
@@ -304,7 +348,18 @@ def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
                 repo.find_proposed_guardian_authority_heuristic_candidates(), "proposed_at"
             )
         ],
+        # Two vocabularies, kept deliberately separate (Task 4B): the
+        # TIGHTEN_SL factor names that actually occur in Guardian
+        # Authority's own decision history, and the pre-entry factor names
+        # that actually occur in real entry evidence. A condition written in
+        # the other type's vocabulary is fail-closed against its own pool
+        # (it matches nothing), so the role prompt names each list
+        # separately rather than handing the model one merged set it could
+        # mix freely.
         "observed_factor_names": _observed_factor_names(shadows, reals),
+        "pre_entry_factor_names": sorted(
+            {name for entry in entry_outcomes for name in entry["factors"]}
+        ),
     }
 
 
@@ -403,6 +458,12 @@ def propose_candidate_heuristics(
                 rationale=proposal.rationale,
                 run_id=run_id,
                 proposed_at=now,
+                # Persisted verbatim (Task 4B): the model's own declaration
+                # of which decision type this proposal is for, which is what
+                # routes it to its own evidence pool in
+                # `validate_pending_heuristic_candidates` below. Never
+                # inferred here from the condition's shape.
+                target_decision_type=proposal.target_decision_type,
             ):
                 saved += 1
 
@@ -588,6 +649,110 @@ def _tighten_sl_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
     return pool
 
 
+# ---------------------------------------------------------------------------
+# Task 4B (2026-09-16 addendum, R2): the SECOND evidence pool - real closed
+# positions, not Guardian Authority's own decision history.
+#
+# --------------------------------------------------------------------------
+# Why a second pool had to exist at all
+# --------------------------------------------------------------------------
+# The pool above is empty BY CONSTRUCTION at cold start, and a post-Task-4
+# audit re-derived that straight from authority.py's own source:
+# `decide_pre_entry`/`decide_open_position` only ever return a non-default
+# decision when `evaluate_heuristics(...)` scores nonzero, which requires at
+# least one row in `guardian_authority_heuristics`. With that table empty -
+# the state every new deployment starts in, and the state this whole
+# self-improvement pipeline exists to get OUT of - every real and shadow
+# decision is APPROVE/NO_ACTION forever, so no TIGHTEN_SL row can ever exist
+# to validate against and every proposed candidate would reject forever on
+# `too few train samples`. Widening to real/shadow PRE_ENTRY_VETO decisions
+# does not help either: `decide_pre_entry` has the same nonzero-score
+# precondition, AND `resolve_pending_decisions` permanently skips resolving a
+# PRE_ENTRY_VETO row's counterfactual by original design (it has no
+# market-data infrastructure to evaluate a position that was never opened).
+#
+# --------------------------------------------------------------------------
+# What this pool is, and why it is neither circular nor fabricated
+# --------------------------------------------------------------------------
+# Every position that was ever actually opened and closed is real,
+# deterministic ground truth that exists completely independent of whether a
+# Guardian Authority heuristic has ever existed - Gate approval and position
+# opening/closing never read the heuristics table at all. For a candidate
+# aimed at PRE_ENTRY_VETO, validation therefore asks a genuine
+# counterfactual: *if this condition had been an active pre-entry veto rule,
+# would it have matched this position's real entry evidence, and would
+# blocking that entry actually have avoided a loss?*
+#
+# - The evidence is the position's own candidate record, reshaped by the
+#   UNMODIFIED `_pre_entry_factors` - literally the same function, and
+#   therefore the same factor vocabulary, `decide_pre_entry` itself is
+#   evaluated against. Never a second, hand-rolled reconstruction.
+# - The outcome is `compute_pnl(position) <= 0` via the UNMODIFIED
+#   `compute_pnl` (the only PnL computation in this codebase), using the same
+#   "a P/L of exactly zero counts as NOT favorable" convention
+#   `resolve_pending_decisions` already applies - so a would-be veto is
+#   scored "correct" iff the real position actually lost money or exactly
+#   broke even.
+# - Nothing is synthesized: every factor and every PnL input is the row's
+#   own real, persisted data. The only counterfactual thing is the VETO
+#   ITSELF (which never fired) - the same kind of counterfactual
+#   `run_tier1_backtest` and Detective's post-trade analysis already treat
+#   as legitimate evidence here, not a new methodology invented for this
+#   task.
+#
+# Two rows are skipped rather than guessed at: a CLOSED row with no
+# `closed_at` (defensive - it has no place in a chronological split; no
+# production path produces one, since close_position_with_event sets status
+# and closed_at in the same UPDATE), and a position whose candidate record is
+# missing or corrupt (`_safe_get_candidate` returning None) - the exact
+# mirror of the TIGHTEN_SL pool skipping a decision whose observation row
+# cannot be reconstructed.
+#
+# Statistical machinery: NONE is added or forked here. `_split_pool_
+# chronologically`, `_split_stats` and `_validation_outcome` are already
+# generic over `list[tuple[str, dict, bool]]` and contain zero TIGHTEN_SL-
+# specific logic, so this pool is a second BUILDER of the identical shape and
+# every threshold, split rule and rejection reason is reused byte-for-byte.
+# The two pools are split independently and never merged: their timestamps
+# live in different domains (a decision's `decided_at` vs. a position's
+# `closed_at`) and a shared split boundary would mean one pool's volume could
+# move the other's train/test cutoff.
+# ---------------------------------------------------------------------------
+
+# The candidate-declared routing key, and the legacy default. A row written
+# before Task 4B existed has target_decision_type NULL; it is read as
+# TIGHTEN_SL because that was the only pool that existed when it was
+# proposed - backward compatibility for a handful of rows, not a valid
+# ongoing state (every row written from Task 4B onward carries the proposing
+# model's own explicit declaration).
+_TARGET_TIGHTEN_SL = "TIGHTEN_SL"
+_TARGET_PRE_ENTRY_VETO = "PRE_ENTRY_VETO"
+
+
+def _pre_entry_veto_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
+    """`(closed_at, pre_entry_factors, would_veto_have_been_correct)` for
+    every real closed position whose candidate record still exists. See the
+    Task 4B module section above for why this pool is available at cold
+    start and why it is neither circular nor fabricated."""
+    pool: list[tuple[str, dict, bool]] = []
+
+    for position in repo.find_closed_positions():
+        if position.closed_at is None:
+            continue  # defensive - nothing to place in a chronological split
+        candidate = _safe_get_candidate(repo, position.candidate_id)
+        if candidate is None:
+            continue  # missing/corrupt entry evidence - skip, never guess
+        pool.append(
+            (
+                position.closed_at.isoformat(),
+                _pre_entry_factors(candidate),
+                compute_pnl(position) <= Decimal("0"),
+            )
+        )
+
+    return pool
+
+
 def _split_pool_chronologically(
     pool: list[tuple[str, dict, bool]],
 ) -> tuple[list[tuple[str, dict, bool]], list[tuple[str, dict, bool]]]:
@@ -661,15 +826,18 @@ def _validation_outcome(
 
 
 def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> int:
-    """Out-of-sample validation gate (Task 4). For every row currently
-    `PROPOSED` (`repo.find_proposed_guardian_authority_heuristic_
-    candidates()`), computes train/test `sample_size`/`correct_rate` for
-    that candidate's own `condition_json` against the chronologically-split
-    TIGHTEN_SL evidence pool (see the Task 4 module section above), and
-    calls the existing, unmodified `record_guardian_authority_heuristic_
-    candidate_validation` with the outcome - `VALIDATED` if both splits
-    clear the sample-size/miscalibration bar and agree in sign, `REJECTED`
-    with a specific reason otherwise.
+    """Out-of-sample validation gate (Task 4, dual-pool since Task 4B). For
+    every row currently `PROPOSED` (`repo.find_proposed_guardian_authority_
+    heuristic_candidates()`), computes train/test `sample_size`/
+    `correct_rate` for that candidate's own `condition_json` against the
+    chronologically-split evidence pool matching that candidate's own
+    declared `target_decision_type` - the TIGHTEN_SL decision pool (Task 4
+    module section) or the closed-position counterfactual pool (Task 4B
+    module section), a NULL/legacy value reading as TIGHTEN_SL - and calls
+    the existing, unmodified `record_guardian_authority_heuristic_candidate_
+    validation` with the outcome: `VALIDATED` if both splits clear the
+    sample-size/miscalibration bar and agree in sign, `REJECTED` with a
+    specific reason otherwise.
 
     Returns the count of candidate rows actually transitioned (VALIDATED +
     REJECTED) in THIS call - `record_guardian_authority_heuristic_
@@ -681,14 +849,33 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
     if not candidates:
         return 0
 
-    pool = _tighten_sl_evidence_pool(repo)
-    train_rows, test_rows = _split_pool_chronologically(pool)
+    # Both pools are built and split ONCE per call, independently of each
+    # other and of which candidates are pending (Task 4B). Each split is its
+    # own chronological 70/30 over its own timestamp domain - the two are
+    # never merged and never share a boundary; see the Task 4B module
+    # section above.
+    splits_by_target = {
+        _TARGET_TIGHTEN_SL: _split_pool_chronologically(_tighten_sl_evidence_pool(repo)),
+        _TARGET_PRE_ENTRY_VETO: _split_pool_chronologically(_pre_entry_veto_evidence_pool(repo)),
+    }
 
     processed = 0
     for candidate in candidates:
         # The candidate's own, unmodified condition_json - never a
         # hand-modified copy (see this module's self-review discipline).
         condition = json.loads(candidate["condition_json"])
+        # The candidate's own declared target decides its pool, and nothing
+        # else: a TIGHTEN_SL candidate is never measured against closed-
+        # position PnL, and a PRE_ENTRY_VETO candidate is never measured
+        # against Guardian Authority's own decision history. A value that
+        # names no pool at all (unreachable through the schema's own
+        # Literal, so only a future writer bypassing it could produce one)
+        # gets an EMPTY pool and is therefore REJECTED on sample size -
+        # "untested stays untested, never evidence" is the conservative
+        # outcome here, not a silent re-route into whichever pool happens to
+        # be richest.
+        target = candidate.get("target_decision_type") or _TARGET_TIGHTEN_SL
+        train_rows, test_rows = splits_by_target.get(target, ([], []))
         train_n, train_rate = _split_stats(train_rows, condition)
         test_n, test_rate = _split_stats(test_rows, condition)
         status, rejected_reason = _validation_outcome(train_n, train_rate, test_n, test_rate)

@@ -49,6 +49,7 @@ def _heuristic(
     condition=None,
     adjustment=-0.2,
     rationale="18 of 24 resolved TIGHTEN_SL rows with momentum_decay >= 0.8 resolved wrong.",
+    target_decision_type="TIGHTEN_SL",
 ) -> ProposedHeuristic:
     return ProposedHeuristic(
         description=description,
@@ -57,6 +58,7 @@ def _heuristic(
         else condition,
         adjustment=adjustment,
         rationale=rationale,
+        target_decision_type=target_decision_type,
     )
 
 
@@ -305,6 +307,42 @@ def test_propose_candidate_heuristics_saves_every_proposed_heuristic_with_its_ow
     assert repo.find_guardian_authority_heuristics() == []
 
 
+def test_propose_candidate_heuristics_persists_each_proposals_declared_target_decision_type(
+    tmp_path,
+):
+    """Task 4B: the LLM declares which decision type each proposal is FOR,
+    and that declaration is persisted verbatim - it is what routes the
+    candidate to its own evidence pool at validation time (an explicit,
+    auditable declaration rather than inferring intent from the condition's
+    shape)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    runner = _CountingRunner(
+        fixtures={
+            _AGENT_NAME: _assessment(
+                _heuristic(target_decision_type="TIGHTEN_SL"),
+                _heuristic(
+                    description="Entries on this trigger mix have mostly lost money",
+                    condition={
+                        "trigger_reasons": ["momentum_breakout"],
+                        "candidate_score_max": 0.4,
+                    },
+                    adjustment=-0.25,
+                    rationale="31 of 40 such entries closed at or below breakeven.",
+                    target_decision_type="PRE_ENTRY_VETO",
+                ),
+            )
+        }
+    )
+
+    assert propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW) == 2
+
+    first = repo.get_guardian_authority_heuristic_candidate("llm:run-1:0")
+    second = repo.get_guardian_authority_heuristic_candidate("llm:run-1:1")
+    assert first["target_decision_type"] == "TIGHTEN_SL"
+    assert second["target_decision_type"] == "PRE_ENTRY_VETO"
+
+
 def test_saved_condition_json_round_trips_through_the_unmodified_condition_matcher(tmp_path):
     """The whole point of copying authority.py's condition-matching semantics
     into the agent's system prompt: what gets persisted must be directly
@@ -373,6 +411,42 @@ def test_propose_candidate_heuristics_context_carries_the_real_history_and_detec
     assert context["already_proposed_candidates"] == []
     assert "momentum_decay" in context["observed_factor_names"]
     assert "guardian_state" in context["observed_factor_names"]
+
+
+def test_propose_candidate_heuristics_context_carries_real_pre_entry_evidence_and_outcomes(
+    tmp_path,
+):
+    """Task 4B: a PRE_ENTRY_VETO proposal may only condition on
+    `_pre_entry_factors`' own fields, so the context has to evidence those
+    fields against real outcomes - otherwise the role's own "never invent a
+    factor name / never cite evidence you were not given" discipline would
+    make the whole second decision type unusable. The vocabulary lists stay
+    SEPARATE: `guardian_state` is a TIGHTEN_SL-only factor and must not
+    appear among the pre-entry names."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)  # one closed position, with its own real candidate
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment()})
+
+    propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+
+    context = runner.calls[0][1]
+    assert len(context["closed_position_entry_outcomes"]) == 1
+    entry = context["closed_position_entry_outcomes"][0]
+    assert entry["factors"] == {
+        "instrument": "BTCUSDT",
+        "candidate_score": 0.5,
+        "trigger_reasons": ["momentum_breakout"],
+    }
+    assert entry["exit_reason"] == "guardian_exit"
+    # Entry 100 -> exit 95 on a size-1000 position, minus 0.1 in fees.
+    assert entry["pnl_usdt"] == "-50.10"
+    assert entry["closed_at"] == (_NOW - timedelta(hours=1)).isoformat()
+    assert context["pre_entry_factor_names"] == [
+        "candidate_score",
+        "instrument",
+        "trigger_reasons",
+    ]
+    assert "guardian_state" not in context["pre_entry_factor_names"]
 
 
 # --------------------------------------------------------------------------

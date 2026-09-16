@@ -287,6 +287,82 @@ def test_migration_matched_heuristic_ids_json_is_idempotent_across_repeated_conn
     assert "matched_heuristic_ids_json" in columns
 
 
+def test_heuristic_candidates_table_has_target_decision_type_column_on_a_fresh_database(tmp_path):
+    conn = get_connection(tmp_path / "test.db")
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(guardian_authority_heuristic_candidates)"
+        ).fetchall()
+    }
+    assert "target_decision_type" in columns
+
+
+def test_migration_adds_target_decision_type_to_a_pre_existing_candidates_table_without_it(
+    tmp_path,
+):
+    """Task 4B (2026-09-16 addendum, Guardian Authority Live Autonomy):
+    guardian_authority_heuristic_candidates.target_decision_type was added
+    AFTER Task 1's own table-creation code had already shipped and started
+    running on every app startup, so a database created between Task 1 and
+    this task already has the table WITHOUT the column. Same migration
+    pattern and same verification style as the matched_heuristic_ids_json
+    migration above: build the table via the OLD shape, reopen via
+    get_connection() (a real restart), and prove the migration adds the
+    column without destroying the existing row (which reads back as NULL -
+    the legacy value validation treats as TIGHTEN_SL)."""
+    db_path = tmp_path / "pre_existing_candidates.db"
+
+    old_conn = sqlite3.connect(db_path)
+    old_conn.execute(
+        "CREATE TABLE guardian_authority_heuristic_candidates ("
+        "candidate_id TEXT PRIMARY KEY, proposed_at TEXT NOT NULL, description TEXT NOT NULL, "
+        "condition_json TEXT NOT NULL, proposed_adjustment REAL NOT NULL, "
+        "rationale TEXT NOT NULL, status TEXT NOT NULL, train_sample_size INTEGER, "
+        "train_correct_rate REAL, test_sample_size INTEGER, test_correct_rate REAL, "
+        "validated_at TEXT, promoted_at TEXT, promoted_heuristic_id TEXT, "
+        "rejected_reason TEXT, demoted_at TEXT, demotion_reason TEXT, run_id TEXT NOT NULL)"
+    )
+    old_conn.execute(
+        "INSERT INTO guardian_authority_heuristic_candidates (candidate_id, proposed_at, "
+        "description, condition_json, proposed_adjustment, rationale, status, run_id) VALUES "
+        "('cand-old', '2026-09-15T00:00:00+00:00', 'legacy candidate', "
+        "'{\"guardian_state\": \"PROTECT\"}', 0.2, 'legacy rationale', 'PROPOSED', 'run-1')"
+    )
+    old_conn.commit()
+    old_conn.close()
+
+    conn = get_connection(db_path)
+
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(guardian_authority_heuristic_candidates)"
+        ).fetchall()
+    }
+    assert "target_decision_type" in columns
+
+    row = conn.execute(
+        "SELECT * FROM guardian_authority_heuristic_candidates WHERE candidate_id = 'cand-old'"
+    ).fetchone()
+    assert row is not None
+    assert row["description"] == "legacy candidate"
+    assert row["target_decision_type"] is None
+
+
+def test_migration_target_decision_type_is_idempotent_across_repeated_connections(tmp_path):
+    db_path = tmp_path / "test.db"
+    get_connection(db_path)
+    conn2 = get_connection(db_path)  # second connection must not crash on ALTER TABLE again
+    columns = {
+        row["name"]
+        for row in conn2.execute(
+            "PRAGMA table_info(guardian_authority_heuristic_candidates)"
+        ).fetchall()
+    }
+    assert "target_decision_type" in columns
+
+
 def test_schema_version_is_recorded(tmp_path):
     conn = get_connection(tmp_path / "test.db")
     row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()

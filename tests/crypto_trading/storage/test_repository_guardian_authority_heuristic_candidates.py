@@ -49,6 +49,11 @@ def test_guardian_authority_heuristic_candidates_table_exists(tmp_path):
         "train_correct_rate", "test_sample_size", "test_correct_rate",
         "validated_at", "promoted_at", "promoted_heuristic_id",
         "rejected_reason", "demoted_at", "demotion_reason", "run_id",
+        # Task 4B (2026-09-16 addendum): which decision type a candidate is
+        # proposed FOR, and therefore which evidence pool it is validated
+        # against. Nullable - a legacy row predating this column routes to
+        # TIGHTEN_SL.
+        "target_decision_type",
     }
 
 
@@ -77,6 +82,30 @@ def test_save_guardian_authority_heuristic_candidate_creates_a_row_with_proposed
     assert row["rejected_reason"] is None
     assert row["demoted_at"] is None
     assert row["demotion_reason"] is None
+    # Task 4B: the additive keyword param defaults to None, so every
+    # pre-existing caller keeps writing exactly the row it always wrote.
+    assert row["target_decision_type"] is None
+
+
+def test_save_guardian_authority_heuristic_candidate_persists_target_decision_type(tmp_path):
+    """Task 4B (2026-09-16 addendum): persisted verbatim, per candidate - it
+    is what routes the row to its own validation pool later."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.save_guardian_authority_heuristic_candidate(
+        **_save_kwargs(candidate_id="tighten", target_decision_type="TIGHTEN_SL")
+    )
+    repo.save_guardian_authority_heuristic_candidate(
+        **_save_kwargs(candidate_id="veto", target_decision_type="PRE_ENTRY_VETO")
+    )
+
+    assert (
+        repo.get_guardian_authority_heuristic_candidate("tighten")["target_decision_type"]
+        == "TIGHTEN_SL"
+    )
+    assert (
+        repo.get_guardian_authority_heuristic_candidate("veto")["target_decision_type"]
+        == "PRE_ENTRY_VETO"
+    )
 
 
 def test_save_guardian_authority_heuristic_candidate_is_idempotent(tmp_path):

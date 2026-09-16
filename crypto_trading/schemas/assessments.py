@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, field_validator
 
@@ -85,12 +86,29 @@ class ProposedHeuristic(BaseModel):
     positive reinforces the decision the heuristic conditions on, negative
     discourages it. Carries ZERO effect on any real decision while the row
     sits in the candidates table - only promotion (a separate, later step)
-    ever copies a candidate into the live heuristics table."""
+    ever copies a candidate into the live heuristics table.
+
+    `target_decision_type` (Task 4B, 2026-09-16 addendum) is the decision
+    type this proposal is FOR, declared explicitly by the proposing model
+    rather than inferred from the condition's shape - an auditable statement
+    of intent, and the ONLY thing that routes the candidate to its own
+    evidence pool at validation time. The two types are validated against
+    two structurally different, never-merged pools: `TIGHTEN_SL` against
+    resolved Guardian Authority TIGHTEN_SL decisions (shadow + real), and
+    `PRE_ENTRY_VETO` against a real closed-position counterfactual pool
+    (real pre-entry evidence, real realized PnL) - which is what makes a
+    PRE_ENTRY_VETO proposal testable at cold start, when no Guardian
+    Authority decision has ever been made. Each type also has its OWN factor
+    vocabulary (`guardian_state`-shaped factors vs. `_pre_entry_factors`'
+    `instrument`/`candidate_score`/`trigger_reasons`); a condition written
+    in the other type's vocabulary simply never matches anything in its own
+    pool and is rejected there on sample size, never silently "fixed" here."""
 
     description: str
     condition: dict
     adjustment: float
     rationale: str
+    target_decision_type: Literal["TIGHTEN_SL", "PRE_ENTRY_VETO"]
 
 
 class GodfatherStrategistAssessment(AssessmentBase):

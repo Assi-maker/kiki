@@ -25,6 +25,11 @@ from crypto_trading.guardian.self_improvement import (
 )
 from crypto_trading.schemas.guardian import GuardianObservation
 from crypto_trading.storage.repository import SQLiteRepository
+from tests.crypto_trading.guardian.test_self_improvement_pre_entry_pool import (
+    _LOSS_EXIT,
+    _WIN_EXIT,
+    _seed_closed_position,
+)
 
 _NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 _BASE = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
@@ -33,7 +38,13 @@ _BASE = datetime(2026, 9, 1, 0, 0, tzinfo=UTC)
 # --------------------------------------------------------------------------
 # Seeding helpers
 # --------------------------------------------------------------------------
-def _seed_candidate(repo, candidate_id="cand-1", condition=None, adjustment=0.2):
+def _seed_candidate(
+    repo, candidate_id="cand-1", condition=None, adjustment=0.2, target_decision_type=None
+):
+    """`target_decision_type=None` by default ON PURPOSE: that is the legacy/
+    pre-Task-4B row shape, and every Task 4 test above must keep exercising
+    exactly the pool it always did (the TIGHTEN_SL one, which is also what a
+    NULL routes to)."""
     repo.save_guardian_authority_heuristic_candidate(
         candidate_id=candidate_id,
         description="a candidate heuristic under validation",
@@ -42,6 +53,7 @@ def _seed_candidate(repo, candidate_id="cand-1", condition=None, adjustment=0.2)
         rationale="seeded directly for a Task 4 test",
         run_id="run-llm",
         proposed_at=_NOW,
+        target_decision_type=target_decision_type,
     )
 
 
@@ -570,3 +582,148 @@ def test_validate_pending_heuristic_candidates_processes_each_candidate_independ
     assert "too few train samples" in nothing_row["rejected_reason"]
     assert everything_row["status"] == "VALIDATED"
     assert everything_row["train_sample_size"] == 70
+
+
+# --------------------------------------------------------------------------
+# Task 4B (2026-09-16 addendum, R2): dual-pool routing. A candidate's own
+# declared `target_decision_type` - and NOTHING else - decides which of the
+# two independent evidence pools it is validated against. The two tests below
+# are the concrete cross-contamination proof: the SAME condition, the SAME
+# call, the SAME database, differing ONLY in `target_decision_type`, gets
+# opposite outcomes, and the rejected side's sample sizes prove it never saw
+# a single row of the other pool (if the pools were merged or shared a split,
+# the "tiny" side would have had 110 rows to draw from, not 10).
+# --------------------------------------------------------------------------
+def _seed_small_closed_position_history(repo, count=10):
+    for i in range(count):
+        _seed_closed_position(
+            repo, f"tiny-pos-{i:04d}", _BASE + timedelta(minutes=i), _LOSS_EXIT, candidate_score=0.9
+        )
+
+
+def _seed_small_tighten_sl_history(repo, count=10):
+    for i in range(count):
+        _seed_real_tighten_sl(
+            repo,
+            position_id=f"tiny-real-{i:04d}",
+            decided_at=_BASE + timedelta(minutes=i),
+            expectation_correct=True,
+            factors={"guardian_state": "PROTECT", "candidate_score": 0.9},
+        )
+
+
+def test_target_decision_type_alone_decides_the_pool_when_only_tighten_sl_history_is_rich(
+    tmp_path,
+):
+    """Rich TIGHTEN_SL pool (100 resolved decisions, 80% correct), thin
+    closed-position pool (10 positions). The TIGHTEN_SL-targeted candidate
+    validates on 70/30; the PRE_ENTRY_VETO-targeted candidate - identical
+    condition - is rejected for too little of ITS OWN evidence."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    condition = {"candidate_score_min": 0.8}
+    _seed_candidate(
+        repo, candidate_id="tighten", condition=condition, target_decision_type="TIGHTEN_SL"
+    )
+    _seed_candidate(
+        repo, candidate_id="veto", condition=condition, target_decision_type="PRE_ENTRY_VETO"
+    )
+
+    for i in range(100):
+        _seed_real_tighten_sl(
+            repo,
+            position_id=f"real-{i:04d}",
+            decided_at=_BASE + timedelta(minutes=i),
+            expectation_correct=i % 5 != 0,
+            factors={"guardian_state": "PROTECT", "candidate_score": 0.9},
+        )
+    _seed_small_closed_position_history(repo)
+
+    assert validate_pending_heuristic_candidates(repo, _NOW) == 2
+
+    tighten_row = repo.get_guardian_authority_heuristic_candidate("tighten")
+    veto_row = repo.get_guardian_authority_heuristic_candidate("veto")
+    assert tighten_row["status"] == "VALIDATED"
+    assert tighten_row["train_sample_size"] == 70
+    assert tighten_row["test_sample_size"] == 30
+    assert tighten_row["train_correct_rate"] == 56 / 70
+    assert veto_row["status"] == "REJECTED"
+    assert veto_row["train_sample_size"] == 7  # 70% of ITS pool's 10 rows
+    assert veto_row["test_sample_size"] == 3
+    assert "too few train samples" in veto_row["rejected_reason"]
+
+
+def test_target_decision_type_alone_decides_the_pool_when_only_closed_position_history_is_rich(
+    tmp_path,
+):
+    """The exact mirror image: rich closed-position pool (100 positions, 80%
+    real losses), thin TIGHTEN_SL pool (10 resolved decisions). Now the
+    PRE_ENTRY_VETO-targeted candidate validates and the TIGHTEN_SL-targeted
+    one - same condition again - is rejected for too little of its own
+    evidence."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    condition = {"candidate_score_min": 0.8}
+    _seed_candidate(
+        repo, candidate_id="tighten", condition=condition, target_decision_type="TIGHTEN_SL"
+    )
+    _seed_candidate(
+        repo, candidate_id="veto", condition=condition, target_decision_type="PRE_ENTRY_VETO"
+    )
+
+    for i in range(100):
+        _seed_closed_position(
+            repo,
+            f"pos-{i:04d}",
+            _BASE + timedelta(minutes=i),
+            _LOSS_EXIT if i % 5 != 0 else _WIN_EXIT,
+            candidate_score=0.9,
+        )
+    _seed_small_tighten_sl_history(repo)
+
+    assert validate_pending_heuristic_candidates(repo, _NOW) == 2
+
+    tighten_row = repo.get_guardian_authority_heuristic_candidate("tighten")
+    veto_row = repo.get_guardian_authority_heuristic_candidate("veto")
+    assert veto_row["status"] == "VALIDATED"
+    assert veto_row["train_sample_size"] == 70
+    assert veto_row["test_sample_size"] == 30
+    assert veto_row["train_correct_rate"] == 56 / 70
+    assert tighten_row["status"] == "REJECTED"
+    assert tighten_row["train_sample_size"] == 7  # 70% of ITS pool's 10 rows
+    assert tighten_row["test_sample_size"] == 3
+    assert "too few train samples" in tighten_row["rejected_reason"]
+
+
+def test_a_legacy_null_target_decision_type_is_validated_against_the_tighten_sl_pool(tmp_path):
+    """Backward compatibility, asserted explicitly: a row saved before Task
+    4B existed has `target_decision_type IS NULL` and must route to the
+    TIGHTEN_SL pool. The closed-position pool here is deliberately LARGE but
+    uncalibrated (50/50 wins and losses), so routing there would have
+    produced a miscalibration REJECTION instead of this VALIDATED row - the
+    outcome itself identifies the pool used."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate(repo, candidate_id="legacy", condition={"candidate_score_min": 0.8})
+
+    for i in range(100):
+        _seed_real_tighten_sl(
+            repo,
+            position_id=f"real-{i:04d}",
+            decided_at=_BASE + timedelta(minutes=i),
+            expectation_correct=i % 5 != 0,
+            factors={"guardian_state": "PROTECT", "candidate_score": 0.9},
+        )
+    for i in range(100):
+        _seed_closed_position(
+            repo,
+            f"pos-{i:04d}",
+            _BASE + timedelta(minutes=i),
+            _LOSS_EXIT if i % 2 == 0 else _WIN_EXIT,
+            candidate_score=0.9,
+        )
+
+    assert validate_pending_heuristic_candidates(repo, _NOW) == 1
+
+    row = repo.get_guardian_authority_heuristic_candidate("legacy")
+    assert row["target_decision_type"] is None
+    assert row["status"] == "VALIDATED"
+    assert row["train_sample_size"] == 70
+    assert row["train_correct_rate"] == 56 / 70

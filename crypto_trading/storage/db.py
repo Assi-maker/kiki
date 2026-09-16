@@ -654,6 +654,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_candidates_add_reference_price(conn)
     _migrate_guardian_authority_decisions_add_intervention_applied(conn)
     _migrate_guardian_authority_decisions_add_matched_heuristic_ids_json(conn)
+    _migrate_guardian_authority_heuristic_candidates_add_target_decision_type(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -762,6 +763,44 @@ def _migrate_guardian_authority_decisions_add_matched_heuristic_ids_json(
         _add_column_idempotent(
             conn,
             "ALTER TABLE guardian_authority_decisions ADD COLUMN matched_heuristic_ids_json TEXT",
+        )
+
+
+def _migrate_guardian_authority_heuristic_candidates_add_target_decision_type(
+    conn: sqlite3.Connection,
+) -> None:
+    """Task 4B (2026-09-16 addendum, Guardian Authority Live Autonomy):
+    guardian_authority_heuristic_candidates.target_decision_type - which
+    decision type a candidate was proposed FOR ('TIGHTEN_SL' or
+    'PRE_ENTRY_VETO'), and therefore which of the two independent,
+    never-merged evidence pools the validation step measures it against.
+    Added AFTER Task 1's own table-creation code had already shipped and
+    started running unconditionally on every app startup, so a database
+    created between Task 1 and this task already has this table WITHOUT the
+    column. Same migration pattern and same reasoning as
+    _migrate_guardian_authority_decisions_add_matched_heuristic_ids_json
+    above: `CREATE TABLE IF NOT EXISTS` alone does nothing to an
+    already-existing table, so an explicit, idempotent `ALTER TABLE` is
+    required, guarded by `PRAGMA table_info` (not "ALTER TABLE ... IF NOT
+    EXISTS", not supported by all SQLite versions) - safe to run on every
+    connection, never destroys existing rows.
+
+    Nullable, no default: NULL means "proposed before this column existed".
+    Validation reads such a row as 'TIGHTEN_SL' (the only pool that existed
+    then) purely for backward compatibility - NOT because NULL is a valid
+    ongoing state; every row written from Task 4B onward carries the
+    proposing model's own explicit declaration."""
+    columns = {
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(guardian_authority_heuristic_candidates)"
+        ).fetchall()
+    }
+    if "target_decision_type" not in columns:
+        _add_column_idempotent(
+            conn,
+            "ALTER TABLE guardian_authority_heuristic_candidates "
+            "ADD COLUMN target_decision_type TEXT",
         )
 
 

@@ -408,6 +408,7 @@ class Repository(Protocol):
         rationale: str,
         run_id: str,
         proposed_at: datetime,
+        target_decision_type: str | None = None,
     ) -> bool: ...
     def get_guardian_authority_heuristic_candidate(self, candidate_id: str) -> dict | None: ...
     def find_proposed_guardian_authority_heuristic_candidates(self) -> list[dict]: ...
@@ -2468,16 +2469,25 @@ class SQLiteRepository:
         rationale: str,
         run_id: str,
         proposed_at: datetime,
+        target_decision_type: str | None = None,
     ) -> bool:
         # INSERT OR IGNORE claim-style idempotency, same as
         # seed_guardian_authority_shadow - a duplicate propose call (e.g. a
         # retried LLM-proposal run) can never produce two rows or silently
         # overwrite the original description/condition/adjustment/rationale.
+        #
+        # target_decision_type (Task 4B) is an ADDITIVE keyword param with a
+        # default, exactly like save_guardian_authority_decision's own
+        # matched_heuristic_ids_json before it: an existing caller that does
+        # not pass it writes NULL and gets byte-identical behaviour to
+        # before this column existed (validation reads NULL as 'TIGHTEN_SL'
+        # for backward compatibility). Persisted verbatim - never inferred
+        # from the condition's shape here.
         cur = self._conn.execute(
             "INSERT OR IGNORE INTO guardian_authority_heuristic_candidates "
             "(candidate_id, proposed_at, description, condition_json, "
-            "proposed_adjustment, rationale, status, run_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'PROPOSED', ?)",
+            "proposed_adjustment, rationale, status, run_id, target_decision_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'PROPOSED', ?, ?)",
             (
                 candidate_id,
                 proposed_at.isoformat(),
@@ -2486,6 +2496,7 @@ class SQLiteRepository:
                 proposed_adjustment,
                 rationale,
                 run_id,
+                target_decision_type,
             ),
         )
         self._conn.commit()
