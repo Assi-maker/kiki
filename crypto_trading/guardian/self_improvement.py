@@ -1,12 +1,19 @@
-"""Guardian Authority self-improvement, step 1 of 4: PROPOSE (design spec:
+"""Guardian Authority self-improvement, steps 1-2 of 4: PROPOSE + VALIDATE
+(design spec:
 docs/superpowers/specs/2026-09-15-guardian-authority-live-autonomy-design.md,
 "What 'self-improvement' concretely means here").
 
 The full pipeline is propose -> validate -> promote -> track/demote. THIS
-module only proposes. Everything it writes lands in one place -
+module proposes (`propose_candidate_heuristics`, Task 3) and validates
+out-of-sample (`validate_pending_heuristic_candidates`, Task 4); promotion
+into the real table and forward-performance tracking/demotion are later
+tasks. Everything Task 3 writes lands in one place -
 `guardian_authority_heuristic_candidates`, status `PROPOSED` - a table the
-real decision engine never reads. `evaluate_heuristics` reads
-`guardian_authority_heuristics`, and nothing here can write there: the only
+real decision engine never reads, and Task 4 only ever moves a row from
+`PROPOSED` to `VALIDATED` or `REJECTED` in that SAME table, via the
+existing, unmodified `record_guardian_authority_heuristic_candidate_
+validation`. `evaluate_heuristics` reads `guardian_authority_heuristics` (a
+different table), and nothing in this module can write there: the only
 write path into that table anywhere in this plan is the existing, unmodified
 `upsert_guardian_authority_heuristic`, called by the later promotion step
 after an independent out-of-sample validation clears a candidate. So an LLM
@@ -66,7 +73,12 @@ from crypto_trading.detective.stats import (
     compute_breakdown_by_signal_type,
     compute_guardian_exit_effectiveness,
 )
-from crypto_trading.guardian.authority import _reconstruct_tighten_sl_factors
+from crypto_trading.guardian.authority import (
+    _MIN_MISCALIBRATION,
+    _MIN_SAMPLE_SIZE,
+    _reconstruct_tighten_sl_factors,
+    heuristic_condition_matches,
+)
 from crypto_trading.guardian.tick import _budget_allows_one_more_call, _utc_day_start
 from crypto_trading.logging import log_event
 from crypto_trading.schemas.assessments import GodfatherStrategistAssessment
@@ -414,3 +426,283 @@ def propose_candidate_heuristics(
             error=str(exc),
         )
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Task 4 (2026-09-15, Guardian Authority Live Autonomy): out-of-sample
+# validation gate - step 2 of 4 (propose -> VALIDATE -> promote ->
+# track/demote). Every row `propose_candidate_heuristics` above writes lands
+# here next: PROPOSED -> VALIDATED | REJECTED, via the ONE write path Task 1
+# built for exactly this transition, the existing, unmodified
+# `record_guardian_authority_heuristic_candidate_validation` - never a new
+# write path, and never `upsert_guardian_authority_heuristic` (that is the
+# LATER promotion step's job, reusing an already-VALIDATED row).
+#
+# --------------------------------------------------------------------------
+# Where the evidence pool comes from - "the SAME pool", not a third reading
+# --------------------------------------------------------------------------
+# The SAME pool Task 8's shadow self-critique
+# (paper_trading/guardian_authority_shadow.py::
+# update_shadow_heuristics_from_resolved_shadow_observations) and the real
+# Task 9 self-critique (authority.py::update_heuristics_from_resolved_
+# decisions) already learn from - not a third, independently-invented
+# reading of the same two tables:
+#
+# - Shadow rows: `repo.find_resolved_guardian_authority_shadows()`, filtered
+#   to `shadow_decision == "TIGHTEN_SL"` with a non-null
+#   `expectation_correct` (same scope note both sibling functions document -
+#   CLOSE_EARLY/NO_ACTION never carry a real expectation to learn from).
+#   Factors come straight off the row's own immutable `factors_json` - no
+#   reconstruction needed, exactly as Task 8's own function does it.
+# - Real rows: `repo.find_resolved_guardian_authority_decisions()`, filtered
+#   to `decision_type == "TIGHTEN_SL"` with a non-null `expectation_correct`
+#   AND `intervention_applied` true (Task 9's own I2 hardening fix - without
+#   it, a single position sitting above the tighten threshold for many
+#   consecutive ticks could inflate a sample with ticks that were never a
+#   genuine, distinct intervention; see authority.py's Task 9 docstring
+#   section for the full rationale). Factors are recovered via the existing,
+#   unmodified `_reconstruct_tighten_sl_factors` exact-join - never a
+#   second, hand-rolled reconstruction.
+#
+# Both sibling functions apply exactly these filters before a row may
+# contribute to ANY group's tally; this function applies them once, up
+# front, before either the chronological split or the later per-candidate
+# condition filter - the pool this function draws its train/test split from
+# is, sample for sample, the intersection of the two pools those two
+# already-trusted functions use, unmodified.
+#
+# --------------------------------------------------------------------------
+# The train/test split: why a row-level index split, not run_tier1_
+# backtest's DB-level split
+# --------------------------------------------------------------------------
+# `run_tier1_backtest` physically separates train/test into two SEPARATE
+# SQLite database files before any evaluation runs, "so out-of-sample cannot
+# leak into training results by construction" (its own module docstring).
+# This function honors that SAME principle - genuine out-of-sample means the
+# test split's statistics can never have been visible to whatever decided
+# the train split's statistics were good enough - but the mechanism here is
+# simpler: this is a one-shot, single-process computation over an in-memory
+# list of `(decided_at, factors, expectation_correct)` tuples, not a replay
+# across two database files, so a plain chronological INDEX split is
+# sufficient; there is no reason to build the heavier DB-level machinery
+# `run_tier1_backtest` needs for its own, structurally different (multi-day
+# replay) use case.
+#
+# `_TRAIN_FRACTION = 0.7`: sort the WHOLE pool by `decided_at` ascending: the
+# first 70% of rows (by COUNT, not by calendar time) become train, the
+# remaining 30% become test - deterministic, reproducible with no RNG/seed,
+# and computed ONCE per call, shared by every candidate processed in that
+# call (the pool and its chronological boundary do not depend on which
+# candidate is being validated - only the per-condition filter below does).
+#
+# --------------------------------------------------------------------------
+# Per-candidate condition filter, and the promotion bar itself
+# --------------------------------------------------------------------------
+# For each split, further filter to rows whose factors satisfy the
+# candidate's own, unmodified `condition_json` (parsed once per candidate),
+# via the real, unmodified `heuristic_condition_matches` - never a
+# simplified restatement of its matching semantics. `sample_size`/
+# `correct_rate` are then computed exactly as `update_heuristics_from_
+# resolved_decisions`'s own per-group tally does (a plain count and a plain
+# correct/n ratio); `deviation = correct_rate - 0.5` follows immediately,
+# same formula, computed inline rather than stored (the DB row only ever
+# stores `correct_rate`, per Task 1's own schema - `deviation`'s sign is
+# re-derived from it wherever needed, here and at promotion time).
+#
+# A candidate is VALIDATED only if BOTH splits clear `_MIN_SAMPLE_SIZE`/
+# `_MIN_MISCALIBRATION` (imported, unmodified, from authority.py - the exact
+# thresholds the real heuristics table itself is held to) AND their
+# deviations agree in sign - train agreeing with itself is not evidence of
+# anything; only train AND an independently-computed, chronologically LATER
+# test split agreeing is the genuine out-of-sample bar Acceptance Criterion
+# 4 requires (a candidate whose pattern looks real on train alone but
+# reverses on test must be rejected, not promoted). Every other outcome is
+# REJECTED, with `rejected_reason` naming the FIRST check that failed,
+# checked in this fixed order (mirrors the brief's own listed order): too
+# few train samples, too few test samples, train miscalibration below
+# floor, test miscalibration below floor, sign disagreement between splits.
+#
+# --------------------------------------------------------------------------
+# Error handling: deliberately NOT wrapped in a blanket try/except
+# --------------------------------------------------------------------------
+# Unlike `propose_candidate_heuristics` above (an AI call site, wrapped for
+# the reasons documented at length in that function's own docstring), this
+# function has no `run_id` parameter and performs no AI call, no budget
+# gate, no once-per-day watermark - it is a pure statistical batch
+# computation over already-resolved DB rows, structurally identical in kind
+# to `update_heuristics_from_resolved_decisions`/`update_shadow_heuristics_
+# from_resolved_shadow_observations`, NEITHER of which catches exceptions
+# either (both let a DB read failure propagate straight to their own
+# caller). A malformed `condition_json` on a candidate row is exactly the
+# case `heuristic_condition_matches`'s own module docstring says should
+# fail loudly rather than be hidden behind a silent no-match (heuristics
+# rows - and candidate rows - are Guardian Authority's own internal data,
+# not third-party input); every candidate's `condition_json` was itself
+# produced by `json.dumps` inside `propose_candidate_heuristics` above, so
+# it is always syntactically valid JSON in practice. This function follows
+# its two direct siblings' own precedent, not `propose_candidate_
+# heuristics`'s AI-call-specific one.
+# ---------------------------------------------------------------------------
+
+_TRAIN_FRACTION = 0.7
+
+
+def _tighten_sl_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
+    """`(decided_at, factors, expectation_correct)` for every resolved
+    TIGHTEN_SL row - shadow AND real - with a non-null `expectation_correct`.
+    See the Task 4 module section above for exactly which pool this is and
+    why."""
+    pool: list[tuple[str, dict, bool]] = []
+
+    for shadow in repo.find_resolved_guardian_authority_shadows():
+        if shadow["shadow_decision"] != "TIGHTEN_SL":
+            continue
+        if shadow["expectation_correct"] is None:
+            continue
+        pool.append(
+            (
+                shadow["decided_at"],
+                json.loads(shadow["factors_json"]),
+                bool(shadow["expectation_correct"]),
+            )
+        )
+
+    for decision in repo.find_resolved_guardian_authority_decisions():
+        if decision["decision_type"] != "TIGHTEN_SL":
+            continue
+        if decision["expectation_correct"] is None:
+            continue
+        if not bool(decision.get("intervention_applied")):
+            continue  # Task 9's own I2 filter - see module section above
+        factors = _reconstruct_tighten_sl_factors(repo, decision)
+        if factors is None:
+            continue  # no matching observation to reconstruct from - skip, don't guess
+        pool.append(
+            (
+                decision["decided_at"],
+                factors,
+                bool(decision["expectation_correct"]),
+            )
+        )
+
+    return pool
+
+
+def _split_pool_chronologically(
+    pool: list[tuple[str, dict, bool]],
+) -> tuple[list[tuple[str, dict, bool]], list[tuple[str, dict, bool]]]:
+    """Sorts `pool` by `decided_at` ascending and returns `(train, test)`:
+    the first `_TRAIN_FRACTION` of rows by COUNT, and the rest. See the
+    Task 4 module section above for why a row-level index split is the
+    right mechanism here (not `run_tier1_backtest`'s DB-level split).
+    Timestamps here are the same ISO-8601 strings `_most_recent_rows` above
+    already relies on sorting lexicographically - lexicographic order IS
+    chronological order for this format, no parsing needed."""
+    ordered = sorted(pool, key=lambda row: row[0])
+    split_index = int(len(ordered) * _TRAIN_FRACTION)
+    return ordered[:split_index], ordered[split_index:]
+
+
+def _split_stats(rows: list[tuple[str, dict, bool]], condition: dict) -> tuple[int, float]:
+    """`(sample_size, correct_rate)` for the subset of `rows` whose factors
+    satisfy `condition` via the real, unmodified `heuristic_condition_
+    matches` - exactly the tally `update_heuristics_from_resolved_
+    decisions` computes per guardian_state group, computed here per
+    CANDIDATE CONDITION instead. `correct_rate` is `0.0` (a placeholder,
+    never read as meaningful) when nothing matched - an n=0 split always
+    fails the `_MIN_SAMPLE_SIZE` check before any caller looks at its
+    correct_rate."""
+    outcomes = [
+        correct for _, factors, correct in rows if heuristic_condition_matches(condition, factors)
+    ]
+    n = len(outcomes)
+    if n == 0:
+        return 0, 0.0
+    return n, sum(1 for correct in outcomes if correct) / n
+
+
+def _validation_outcome(
+    train_n: int, train_rate: float, test_n: int, test_rate: float
+) -> tuple[str, str | None]:
+    """`(status, rejected_reason)` per the promotion bar documented in the
+    Task 4 module section above. Checks run in the brief's own listed
+    order; `rejected_reason` names the FIRST one that failed. `status` is
+    always `"VALIDATED"` or `"REJECTED"` - the two outcomes `record_
+    guardian_authority_heuristic_candidate_validation` accepts."""
+    if train_n < _MIN_SAMPLE_SIZE:
+        return "REJECTED", f"too few train samples (n={train_n} < {_MIN_SAMPLE_SIZE})"
+    if test_n < _MIN_SAMPLE_SIZE:
+        return "REJECTED", f"too few test samples (n={test_n} < {_MIN_SAMPLE_SIZE})"
+
+    train_deviation = train_rate - 0.5
+    if abs(train_deviation) < _MIN_MISCALIBRATION:
+        return (
+            "REJECTED",
+            f"train miscalibration below floor (|deviation|={abs(train_deviation):.4f} "
+            f"< {_MIN_MISCALIBRATION})",
+        )
+
+    test_deviation = test_rate - 0.5
+    if abs(test_deviation) < _MIN_MISCALIBRATION:
+        return (
+            "REJECTED",
+            f"test miscalibration below floor (|deviation|={abs(test_deviation):.4f} "
+            f"< {_MIN_MISCALIBRATION})",
+        )
+
+    if (train_deviation > 0) != (test_deviation > 0):
+        return (
+            "REJECTED",
+            f"sign disagreement between splits (train_deviation={train_deviation:+.4f}, "
+            f"test_deviation={test_deviation:+.4f})",
+        )
+
+    return "VALIDATED", None
+
+
+def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> int:
+    """Out-of-sample validation gate (Task 4). For every row currently
+    `PROPOSED` (`repo.find_proposed_guardian_authority_heuristic_
+    candidates()`), computes train/test `sample_size`/`correct_rate` for
+    that candidate's own `condition_json` against the chronologically-split
+    TIGHTEN_SL evidence pool (see the Task 4 module section above), and
+    calls the existing, unmodified `record_guardian_authority_heuristic_
+    candidate_validation` with the outcome - `VALIDATED` if both splits
+    clear the sample-size/miscalibration bar and agree in sign, `REJECTED`
+    with a specific reason otherwise.
+
+    Returns the count of candidate rows actually transitioned (VALIDATED +
+    REJECTED) in THIS call - `record_guardian_authority_heuristic_
+    candidate_validation`'s own `WHERE status = 'PROPOSED'` guard makes a
+    row some concurrent/earlier call already transitioned a structural
+    no-op, not counted here (same idempotency discipline as `propose_
+    candidate_heuristics`'s own `saved` count above)."""
+    candidates = repo.find_proposed_guardian_authority_heuristic_candidates()
+    if not candidates:
+        return 0
+
+    pool = _tighten_sl_evidence_pool(repo)
+    train_rows, test_rows = _split_pool_chronologically(pool)
+
+    processed = 0
+    for candidate in candidates:
+        # The candidate's own, unmodified condition_json - never a
+        # hand-modified copy (see this module's self-review discipline).
+        condition = json.loads(candidate["condition_json"])
+        train_n, train_rate = _split_stats(train_rows, condition)
+        test_n, test_rate = _split_stats(test_rows, condition)
+        status, rejected_reason = _validation_outcome(train_n, train_rate, test_n, test_rate)
+
+        if repo.record_guardian_authority_heuristic_candidate_validation(
+            candidate_id=candidate["candidate_id"],
+            status=status,
+            train_sample_size=train_n,
+            train_correct_rate=train_rate,
+            test_sample_size=test_n,
+            test_correct_rate=test_rate,
+            validated_at=now,
+            rejected_reason=rejected_reason,
+        ):
+            processed += 1
+
+    return processed
