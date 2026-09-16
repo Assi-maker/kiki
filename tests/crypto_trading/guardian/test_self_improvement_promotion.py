@@ -2,7 +2,10 @@
 live-autonomy/ - the PROMOTE step of the propose -> validate -> promote ->
 track/demote pipeline (crypto_trading/guardian/self_improvement.py::
 promote_validated_heuristic_candidates), including the co-firing cap the
-design spec's "Addendum (2026-09-16)" R3 requires.
+design spec's "Addendum (2026-09-16)" R3 requires - and, added by Task 6, the
+TIGHTEN_SL cardinality cap that same addendum's consequence 1 requires, which
+is enforced at promotion time and therefore lives in this function rather than
+in Task 6's own.
 
 This is the one step of the pipeline that writes into the REAL
 `guardian_authority_heuristics` table - the table `evaluate_heuristics`
@@ -25,12 +28,23 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from crypto_trading.guardian.authority import evaluate_heuristics
-from crypto_trading.guardian.self_improvement import promote_validated_heuristic_candidates
+from crypto_trading.guardian.self_improvement import (
+    _MAX_LIVE_TIGHTEN_SL_HEURISTICS,
+    promote_validated_heuristic_candidates,
+)
 from crypto_trading.storage.repository import SQLiteRepository
 
 _NOW = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 _LATER = _NOW + timedelta(days=1)
 _VALIDATED_AT = _NOW - timedelta(hours=1)
+
+# The cap's DOCUMENTED value, written out as a literal on purpose: every
+# cardinality-cap fixture below is sized from this, never from the production
+# constant, so raising the constant makes those tests fail instead of quietly
+# resizing itself to match. Changing the cap is a deliberate, documented
+# decision (see `_MAX_LIVE_TIGHTEN_SL_HEURISTICS`' own section) and should
+# have to be made here too.
+_CAP = 3
 
 # The factors dict every condition in this file is matched against. Two
 # DIFFERENT conditions both match it - which is exactly the co-firing shape
@@ -253,6 +267,13 @@ def test_the_co_firing_cap_holds_as_the_family_grows(tmp_path):
             # Four distinct conditions, all matching the same factors dict.
             condition={"guardian_state": "PROTECT"} if index % 2 else {"instrument": "BTCUSDT"},
             test_correct_rate=0.5 + worth,
+            # Two of each (Task 6 amendment): the TIGHTEN_SL cardinality cap
+            # below allows at most _CAP of that
+            # track, and the co-firing property under test here is a
+            # whole-family one anyway - mixed targets are the harder case,
+            # since the real heuristics table has no target column and both
+            # kinds co-fire on the same factors dict.
+            target_decision_type="TIGHTEN_SL" if index % 2 else "PRE_ENTRY_VETO",
         )
 
     assert promote_validated_heuristic_candidates(repo, _NOW) == 4
@@ -369,6 +390,176 @@ def test_a_demoted_heuristic_is_neither_counted_nor_resurrected(tmp_path):
 
     score, _ = evaluate_heuristics(_CO_FIRING_FACTORS, repo.find_guardian_authority_heuristics())
     assert score == pytest.approx(0.3)
+
+
+# --------------------------------------------------------------------------
+# The TIGHTEN_SL cardinality cap (design spec "Addendum (2026-09-16)", R3,
+# consequence 1 - added by Task 6, enforced HERE because it is a
+# promotion-time decision).
+#
+# Cap B above dilutes every live `ga-llm:*` heuristic by the family's size. A
+# TIGHTEN_SL-targeted member diluted below `authority_tighten_threshold` can
+# never fire again, so can never accumulate the `intervention_applied`
+# forward sample Task 6's TIGHTEN_SL demotion track needs - an absorbing
+# state that only grows. The cap bounds how far that dilution can go by
+# refusing further TIGHTEN_SL promotions once
+# `_CAP` of them are live; a refused candidate
+# stays VALIDATED and becomes eligible again when a demotion frees a slot.
+# --------------------------------------------------------------------------
+def test_the_cardinality_cap_is_the_documented_value():
+    """The one place the production constant and this file's own `_CAP`
+    literal are tied together - so a changed cap fails HERE, with a clear
+    message, rather than as a confusing cascade of resized fixtures."""
+    assert _MAX_LIVE_TIGHTEN_SL_HEURISTICS == _CAP
+
+
+def _fill_the_tighten_sl_cap(repo, at=_NOW):
+    """Promotes exactly `_CAP` TIGHTEN_SL candidates - the cap genuinely
+    filled through the real promotion path, not asserted about."""
+    for index in range(_CAP):
+        _seed_validated_candidate(repo, f"cand-{index}", condition=_STATE_CONDITION)
+    assert promote_validated_heuristic_candidates(repo, at) == _CAP
+    return {row["heuristic_id"] for row in repo.find_guardian_authority_heuristics()}
+
+
+def test_a_tighten_sl_promotion_is_refused_once_the_cardinality_cap_is_full(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    already_live = _fill_the_tighten_sl_cap(repo)
+    before = _heuristics_by_id(repo)
+
+    _seed_validated_candidate(repo, "one-too-many", condition=_INSTRUMENT_CONDITION)
+
+    assert promote_validated_heuristic_candidates(repo, _LATER) == 0
+
+    # Refusal, not failure: nothing was written to the real table at all -
+    # not the refused heuristic, and not a pointless rescale of the live
+    # family (whose size did not change).
+    assert set(_heuristics_by_id(repo)) == already_live
+    assert _heuristics_by_id(repo) == before
+
+    # ...and the candidate is still VALIDATED, queued for a later pass.
+    candidate = repo.get_guardian_authority_heuristic_candidate("one-too-many")
+    assert candidate["status"] == "VALIDATED"
+    assert candidate["promoted_at"] is None
+    assert candidate["promoted_heuristic_id"] is None
+    still_validated = repo.find_validated_guardian_authority_heuristic_candidates()
+    assert [row["candidate_id"] for row in still_validated] == ["one-too-many"]
+
+
+def test_only_cap_many_tighten_sl_candidates_are_promoted_from_one_oversized_pass(tmp_path):
+    """A cold start where more TIGHTEN_SL candidates validate at once than
+    the cap allows: exactly `_CAP` are promoted
+    (deterministically, the lowest candidate_ids), the rest stay VALIDATED."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for index in range(_CAP + 2):
+        _seed_validated_candidate(repo, f"cand-{index}", condition=_STATE_CONDITION)
+
+    assert promote_validated_heuristic_candidates(repo, _NOW) == _CAP
+
+    assert set(_heuristics_by_id(repo)) == {
+        f"ga-llm:cand-{index}" for index in range(_CAP)
+    }
+    assert sorted(
+        row["candidate_id"] for row in repo.find_validated_guardian_authority_heuristic_candidates()
+    ) == [f"cand-{_CAP}", f"cand-{_CAP + 1}"]
+
+
+def test_the_tighten_sl_cap_never_blocks_a_pre_entry_veto_promotion(tmp_path):
+    """The cap counts and constrains the TIGHTEN_SL track only. A
+    PRE_ENTRY_VETO candidate is promoted in the very same pass that refuses
+    an over-cap TIGHTEN_SL one - its own forward-tracking (Task 6's
+    closed-position track) does not require the heuristic to fire, so it has
+    no liveness trap to protect it from."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _fill_the_tighten_sl_cap(repo)
+    _seed_validated_candidate(repo, "over-cap-tighten", condition=_INSTRUMENT_CONDITION)
+    _seed_validated_candidate(
+        repo, "a-veto", condition=_INSTRUMENT_CONDITION, target_decision_type="PRE_ENTRY_VETO"
+    )
+
+    assert promote_validated_heuristic_candidates(repo, _LATER) == 1
+
+    heuristics = _heuristics_by_id(repo)
+    assert "ga-llm:a-veto" in heuristics
+    assert "ga-llm:over-cap-tighten" not in heuristics
+    assert (
+        repo.get_guardian_authority_heuristic_candidate("over-cap-tighten")["status"] == "VALIDATED"
+    )
+    # The refused candidate never joins the divisor either: the family is the
+    # three live TIGHTEN_SL rows plus the one newly promoted veto rule.
+    family_size = _CAP + 1
+    assert heuristics["ga-llm:a-veto"]["adjustment"] == pytest.approx(0.4 / family_size)
+    assert heuristics["ga-llm:cand-0"]["adjustment"] == pytest.approx(0.4 / family_size)
+
+
+def test_a_pre_entry_veto_family_never_fills_the_tighten_sl_cap(tmp_path):
+    """The mirror direction: live PRE_ENTRY_VETO heuristics do not consume
+    TIGHTEN_SL slots."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for index in range(_CAP + 2):
+        _seed_validated_candidate(
+            repo,
+            f"veto-{index}",
+            condition=_STATE_CONDITION,
+            target_decision_type="PRE_ENTRY_VETO",
+        )
+    assert promote_validated_heuristic_candidates(repo, _NOW) == (
+        _CAP + 2
+    )
+
+    _seed_validated_candidate(repo, "a-tighten", condition=_INSTRUMENT_CONDITION)
+    assert promote_validated_heuristic_candidates(repo, _LATER) == 1
+    assert "ga-llm:a-tighten" in _heuristics_by_id(repo)
+
+
+def test_a_legacy_null_target_decision_type_counts_against_the_tighten_sl_cap(tmp_path):
+    """A pre-Task-4B candidate row carries `target_decision_type = NULL` and
+    is read as TIGHTEN_SL everywhere else in this pipeline (validation
+    routing, Task 6's forward tracking). The cap must read it the same way -
+    a NULL that slipped past the cap would be exactly the stuck TIGHTEN_SL
+    heuristic the cap exists to prevent."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for index in range(_CAP):
+        _seed_validated_candidate(
+            repo, f"legacy-{index}", condition=_STATE_CONDITION, target_decision_type=None
+        )
+    assert promote_validated_heuristic_candidates(repo, _NOW) == _CAP
+
+    _seed_validated_candidate(repo, "one-too-many", condition=_INSTRUMENT_CONDITION)
+    assert promote_validated_heuristic_candidates(repo, _LATER) == 0
+    assert "ga-llm:one-too-many" not in _heuristics_by_id(repo)
+
+
+def test_a_demotion_frees_a_tighten_sl_slot_for_the_refused_candidate(tmp_path):
+    """The cap is a queue, not a permanent lockout: the refused candidate
+    stays VALIDATED and is promoted by the very next pass after a demotion
+    frees a slot - which is exactly what makes Task 6's own demotion the
+    release valve for this cap."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _fill_the_tighten_sl_cap(repo)
+    _seed_validated_candidate(repo, "one-too-many", condition=_INSTRUMENT_CONDITION)
+    assert promote_validated_heuristic_candidates(repo, _LATER) == 0
+
+    # Task 6's demotion, in its own binding order: mark, then zero.
+    demoted_at = _LATER + timedelta(hours=1)
+    assert repo.mark_guardian_authority_heuristic_candidate_demoted(
+        "cand-0", demoted_at, "forward performance degraded"
+    )
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="ga-llm:cand-0",
+        description="cand-0 description",
+        condition_json=json.dumps(_STATE_CONDITION),
+        adjustment=0.0,
+        confidence=0.0,
+        sample_size=20,
+        updated_at=demoted_at,
+    )
+
+    assert promote_validated_heuristic_candidates(repo, demoted_at + timedelta(hours=1)) == 1
+    assert "ga-llm:one-too-many" in _heuristics_by_id(repo)
+    assert (
+        repo.get_guardian_authority_heuristic_candidate("one-too-many")["status"] == "PROMOTED"
+    )
 
 
 def test_the_self_critique_heuristic_family_is_never_touched_by_promotion(tmp_path):

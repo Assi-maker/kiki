@@ -1,26 +1,29 @@
-"""Guardian Authority self-improvement, steps 1-3 of 4: PROPOSE + VALIDATE
-+ PROMOTE (design spec:
+"""Guardian Authority self-improvement, all four steps: PROPOSE + VALIDATE +
+PROMOTE + TRACK/DEMOTE (design spec:
 docs/superpowers/specs/2026-09-15-guardian-authority-live-autonomy-design.md,
 "What 'self-improvement' concretely means here").
 
 The full pipeline is propose -> validate -> promote -> track/demote. THIS
 module proposes (`propose_candidate_heuristics`, Task 3), validates
-out-of-sample (`validate_pending_heuristic_candidates`, Task 4) and promotes
-(`promote_validated_heuristic_candidates`, Task 5); forward-performance
-tracking/demotion is a later task. Everything Task 3 writes lands in one
-place - `guardian_authority_heuristic_candidates`, status `PROPOSED` - a
-table the real decision engine never reads, and Task 4 only ever moves a row
-from `PROPOSED` to `VALIDATED` or `REJECTED` in that SAME table, via the
-existing, unmodified `record_guardian_authority_heuristic_candidate_
-validation`. `evaluate_heuristics` reads `guardian_authority_heuristics` (a
-different table), and the ONLY way anything from this module reaches it is
-Task 5's single call to the existing, unmodified `upsert_guardian_authority_
-heuristic`, made only for a row an independent out-of-sample validation has
-already moved to `VALIDATED`. So an LLM that hallucinates a confident-
-sounding rule cannot influence a single real trade from here - it can only
-queue a hypothesis for a statistical test it has no way to reach, and its
-own proposed numbers are discarded even if that test clears (see Task 5's
-section below).
+out-of-sample (`validate_pending_heuristic_candidates`, Task 4), promotes
+(`promote_validated_heuristic_candidates`, Task 5) and tracks each promoted
+heuristic's own forward record, retiring the ones that degrade
+(`track_and_demote_underperforming_heuristics`, Task 6). Everything Task 3
+writes lands in one place - `guardian_authority_heuristic_candidates`, status
+`PROPOSED` - a table the real decision engine never reads, and Task 4 only
+ever moves a row from `PROPOSED` to `VALIDATED` or `REJECTED` in that SAME
+table, via the existing, unmodified `record_guardian_authority_heuristic_
+candidate_validation`. `evaluate_heuristics` reads
+`guardian_authority_heuristics` (a different table), and the only ways
+anything from this module reaches it are Task 5's single call to the
+existing, unmodified `upsert_guardian_authority_heuristic` - made only for a
+row an independent out-of-sample validation has already moved to `VALIDATED`
+- and Task 6's single call to the SAME unmodified method, which only ever
+writes `adjustment=0.0` (a demotion can silence a rule, never strengthen
+one). So an LLM that hallucinates a confident-sounding rule cannot influence
+a single real trade from here - it can only queue a hypothesis for a
+statistical test it has no way to reach, and its own proposed numbers are
+discarded even if that test clears (see Task 5's section below).
 
 Isolation (design spec, Global Constraints): this module never imports
 `position_sizing.py`, never references `set_leverage`, and never imports
@@ -1072,9 +1075,104 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
 # The live-heuristic id prefix that IS this family - see the R3 section above.
 _LLM_HEURISTIC_ID_PREFIX = "ga-llm:"
 
+# --------------------------------------------------------------------------
+# The TIGHTEN_SL cardinality cap (added by Task 6 - see the design spec's
+# "Addendum (2026-09-16)", R3, consequence 1, and the note at the end of the
+# Task 5 section above that predicted this exact follow-up).
+# --------------------------------------------------------------------------
+# WHY IT LIVES HERE AND NOT IN TASK 6's OWN FUNCTION: it is a decision about
+# whether a promotion may happen, made from the state that exists at the
+# instant of promotion. Task 6 demotes; it has no say over what gets written
+# in the first place, and a cap enforced anywhere else could only ever notice
+# a violation after the over-cap row was already live for the real decision
+# core. The brief's own wording ("checked at promotion time... naturally Task
+# 5's own promotion function") and the mechanics agree.
+#
+# WHAT IT FIXES: Cap B above divides every live `ga-llm:*` heuristic's stored
+# adjustment by the size of the whole live family. A TIGHTEN_SL-targeted
+# member diluted below `authority_tighten_threshold` can never fire again;
+# Task 6's TIGHTEN_SL forward-tracking counts only resolved decisions with
+# `intervention_applied` true, so it can never accumulate a forward sample,
+# so it can never be demoted - an absorbing state that only grows as more
+# TIGHTEN_SL candidates are promoted. PRE_ENTRY_VETO members are structurally
+# immune (Task 6 tracks them against real closed positions, whether or not
+# they ever fired), which is why the cap is TIGHTEN_SL-only.
+#
+# WHY 3, specifically:
+# - The binding number is what a TIGHTEN_SL heuristic needs in order to still
+#   be ABLE to fire: its stored adjustment is `raw / family_size` and
+#   `decide_open_position` requires that to exceed `authority_tighten_
+#   threshold` (0.15 by default). A strong rule (test_correct_rate ~0.95,
+#   raw ~0.45) clears 0.15 at a family of 3 and fails it at 4. So 3 is the
+#   largest cap at which even the strongest realistic TIGHTEN_SL heuristic is
+#   still guaranteed a way out of the absorbing state described above - the
+#   whole point of having a cap at all.
+# - It is deliberately conservative in the direction the brief names: "too
+#   few TIGHTEN_SL heuristics can ever be promoted" is a missed opportunity
+#   (the candidate stays VALIDATED and is promoted the moment a slot frees),
+#   while unbounded accumulation of stuck ones permanently degrades every
+#   other member's signal through the shared divisor. Same conservative
+#   framing as `_MIN_SAMPLE_SIZE = 30`'s own.
+# - It is not 1: that would freeze the TIGHTEN_SL track at a single live rule
+#   forever, the same amputation the Task 5 section above rejected when it
+#   chose Cap B over a global count cap of 1.
+#
+# HONEST LIMIT, stated rather than glossed: this caps the TIGHTEN_SL half of
+# the divisor, not the divisor itself. Cap B's divisor is the WHOLE live
+# family (both target types - see the Task 5 section for why a per-target
+# divisor would leave the cross-type co-firing overlap unproven), so a large
+# PRE_ENTRY_VETO family can still dilute a TIGHTEN_SL member below the
+# threshold. That residual is the accepted, documented cost of the addendum's
+# own chosen resolution; bounding it fully would require a global cap, which
+# the spec deliberately did not ask for.
+#
+# REFUSAL, NOT FAILURE: an over-cap candidate is left exactly as it was -
+# `VALIDATED`, unwritten, unpromoted - and is picked up by the next promotion
+# pass after a demotion frees a slot. Same refusal-not-failure pattern as
+# every other gate in this pipeline; nothing is rejected, nothing is lost.
+_MAX_LIVE_TIGHTEN_SL_HEURISTICS = 3
+
 
 def _llm_heuristic_id(candidate_id: str) -> str:
     return f"{_LLM_HEURISTIC_ID_PREFIX}{candidate_id}"
+
+
+def _target_decision_type(candidate: dict) -> str:
+    """The candidate's own declared target, with Task 4B's documented legacy
+    default. Read through ONE helper everywhere (validation routing reads the
+    same `or _TARGET_TIGHTEN_SL`), so the cap below, Task 6's forward
+    tracking and the validation router can never disagree about what a NULL
+    row is."""
+    return candidate.get("target_decision_type") or _TARGET_TIGHTEN_SL
+
+
+def _within_tighten_sl_cardinality_cap(live: list[dict], incoming: list[dict]) -> list[dict]:
+    """`incoming` minus the TIGHTEN_SL-targeted candidates that would push the
+    live TIGHTEN_SL family past `_MAX_LIVE_TIGHTEN_SL_HEURISTICS` - see the
+    section above. `live` is the SAME "live" this function's own rescale uses
+    (`_live_promoted_llm_candidates`: promoted, `ga-llm:*`, `demoted_at IS
+    NULL`), so a demotion frees a slot the moment it lands. PRE_ENTRY_VETO
+    candidates pass through untouched, and never consume a slot."""
+    slots = _MAX_LIVE_TIGHTEN_SL_HEURISTICS - sum(
+        1 for row in live if _target_decision_type(row) == _TARGET_TIGHTEN_SL
+    )
+
+    accepted: list[dict] = []
+    for row in incoming:
+        if _target_decision_type(row) != _TARGET_TIGHTEN_SL:
+            accepted.append(row)
+            continue
+        if slots <= 0:
+            log_event(
+                row["run_id"],
+                event="ga_llm_tighten_sl_promotion_refused_at_cap",
+                candidate_id=row["candidate_id"],
+                cap=_MAX_LIVE_TIGHTEN_SL_HEURISTICS,
+            )
+            continue
+        slots -= 1
+        accepted.append(row)
+    return accepted
 
 
 def _live_promoted_llm_candidates(repo: Repository) -> list[dict]:
@@ -1128,7 +1226,13 @@ def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> i
     Every already-live `ga-llm:*` heuristic is rewritten in the same pass
     with the new family divisor, which is what keeps the R3 co-firing cap
     true continuously rather than only at the instant of a promotion; see
-    the Task 5 module section above for the mechanism and its proof."""
+    the Task 5 module section above for the mechanism and its proof.
+
+    A TIGHTEN_SL-targeted candidate is additionally refused (left VALIDATED,
+    counted in neither the return value nor the divisor) when the live
+    TIGHTEN_SL family already stands at `_MAX_LIVE_TIGHTEN_SL_HEURISTICS` -
+    see that constant's own section above for why the cap exists, why it
+    lives here, and why its value is 3."""
     validated = repo.find_validated_guardian_authority_heuristic_candidates()
     if not validated:
         # Nothing to promote means nothing to rescale either: the live family
@@ -1136,10 +1240,20 @@ def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> i
         return 0
 
     # Sorted by candidate_id purely for deterministic write order - the
-    # values written do not depend on it. Already-live rows first: see the
-    # ordering note in the module section above.
+    # values written do not depend on it, but WHICH TIGHTEN_SL candidates win
+    # the last free slots of the cap below does, so the order is pinned
+    # rather than left to the database's own row order. Already-live rows
+    # first: see the ordering note in the module section above.
     live = sorted(_live_promoted_llm_candidates(repo), key=lambda row: row["candidate_id"])
-    incoming = sorted(validated, key=lambda row: row["candidate_id"])
+    incoming = _within_tighten_sl_cardinality_cap(
+        live, sorted(validated, key=lambda row: row["candidate_id"])
+    )
+    if not incoming:
+        # Every validated candidate was refused by the cap: the live family is
+        # unchanged, so - exactly as in the empty-queue case above - its
+        # existing divisor is still correct and nothing must be rewritten.
+        return 0
+
     family_size = len(live) + len(incoming)
 
     for row in live:
@@ -1155,3 +1269,311 @@ def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> i
             promoted += 1
 
     return promoted
+
+
+# ---------------------------------------------------------------------------
+# Task 6 (2026-09-15, Guardian Authority Live Autonomy): FORWARD-PERFORMANCE
+# TRACKING + AUTO-DEMOTION - step 4 of 4 (propose -> validate -> promote ->
+# TRACK/DEMOTE), and Acceptance Criterion 5's whole mechanism: "a promoted
+# heuristic whose real forward performance degrades gets demoted (adjustment
+# set to 0.0) automatically, with full audit trail".
+#
+# --------------------------------------------------------------------------
+# What "forward" means, and why every track is windowed to promoted_at
+# --------------------------------------------------------------------------
+# A promoted heuristic earned its place on a HELD-OUT TEST SPLIT of history
+# that existed before it did. This step asks a different, harder question: how
+# has the rule done since it started acting? Every sample counted below is
+# therefore strictly AFTER the candidate's own `promoted_at` - never a
+# decision or a closed position from before the rule existed. Including
+# pre-promotion evidence would just re-measure (a subset of) what validation
+# already measured and would blunt exactly the degradation this step exists to
+# catch.
+#
+# --------------------------------------------------------------------------
+# Two tracks, because the two decision types leave two different traces
+# --------------------------------------------------------------------------
+# TIGHTEN_SL: the heuristic's real fired decisions DO resolve (a tightened
+# stop either helped or did not), so the track record is the heuristic's own
+# resolved `guardian_authority_decisions` rows, attributed through the
+# `matched_heuristic_ids_json` column Task 2 populates at the orchestration
+# layer. Three filters are inherited verbatim from the two existing consumers
+# of that table (`update_heuristics_from_resolved_decisions` and this module's
+# own `_tighten_sl_evidence_pool`), not re-invented:
+#   - `decision_type == "TIGHTEN_SL"` and a non-null `expectation_correct`
+#     (CLOSE_EARLY resolves with None; PRE_ENTRY_VETO never resolves at all);
+#   - `bool(row.get("intervention_applied"))` - the R1 fix, and the single
+#     most important filter here. One losing position sitting above the
+#     tighten threshold re-saves a decision EVERY tick, and every one of those
+#     rows resolves to the same outcome from the same trade. Without this
+#     filter a single position could clear the forward sample-size bar on its
+#     own and retire a heuristic on the evidence of one trade. `bool(...)`
+#     rather than `is True` for the reason both siblings document: SQLite has
+#     no boolean type, so a stored True round-trips as the int 1.
+#
+# PRE_ENTRY_VETO: its real fired decisions can NEVER resolve. `resolve_
+# pending_decisions` permanently skips a PRE_ENTRY_VETO row's counterfactual
+# by the original Guardian Authority plan's own deliberate, documented scope
+# limit ("this task has no market-data infrastructure to evaluate it... Not a
+# bug, not a TODO"), so the attribution-based track above would give this half
+# of the family ZERO forward-performance safety net the moment it starts
+# acting on real capital. The 2026-09-16 addendum closes that with the SAME
+# mechanism Task 4B already built and reviewed for validation: `_pre_entry_
+# veto_evidence_pool` (unmodified, no new call path near it, still read-only),
+# windowed to `closed_at > promoted_at` and filtered by the promoted
+# heuristic's OWN `condition_json` through the real, unmodified
+# `heuristic_condition_matches` - literally validation's question, re-asked
+# forward. No new mechanism is invented for this task.
+#
+# Each promoted heuristic is measured ONLY against the pool its own
+# `target_decision_type` names - the same "untested stays untested, never
+# evidence" routing Task 4B established, via the same `_target_decision_type`
+# helper, so a NULL/legacy row reads as TIGHTEN_SL here exactly as it does at
+# validation and at the cardinality cap.
+#
+# --------------------------------------------------------------------------
+# The bar: 15 samples, correct_rate < 0.4 - and why neither is the validation
+# threshold
+# --------------------------------------------------------------------------
+# `_FORWARD_MIN_SAMPLE_SIZE = 15`, HALF of validation's `_MIN_SAMPLE_SIZE =
+# 30`, and named "canary" on purpose. Validation's job is to keep a weak rule
+# OUT, so its sample bar should be hard to clear. This step's job is the
+# opposite: to get a rule that is actively costing money OUT, quickly, while
+# real forward data accumulates far more slowly than the historical pool
+# validation drew on. Per Acceptance Criterion 5 it must be able to catch real
+# degradation before 30 more real decisions/closed positions have piled up
+# behind it. 15 is still large enough that no single trade can reach it (the
+# `intervention_applied` filter above guarantees distinct interventions), and
+# the asymmetry is the safe direction: demoting too eagerly costs a missed
+# opportunity that promotion can re-earn, while demoting too late costs real
+# capital.
+#
+# `_FORWARD_MAX_CORRECT_RATE = 0.4` is a strict `<`, i.e. a forward deviation
+# of at least -0.10 from the uninformative 0.5 baseline. It is deliberately
+# NOT "anything below what got it promoted" (a rule that merely regressed to
+# ~0.5 is uninformative, not harmful - it contributes noise, and Cap B already
+# bounds how loud that noise can be) and deliberately NOT 0.5 itself (which
+# would retire half the family on a coin flip). It sits inside
+# `_MIN_MISCALIBRATION`'s own 0.15 floor rather than at it: a heuristic that
+# has crossed all the way to a 0.35 correct_rate is already MORE miscalibrated
+# than the bar it had to clear to be promoted at all, which would be a late
+# canary, not an early one. 0.10 is the same order of magnitude as that
+# established floor - "meaningfully below 0.5, not merely not-perfect" - while
+# firing one step sooner.
+#
+# Both constants are shared by both tracks: there is no reason to hold the two
+# decision types to different bars, and two sets of numbers would be two
+# things to keep in agreement forever.
+#
+# --------------------------------------------------------------------------
+# The two writes, and why their ORDER is binding (2026-09-16 addendum)
+# --------------------------------------------------------------------------
+# A demotion is `mark_guardian_authority_heuristic_candidate_demoted` followed
+# by `upsert_guardian_authority_heuristic(adjustment=0.0, confidence=0.0,
+# sample_size=<forward sample>)` - always both, always in THAT order, never
+# one without the other. Nothing is ever deleted: the candidate row stays
+# `PROMOTED` (with `demoted_at`/`demotion_reason` filled in) and the real
+# heuristic row stays in the table with its own description and condition
+# intact, contributing exactly 0.0 to `evaluate_heuristics`' summation - a
+# genuine no-op, and a complete audit trail.
+#
+# The order is not stylistic. The two writes are separately committed (there
+# is no shared transaction - same as every other write pair against this
+# table), and `promote_validated_heuristic_candidates` above rescales every
+# live `ga-llm:*` heuristic on every pass, excluding demoted rows by
+# `demoted_at IS NOT NULL`. If the zeroing upsert ran FIRST, a promotion pass
+# interleaving between the two writes would still see `demoted_at IS NULL`,
+# count the row as live, and rescale its 0.0 back to a nonzero value - which
+# the following `mark_..._demoted` would then freeze in place forever, since
+# every subsequent promotion pass skips demoted rows. The result would be a
+# permanently-live, permanently-non-rescalable heuristic acting on real
+# capital after forward performance already retired it. Marking FIRST closes
+# the window completely: from the instant `demoted_at` is set, no promotion
+# pass - concurrent or later - can touch the row again, whatever the zeroing
+# upsert's own timing turns out to be.
+#
+# `mark_..._demoted`'s own `WHERE status = 'PROMOTED' AND demoted_at IS NULL`
+# guard is also what makes this step idempotent: it returns False for a row
+# some earlier/concurrent pass already demoted, and this function then skips
+# the zeroing write and the count entirely - same "a structural no-op is not
+# counted" discipline as the three steps above.
+#
+# Error handling follows `validate_pending_heuristic_candidates` and
+# `promote_validated_heuristic_candidates` directly above (no blanket
+# try/except): a pure DB-in/DB-out batch step with no AI call, no budget gate
+# and no watermark lets a failure propagate to its caller rather than silently
+# half-demoting.
+# ---------------------------------------------------------------------------
+
+# The canary thresholds - see the section above for why each is what it is,
+# and why neither is the validation threshold of the same name.
+_FORWARD_MIN_SAMPLE_SIZE = 15
+_FORWARD_MAX_CORRECT_RATE = 0.4
+
+
+def _outcome_stats(outcomes: list[bool]) -> tuple[int, float]:
+    """`(sample_size, correct_rate)` - the same plain count/ratio tally
+    `_split_stats` computes for a condition-filtered pool, for a track whose
+    rows are already attributed and therefore need no condition matching.
+    `correct_rate` is `0.0` (a placeholder, never read as meaningful) when
+    the sample is empty: an n=0 track always fails the sample-size bar before
+    any caller looks at its rate."""
+    n = len(outcomes)
+    if n == 0:
+        return 0, 0.0
+    return n, sum(1 for correct in outcomes if correct) / n
+
+
+def _forward_tighten_sl_stats(
+    resolved_decisions: list[dict], heuristic_id: str, promoted_at: str
+) -> tuple[int, float]:
+    """This heuristic's OWN forward record among real, resolved, genuinely
+    applied TIGHTEN_SL interventions decided after `promoted_at`. See the
+    Task 6 module section above for each of the four filters and where it
+    comes from."""
+    outcomes: list[bool] = []
+    for decision in resolved_decisions:
+        if decision["decision_type"] != _TARGET_TIGHTEN_SL:
+            continue
+        if decision["expectation_correct"] is None:
+            continue
+        if not bool(decision.get("intervention_applied")):
+            continue  # R1 - the repeated-tick filter, see module section
+        decided_at = decision["decided_at"]
+        # Both timestamps are ISO-8601 strings written by `.isoformat()`, so
+        # lexicographic order IS chronological order - the same property
+        # `_most_recent_rows`/`_split_pool_chronologically` already rely on.
+        # Strictly greater: a decision made in the same instant as the
+        # promotion was not made BY the promoted heuristic.
+        if not decided_at or decided_at <= promoted_at:
+            continue
+        matched_ids = _safe_json_list(decision["matched_heuristic_ids_json"]) or []
+        if heuristic_id not in matched_ids:
+            continue
+        outcomes.append(bool(decision["expectation_correct"]))
+    return _outcome_stats(outcomes)
+
+
+def _forward_pre_entry_veto_stats(
+    pool: list[tuple[str, dict, bool]], condition: dict, promoted_at: str
+) -> tuple[int, float]:
+    """This heuristic's OWN forward record among real positions closed after
+    `promoted_at` whose entry evidence its own condition genuinely matches -
+    Task 4B's pool and Task 4's `_split_stats`, both unmodified, asked
+    forward instead of retrospectively."""
+    forward = [row for row in pool if row[0] > promoted_at]
+    return _split_stats(forward, condition)
+
+
+def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime) -> int:
+    """Forward-performance tracking and auto-demotion (Task 6). For every
+    promoted, not-yet-demoted `ga-llm:*` heuristic, computes its own forward
+    record on the track its `target_decision_type` names, and demotes it -
+    `mark_guardian_authority_heuristic_candidate_demoted` FIRST, then the
+    zeroing `upsert_guardian_authority_heuristic` (the order is binding; see
+    the Task 6 module section above) - when that record reaches
+    `_FORWARD_MIN_SAMPLE_SIZE` samples at a correct_rate below
+    `_FORWARD_MAX_CORRECT_RATE`.
+
+    Returns the number of heuristics actually demoted by THIS call. A row
+    some concurrent/earlier call already demoted is a structural no-op via
+    `mark_..._demoted`'s own `demoted_at IS NULL` guard and is not counted -
+    same idempotency discipline as the three steps above."""
+    # The SAME "live" the promotion pass's own rescale uses - one definition
+    # (`promoted`, `ga-llm:*`, `demoted_at IS NULL`), read through the same
+    # helper, so the half of the plan that writes adjustments and the half
+    # that zeroes them can never disagree about which rows are in play.
+    live = _live_promoted_llm_candidates(repo)
+    if not live:
+        return 0
+
+    # Read once per call, not once per heuristic: both are whole-table
+    # aggregate reads, and every heuristic on a given track is measured
+    # against the same underlying evidence (only the window and the
+    # attribution/condition filter differ per heuristic). The veto pool is
+    # built lazily because a family with no PRE_ENTRY_VETO members should not
+    # pay for a full `find_closed_positions()` scan.
+    resolved_decisions: list[dict] | None = None
+    veto_pool: list[tuple[str, dict, bool]] | None = None
+
+    demoted = 0
+    for candidate in sorted(live, key=lambda row: row["candidate_id"]):
+        promoted_at = candidate["promoted_at"]
+        heuristic_id = candidate["promoted_heuristic_id"]
+        if not promoted_at or not heuristic_id:
+            # Defensive - `promote_guardian_authority_heuristic_candidate`
+            # writes both in the same UPDATE that sets status='PROMOTED', so
+            # no production path produces this. A row without a promotion
+            # timestamp has no forward window to measure, and demoting on an
+            # unmeasurable record is the one thing this step must not do.
+            continue
+
+        target = _target_decision_type(candidate)
+        if target == _TARGET_PRE_ENTRY_VETO:
+            if veto_pool is None:
+                veto_pool = _pre_entry_veto_evidence_pool(repo)
+            # The candidate's own condition, read through the single-row
+            # accessor the brief names. `condition_json` is write-once on this
+            # table (only `save_guardian_authority_heuristic_candidate` ever
+            # sets it), so this is necessarily the same string the batch row
+            # carries - the separate read costs one indexed primary-key lookup
+            # per PRE_ENTRY_VETO heuristic and makes the condition's
+            # provenance explicit at the point it decides a demotion. Parsed,
+            # never re-serialized, so what is matched forward is byte-for-byte
+            # what validation matched.
+            promoted_row = repo.get_guardian_authority_heuristic_candidate(
+                candidate["candidate_id"]
+            )
+            sample_size, correct_rate = _forward_pre_entry_veto_stats(
+                veto_pool, json.loads(promoted_row["condition_json"]), promoted_at
+            )
+        else:
+            if resolved_decisions is None:
+                resolved_decisions = repo.find_resolved_guardian_authority_decisions()
+            sample_size, correct_rate = _forward_tighten_sl_stats(
+                resolved_decisions, heuristic_id, promoted_at
+            )
+
+        if sample_size < _FORWARD_MIN_SAMPLE_SIZE:
+            continue
+        if correct_rate >= _FORWARD_MAX_CORRECT_RATE:
+            continue
+
+        reason = (
+            f"forward correct_rate {correct_rate:.4f} < {_FORWARD_MAX_CORRECT_RATE} "
+            f"over n={sample_size} forward {target} samples since "
+            f"promoted_at={promoted_at}"
+        )
+
+        # ORDER IS BINDING - mark first, zero second. See the module section
+        # above for the interleaving this closes.
+        if not repo.mark_guardian_authority_heuristic_candidate_demoted(
+            candidate["candidate_id"], now, reason
+        ):
+            continue  # already demoted by a concurrent/earlier pass
+        repo.upsert_guardian_authority_heuristic(
+            heuristic_id=heuristic_id,
+            # The row is kept on file verbatim - same description, same
+            # condition - so the audit trail shows what was retired, not a
+            # blank placeholder. Only its voice is removed.
+            description=candidate["description"],
+            condition_json=candidate["condition_json"],
+            adjustment=0.0,
+            confidence=0.0,
+            sample_size=sample_size,
+            updated_at=now,
+        )
+
+        log_event(
+            candidate["run_id"],
+            event="ga_llm_heuristic_demoted",
+            candidate_id=candidate["candidate_id"],
+            heuristic_id=heuristic_id,
+            target_decision_type=target,
+            forward_sample_size=sample_size,
+            forward_correct_rate=correct_rate,
+            demotion_reason=reason,
+        )
+        demoted += 1
+
+    return demoted
