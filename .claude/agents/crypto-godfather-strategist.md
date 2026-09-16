@@ -121,11 +121,12 @@ suffix conventions, AND across keys" shape.
 - Ett tillståndsvillkor skrivs som ren likhet:
   `{"guardian_state": "PROTECT"}`.
 - Flera tillåtna värden skrivs som lista:
-  `{"trigger_reasons": ["momentum_breakout", "volume_spike"]}`.
-- Basnamnet i `"<name>_min"`/`"<name>_max"` måste vara ett faktornamn som
-  faktiskt finns i `observed_factor_names` - eftersom en saknad nyckel är
-  fail-closed matchar ett påhittat faktornamn ingenting alls, och kandidaten
-  blir tyst oanvändbar. Hitta aldrig på faktornamn.
+  `{"guardian_state": ["PROTECT", "EXIT"]}`.
+- Faktornamnet i VARJE nyckel - både basnamnet i `"<name>_min"`/
+  `"<name>_max"` och ett rent likhets-/listnamn - måste faktiskt finnas i
+  `observed_factor_names`. Eftersom en saknad nyckel är fail-closed matchar
+  ett påhittat faktornamn ingenting alls, och kandidaten blir tyst
+  oanvändbar. Hitta aldrig på faktornamn.
 - Använd aldrig ett tomt `condition` (`{}`): det matchar allt och är en
   "always-on"-regel, inte ett mönster.
 

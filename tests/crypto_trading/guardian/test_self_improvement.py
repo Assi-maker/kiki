@@ -15,6 +15,7 @@ made.
 """
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -22,6 +23,7 @@ from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.runner import MockAgentRunner
 from crypto_trading.guardian.authority import heuristic_condition_matches
 from crypto_trading.guardian.self_improvement import (
+    _MAX_EVIDENCE_ROWS,
     _STRATEGIST_AGENT_FILE,
     propose_candidate_heuristics,
 )
@@ -217,29 +219,33 @@ def _seed_resolved_real_decision(
     return decision_id
 
 
-def _seed_history(repo):
-    """One closed position (so Detective's read-only stats have real
-    content), one resolved shadow row, one resolved real decision row."""
-    _seed_candidate_and_position(repo, position_id="pos-1", opened_at=_NOW - timedelta(hours=6))
+def _close_position(repo, position_id, closed_at, exit_reason="guardian_exit"):
     repo.close_position_with_event(
-        "pos-1",
+        position_id,
         Decimal("95"),
         Decimal("95"),
-        "guardian_exit",
+        exit_reason,
         Decimal("0.1"),
         Decimal("0"),
-        _NOW - timedelta(hours=1),
+        closed_at,
         Event(
-            event_id="POSITION_CLOSED:pos-1",
+            event_id=f"POSITION_CLOSED:{position_id}",
             event_type="POSITION_CLOSED",
             aggregate_type="position",
-            aggregate_id="pos-1",
-            occurred_at=_NOW - timedelta(hours=1),
+            aggregate_id=position_id,
+            occurred_at=closed_at,
             run_id="run-0",
             schema_version=1,
             payload={},
         ),
     )
+
+
+def _seed_history(repo):
+    """One closed position (so Detective's read-only stats have real
+    content), one resolved shadow row, one resolved real decision row."""
+    _seed_candidate_and_position(repo, position_id="pos-1", opened_at=_NOW - timedelta(hours=6))
+    _close_position(repo, "pos-1", _NOW - timedelta(hours=1))
     _seed_resolved_shadow(repo)
     _seed_resolved_real_decision(repo)
 
@@ -568,6 +574,120 @@ def test_propose_candidate_heuristics_never_raises_when_the_repository_read_expl
     assert runner.calls == []
     assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
     assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-15"
+
+
+def test_propose_candidate_heuristics_never_raises_when_the_watermark_write_explodes(tmp_path):
+    """Review fix, round 1, Finding 1. The watermark claim is a SQLite
+    WRITE, and both gates before it are SQLite READS - under concurrent
+    tick/write contention any of them can raise
+    `sqlite3.OperationalError: database is locked`. Before the fix these
+    four calls sat OUTSIDE the try/except, so such an error propagated
+    straight out of propose_candidate_heuristics into the hosting trading
+    tick. The pre-existing "repository read explodes" test could not catch
+    this: it patches a method that was already inside the try."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
+
+    def _boom(date_iso, updated_at):
+        raise sqlite3.OperationalError("database is locked")
+
+    repo.set_guardian_authority_strategist_last_proposed_date = _boom
+
+    saved = propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+
+    assert saved == 0
+    assert runner.calls == []  # it failed before the AI call
+    assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
+
+
+def test_propose_candidate_heuristics_never_raises_when_the_budget_gate_explodes(tmp_path):
+    """The other half of Finding 1: the budget gate is itself two SQLite
+    reads, and it runs before anything else in the function."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
+
+    def _boom(cutoff):
+        raise sqlite3.OperationalError("database is locked")
+
+    repo.count_ai_calls_since = _boom
+
+    saved = propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+
+    assert saved == 0
+    assert runner.calls == []
+    # The gate never passed, so the day's slot must remain unclaimed.
+    assert repo.get_guardian_authority_strategist_last_proposed_date() is None
+
+
+# --------------------------------------------------------------------------
+# Evidence window (review fix, round 1, Finding 2)
+# --------------------------------------------------------------------------
+def test_propose_candidate_heuristics_bounds_the_evidence_to_the_newest_rows(tmp_path):
+    """Unbounded, the three history reads grow forever: every resolved
+    shadow, resolved decision and closed position ever recorded would be
+    serialized into a PAID call, until one day the prompt crosses the
+    model's context limit and the call fails - permanently, one wasted paid
+    attempt per day, since the day's slot is claimed up front. The window
+    keeps the NEWEST rows, which are also the relevant ones."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    overflow = _MAX_EVIDENCE_ROWS + 5
+    # Seeded oldest-first, so the rows that must survive the window are the
+    # LAST ones written, not simply "the ones that happened to be seeded".
+    for i in range(overflow):
+        decided_at = _NOW + timedelta(minutes=i)
+        _seed_resolved_shadow(repo, shadow_id=f"shadow-{i:04d}", decided_at=decided_at)
+        _seed_resolved_real_decision(repo, position_id=f"real-{i:04d}", decided_at=decided_at)
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment()})
+
+    propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+
+    context = runner.calls[0][1]
+    assert len(context["resolved_shadow_decisions"]) == _MAX_EVIDENCE_ROWS
+    assert len(context["resolved_real_decisions"]) == _MAX_EVIDENCE_ROWS
+    # Newest-first, and the oldest rows really were dropped rather than the
+    # newest ones truncated away.
+    newest = _NOW + timedelta(minutes=overflow - 1)
+    assert context["resolved_shadow_decisions"][0]["decided_at"] == newest.isoformat()
+    assert context["resolved_real_decisions"][0]["decided_at"] == newest.isoformat()
+    kept_shadow_ids = {row["shadow_id"] for row in context["resolved_shadow_decisions"]}
+    assert f"shadow-{overflow - 1:04d}" in kept_shadow_ids
+    assert "shadow-0000" not in kept_shadow_ids
+    assert "pos-1" not in kept_shadow_ids  # the oldest row of all, from _seed_history
+
+
+def test_propose_candidate_heuristics_bounds_the_closed_position_read_and_its_n_plus_1(tmp_path):
+    """Closed positions feed Detective's aggregates rather than the prompt
+    directly, but the read was also an unbounded N+1 (one get_candidate per
+    closed position). The window is applied BEFORE those lookups."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    # All strictly newer than _seed_history's own pos-1 (closed at _NOW-1h),
+    # so the surviving window is exactly this batch and the assertion below
+    # cannot be satisfied by an accidental mix of the two.
+    for i in range(_MAX_EVIDENCE_ROWS + 5):
+        closed_at = _NOW - timedelta(seconds=i + 1)
+        _seed_candidate_and_position(
+            repo, position_id=f"closed-{i:04d}", opened_at=closed_at - timedelta(hours=2)
+        )
+        _close_position(repo, f"closed-{i:04d}", closed_at)
+    looked_up: list[str] = []
+    real_get_candidate = repo.get_candidate
+
+    def _counting_get_candidate(candidate_id):
+        looked_up.append(candidate_id)
+        return real_get_candidate(candidate_id)
+
+    repo.get_candidate = _counting_get_candidate
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment()})
+
+    propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+
+    assert len(looked_up) == _MAX_EVIDENCE_ROWS
+    effectiveness = runner.calls[0][1]["historical_guardian_exit_effectiveness"]
+    assert effectiveness["guardian_exit"]["trade_count"] == _MAX_EVIDENCE_ROWS
 
 
 def test_propose_candidate_heuristics_is_idempotent_within_one_run_id(tmp_path):

@@ -72,10 +72,46 @@ from crypto_trading.logging import log_event
 from crypto_trading.schemas.assessments import GodfatherStrategistAssessment
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
+from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.exceptions import CorruptCandidateStateError
 from crypto_trading.storage.repository import Repository
 
 _STRATEGIST_AGENT_FILE = "crypto-godfather-strategist.md"
+
+# Evidence window (review fix, round 1, Finding 2). The three history reads
+# below are full-table SELECTs that grow forever. Unbounded, two things go
+# wrong - and the second is a SILENT TERMINAL STATE, which is what makes
+# this a correctness bound and not a tuning knob:
+#   (a) cost per call rises linearly with history, for a call whose value
+#       does not - the model does not get better at spotting a pattern by
+#       being handed every row since the system's first day;
+#   (b) once the serialized prompt crosses the model's context limit the
+#       call fails outright - and because the day's slot is claimed up
+#       front (deliberately, see the module docstring), the system would
+#       then burn exactly one failed PAID attempt per day, every day,
+#       forever, visible only as a `godfather_strategist_failed` log line.
+#
+# 150 rows per source, most-recent-first. The number is chosen against the
+# budget gate's own worst-case assumption rather than picked round:
+# `tick.py::_WORST_CASE_COST_PER_CALL_USD` reserves $0.20 for one AI call,
+# and 150 shadow + 150 real rows at roughly 600 bytes of JSON each is about
+# 45k input tokens, i.e. ~$0.09 at the Sonnet input price `runner.py`
+# already records - leaving comfortable room for the response inside the
+# $0.20 this call is budgeted for. It is also 5x `authority.py`'s own
+# `_MIN_SAMPLE_SIZE = 30`, so a bounded window still carries several times
+# the evidence a pattern needs to clear validation, and the freshest rows
+# are the relevant ones anyway: a heuristic is being proposed about how the
+# system behaves NOW, not in its first month.
+#
+# Bounding happens here rather than as a new SQL `LIMIT` repository method
+# (the `find_closed_positions_pending_detective_analysis(limit)` shape)
+# deliberately: the harm above is entirely prompt-side, the three reads are
+# existing plan-sanctioned methods this task must reuse UNMODIFIED, and
+# this task already carries one flagged repository.py addition. Slicing
+# before the per-position candidate lookups also bounds what was an
+# unbounded N+1. If the read cost itself ever matters, converting these to
+# ORDER BY ... DESC LIMIT ? methods is a mechanical follow-up.
+_MAX_EVIDENCE_ROWS = 150
 
 
 def _safe_json_loads(raw: str | None) -> dict | None:
@@ -180,14 +216,45 @@ def _observed_factor_names(shadows: list[dict], reals: list[dict]) -> list[str]:
     return sorted(names)
 
 
+def _most_recent_rows(rows: list[dict], timestamp_key: str) -> list[dict]:
+    """The newest `_MAX_EVIDENCE_ROWS` rows, most-recent-first. Timestamps
+    on these tables are stored as ISO-8601 strings, so lexicographic order
+    IS chronological order - no parsing, and a row with a missing/NULL
+    timestamp sorts last instead of raising."""
+    ordered = sorted(rows, key=lambda row: row.get(timestamp_key) or "", reverse=True)
+    return ordered[:_MAX_EVIDENCE_ROWS]
+
+
+def _most_recent_closed_positions(positions: list[Position]) -> list[Position]:
+    """Positions counterpart of `_most_recent_rows`. `closed_at` is a
+    nullable datetime here rather than a string, and sorting a mix of
+    `None` and `datetime` raises `TypeError`, so undated rows are dropped
+    up front - a closed position without a close time cannot contribute to
+    a time-windowed view of recent behaviour anyway."""
+    dated = [position for position in positions if position.closed_at is not None]
+    ordered = sorted(dated, key=lambda position: position.closed_at, reverse=True)
+    return ordered[:_MAX_EVIDENCE_ROWS]
+
+
 def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
-    shadows = [_shadow_context(row) for row in repo.find_resolved_guardian_authority_shadows()]
+    # Every read here is windowed to _MAX_EVIDENCE_ROWS before anything is
+    # built from it - see that constant's rationale.
+    shadows = [
+        _shadow_context(row)
+        for row in _most_recent_rows(
+            repo.find_resolved_guardian_authority_shadows(), "decided_at"
+        )
+    ]
     reals = [
         _real_decision_context(repo, row)
-        for row in repo.find_resolved_guardian_authority_decisions()
+        for row in _most_recent_rows(
+            repo.find_resolved_guardian_authority_decisions(), "decided_at"
+        )
     ]
 
-    closed_positions = repo.find_closed_positions()
+    # Sliced BEFORE the per-position candidate lookups, so the N+1 below is
+    # bounded by the window too.
+    closed_positions = _most_recent_closed_positions(repo.find_closed_positions())
     candidates_by_id: dict[str, Candidate] = {}
     for position in closed_positions:
         candidate = _safe_get_candidate(repo, position.candidate_id)
@@ -221,7 +288,9 @@ def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
                 "condition_json": row["condition_json"],
                 "proposed_adjustment": row["proposed_adjustment"],
             }
-            for row in repo.find_proposed_guardian_authority_heuristic_candidates()
+            for row in _most_recent_rows(
+                repo.find_proposed_guardian_authority_heuristic_candidates(), "proposed_at"
+            )
         ],
         "observed_factor_names": _observed_factor_names(shadows, reals),
     }
@@ -239,28 +308,42 @@ def propose_candidate_heuristics(
     whose deterministic id already exists is an INSERT OR IGNORE no-op and
     is not counted). Never raises - every AI call site in this codebase is
     fail-safe, and a failing self-improvement step must never be able to
-    disturb the trading tick that hosts it."""
-    if not _budget_allows_one_more_call(repo, settings, now):
-        log_event(run_id, event="godfather_strategist_deferred_budget")
-        return 0
+    disturb the trading tick that hosts it.
 
-    day_key = _utc_day_start(now).date().isoformat()
-    last_proposed = repo.get_guardian_authority_strategist_last_proposed_date()
-    # `>=`, not `==`: a clock that jumps backwards must not be able to buy a
-    # second proposal for a day that already had one.
-    if last_proposed is not None and last_proposed >= day_key:
-        log_event(
-            run_id,
-            event="godfather_strategist_already_proposed_today",
-            last_proposed_date=last_proposed,
-            proposal_date=day_key,
-        )
-        return 0
-
-    # Claim the day's slot before any work - see module docstring.
-    repo.set_guardian_authority_strategist_last_proposed_date(day_key, now)
-
+    Review fix (round 1, Finding 1): the try/except covers the ENTIRE body,
+    including both gates and the watermark claim. Those are SQLite reads
+    and a SQLite WRITE - under concurrent tick/write contention a
+    `sqlite3.OperationalError: database is locked` from any of them would
+    otherwise propagate straight out of this function into the hosting
+    trading tick, which is precisely the failure this contract exists to
+    prevent. The claim itself has NOT moved: it still happens after both
+    gates and before the AI call, so every slot-consumption semantic
+    documented in the module docstring is unchanged."""
+    # Assigning None cannot raise, and it keeps `proposal_date` safe to log
+    # even if the very first statement inside the try is what failed.
+    day_key: str | None = None
     try:
+        day_key = _utc_day_start(now).date().isoformat()
+
+        if not _budget_allows_one_more_call(repo, settings, now):
+            log_event(run_id, event="godfather_strategist_deferred_budget")
+            return 0
+
+        last_proposed = repo.get_guardian_authority_strategist_last_proposed_date()
+        # `>=`, not `==`: a clock that jumps backwards must not be able to
+        # buy a second proposal for a day that already had one.
+        if last_proposed is not None and last_proposed >= day_key:
+            log_event(
+                run_id,
+                event="godfather_strategist_already_proposed_today",
+                last_proposed_date=last_proposed,
+                proposal_date=day_key,
+            )
+            return 0
+
+        # Claim the day's slot before any work - see module docstring.
+        repo.set_guardian_authority_strategist_last_proposed_date(day_key, now)
+
         context = _build_context(repo, settings, run_id)
         agent_def = load_agent_definition(_STRATEGIST_AGENT_FILE)
         assessment: GodfatherStrategistAssessment = runner.run(
