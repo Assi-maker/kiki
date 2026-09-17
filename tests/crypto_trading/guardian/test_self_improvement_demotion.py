@@ -818,10 +818,13 @@ def test_the_reverse_write_order_would_have_resurrected_the_demoted_heuristic(tm
     # The damage: a demoted heuristic left live at a nonzero adjustment.
     resurrected = _heuristics_by_id(repo)[heuristic_id]
     assert resurrected["adjustment"] != 0.0
-    assert resurrected["adjustment"] == pytest.approx(0.2)  # its own 0.4, over a family of 2
+    # Its own full 0.4: it is the only live member of its OWN (TIGHTEN_SL)
+    # family, and the interleaved promotion is PRE_ENTRY_VETO-targeted, which
+    # since review finding I1 (2026-09-17) no longer shares its divisor.
+    assert resurrected["adjustment"] == pytest.approx(0.4)
 
     # And it is now permanently stuck there: every later promotion pass skips
     # it, because it IS demoted.
     _seed_second_validated_candidate(repo, "cand-3")
     promote_validated_heuristic_candidates(repo, _NOW + timedelta(days=1))
-    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == pytest.approx(0.2)
+    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == pytest.approx(0.4)

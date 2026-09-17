@@ -1073,9 +1073,41 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
 # contribution cap achieved entirely by what gets WRITTEN, with zero changes
 # to `evaluate_heuristics`): **every live `ga-llm:*` heuristic's stored
 # `adjustment` is its own earned adjustment divided by the number of live
-# `ga-llm:*` heuristics.** Each promotion pass rewrites the whole live family
-# with the new divisor, so the invariant holds continuously, not just at the
-# moment of a promotion.
+# `ga-llm:*` heuristics OF ITS OWN `target_decision_type`.** Each promotion
+# pass rewrites the whole live family with the new divisors, so the invariant
+# holds continuously, not just at the moment of a promotion.
+#
+# THE DIVISOR IS PER TARGET TYPE (review finding I1, 2026-09-17 - this
+# replaced a whole-family divisor; see `_per_target_family_sizes`). The
+# original whole-family divisor was chosen because a PRE_ENTRY_VETO-targeted
+# condition and a TIGHTEN_SL-targeted one "can still co-fire on one factors
+# dict (trivially so for an empty/permissive condition)". Two things have
+# changed since, and together they make cross-type co-firing provably
+# impossible rather than merely unlikely:
+#   (a) C1's guard means a promoted condition can never be empty - it is a
+#       dict with at least one key;
+#   (b) a candidate only reaches VALIDATED by matching at least
+#       `_MIN_SAMPLE_SIZE` rows of ITS OWN pool, which requires every key in
+#       its condition to be present in that pool's factor vocabulary (matching
+#       is fail-closed on a missing key). The two vocabularies share no field
+#       name at all - `_pre_entry_factors` is exactly `{instrument,
+#       candidate_score, trigger_reasons}`, while a reconstructed TIGHTEN_SL
+#       factors dict is exactly the configured decay factors (`time_decay`,
+#       `momentum_decay`, `volume_decay`, `funding_decay`,
+#       `secondary_confirmation_lost`, `market_regime`) plus `guardian_state`.
+# So a promoted rule of one type carries at least one key the other type's
+# factors dict never contains, and therefore can never match it. Each family
+# only ever co-fires with itself, and Cap B's bound ("the family contributes
+# an AVERAGE, never a sum") holds per family - which is what makes the
+# TIGHTEN_SL cardinality cap's own arithmetic actually true (see that
+# constant's section below).
+#
+# The honest residual: (b) rests on the two vocabularies staying disjoint. If
+# a future change ever gave `_pre_entry_factors` a field name that also
+# appears in a guardian observation's factors (or vice versa), a cross-type
+# match would become possible again and this divisor would need revisiting.
+# That is a grep-checkable property of two small, explicit field lists, not a
+# statement about what the model might propose.
 #
 # The bound this buys, stated exactly: with M live rows, each storing
 # `raw_i / M`, the sum over ANY subset that co-fires on ANY factors dict is at
@@ -1095,14 +1127,19 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
 #   condition and a TIGHTEN_SL-targeted one can still co-fire on one factors
 #   dict (trivially so for an empty/permissive condition); proving they cannot
 #   would require reasoning about the model's conditions staying disjoint -
-#   the one thing the brief explicitly forbids relying on.
+#   the one thing the brief explicitly forbids relying on. (SUPERSEDED in
+#   part by the I1 note above: with C1's guard in place the proof rests on the
+#   two FACTOR VOCABULARIES being disjoint - two short, explicit field lists
+#   in this codebase - not on the model's conditions being disjoint. That is
+#   what made the per-target divisor sound; a per-target COUNT cap is still
+#   not the mechanism chosen here.)
 # - A GLOBAL count cap of 1 would be provable, but it freezes the pipeline at
 #   a single live LLM-authored rule forever (a second one can only ever exist
 #   after the first degrades enough for Task 6 to demote it), which is a much
 #   larger amputation of the self-improvement the spec is built around.
-# The divisor here is likewise the WHOLE live family, across both target
-# decision types, for exactly the first reason above - a per-target divisor
-# would leave the cross-type overlap unproven.
+# (The first bullet is also what originally made the divisor whole-family
+# rather than per-target; the I1 note above is where that reasoning was
+# re-derived and superseded.)
 #
 # The cost, stated honestly: an individual heuristic gets quieter as the
 # family grows (with 4 live rules, a lone matching rule contributes a quarter
@@ -1175,13 +1212,18 @@ _LLM_HEURISTIC_ID_PREFIX = "ga-llm:"
 #
 # WHY 3, specifically:
 # - The binding number is what a TIGHTEN_SL heuristic needs in order to still
-#   be ABLE to fire: its stored adjustment is `raw / family_size` and
-#   `decide_open_position` requires that to exceed `authority_tighten_
-#   threshold` (0.15 by default). A strong rule (test_correct_rate ~0.95,
-#   raw ~0.45) clears 0.15 at a family of 3 and fails it at 4. So 3 is the
-#   largest cap at which even the strongest realistic TIGHTEN_SL heuristic is
-#   still guaranteed a way out of the absorbing state described above - the
-#   whole point of having a cap at all.
+#   be ABLE to fire: its stored adjustment is `raw / tighten_sl_family_size`
+#   and `decide_open_position` requires that to STRICTLY exceed `authority_
+#   tighten_threshold` (0.15 by default). The largest `raw` the validation bar
+#   can ever produce is `(1.0 - 0.5) * _ADJUSTMENT_SCALE = 0.5` (a perfect
+#   test split). At a family of 3 that stores 0.1667 > 0.15 and can still
+#   fire; at a family of 4 it stores 0.125 and NO TIGHTEN_SL heuristic,
+#   however strong, can ever fire again. So 3 is the largest cap at which a
+#   way out of the absorbing state described above still exists at all - the
+#   whole point of having a cap at all. (Stated precisely rather than
+#   loosely: at a family of 3 only a near-perfect rule - test_correct_rate
+#   above ~0.95 - clears the threshold; the cap guarantees the possibility,
+#   not that every member will use it.)
 # - It is deliberately conservative in the direction the brief names: "too
 #   few TIGHTEN_SL heuristics can ever be promoted" is a missed opportunity
 #   (the candidate stays VALIDATED and is promoted the moment a slot frees),
@@ -1192,14 +1234,27 @@ _LLM_HEURISTIC_ID_PREFIX = "ga-llm:"
 #   forever, the same amputation the Task 5 section above rejected when it
 #   chose Cap B over a global count cap of 1.
 #
-# HONEST LIMIT, stated rather than glossed: this caps the TIGHTEN_SL half of
-# the divisor, not the divisor itself. Cap B's divisor is the WHOLE live
-# family (both target types - see the Task 5 section for why a per-target
-# divisor would leave the cross-type co-firing overlap unproven), so a large
-# PRE_ENTRY_VETO family can still dilute a TIGHTEN_SL member below the
-# threshold. That residual is the accepted, documented cost of the addendum's
-# own chosen resolution; bounding it fully would require a global cap, which
-# the spec deliberately did not ask for.
+# WHAT THIS CAP DOES AND DOES NOT BOUND (review finding I1, 2026-09-17 -
+# this section used to concede that it bounded neither):
+# - Since I1, Cap B's divisor is PER target decision type
+#   (`_per_target_family_sizes`), so a TIGHTEN_SL member's divisor counts
+#   ONLY live TIGHTEN_SL members and this cap therefore genuinely bounds that
+#   divisor at 3. The arithmetic in "WHY 3" above is now true as stated:
+#   PRE_ENTRY_VETO promotions, however many, cannot dilute a TIGHTEN_SL
+#   member at all. (Before I1 the cap capped the TIGHTEN_SL half while the
+#   divisor counted both halves, so one live veto member was enough to push
+#   every TIGHTEN_SL member into the exact absorbing state this cap exists to
+#   prevent - the cap's own comment claimed a guarantee the code did not
+#   provide.)
+# - What it still does NOT bound: how strong a TIGHTEN_SL member has to be to
+#   use its way out. At a full family of 3 only a near-perfect rule clears
+#   `authority_tighten_threshold`; a weaker member is silent (safe, but it
+#   cannot accumulate forward evidence through the firing-based TIGHTEN_SL
+#   track). Since I1's sibling fix I2, that member is no longer stuck
+#   forever: the time-based "no forward evidence" demotion path in
+#   `track_and_demote_underperforming_heuristics` retires a heuristic that
+#   accumulates zero forward samples for `_FORWARD_MAX_SILENT_DAYS`, which
+#   frees its slot.
 #
 # REFUSAL, NOT FAILURE: an over-cap candidate is left exactly as it was -
 # `VALIDATED`, unwritten, unpromoted - and is picked up by the next promotion
@@ -1219,6 +1274,23 @@ def _target_decision_type(candidate: dict) -> str:
     tracking and the validation router can never disagree about what a NULL
     row is."""
     return candidate.get("target_decision_type") or _TARGET_TIGHTEN_SL
+
+
+def _per_target_family_sizes(live: list[dict], incoming: list[dict]) -> dict[str, int]:
+    """Cap B's divisor, PER `target_decision_type` (review finding I1,
+    2026-09-17): how many live `ga-llm:*` heuristics of each target type there
+    will be once this pass finishes. A TIGHTEN_SL member is divided by the
+    TIGHTEN_SL count only, a PRE_ENTRY_VETO member by the PRE_ENTRY_VETO count
+    only - see the I1 section in the Task 5 module comment above for why that
+    is sound (disjoint vocabularies + fail-closed matching + C1's
+    empty-condition guard) and what it fixes (the cardinality cap's own
+    arithmetic, which was being defeated by veto members counting toward a
+    TIGHTEN_SL member's divisor)."""
+    sizes: dict[str, int] = {}
+    for row in (*live, *incoming):
+        target = _target_decision_type(row)
+        sizes[target] = sizes.get(target, 0) + 1
+    return sizes
 
 
 def _within_tighten_sl_cardinality_cap(live: list[dict], incoming: list[dict]) -> list[dict]:
@@ -1374,15 +1446,23 @@ def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> i
         # existing divisor is still correct and nothing must be rewritten.
         return 0
 
-    family_size = len(live) + len(incoming)
+    family_sizes = _per_target_family_sizes(live, incoming)
 
     for row in live:
-        _write_llm_heuristic(repo, row, row["promoted_heuristic_id"], family_size, now)
+        _write_llm_heuristic(
+            repo,
+            row,
+            row["promoted_heuristic_id"],
+            family_sizes[_target_decision_type(row)],
+            now,
+        )
 
     promoted = 0
     for row in incoming:
         heuristic_id = _llm_heuristic_id(row["candidate_id"])
-        _write_llm_heuristic(repo, row, heuristic_id, family_size, now)
+        _write_llm_heuristic(
+            repo, row, heuristic_id, family_sizes[_target_decision_type(row)], now
+        )
         if repo.promote_guardian_authority_heuristic_candidate(
             row["candidate_id"], heuristic_id, now
         ):

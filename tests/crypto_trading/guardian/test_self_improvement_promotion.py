@@ -267,13 +267,16 @@ def test_the_co_firing_cap_holds_as_the_family_grows(tmp_path):
             # Four distinct conditions, all matching the same factors dict.
             condition={"guardian_state": "PROTECT"} if index % 2 else {"instrument": "BTCUSDT"},
             test_correct_rate=0.5 + worth,
-            # Two of each (Task 6 amendment): the TIGHTEN_SL cardinality cap
-            # below allows at most _CAP of that
-            # track, and the co-firing property under test here is a
-            # whole-family one anyway - mixed targets are the harder case,
-            # since the real heuristics table has no target column and both
-            # kinds co-fire on the same factors dict.
-            target_decision_type="TIGHTEN_SL" if index % 2 else "PRE_ENTRY_VETO",
+            # All four on the PRE_ENTRY_VETO track (review finding I1,
+            # 2026-09-17): the divisor is now per target decision type, so a
+            # four-member family has to be four members of the SAME type for
+            # this to be a four-member co-firing test at all - and
+            # PRE_ENTRY_VETO is the track with no cardinality cap, so four of
+            # them is a reachable real state. (The mixed-target case this
+            # fixture used to encode is now covered, with its new semantics,
+            # by test_a_tighten_sl_members_dilution_is_bounded_by_its_own_
+            # target_family_only below.)
+            target_decision_type="PRE_ENTRY_VETO",
         )
 
     assert promote_validated_heuristic_candidates(repo, _NOW) == 4
@@ -321,12 +324,14 @@ def test_an_already_live_heuristic_is_rescaled_when_a_new_one_joins_the_family(t
     assert score <= max(0.4, 0.3)
 
 
-def test_the_co_firing_cap_counts_the_whole_family_across_target_decision_types(tmp_path):
-    """The real heuristics table has no `target_decision_type` column and
-    `evaluate_heuristics` reads every row in it, so a PRE_ENTRY_VETO-targeted
-    condition and a TIGHTEN_SL-targeted one CAN co-fire on the same factors
-    dict. The divisor is therefore the whole live `ga-llm:*` family, not a
-    per-target subset."""
+def test_the_co_firing_divisor_counts_only_the_candidates_own_target_type(tmp_path):
+    """Review finding I1 (2026-09-17). This test previously asserted the
+    OPPOSITE - that the divisor counts the whole live family across both
+    target types - which is what broke the TIGHTEN_SL cardinality cap's own
+    arithmetic (a single live veto member diluted every TIGHTEN_SL member
+    below `authority_tighten_threshold`, into the absorbing state the cap
+    exists to prevent). The divisor is now per target decision type, so each
+    of these two lone members keeps its OWN full earned worth."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_validated_candidate(
         repo,
@@ -345,12 +350,9 @@ def test_the_co_firing_cap_counts_the_whole_family_across_target_decision_types(
 
     assert promote_validated_heuristic_candidates(repo, _NOW) == 2
 
-    score, matched_ids = evaluate_heuristics(
-        _CO_FIRING_FACTORS, repo.find_guardian_authority_heuristics()
-    )
-    assert len(matched_ids) == 2
-    assert score == pytest.approx(0.35)
-    assert score <= max(0.4, 0.3)
+    heuristics = _heuristics_by_id(repo)
+    assert heuristics["ga-llm:cand-1"]["adjustment"] == pytest.approx(0.4)
+    assert heuristics["ga-llm:cand-2"]["adjustment"] == pytest.approx(0.3)
 
 
 def test_a_demoted_heuristic_is_neither_counted_nor_resurrected(tmp_path):
@@ -485,11 +487,12 @@ def test_the_tighten_sl_cap_never_blocks_a_pre_entry_veto_promotion(tmp_path):
     assert (
         repo.get_guardian_authority_heuristic_candidate("over-cap-tighten")["status"] == "VALIDATED"
     )
-    # The refused candidate never joins the divisor either: the family is the
-    # three live TIGHTEN_SL rows plus the one newly promoted veto rule.
-    family_size = _CAP + 1
-    assert heuristics["ga-llm:a-veto"]["adjustment"] == pytest.approx(0.4 / family_size)
-    assert heuristics["ga-llm:cand-0"]["adjustment"] == pytest.approx(0.4 / family_size)
+    # The refused candidate never joins its own track's divisor either: the
+    # TIGHTEN_SL family stays at the three already-live rows, and the newly
+    # promoted veto rule is the only member of its own (review finding I1,
+    # 2026-09-17: the divisor is per target decision type).
+    assert heuristics["ga-llm:a-veto"]["adjustment"] == pytest.approx(0.4)
+    assert heuristics["ga-llm:cand-0"]["adjustment"] == pytest.approx(0.4 / _CAP)
 
 
 def test_a_pre_entry_veto_family_never_fills_the_tighten_sl_cap(tmp_path):
@@ -661,3 +664,114 @@ def test_a_refused_empty_condition_never_joins_the_co_firing_divisor(tmp_path):
     heuristics = _heuristics_by_id(repo)
     assert set(heuristics) == {"ga-llm:b-real"}
     assert heuristics["ga-llm:b-real"]["adjustment"] == pytest.approx(0.4)
+
+
+# --------------------------------------------------------------------------
+# I1 (final whole-branch review, 2026-09-17) - the co-firing divisor is
+# PER TARGET DECISION TYPE.
+#
+# The cardinality cap above bounds the live TIGHTEN_SL family at 3 so that a
+# TIGHTEN_SL member can still clear `authority_tighten_threshold` (0.15) and
+# therefore still accumulate the forward evidence that can retire it. Before
+# this fix the divisor counted the WHOLE live family across both target
+# types, while the cap counted only the TIGHTEN_SL half - so a single live
+# PRE_ENTRY_VETO member was enough to push every TIGHTEN_SL member below the
+# threshold and straight into the absorbing state the cap exists to prevent.
+#
+# The two vocabularies are disjoint (`_pre_entry_factors`: instrument /
+# candidate_score / trigger_reasons; a reconstructed TIGHTEN_SL factors dict:
+# the decay factors plus guardian_state) and `heuristic_condition_matches` is
+# fail-closed on a missing key, so - now that C1 makes an empty, matches-
+# everything condition unreachable - a promoted rule of one type can never
+# match the other type's factors dict. The fixtures below use REAL factor
+# vocabularies on both sides to exercise exactly that.
+# --------------------------------------------------------------------------
+_REAL_TIGHTEN_SL_CONDITION = {"guardian_state": "PROTECT"}
+_REAL_PRE_ENTRY_CONDITION = {"trigger_reasons": ["funding_extreme"]}
+_REAL_TIGHTEN_SL_FACTORS = {
+    "guardian_state": "PROTECT",
+    "momentum_decay": 0.9,
+    "volume_decay": 0.2,
+}
+_REAL_PRE_ENTRY_FACTORS = {
+    "instrument": "BTCUSDT",
+    "candidate_score": 0.3,
+    "trigger_reasons": ["funding_extreme"],
+}
+_AUTHORITY_TIGHTEN_THRESHOLD = 0.15  # guardian.yaml's own default
+
+
+def test_a_tighten_sl_members_dilution_is_bounded_by_its_own_target_family_only(tmp_path):
+    """The specific claim `_MAX_LIVE_TIGHTEN_SL_HEURISTICS`' own comment now
+    makes: a TIGHTEN_SL member's stored adjustment is its earned worth
+    divided by the number of live TIGHTEN_SL members - at most 3 - REGARDLESS
+    of how many PRE_ENTRY_VETO members are live. Five veto members here, far
+    past the TIGHTEN_SL cap, and every TIGHTEN_SL member still stores
+    `raw / 3` and still clears authority_tighten_threshold on its own."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for index in range(_CAP):
+        _seed_validated_candidate(
+            repo,
+            f"tighten-{index}",
+            condition=_REAL_TIGHTEN_SL_CONDITION,
+            # The strongest rule the bar can possibly produce: deviation 0.5.
+            test_correct_rate=1.0,
+            target_decision_type="TIGHTEN_SL",
+        )
+    for index in range(5):
+        _seed_validated_candidate(
+            repo,
+            f"veto-{index}",
+            condition=_REAL_PRE_ENTRY_CONDITION,
+            test_correct_rate=0.9,
+            target_decision_type="PRE_ENTRY_VETO",
+        )
+
+    assert promote_validated_heuristic_candidates(repo, _NOW) == _CAP + 5
+
+    heuristics = _heuristics_by_id(repo)
+    for index in range(_CAP):
+        row = heuristics[f"ga-llm:tighten-{index}"]
+        assert row["adjustment"] == pytest.approx(0.5 / _CAP)
+        # The whole point of the cap: a lone TIGHTEN_SL member can still fire.
+        assert row["adjustment"] > _AUTHORITY_TIGHTEN_THRESHOLD
+    for index in range(5):
+        assert heuristics[f"ga-llm:veto-{index}"]["adjustment"] == pytest.approx(0.4 / 5)
+
+
+def test_the_two_target_families_are_invisible_to_each_others_factor_vocabulary(tmp_path):
+    """Why a per-target divisor is sound: promoted conditions are written in
+    their own target's vocabulary (a condition in the other's matches nothing
+    in its own validation pool, so it can never reach VALIDATED at all), the
+    two vocabularies share no field name, and `heuristic_condition_matches`
+    is fail-closed on a missing key. So each family's members only ever
+    co-fire with their OWN family, and Cap B's 'the family contributes an
+    average, never a sum' bound holds per family."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for index in range(_CAP):
+        _seed_validated_candidate(
+            repo,
+            f"tighten-{index}",
+            condition=_REAL_TIGHTEN_SL_CONDITION,
+            test_correct_rate=1.0,
+            target_decision_type="TIGHTEN_SL",
+        )
+    for index in range(5):
+        _seed_validated_candidate(
+            repo,
+            f"veto-{index}",
+            condition=_REAL_PRE_ENTRY_CONDITION,
+            test_correct_rate=0.9,
+            target_decision_type="PRE_ENTRY_VETO",
+        )
+    promote_validated_heuristic_candidates(repo, _NOW)
+    heuristics = repo.find_guardian_authority_heuristics()
+
+    tighten_score, tighten_matched = evaluate_heuristics(_REAL_TIGHTEN_SL_FACTORS, heuristics)
+    assert sorted(tighten_matched) == [f"ga-llm:tighten-{i}" for i in range(_CAP)]
+    # The family's TOTAL is still its own strongest member's worth, never a sum.
+    assert tighten_score == pytest.approx(0.5)
+
+    veto_score, veto_matched = evaluate_heuristics(_REAL_PRE_ENTRY_FACTORS, heuristics)
+    assert sorted(veto_matched) == [f"ga-llm:veto-{i}" for i in range(5)]
+    assert veto_score == pytest.approx(0.4)
