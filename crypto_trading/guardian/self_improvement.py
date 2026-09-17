@@ -1665,3 +1665,89 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
         demoted += 1
 
     return demoted
+
+
+# ---------------------------------------------------------------------------
+# Task 7 (2026-09-15, Guardian Authority Live Autonomy): the periodic-tick
+# orchestrator. Wires the four steps above into a single call - propose ->
+# validate -> promote -> track/demote, in that order - mirroring the
+# multi-step try/except-per-step orchestration pattern this codebase already
+# established for Shadow Mode's own `run_guardian_authority_shadow_tick`
+# (crypto_trading/paper_trading/guardian_authority_shadow.py) and the real
+# Task 9 self-critique tick wiring (guardian/tick.py): each step gets its
+# own try/except and its own `log_event` name, so one step's failure can
+# never block, mask, or be confused with another's.
+#
+# This function itself never reads `settings.guardian.authority_enabled` -
+# gating the WHOLE pipeline on that flag is the wiring's job, at the call
+# site in the chosen loop (see discovery_loop.py), exactly the same
+# division of responsibility `run_guardian_authority_shadow_tick`'s own
+# caller in monitoring_loop.py uses for `authority_shadow_enabled`. Calling
+# this function directly always runs all four steps; whether it gets called
+# at all for a given tick is decided one layer up.
+#
+# Same-tick propose -> validate behavior (deliberate choice, not an
+# accident): validate_pending_heuristic_candidates is called unconditionally
+# right after propose_candidate_heuristics, against the SAME live
+# repository, with no re-query gate suppressing rows written this same
+# tick. propose_candidate_heuristics commits its candidate row to SQLite
+# before returning (Task 3's own watermark-claimed-up-front discipline), so
+# validate's own `find_proposed_guardian_authority_heuristic_candidates()`
+# query - run moments later, same call - already sees it. A candidate
+# proposed this tick can therefore be validated (and, if it clears the
+# bar, promoted) in this SAME call. This was chosen over adding an
+# artificial "skip anything proposed this run_id" gate because: (1) neither
+# Task 3 nor Task 4 needs such a gate to behave correctly - validate reads
+# whatever is PROPOSED regardless of when it was proposed, exactly like a
+# second, independent call would; (2) propose only ever runs at most once
+# per UTC day (its own watermark), so a same-tick pickup is a rare, harmless
+# latency win, never a flood; (3) inventing a suppression gate would be new,
+# untested surface area this task does not need. See
+# test_self_improvement_tick.py::
+# test_a_candidate_proposed_this_tick_is_validated_in_the_same_call for the
+# proof.
+def run_godfather_self_improvement_tick(
+    repo: Repository,
+    runner: AgentRunner,
+    settings: Settings,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """Top-level periodic-tick orchestrator for the whole self-improvement
+    pipeline. Calls, in order, `propose_candidate_heuristics` (Task 3),
+    `validate_pending_heuristic_candidates` (Task 4), `promote_validated_
+    heuristic_candidates` (Task 5), and `track_and_demote_underperforming_
+    heuristics` (Task 6) - each in its own try/except with its own
+    `log_event` name, so a crash in any one step never prevents the
+    remaining steps from running this same tick. Never raises."""
+    try:
+        propose_candidate_heuristics(repo, runner, settings, run_id, now)
+    except Exception as exc:
+        log_event(
+            run_id, event="godfather_self_improvement_propose_failed",
+            error_type=type(exc).__name__, error=str(exc),
+        )
+
+    try:
+        validate_pending_heuristic_candidates(repo, now)
+    except Exception as exc:
+        log_event(
+            run_id, event="godfather_self_improvement_validate_failed",
+            error_type=type(exc).__name__, error=str(exc),
+        )
+
+    try:
+        promote_validated_heuristic_candidates(repo, now)
+    except Exception as exc:
+        log_event(
+            run_id, event="godfather_self_improvement_promote_failed",
+            error_type=type(exc).__name__, error=str(exc),
+        )
+
+    try:
+        track_and_demote_underperforming_heuristics(repo, now)
+    except Exception as exc:
+        log_event(
+            run_id, event="godfather_self_improvement_track_failed",
+            error_type=type(exc).__name__, error=str(exc),
+        )

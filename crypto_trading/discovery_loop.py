@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
+from crypto_trading.guardian.self_improvement import run_godfather_self_improvement_tick
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.market_snapshot import LiveMarketDataSource, build_live_snapshot
 from crypto_trading.paper_trading.live_execution import has_sufficient_live_capacity
@@ -70,6 +71,34 @@ def run_discovery_tick(
     except Exception as exc:
         log_event(
             run_id, event="recovery_sweep_failed",
+            error_type=type(exc).__name__, error=str(exc),
+        )
+    # Task 7 (Guardian Authority Live Autonomy, 2026-09-15): the full
+    # self-improvement pipeline (propose -> validate -> promote -> track/
+    # demote, crypto_trading/guardian/self_improvement.py::
+    # run_godfather_self_improvement_tick). Its own try/except (never
+    # shared with the recovery sweep above or the live-capacity gate
+    # below), gated by settings.guardian.authority_enabled - NOT
+    # authority_shadow_enabled, a completely separate, already-shipped
+    # concern (see self_improvement.py module docstring). Wired here
+    # (discovery_loop.py), not monitoring_loop.py, because propose_
+    # candidate_heuristics (Task 3) makes an LLM call and needs an
+    # AgentRunner: run_monitoring_tick has no `runner` parameter at all
+    # (only a LivePriceSource connector), while run_discovery_tick already
+    # has `runner` in scope for exactly this reason.
+    #
+    # Placed BEFORE the live-capacity gate below (and its own early
+    # return) so this pipeline runs every discovery tick regardless of
+    # whether live capacity permits opening a new position this tick - an
+    # unrelated concern, same "each concern gets its own try/except,
+    # independent of the others" discipline monitoring_loop.py already
+    # established for its own per-feature tick calls.
+    try:
+        if settings.guardian.authority_enabled:
+            run_godfather_self_improvement_tick(repo, runner, settings, run_id, now)
+    except Exception as exc:
+        log_event(
+            run_id, event="godfather_self_improvement_tick_failed",
             error_type=type(exc).__name__, error=str(exc),
         )
     if live_connector is not None:

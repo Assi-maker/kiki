@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import patch
@@ -363,3 +364,109 @@ def test_run_discovery_tick_recovers_an_orphaned_confirmed_candidate_at_tick_sta
     position = repo.get_position("orphan-1")
     assert position is not None
     assert position.status == "OPEN_POSITION"
+
+
+# ---------------------------------------------------------------------------
+# Guardian Authority self-improvement pipeline wiring (Task 7,
+# docs/superpowers/plans/2026-09-15-guardian-authority-live-autonomy.md).
+# run_godfather_self_improvement_tick (crypto_trading/guardian/
+# self_improvement.py) is wired in HERE (discovery_loop.py), not
+# monitoring_loop.py, because propose_candidate_heuristics (Task 3) makes an
+# LLM call and needs an AgentRunner - run_monitoring_tick has no `runner`
+# parameter at all, while run_discovery_tick already has one in scope for
+# exactly this reason. Its own try/except (never shared with the recovery
+# sweep or live-capacity gate above), gated by settings.guardian.
+# authority_enabled (NOT authority_shadow_enabled - a completely separate,
+# already-shipped concern) - same "each concern gets its own try/except,
+# gated by its own flag" discipline monitoring_loop.py already established
+# for the shadow tick / pre-entry shadow resolution / shadow self-critique
+# calls.
+# ---------------------------------------------------------------------------
+class _CallRecorder:
+    """Records every call's positional/keyword args - same idiom
+    test_monitoring_loop.py's own _CallRecorder uses for spying on
+    module-level functions via monkeypatch."""
+
+    def __init__(self):
+        self.calls: list[tuple[tuple, dict]] = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
+def test_run_discovery_tick_never_calls_self_improvement_tick_when_flag_off(tmp_path, monkeypatch):
+    """authority_enabled defaults False. Proven via a call-recorder spy, not
+    just by checking for absent DB effects afterwards - a spy catches the
+    function being called and happening to no-op internally, which
+    absence-of-writes alone cannot."""
+    import crypto_trading.discovery_loop as discovery_loop_module
+
+    spy = _CallRecorder()
+    monkeypatch.setattr(discovery_loop_module, "run_godfather_self_improvement_tick", spy)
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    connector = _stub_connector_with_one_healthy_symbol()
+    settings = _settings(top_n=1)
+    assert settings.guardian.authority_enabled is False  # baseline assumption
+
+    run_discovery_tick(connector, repo, MockAgentRunner(_happy_fixtures()), settings)
+
+    assert spy.calls == []  # never called, not "called but no-op"
+
+
+def test_run_discovery_tick_calls_self_improvement_tick_once_with_correct_args_when_flag_on(
+    tmp_path, monkeypatch
+):
+    import crypto_trading.discovery_loop as discovery_loop_module
+
+    spy = _CallRecorder()
+    monkeypatch.setattr(discovery_loop_module, "run_godfather_self_improvement_tick", spy)
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    connector = _stub_connector_with_one_healthy_symbol()
+    runner = MockAgentRunner(_happy_fixtures())
+    settings = _settings(top_n=1)
+    settings.guardian.authority_enabled = True
+
+    run_discovery_tick(connector, repo, runner, settings)
+
+    assert len(spy.calls) == 1  # exactly once per tick
+    args, kwargs = spy.calls[0]
+    assert kwargs == {}
+    assert len(args) == 5
+    call_repo, call_runner, call_settings, call_run_id, call_now = args
+    assert call_repo is repo
+    assert call_runner is runner
+    assert call_settings is settings
+    assert isinstance(call_run_id, str) and call_run_id
+    assert call_now is not None
+
+
+def test_a_crash_in_self_improvement_tick_never_affects_the_discovery_pipeline(
+    tmp_path, monkeypatch, caplog
+):
+    """Mirrors test_monitoring_loop.py's own
+    test_a_crash_in_guardian_authority_shadow_never_affects_real_position_
+    closing: an unexpected crash in the self-improvement tick must never
+    propagate out of run_discovery_tick, must never mark the run as
+    'error', and must be logged under its OWN failed-event name."""
+    import crypto_trading.discovery_loop as discovery_loop_module
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(discovery_loop_module, "run_godfather_self_improvement_tick", _raise)
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    connector = _stub_connector_with_one_healthy_symbol()
+    settings = _settings(top_n=1)
+    settings.guardian.authority_enabled = True
+
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        positions = run_discovery_tick(connector, repo, MockAgentRunner(_happy_fixtures()), settings)
+
+    assert positions == []  # this fixture triggers no candidate either way
+    row = repo._conn.execute("SELECT * FROM runs WHERE run_type = 'discovery'").fetchone()
+    assert row["status"] == "ok"  # the crash never reached the outer try/except
+    assert "godfather_self_improvement_tick_failed" in caplog.text
+    assert "discovery_tick_failed" not in caplog.text
