@@ -587,16 +587,27 @@ def test_no_new_line_anywhere_in_the_diff_textually_calls_set_leverage():
     """Line-restricted textual scan (belt-and-suspenders on top of the AST
     scan above, same discipline as the sibling isolation file's own
     position_sizing textual check): every line THIS plan added, across
-    every touched file (production AND test), must not contain the literal
+    every PRODUCTION file it touched, must not contain the literal
     substring "set_leverage(" - the opening parenthesis is what
     distinguishes an actual call/reference-as-callable from a bare
     docstring mention of the identifier (e.g. self_improvement.py's own
     module docstring: "never references `set_leverage`" - no parenthesis
     follows, so this pattern does not match it). Confirmed by hand at
-    authoring time that "set_leverage(" does not occur anywhere in any file
-    this plan touches, added or not."""
+    authoring time that "set_leverage(" does not occur anywhere in any
+    production file this plan touches, added or not.
+
+    Deliberately scoped to PRODUCTION_FILES, not the broader
+    ALL_TOUCHED_PY_FILES: this isolation test's OWN source necessarily
+    contains the literal substring "set_leverage(" many times over (as
+    synthetic test fixture strings and in this very docstring/assertion
+    text), and a raw substring scan - unlike the AST-based scans elsewhere
+    in this file, which correctly see a string literal as an
+    `ast.Constant`, never a `Call` node - cannot tell "the text
+    'set_leverage(' appears in this line" apart from "this line is a Call
+    to set_leverage". PRODUCTION_FILES has no such self-reference problem
+    and is the actual scope item 2's Global Constraint cares about."""
     offenders: list[str] = []
-    for path in ALL_TOUCHED_PY_FILES:
+    for path in PRODUCTION_FILES:
         added = _added_line_numbers(path)
         if not added:
             continue
