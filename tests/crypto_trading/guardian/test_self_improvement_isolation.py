@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -143,14 +144,28 @@ def test_hardcoded_scan_universe_is_internally_consistent_and_self_contained():
 
 
 def test_scan_universe_excludes_every_never_modify_path_and_directory():
-    """Checklist item 2 (exclusion half): the plan's Global Constraint list
-    (`position_opening.py`, `position_sizing.py`, `gate/`, `screening/`,
-    `risk_limits.yaml`, `live_execution.yaml`) must never appear in the
-    hardcoded scan universe - confirmed once, by hand, via `git diff --stat
-    a09b0ab..HEAD` at authoring time (none of these paths appears in that
-    diff at all), and pinned here so a future edit to PRODUCTION_FILES/
-    ALL_TOUCHED_PY_FILES that accidentally adds one of them is caught
-    immediately, without needing to re-run git to notice."""
+    """Checklist item 2 (exclusion half, STRUCTURAL layer): the plan's
+    Global Constraint list (`position_opening.py`, `position_sizing.py`,
+    `gate/`, `screening/`, `risk_limits.yaml`, `live_execution.yaml`) must
+    never appear in the hardcoded scan universe - confirmed once, by hand,
+    via `git diff --stat a09b0ab..HEAD` at authoring time (none of these
+    paths appears in that diff at all), and pinned here so a future edit to
+    PRODUCTION_FILES/ALL_TOUCHED_PY_FILES that accidentally adds one of
+    them is caught immediately, without needing to re-run git to notice.
+
+    IMPORTANT SCOPE NOTE: this test only proves something about THIS
+    FILE'S OWN CONSTANTS - it can only fail if a human hand-edits
+    PRODUCTION_FILES/ALL_TOUCHED_PY_FILES to (re-)add one of these paths;
+    it says nothing about whether `risk_limits.yaml`/`live_execution.yaml`
+    have actually been left untouched in the live checked-out repo. That
+    durable, content-level proof is what the two hash tests below
+    (`test_risk_limits_yaml_is_byte_identical_to_recorded_hash`,
+    `test_live_execution_yaml_hard_limit_fields_are_byte_identical_to_
+    recorded_hash`) provide, using the exact same zero-git-history-
+    dependency discipline as item 1's frozen-function hashes. This test
+    remains useful only as a narrower, faster sanity check on the scan-
+    universe constants themselves (existence on disk, no forbidden
+    directory prefix)."""
     for forbidden in FORBIDDEN_TOUCHED_PATHS:
         assert forbidden not in PRODUCTION_FILES
         assert forbidden not in ALL_TOUCHED_PY_FILES
@@ -158,15 +173,92 @@ def test_scan_universe_excludes_every_never_modify_path_and_directory():
     for path in ALL_TOUCHED_PY_FILES:
         for prefix in FORBIDDEN_TOUCHED_DIR_PREFIXES:
             assert not path.startswith(prefix), f"{path} is under forbidden prefix {prefix}"
-    # Existence + sanity of live_execution.yaml's own three hard-limit
-    # fields (not a "this plan left them at value X" claim - the exclusion
-    # assertion above is what proves this plan never touched the file at
-    # all - just confirming the file this plan is forbidden from touching
-    # is itself intact and still carries the fields the constraint names).
-    with (REPO_ROOT / "crypto_trading/config/live_execution.yaml").open(encoding="utf-8") as f:
-        live_execution_raw = yaml.safe_load(f)
-    for field in ("leverage", "margin_per_trade_usdt", "max_concurrent_positions"):
-        assert field in live_execution_raw, f"live_execution.yaml missing hard-limit field {field}"
+
+
+# ---------------------------------------------------------------------------
+# Item 2 (exclusion half, CONTENT layer - code review fix, Important #1):
+# risk_limits.yaml and live_execution.yaml's own hard-limit field VALUES
+# must be byte-identical/value-identical to their state at authoring time -
+# not merely "not in our own file list" (the test above), which is a
+# tautology about a constant this same file defines and proves nothing
+# about the live repository. Same mechanism, same zero-git-history-
+# dependency discipline as item 1's 8 frozen-function hashes.
+# ---------------------------------------------------------------------------
+
+_RISK_LIMITS_YAML_PATH = "crypto_trading/config/risk_limits.yaml"
+_LIVE_EXECUTION_YAML_PATH = "crypto_trading/config/live_execution.yaml"
+_LIVE_EXECUTION_HARD_LIMIT_FIELDS = ("leverage", "margin_per_trade_usdt", "max_concurrent_positions")
+
+# Recorded once (2026-09-17, authoring/fix time), from the live checked-out
+# files - never from git history.
+_EXPECTED_RISK_LIMITS_YAML_SHA256 = (
+    "88806ef2f5d74b2f5a494eb3a70a0d98d4b1ce8b66c91387a427b65652a2112b"
+)
+_EXPECTED_LIVE_EXECUTION_HARD_LIMITS_SHA256 = (
+    "2efa5bacb4c509333ed71267dfd4091456b9e8d27eb68a4c842ef3fec12adb05"
+)
+
+
+def _live_execution_hard_limits_canonical_json() -> str:
+    """Deterministic (sorted-keys) JSON of ONLY live_execution.yaml's 3
+    named hard-limit fields - not the whole file, since the Global
+    Constraint specifically names "live_execution.yaml's hard limits
+    (leverage, margin, max_concurrent_positions)", not the file's every
+    byte (which also carries comments/other, non-frozen fields this plan
+    has no constraint against). Hashing the canonical JSON of just the 3
+    values (not the raw YAML text) means a value's own type/formatting is
+    what is protected, immune to an unrelated reflow of surrounding
+    comments elsewhere in the same file."""
+    with (REPO_ROOT / _LIVE_EXECUTION_YAML_PATH).open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    fields = {name: raw[name] for name in _LIVE_EXECUTION_HARD_LIMIT_FIELDS}
+    return json.dumps(fields, sort_keys=True)
+
+
+def test_risk_limits_yaml_is_byte_identical_to_recorded_hash():
+    """Global Constraint (verbatim): never modify
+    crypto_trading/config/risk_limits.yaml. Whole-file SHA-256 (the entire
+    file is in scope for this constraint, unlike live_execution.yaml which
+    only names 3 specific fields) against a hash recorded at authoring
+    time from the live file - a real edit to this file, accidental or
+    malicious, fails this test; the exclusion-from-our-own-constant test
+    above cannot detect that at all."""
+    content = (REPO_ROOT / _RISK_LIMITS_YAML_PATH).read_text(encoding="utf-8")
+    assert _sha256(content) == _EXPECTED_RISK_LIMITS_YAML_SHA256, (
+        "crypto_trading/config/risk_limits.yaml changed since its hash was "
+        "recorded - Global Constraint violation"
+    )
+
+
+def test_live_execution_yaml_hard_limit_fields_are_byte_identical_to_recorded_hash():
+    """Global Constraint (verbatim): never modify live_execution.yaml's
+    hard limits (leverage, margin, max_concurrent_positions). SHA-256 of
+    the 3 fields' own canonical values (not the whole file - see
+    `_live_execution_hard_limits_canonical_json`'s own docstring) against a
+    hash recorded at authoring time from the live file."""
+    canonical = _live_execution_hard_limits_canonical_json()
+    assert _sha256(canonical) == _EXPECTED_LIVE_EXECUTION_HARD_LIMITS_SHA256, (
+        "live_execution.yaml's hard-limit fields changed since their hash "
+        "was recorded - Global Constraint violation"
+    )
+
+
+def test_risk_limits_and_live_execution_hash_checks_genuinely_detect_a_real_change():
+    """Deliberate-break confirmation for both hash checks above, same
+    shape as item 1's own `test_byte_identical_check_genuinely_detects_a_
+    real_change_in_a_function`: mutates each real, live value and confirms
+    the hash changes AND no longer matches the recorded expected hash."""
+    real_risk_limits = (REPO_ROOT / _RISK_LIMITS_YAML_PATH).read_text(encoding="utf-8")
+    mutated_risk_limits = real_risk_limits + "\n# tampered\n"
+    assert _sha256(mutated_risk_limits) != _sha256(real_risk_limits)
+    assert _sha256(mutated_risk_limits) != _EXPECTED_RISK_LIMITS_YAML_SHA256
+
+    real_canonical = _live_execution_hard_limits_canonical_json()
+    mutated_fields = json.loads(real_canonical)
+    mutated_fields["leverage"] = mutated_fields["leverage"] + 1
+    mutated_canonical = json.dumps(mutated_fields, sort_keys=True)
+    assert _sha256(mutated_canonical) != _sha256(real_canonical)
+    assert _sha256(mutated_canonical) != _EXPECTED_LIVE_EXECUTION_HARD_LIMITS_SHA256
 
 
 _HUNK_HEADER_RE = None
@@ -508,6 +600,123 @@ def test_position_sizing_import_scan_genuinely_catches_a_synthesized_violation()
         if isinstance(node, ast.ImportFrom) and node.module == _FORBIDDEN_POSITION_SIZING_MODULE:
             hits.append(node.module)
     assert hits == [_FORBIDDEN_POSITION_SIZING_MODULE]
+
+
+# ---------------------------------------------------------------------------
+# Item 2 (code review fix, Important #2): the AST Import/ImportFrom scan
+# above cannot see a DYNAMIC import - `importlib.import_module(
+# "crypto_trading.paper_trading.position_sizing")` or `__import__(...)`
+# produces no Import/ImportFrom node at all, and would sail through
+# undetected. The reference file's own equivalent coverage (test_
+# authority_shadow_isolation.py:368-384) pairs its AST scan with a line-
+# restricted TEXTUAL scan for this exact reason. A bare textual/substring
+# scan is not safe to reuse verbatim here: this plan's own self_
+# improvement.py module docstring legitimately narrates, in prose, "this
+# module never imports position_sizing.py" - a raw substring scan across
+# the whole file (or even restricted to added lines, since that docstring
+# line IS an added line in a wholly new file) would flag its own
+# documentation of the guarantee as a violation of it.
+#
+# Fix: stay AST-based, but target the SPECIFIC call shapes a dynamic-import
+# escape hatch actually takes (import_module(...)/__import__(...) with a
+# string-literal argument, or getattr(module, "compute_position_size")) -
+# never a bare "does this string constant contain the substring" scan over
+# every ast.Constant in the file, which would re-introduce the exact same
+# docstring false positive a module docstring IS an ast.Constant string at
+# the AST level, indistinguishable from any other string literal without
+# this position-in-a-Call restriction.
+# ---------------------------------------------------------------------------
+
+_DYNAMIC_IMPORT_CALL_NAMES = ("import_module", "__import__")
+_FORBIDDEN_COMPUTE_POSITION_SIZE_ATTR = "compute_position_size"
+
+
+def _dynamic_import_escape_hatch_violations(path: str) -> list[str]:
+    """Every `import_module(...)`/`__import__(...)` call whose argument is
+    a string-literal naming the forbidden position_sizing module (exact
+    match or a submodule of it), and every `getattr(obj, "compute_position_
+    size")` call - the two concrete shapes that let code reach the
+    forbidden module/function WITHOUT ever producing an
+    Import/ImportFrom AST node. Restricted to actual Call-argument string
+    literals, never a bare scan of every string constant in the file, so a
+    docstring/comment mentioning either name in prose is never matched."""
+    offenders: list[str] = []
+    tree = ast.parse(_read(path), filename=path)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        string_args = [
+            arg.value
+            for arg in (*node.args, *(kw.value for kw in node.keywords))
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+        ]
+        if name in _DYNAMIC_IMPORT_CALL_NAMES:
+            for value in string_args:
+                if value == _FORBIDDEN_POSITION_SIZING_MODULE or value.startswith(
+                    _FORBIDDEN_POSITION_SIZING_MODULE + "."
+                ):
+                    offenders.append(f"{path}:{node.lineno} dynamic-imports {value!r} via {name}()")
+        elif name == "getattr":
+            for value in string_args:
+                if value == _FORBIDDEN_COMPUTE_POSITION_SIZE_ATTR:
+                    offenders.append(
+                        f"{path}:{node.lineno} getattr(..., {value!r}) escape hatch"
+                    )
+    return offenders
+
+
+def test_no_production_file_dynamically_imports_position_sizing():
+    """Global Constraint (verbatim): never import position_sizing.py -
+    covering the dynamic-import escape hatch the static AST import scan
+    above cannot see (see module section above)."""
+    offenders: list[str] = []
+    for path in PRODUCTION_FILES:
+        offenders.extend(_dynamic_import_escape_hatch_violations(path))
+    assert offenders == [], f"forbidden dynamic position_sizing reference(s): {offenders}"
+
+
+def test_dynamic_import_escape_hatch_scan_genuinely_catches_both_shapes():
+    """Deliberate-break confirmation for both shapes the scan above
+    catches - `importlib.import_module(...)` and `getattr(..., "compute_
+    position_size")` - and confirms it does NOT flag an unrelated dynamic
+    import of a different, unforbidden module (proving this is a targeted
+    match, not an over-broad 'any dynamic import at all' scan that would
+    also flag legitimate dynamic imports elsewhere in this codebase)."""
+    fake_source = (
+        "import importlib\n"
+        "\n"
+        "def f(other_module):\n"
+        "    mod = importlib.import_module('crypto_trading.paper_trading.position_sizing')\n"
+        "    fn = getattr(mod, 'compute_position_size')\n"
+        "    unrelated = importlib.import_module('crypto_trading.guardian.authority')\n"
+        "    return fn, unrelated\n"
+    )
+    tree = ast.parse(fake_source)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node)
+        string_args = [
+            arg.value
+            for arg in (*node.args, *(kw.value for kw in node.keywords))
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+        ]
+        if name in _DYNAMIC_IMPORT_CALL_NAMES:
+            for value in string_args:
+                if value == _FORBIDDEN_POSITION_SIZING_MODULE or value.startswith(
+                    _FORBIDDEN_POSITION_SIZING_MODULE + "."
+                ):
+                    offenders.append(f"import_module:{value}")
+        elif name == "getattr":
+            for value in string_args:
+                if value == _FORBIDDEN_COMPUTE_POSITION_SIZE_ATTR:
+                    offenders.append(f"getattr:{value}")
+    assert offenders == [
+        f"import_module:{_FORBIDDEN_POSITION_SIZING_MODULE}",
+        f"getattr:{_FORBIDDEN_COMPUTE_POSITION_SIZE_ATTR}",
+    ]
 
 
 def _new_set_leverage_call_violations(path: str) -> list[str]:
@@ -967,27 +1176,93 @@ def test_authority_enabled_defaults_false_via_get_settings():
     assert get_settings().guardian.authority_enabled is False
 
 
-def test_run_godfather_self_improvement_tick_wiring_is_gated_by_authority_enabled():
-    """Corroborates that the flag genuinely gates the whole pipeline at its
-    one production call site (discovery_loop.py, Task 7), not merely that
-    the flag itself defaults False in isolation - i.e. the pre-activation
-    state really is "this whole pipeline is a no-op today", not just "one
-    config field happens to read False"."""
-    source = _read("crypto_trading/discovery_loop.py")
-    tree = ast.parse(source, filename="crypto_trading/discovery_loop.py")
-    found_gated_call = False
+_SELF_IMPROVEMENT_TICK_FN = "run_godfather_self_improvement_tick"
+
+
+def _authority_enabled_gated_call_linenos(path: str, function_name: str) -> set[int]:
+    """Line numbers of every Call to `function_name`, anywhere in `path`,
+    that sits inside an `ast.If` block whose OWN test expression mentions
+    `authority_enabled` - the same test-source-substring check the
+    original (weaker) version of this test used, now used only to build a
+    per-file allow-set rather than to answer "does at least one exist"."""
+    source = _read(path)
+    tree = ast.parse(source, filename=path)
+    gated: set[int] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.If):
             test_source = ast.get_source_segment(source, node.test) or ""
             if "authority_enabled" not in test_source:
                 continue
             for inner in ast.walk(node):
-                if isinstance(inner, ast.Call) and _call_name(inner) == "run_godfather_self_improvement_tick":
-                    found_gated_call = True
-    assert found_gated_call, (
-        "run_godfather_self_improvement_tick is not called inside an "
-        "authority_enabled-gated if-block in discovery_loop.py"
+                if isinstance(inner, ast.Call) and _call_name(inner) == function_name:
+                    gated.add(inner.lineno)
+    return gated
+
+
+def test_run_godfather_self_improvement_tick_wiring_is_gated_by_authority_enabled():
+    """Checklist item 6 corroboration (code review fix, Important #3):
+    corroborates that the flag genuinely gates the WHOLE pipeline - i.e.
+    the pre-activation state really is "this whole pipeline is a no-op
+    today", not just "one config field happens to read False" and not just
+    "at least one call site happens to be gated, and there might be others
+    that are not".
+
+    The original version of this test set `found_gated_call = True` on the
+    FIRST `ast.If` matching (test mentions authority_enabled) AND (body
+    contains the call) anywhere in discovery_loop.py, which proves
+    EXISTENCE of a gated call site but nothing about EXCLUSIVITY: a second,
+    UNGATED call site added later - in discovery_loop.py or any other
+    production file - would leave that version green. Fixed by reusing
+    item 3's own `_production_call_sites` (already proven, via its own
+    deliberate-break test, to enumerate every Call to a named function
+    across the WHOLE crypto_trading/ package) to find EVERY real call site
+    of `run_godfather_self_improvement_tick` anywhere in the codebase, then
+    asserting every single one's line number is in its own file's
+    `_authority_enabled_gated_call_linenos` set. Zero call sites anywhere
+    is accepted (vacuously fine - nothing to gate); one ungated call site
+    among N is a failure."""
+    all_sites = _production_call_sites(_SELF_IMPROVEMENT_TICK_FN)
+    assert all_sites, "expected at least one real call site of run_godfather_self_improvement_tick"
+
+    ungated: list[str] = []
+    gated_cache: dict[str, set[int]] = {}
+    for path, lineno, enclosing in all_sites:
+        if path not in gated_cache:
+            gated_cache[path] = _authority_enabled_gated_call_linenos(path, _SELF_IMPROVEMENT_TICK_FN)
+        if lineno not in gated_cache[path]:
+            ungated.append(f"{path}:{lineno} in {enclosing}")
+    assert ungated == [], f"ungated call site(s) of {_SELF_IMPROVEMENT_TICK_FN}: {ungated}"
+
+
+def test_authority_enabled_gating_check_genuinely_catches_an_ungated_call_site():
+    """Deliberate-break confirmation, same real-scratch-file discipline as
+    item 3's own `test_upsert_call_site_scan_genuinely_catches_a_fourth_
+    synthesized_call_site`: writes a REAL throwaway `.py` file under
+    `crypto_trading/` containing an UNGATED call to `run_godfather_self_
+    improvement_tick`, re-runs the exact same call-site-plus-gating scan
+    against the real repo plus that file, and confirms the ungated site is
+    caught - proving the exclusivity check above is not vacuously true
+    just because today's real codebase happens to gate its one real call
+    site correctly. Cleans up the scratch file in a `finally` block."""
+    scratch_path = (
+        REPO_ROOT / "crypto_trading" / "_scratch_isolation_test_ungated_self_improvement_call.py"
     )
+    assert not scratch_path.exists(), "scratch file collision - aborting synthesized-violation test"
+    try:
+        scratch_path.write_text(
+            "def rogue_caller(repo, runner, settings, run_id, now):\n"
+            "    run_godfather_self_improvement_tick(repo, runner, settings, run_id, now)\n",
+            encoding="utf-8",
+        )
+        all_sites = _production_call_sites(_SELF_IMPROVEMENT_TICK_FN)
+        ungated = []
+        for path, lineno, enclosing in all_sites:
+            gated = _authority_enabled_gated_call_linenos(path, _SELF_IMPROVEMENT_TICK_FN)
+            if lineno not in gated:
+                ungated.append(f"{path}:{lineno} in {enclosing}")
+        assert ungated, "scanner failed to detect the synthesized ungated call site"
+    finally:
+        scratch_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1016,8 +1291,11 @@ def test_full_diff_position_sizing_import_is_genuinely_absent_everywhere():
     """Broadest re-check of the position_sizing import scan: every touched
     file, not just PRODUCTION_FILES, whole-file (not new-lines-restricted -
     no legitimate pre-existing import of this module could exist in ANY of
-    these files at any point)."""
+    these files at any point). Covers both the static AST Import/ImportFrom
+    scan and the dynamic-import escape-hatch scan (code review fix,
+    Important #2)."""
     offenders: list[str] = []
     for path in ALL_TOUCHED_PY_FILES:
         offenders.extend(_position_sizing_import_violations(path))
+        offenders.extend(_dynamic_import_escape_hatch_violations(path))
     assert offenders == [], f"forbidden position_sizing import(s) anywhere in the diff: {offenders}"
