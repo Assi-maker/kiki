@@ -827,27 +827,34 @@ def test_no_new_line_anywhere_in_the_diff_textually_calls_set_leverage():
 
 
 # ---------------------------------------------------------------------------
-# Item 3: upsert_guardian_authority_heuristic has EXACTLY 3 call sites in
+# Item 3: upsert_guardian_authority_heuristic has EXACTLY 4 call sites in
 # the whole codebase - the original (pre-this-plan) Task 9 self-critique
 # call site (authority.py::update_heuristics_from_resolved_decisions), this
 # plan's Task 5 promotion call site (self_improvement.py::
 # _write_llm_heuristic, called from promote_validated_heuristic_candidates),
-# and this plan's Task 6 demotion call site (self_improvement.py::
-# track_and_demote_underperforming_heuristics). A 4th call site anywhere -
-# in this plan's diff or any future one - would mean a second write path
-# into the real guardian_authority_heuristics table exists, which the
-# plan's own Global Constraint forbids outright.
+# this plan's Task 6 demotion call site (self_improvement.py::
+# track_and_demote_underperforming_heuristics), and the 4th, added by the
+# 2026-09-17 final-review fix wave (review finding I4): self_improvement.py::
+# _zero_orphan_llm_heuristic, called from _reconcile_orphan_llm_heuristics,
+# which silences a live `ga-llm:*` row that no PROMOTED candidate references
+# (a crash between promotion's own two writes). It is a ZEROING write only -
+# adjustment=0.0, confidence=0.0 - in the same category as the demotion site
+# above: it can silence a rule, never strengthen one. A 5th call site
+# anywhere - in this plan's diff or any future one - would mean an
+# unaccounted write path into the real guardian_authority_heuristics table
+# exists, which the plan's own Global Constraint forbids outright.
 # ---------------------------------------------------------------------------
 
 _UPSERT_HEURISTIC_FN = "upsert_guardian_authority_heuristic"
 
-# Named explicitly, one entry per sanctioned call site, so a 4th appearing
+# Named explicitly, one entry per sanctioned call site, so a 5th appearing
 # anywhere is structurally impossible to miss: the count check below must
 # equal exactly `len(_SANCTIONED_UPSERT_CALL_SITES)`.
 _SANCTIONED_UPSERT_CALL_SITES = (
     ("crypto_trading/guardian/authority.py", "update_heuristics_from_resolved_decisions"),
     ("crypto_trading/guardian/self_improvement.py", "_write_llm_heuristic"),
     ("crypto_trading/guardian/self_improvement.py", "track_and_demote_underperforming_heuristics"),
+    ("crypto_trading/guardian/self_improvement.py", "_zero_orphan_llm_heuristic"),
 )
 
 
@@ -888,31 +895,35 @@ def _production_call_sites(function_name: str) -> list[tuple[str, int, str]]:
     return sites
 
 
-def test_upsert_guardian_authority_heuristic_has_exactly_three_call_sites_in_the_whole_codebase():
+def test_upsert_guardian_authority_heuristic_has_exactly_four_call_sites_in_the_whole_codebase():
     """Checklist item 3. Enumerates every Call node named
     upsert_guardian_authority_heuristic across the entire crypto_trading/
     production package and asserts the set of (path, enclosing function)
-    pairs is EXACTLY the 3 named, sanctioned sites - not merely 'count ==
-    3' (which a 4th call site replacing one of the 3 could satisfy by
-    accident), and not merely 'each of the 3 exists' (which would not
-    catch a 4th)."""
+    pairs is EXACTLY the 4 named, sanctioned sites - not merely 'count ==
+    4' (which a 5th call site replacing one of the 4 could satisfy by
+    accident), and not merely 'each of the 4 exists' (which would not
+    catch a 5th)."""
     sites = _production_call_sites(_UPSERT_HEURISTIC_FN)
     observed = sorted({(path, enclosing) for path, _lineno, enclosing in sites})
     expected = sorted(_SANCTIONED_UPSERT_CALL_SITES)
     assert observed == expected, (
-        f"expected exactly the 3 sanctioned upsert_guardian_authority_heuristic "
-        f"call sites {expected}, found {observed}"
+        f"expected exactly the {len(expected)} sanctioned "
+        f"upsert_guardian_authority_heuristic call sites {expected}, found {observed}"
     )
-    assert len(sites) == 3, f"expected exactly 3 call sites total, found {len(sites)}: {sites}"
+    assert len(sites) == len(_SANCTIONED_UPSERT_CALL_SITES), (
+        f"expected exactly {len(_SANCTIONED_UPSERT_CALL_SITES)} call sites total, "
+        f"found {len(sites)}: {sites}"
+    )
 
 
-def test_upsert_call_site_scan_genuinely_catches_a_fourth_synthesized_call_site():
-    """Deliberate-break confirmation: synthesizes a fake fourth call site in
+def test_upsert_call_site_scan_genuinely_catches_an_extra_synthesized_call_site():
+    """Deliberate-break confirmation: synthesizes a fake extra call site in
     a throwaway file inside crypto_trading/, re-runs the exact same scan
     logic against the real repo PLUS that synthesized file, and confirms it
-    is caught as a 4th site - proving the count/identity check above is not
-    vacuously true just because today's real codebase happens to have
-    exactly 3. Cleans up the throwaway file itself in a `finally` block."""
+    is caught as one site too many - proving the count/identity check above
+    is not vacuously true just because today's real codebase happens to have
+    exactly the sanctioned set. Cleans up the throwaway file itself in a
+    `finally` block."""
     scratch_path = REPO_ROOT / "crypto_trading" / "_scratch_isolation_test_fourth_call_site.py"
     assert not scratch_path.exists(), "scratch file collision - aborting synthesized-violation test"
     try:
@@ -924,8 +935,8 @@ def test_upsert_call_site_scan_genuinely_catches_a_fourth_synthesized_call_site(
         sites = _production_call_sites(_UPSERT_HEURISTIC_FN)
         observed = sorted({(path, enclosing) for path, _lineno, enclosing in sites})
         expected = sorted(_SANCTIONED_UPSERT_CALL_SITES)
-        assert observed != expected, "scanner failed to detect the synthesized 4th call site"
-        assert len(sites) == 4
+        assert observed != expected, "scanner failed to detect the synthesized extra call site"
+        assert len(sites) == len(_SANCTIONED_UPSERT_CALL_SITES) + 1
     finally:
         scratch_path.unlink(missing_ok=True)
 

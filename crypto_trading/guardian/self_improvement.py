@@ -1748,6 +1748,108 @@ def _days_since_promotion(promoted_at: str, now: datetime) -> float | None:
     return (now - promoted).total_seconds() / 86400.0
 
 
+# ---------------------------------------------------------------------------
+# I4 (final whole-branch review, 2026-09-17): orphan reconciliation.
+#
+# THE WINDOW: `promote_validated_heuristic_candidates` writes the real
+# heuristic row (`upsert_guardian_authority_heuristic`) BEFORE it marks the
+# candidate PROMOTED (`promote_guardian_authority_heuristic_candidate`), and
+# the two writes are separately committed (no shared transaction - same as
+# every other write pair against these tables). That order is forced, not
+# chosen: the candidate row has to record the heuristic id the write
+# produced, which is the opposite of demotion's own binding mark-then-zero
+# order. So a crash - or a failure of the second write - between them leaves
+# a LIVE `ga-llm:*` row in the real `guardian_authority_heuristics` table
+# whose candidate is still `VALIDATED`.
+#
+# WHY THAT IS NOT SELF-CORRECTING: `_live_promoted_llm_candidates` only ever
+# sees PROMOTED candidates, so such a row is invisible to BOTH halves of this
+# pipeline - it is excluded from Cap B's divisor accounting (every other
+# member is then scaled as if it did not exist, while it contributes its full
+# adjustment to every matching decision) and from this function's own
+# demotion sweep (which iterates candidates, not heuristics). It would act on
+# real capital indefinitely, unowned and unmeasurable.
+#
+# THE FIX, and why ZEROING rather than logging alone: a logged-but-live
+# orphan is still acting. Zeroing removes its voice - the row itself stays on
+# file, verbatim, exactly as a demotion leaves one - and the state is
+# genuinely recoverable rather than destructive: if the interrupted promotion
+# did land its candidate transition after all, the row is owned again and the
+# next promotion pass rescales it back to its earned value (a live,
+# non-demoted `ga-llm:*` row is rewritten on every pass). So the conservative
+# action costs at most one pass of silence for a rule that was never
+# accounted for anyway.
+#
+# Two deliberate narrowings:
+# - Only `ga-llm:*` ids are considered. `ga-hc:state:*` rows belong to
+#   authority.py's own self-critique pass and have no candidate row BY
+#   DESIGN; they are not orphans, and this module must never write to them.
+# - An orphan already at 0.0/0.0 is left completely alone: nothing is acting
+#   on capital any more, and rewriting (and re-logging) it on every tick
+#   forever would be pure noise.
+# ---------------------------------------------------------------------------
+
+# This reconciliation has no run_id of its own to log under - it is triggered
+# by the STATE of a table, not by a run. A fixed, greppable id is used
+# instead of borrowing an unrelated one.
+_ORPHAN_RECONCILIATION_RUN_ID = "ga-llm-orphan-reconciliation"
+
+
+def _zero_orphan_llm_heuristic(repo: Repository, row: dict, now: datetime) -> None:
+    """Silences one orphaned `ga-llm:*` heuristic through the same existing,
+    unmodified `upsert_guardian_authority_heuristic` every other write in
+    this pipeline uses. The row is preserved verbatim (same description, same
+    condition, same sample size) - only its adjustment and confidence are
+    zeroed, exactly as a demotion does."""
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id=row["heuristic_id"],
+        description=row["description"],
+        condition_json=row["condition_json"],
+        adjustment=0.0,
+        confidence=0.0,
+        sample_size=int(row["sample_size"] or 0),
+        updated_at=now,
+    )
+
+
+def _reconcile_orphan_llm_heuristics(repo: Repository, now: datetime) -> int:
+    """Zeroes every live `ga-llm:*` heuristic row with no PROMOTED candidate
+    referencing it, and returns how many were silenced. See the I4 section
+    above for what produces such a row and why zeroing is the right response.
+
+    Deliberately reads ALL promoted candidates - including demoted ones,
+    which keep `status='PROMOTED'` and their `promoted_heuristic_id` as an
+    audit trail - so a demoted row counts as OWNED, not orphaned."""
+    owned = {
+        str(row["promoted_heuristic_id"] or "")
+        for row in repo.find_promoted_guardian_authority_heuristic_candidates()
+    }
+
+    zeroed = 0
+    for row in repo.find_guardian_authority_heuristics():
+        heuristic_id = str(row["heuristic_id"])
+        if not heuristic_id.startswith(_LLM_HEURISTIC_ID_PREFIX):
+            continue
+        if heuristic_id in owned:
+            continue
+        if float(row["adjustment"]) == 0.0 and float(row["confidence"]) == 0.0:
+            continue
+        _zero_orphan_llm_heuristic(repo, row, now)
+        log_event(
+            _ORPHAN_RECONCILIATION_RUN_ID,
+            event="ga_llm_orphan_heuristic_zeroed",
+            heuristic_id=heuristic_id,
+            previous_adjustment=float(row["adjustment"]),
+            previous_confidence=float(row["confidence"]),
+            reason=(
+                "live ga-llm heuristic with no PROMOTED candidate - a promotion "
+                "that wrote the heuristic row but never marked its candidate"
+            ),
+        )
+        zeroed += 1
+    return zeroed
+
+
 def _outcome_stats(outcomes: list[bool]) -> tuple[int, float]:
     """`(sample_size, correct_rate)` - the same plain count/ratio tally
     `_split_stats` computes for a condition-filtered pool, for a track whose
@@ -1822,10 +1924,27 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
       forward evidence by preventing the very positions that would produce
       it, can ever be retired. See that constant's own section above.
 
-    Returns the number of heuristics actually demoted by THIS call. A row
-    some concurrent/earlier call already demoted is a structural no-op via
+    Also reconciles ORPHANED `ga-llm:*` heuristic rows before doing any of
+    that (I4 - see `_reconcile_orphan_llm_heuristics`): a live row in the real
+    table with no PROMOTED candidate referencing it, which a crash between
+    promotion's own two writes can leave behind, is zeroed and logged. Such a
+    row is invisible to every other part of this pipeline, so this is the
+    only place it can be caught.
+
+    Returns the number of heuristics actually demoted by THIS call (orphan
+    zeroings are NOT counted - nothing was demoted). A row some
+    concurrent/earlier call already demoted is a structural no-op via
     `mark_..._demoted`'s own `demoted_at IS NULL` guard and is not counted -
     same idempotency discipline as the three steps above."""
+    # I4: run BEFORE the live-candidate loop (and before its early return) -
+    # an orphan's defining feature is that no candidate row points at it, so
+    # a sweep that iterates candidates can never find it, and a repository
+    # with zero promoted candidates is exactly the state a first, crashed
+    # promotion leaves behind. Not counted in this function's return value:
+    # nothing was demoted, an unowned row was silenced (it has its own
+    # `ga_llm_orphan_heuristic_zeroed` log event).
+    _reconcile_orphan_llm_heuristics(repo, now)
+
     # The SAME "live" the promotion pass's own rescale uses - one definition
     # (`promoted`, `ga-llm:*`, `demoted_at IS NULL`), read through the same
     # helper, so the half of the plan that writes adjustments and the half

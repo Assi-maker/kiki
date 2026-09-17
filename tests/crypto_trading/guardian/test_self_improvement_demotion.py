@@ -22,6 +22,7 @@ There is no AI call anywhere in this file;
 """
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -968,3 +969,142 @@ def test_an_unparseable_promoted_at_never_triggers_the_time_based_rule(tmp_path)
     # tz-aware ISO-8601 strings this pipeline actually writes.
     measured = _days_since_promotion(_PROMOTED_AT.isoformat(), _PAST_THE_SILENCE_BAR)
     assert measured == pytest.approx(_FORWARD_MAX_SILENT_DAYS + 1 / (24 * 60))
+
+
+# --------------------------------------------------------------------------
+# I4 (final whole-branch review, 2026-09-17): orphan reconciliation.
+#
+# `promote_validated_heuristic_candidates` writes the real heuristic row
+# BEFORE it marks the candidate PROMOTED (the opposite order to demotion's
+# own binding mark-then-zero, and for this table the only possible order -
+# the candidate row has to record the heuristic id the write produced). The
+# two writes are separately committed, so a crash between them leaves a LIVE
+# `ga-llm:*` heuristic in the real table whose candidate is still VALIDATED:
+# invisible to `_live_promoted_llm_candidates`, therefore excluded from Cap
+# B's divisor AND from every demotion sweep - a heuristic acting on real
+# capital that no part of this pipeline can see or retire.
+#
+# Reconciliation zeroes such a row (adjustment 0.0, confidence 0.0) and logs
+# a distinctly-named event. It is self-healing in the benign interleaving: if
+# the promotion that produced the orphan does eventually mark its candidate
+# PROMOTED, the next promotion pass rescales the row back to its earned
+# value, because the row is live and not demoted.
+# --------------------------------------------------------------------------
+_ORPHAN_EVENT = "ga_llm_orphan_heuristic_zeroed"
+
+
+def _seed_orphan_llm_heuristic(repo, heuristic_id="ga-llm:orphan-1", adjustment=0.4):
+    """Exactly what a crash between promotion's two writes leaves behind: the
+    real heuristic row, with no PROMOTED candidate referencing it."""
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id=heuristic_id,
+        description="an orphaned promotion",
+        condition_json=json.dumps(_STATE_CONDITION),
+        adjustment=adjustment,
+        confidence=0.8,
+        sample_size=40,
+        updated_at=_BEFORE,
+    )
+    return heuristic_id
+
+
+def test_an_orphaned_llm_heuristic_is_zeroed_and_logged(tmp_path, caplog):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_orphan_llm_heuristic(repo)
+    assert repo.find_promoted_guardian_authority_heuristic_candidates() == []
+
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        # Not counted as a demotion: nothing was demoted, an unowned row was
+        # silenced.
+        assert track_and_demote_underperforming_heuristics(repo, _NOW) == 0
+
+    row = _heuristics_by_id(repo)[heuristic_id]
+    assert row["adjustment"] == 0.0
+    assert row["confidence"] == 0.0
+    assert row["updated_at"] == _NOW.isoformat()
+    assert _ORPHAN_EVENT in caplog.text
+    assert heuristic_id in caplog.text
+
+    # And it is genuinely a no-op for the real decision core.
+    score, matched_ids = evaluate_heuristics(
+        _CO_FIRING_FACTORS, repo.find_guardian_authority_heuristics()
+    )
+    assert matched_ids == [heuristic_id]
+    assert score == 0.0
+
+
+def test_a_normal_promoted_heuristic_is_never_touched_by_reconciliation(tmp_path):
+    """The whole point: a row whose candidate really is PROMOTED is owned,
+    measurable and must keep its earned adjustment."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(repo, "cand-1", condition=_STATE_CONDITION)
+    before = _heuristics_by_id(repo)[heuristic_id]
+
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 0
+    assert _heuristics_by_id(repo)[heuristic_id] == before
+
+
+def test_reconciliation_runs_even_when_no_candidate_is_currently_live(tmp_path):
+    """The orphan case's defining feature is that there IS no live promoted
+    candidate to iterate over - so the reconciliation must run before (not
+    inside) the loop over live candidates."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_orphan_llm_heuristic(repo)
+
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 0
+    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == 0.0
+
+
+def test_reconciliation_never_touches_the_self_critique_family(tmp_path):
+    """`ga-hc:state:*` rows belong to authority.py's own self-critique pass
+    and have no candidate row by design - they are not orphans, and this
+    module must never write to them."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id="ga-hc:state:PROTECT",
+        description="TIGHTEN_SL outcomes while guardian_state=PROTECT",
+        condition_json=json.dumps(_STATE_CONDITION),
+        adjustment=0.25,
+        confidence=0.5,
+        sample_size=40,
+        updated_at=_BEFORE,
+    )
+    before = _heuristics_by_id(repo)["ga-hc:state:PROTECT"]
+
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 0
+    assert _heuristics_by_id(repo)["ga-hc:state:PROTECT"] == before
+
+
+def test_an_already_silent_orphan_is_not_rewritten_on_every_pass(tmp_path, caplog):
+    """Idempotence, and log hygiene: once an orphan is at 0.0/0.0 there is
+    nothing acting on capital any more, so later passes leave it completely
+    alone rather than re-writing (and re-logging) it every tick forever."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_orphan_llm_heuristic(repo)
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 0
+    after_first = _heuristics_by_id(repo)[heuristic_id]
+
+    later = _NOW + timedelta(days=1)
+    caplog.clear()  # only the SECOND pass's own log output is in scope here
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        assert track_and_demote_underperforming_heuristics(repo, later) == 0
+    assert _heuristics_by_id(repo)[heuristic_id] == after_first
+    assert _ORPHAN_EVENT not in caplog.text
+
+
+def test_a_demoted_candidates_heuristic_is_not_an_orphan(tmp_path):
+    """A demoted candidate keeps `status='PROMOTED'` (audit trail) and still
+    references its heuristic id, so its row is owned - it is already at 0.0
+    anyway, but the reconciliation must recognize it as accounted-for rather
+    than as an unowned row."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(repo, "cand-1", condition=_STATE_CONDITION)
+    _seed_forward_tighten_sl_record(
+        repo, heuristic_id, count=20, correct_count=4, first_decided_at=_FORWARD_START
+    )
+    assert track_and_demote_underperforming_heuristics(repo, _NOW) == 1
+    after_demotion = _heuristics_by_id(repo)[heuristic_id]
+
+    later = _NOW + timedelta(days=1)
+    assert track_and_demote_underperforming_heuristics(repo, later) == 0
+    assert _heuristics_by_id(repo)[heuristic_id] == after_demotion
