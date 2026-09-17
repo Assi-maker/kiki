@@ -336,6 +336,7 @@ _PURE_DECISION_FUNCTIONS = (
 
 AUTHORITY_PATH = "crypto_trading/guardian/authority.py"
 REPOSITORY_PATH = "crypto_trading/storage/repository.py"
+SELF_IMPROVEMENT_PATH = "crypto_trading/guardian/self_improvement.py"
 _REPOSITORY_CLASS = "SQLiteRepository"
 
 _REPOSITORY_FROZEN_METHODS = (
@@ -371,17 +372,36 @@ _EXPECTED_METHOD_SOURCE_SHA256 = {
 }
 
 
+def _source_with_decorators(source: str, node) -> str:
+    """The node's own source segment WITH its decorator lines prepended.
+
+    `ast.get_source_segment` on a FunctionDef starts at the `def` line and
+    excludes every decorator above it (a decorator is a separate child node,
+    `node.decorator_list`), so a hash of that segment alone would not change
+    if someone added, removed or edited a decorator on a frozen function -
+    and a decorator can change what the function DOES without touching a
+    single byte inside it. All 8 frozen functions/methods have zero
+    decorators today, so including them changes none of the recorded hashes;
+    this is purely about what a future change would be caught by. (Code
+    review fix, 2026-09-17 fix wave, Task 8 item 1 hardening.)"""
+    decorators = [
+        ast.get_source_segment(source, decorator) or "" for decorator in node.decorator_list
+    ]
+    segment = ast.get_source_segment(source, node)
+    assert segment is not None
+    return "".join(f"@{decorator}\n" for decorator in decorators) + segment
+
+
 def _current_function_source(path: str, function_name: str) -> str:
     """`function_name`'s CURRENT top-level (or nested, but here always
     top-level) source segment, read straight from the live file on disk
-    (never `git show` - see module docstring, lesson #2)."""
+    (never `git show` - see module docstring, lesson #2), decorators
+    included (see `_source_with_decorators`)."""
     source = _read(path)
     tree = ast.parse(source, filename=path)
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
-            segment = ast.get_source_segment(source, node)
-            assert segment is not None, f"could not extract source for {function_name}"
-            return segment
+            return _source_with_decorators(source, node)
     raise AssertionError(f"function {function_name} not found in {path}")
 
 
@@ -396,9 +416,7 @@ def _current_method_source(path: str, class_name: str, method_name: str) -> str:
         if isinstance(node, ast.ClassDef) and node.name == class_name:
             for child in node.body:
                 if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == method_name:
-                    segment = ast.get_source_segment(source, child)
-                    assert segment is not None, f"could not extract source for {class_name}.{method_name}"
-                    return segment
+                    return _source_with_decorators(source, child)
     raise AssertionError(f"method {class_name}.{method_name} not found in {path}")
 
 
@@ -434,6 +452,39 @@ def test_frozen_repository_method_is_byte_identical_to_recorded_hash(method_name
     assert current_hash == _EXPECTED_METHOD_SOURCE_SHA256[method_name], (
         f"{method_name} changed since its hash was recorded - Global Constraint violation"
     )
+
+
+def test_the_frozen_source_hash_covers_decorators_too():
+    """Deliberate-break confirmation for `_source_with_decorators` (Task 8
+    item 1 hardening, 2026-09-17 fix wave): a decorator added to a frozen
+    function must change its recorded hash. Proven on a synthesized pair
+    rather than by touching a real frozen function - the extraction logic is
+    the thing under test, and it is the SAME helper both hash tests above
+    use.
+
+    Also pins the reason the 8 recorded hashes did not have to change when
+    this hardening landed: none of the frozen functions has a decorator, so
+    the prepended prefix is empty for every one of them."""
+    undecorated = "def f(x):\n    return x\n"
+    decorated = "@some_decorator\ndef f(x):\n    return x\n"
+
+    def _extract(source: str) -> str:
+        tree = ast.parse(source)
+        return _source_with_decorators(source, tree.body[0])
+
+    assert _extract(undecorated) == "def f(x):\n    return x"
+    assert _extract(decorated).startswith("@some_decorator\n")
+    assert _sha256(_extract(decorated)) != _sha256(_extract(undecorated))
+
+    # ...and the real frozen functions/methods genuinely carry no decorator,
+    # which is why every recorded hash above is unaffected by this change.
+    authority_source = _read(AUTHORITY_PATH)
+    authority_tree = ast.parse(authority_source, filename=AUTHORITY_PATH)
+    for node in ast.walk(authority_tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in (
+            _PURE_DECISION_FUNCTIONS
+        ):
+            assert node.decorator_list == [], f"{node.name} unexpectedly has a decorator"
 
 
 def test_byte_identical_check_genuinely_detects_a_real_change_in_a_function():
@@ -1079,16 +1130,38 @@ def _keyword_write_sites(path: str, field_name: str) -> list[tuple[int, str]]:
     return sites
 
 
+def _package_keyword_write_sites(field_name: str) -> list[tuple[str, int, str]]:
+    """(path, lineno, enclosing_function) for every `field_name=...` keyword
+    write across the WHOLE production crypto_trading/ package - the same live
+    filesystem walk `_production_call_sites` (item 3) already uses, for the
+    same reason: this check must catch a writer ANYWHERE, not only in this
+    plan's own hardcoded touched-file list.
+
+    Code review fix (2026-09-17 fix wave, Task 8 item 1): the write-site
+    check below used to scan only PRODUCTION_FILES while its sibling
+    upsert_guardian_authority_heuristic check already scanned the whole
+    package - an asymmetry that meant a third writer added in any file
+    outside that hardcoded list would not have been caught at all. Test
+    files are deliberately excluded, exactly as in `_production_call_sites`:
+    tests legitimately pass this field when seeding fixture decision rows."""
+    sites: list[tuple[str, int, str]] = []
+    for path in sorted((REPO_ROOT / "crypto_trading").rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        for lineno, enclosing in _keyword_write_sites(relative, field_name):
+            sites.append((relative, lineno, enclosing))
+    return sites
+
+
 def test_matched_heuristic_ids_json_is_written_only_at_the_two_orchestration_call_sites():
-    """Checklist item 5 (write half). Across every production file this
-    plan touched, every keyword-argument write of matched_heuristic_ids_json
-    must be inside exactly the 2 named orchestration functions - never
-    inside decide_open_position/decide_pre_entry (already proven separately
-    above), and never a 3rd new call site anywhere else."""
-    observed: list[tuple[str, int, str]] = []
-    for path in PRODUCTION_FILES:
-        for lineno, enclosing in _keyword_write_sites(path, _MATCHED_IDS_FIELD):
-            observed.append((path, lineno, enclosing))
+    """Checklist item 5 (write half). Across the WHOLE production
+    crypto_trading/ package, every keyword-argument write of
+    matched_heuristic_ids_json must be inside exactly the 2 named
+    orchestration functions - never inside decide_open_position/
+    decide_pre_entry (already proven separately above), and never a 3rd new
+    call site anywhere else."""
+    observed = _package_keyword_write_sites(_MATCHED_IDS_FIELD)
 
     observed_pairs = sorted({(path, enclosing) for path, _lineno, enclosing in observed})
     expected_pairs = sorted(_MATCHED_IDS_ORCHESTRATION_WRITE_SITES)
@@ -1129,6 +1202,34 @@ def test_matched_heuristic_ids_json_write_scan_genuinely_catches_a_third_site():
     assert hits == ["rogue_orchestrator"]
 
 
+def test_matched_ids_write_scan_catches_a_third_site_outside_the_hardcoded_file_list():
+    """Deliberate-break confirmation for the WIDENING itself (2026-09-17 fix
+    wave), not just for the keyword-matching logic: the synthesized third
+    writer is placed in a REAL throwaway file inside crypto_trading/ that is
+    deliberately NOT in PRODUCTION_FILES. The old, narrower scan would have
+    sailed straight past it; the whole-package walk catches it. Same
+    scratch-file discipline (and `finally` cleanup) as item 3's own
+    equivalent test."""
+    scratch_path = (
+        REPO_ROOT / "crypto_trading" / "_scratch_isolation_test_third_matched_ids_write.py"
+    )
+    relative = scratch_path.relative_to(REPO_ROOT).as_posix()
+    assert relative not in PRODUCTION_FILES, "scratch file must be outside the hardcoded list"
+    assert not scratch_path.exists(), "scratch file collision - aborting synthesized-violation test"
+    try:
+        scratch_path.write_text(
+            "def rogue_orchestrator(repo):\n"
+            "    repo.save_guardian_authority_decision(matched_heuristic_ids_json='[]')\n",
+            encoding="utf-8",
+        )
+        observed = _package_keyword_write_sites(_MATCHED_IDS_FIELD)
+        observed_pairs = sorted({(path, enclosing) for path, _lineno, enclosing in observed})
+        assert (relative, "rogue_orchestrator") in observed_pairs
+        assert observed_pairs != sorted(_MATCHED_IDS_ORCHESTRATION_WRITE_SITES)
+    finally:
+        scratch_path.unlink(missing_ok=True)
+
+
 def test_matched_heuristic_ids_json_read_sites_are_limited_to_forward_tracking():
     """The read side has exactly one legitimate consumer beyond the DB
     layer's own row-shape plumbing: Task 6's forward-performance tracking
@@ -1154,6 +1255,23 @@ def test_matched_heuristic_ids_json_read_sites_are_limited_to_forward_tracking()
                 "crypto_trading/storage/db.py",
                 "crypto_trading/storage/repository.py",
             ), f"unexpected matched_heuristic_ids_json reference in {path}"
+
+    # POSITIVE assertion (code review fix, 2026-09-17 fix wave, Task 8 item
+    # 2): every check above is an ABSENCE check, so all of them would pass
+    # vacuously if the field were renamed repo-wide and every reference
+    # silently vanished - including the forward-attribution read this whole
+    # tracking mechanism depends on. Confirm the field really IS read where
+    # it is supposed to be, in the extracted source of the two real reading
+    # functions: `_forward_tighten_sl_stats` (Task 6's own attribution read,
+    # the load-bearing one) and `_real_decision_context` (Task 3's
+    # prompt-building read).
+    for reader in ("_forward_tighten_sl_stats", "_real_decision_context"):
+        reader_source = _current_function_source(SELF_IMPROVEMENT_PATH, reader)
+        assert _MATCHED_IDS_FIELD in reader_source, (
+            f"{reader} no longer reads {_MATCHED_IDS_FIELD} - forward "
+            "attribution would be silently broken, and every absence check "
+            "in this test would still pass"
+        )
 
 
 # ---------------------------------------------------------------------------
