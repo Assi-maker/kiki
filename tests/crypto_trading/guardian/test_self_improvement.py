@@ -852,8 +852,21 @@ def test_strategist_system_prompt_reproduces_the_condition_matching_semantics():
     assert "equality" in prompt
     # AND across keys, and the two opposite empty-collection conventions.
     assert "logical AND across keys" in prompt
-    assert "always-on" in prompt
+    assert "vacuously satisfied by everything" in prompt
     assert "An EMPTY condition list never matches" in prompt
+
+
+def test_strategist_system_prompt_forbids_an_empty_condition_outright():
+    """C1 (final whole-branch review, 2026-09-17). The prompt used to
+    characterize an empty `condition` ({}) as "a legitimate 'always-on'
+    base-rate heuristic" in its semantics section while forbidding it a few
+    lines later - a self-contradiction, and on the wrong side of a guard that
+    now REJECTS such a candidate at validation time. The prompt must now say
+    only the latter, in both places."""
+    prompt = load_agent_definition(_STRATEGIST_AGENT_FILE).system_prompt
+    assert "always-on" not in prompt
+    assert "ALDRIG får föreslå ett tomt `condition`" in prompt
+    assert "AVVISAR (`REJECTED`)" in prompt
     # Fail-closed on missing factors.
     assert "A missing key in `factors` never satisfies any requirement" in prompt
     assert "fail-closed" in prompt

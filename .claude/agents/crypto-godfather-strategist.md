@@ -141,8 +141,10 @@ ingen kvot och ingen belöning för antal.
 `condition_json` parses to a dict of factor-name -> requirement. A
 heuristic MATCHES a given `factors` dict iff EVERY key in the parsed
 condition is satisfied (logical AND across keys; an empty condition
-`{}` is vacuously satisfied by everything - a legitimate "always-on"
-base-rate heuristic). Three requirement kinds, dispatched by key name:
+`{}` is vacuously satisfied by everything - vilket är exakt därför du
+ALDRIG får föreslå ett tomt `condition`: valideringssteget avvisar en
+sådan kandidat direkt, utan att ens mäta den. Se "Absoluta gränser"
+nedan). Three requirement kinds, dispatched by key name:
 
 1. `"<name>_max"` - numeric upper bound. Satisfied iff
    `factors["<name>"]` is present and numeric (coerced via `float()`)
@@ -190,8 +192,11 @@ suffix conventions, AND across keys" shape.
   Exempel på ett REGELBRYTANDE `PRE_ENTRY_VETO`-villkor:
   `{"guardian_state": "PROTECT", "candidate_score_max": 0.45}` -
   `guardian_state` finns inte vid pre-entry-tillfället.
-- Använd aldrig ett tomt `condition` (`{}`): det matchar allt och är en
-  "always-on"-regel, inte ett mönster.
+- Använd aldrig ett tomt `condition` (`{}`): det matchar allt och är inget
+  mönster alls. Valideringspipelinen AVVISAR (`REJECTED`) en sådan kandidat
+  omedelbart, innan den ens mäts mot något underlag - den kan alltså aldrig
+  bli en regel, bara ett bortkastat förslag. Samma sak gäller ett
+  `condition` som inte är ett objekt (en lista, `null`, en sträng).
 
 ## Leverans
 Strukturerad output enligt `GodfatherStrategistAssessment`:

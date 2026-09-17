@@ -587,3 +587,77 @@ def test_the_self_critique_heuristic_family_is_never_touched_by_promotion(tmp_pa
     assert heuristics["ga-hc:state:PROTECT"]["adjustment"] == pytest.approx(0.25)
     assert heuristics["ga-hc:state:PROTECT"]["updated_at"] == _NOW.isoformat()
     assert heuristics["ga-llm:cand-1"]["adjustment"] == pytest.approx(0.4)
+
+
+# --------------------------------------------------------------------------
+# C1 (final whole-branch review, 2026-09-17) - the promotion-time MIRROR of
+# validation's own empty-condition guard: defense in depth for a row that is
+# ALREADY `VALIDATED` (a legacy row written before that guard existed, or one
+# some future writer transitions by another route). An empty/non-object
+# condition is vacuously true for every factors dict under the frozen
+# `heuristic_condition_matches`, so such a row must never reach the real
+# table - refused, not failed, exactly like the TIGHTEN_SL cardinality cap.
+# --------------------------------------------------------------------------
+def _seed_validated_row_with_raw_condition_json(repo, candidate_id, condition_json):
+    """A VALIDATED candidate whose `condition_json` is written verbatim -
+    bypassing `validate_pending_heuristic_candidates` entirely, which is the
+    only way this state can exist at all now that C1's validation guard is in
+    place. Simulates a legacy row."""
+    repo.save_guardian_authority_heuristic_candidate(
+        candidate_id=candidate_id,
+        description=f"{candidate_id} description",
+        condition_json=condition_json,
+        proposed_adjustment=0.5,
+        rationale=f"{candidate_id} rationale",
+        run_id="run-llm",
+        proposed_at=_VALIDATED_AT - timedelta(hours=1),
+        target_decision_type="TIGHTEN_SL",
+    )
+    repo.record_guardian_authority_heuristic_candidate_validation(
+        candidate_id=candidate_id,
+        status="VALIDATED",
+        train_sample_size=90,
+        train_correct_rate=0.85,
+        test_sample_size=40,
+        test_correct_rate=0.9,
+        validated_at=_VALIDATED_AT,
+        rejected_reason=None,
+    )
+
+
+@pytest.mark.parametrize("condition_json", ["{}", "[]", "null", "not json at all"])
+def test_an_already_validated_empty_or_unusable_condition_is_never_promoted(
+    tmp_path, condition_json
+):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_validated_row_with_raw_condition_json(repo, "legacy-empty", condition_json)
+
+    assert promote_validated_heuristic_candidates(repo, _NOW) == 0
+
+    # Nothing reached the real table...
+    assert repo.find_guardian_authority_heuristics() == []
+    # ...and the row is left exactly as it was: VALIDATED, not silently
+    # dropped, not REJECTED, not PROMOTED (refusal, not failure).
+    row = repo.get_guardian_authority_heuristic_candidate("legacy-empty")
+    assert row["status"] == "VALIDATED"
+    assert row["promoted_at"] is None
+    assert row["promoted_heuristic_id"] is None
+    assert [
+        candidate["candidate_id"]
+        for candidate in repo.find_validated_guardian_authority_heuristic_candidates()
+    ] == ["legacy-empty"]
+
+
+def test_a_refused_empty_condition_never_joins_the_co_firing_divisor(tmp_path):
+    """The refusal must not distort the family either: the one genuinely
+    promotable candidate in this pass gets its OWN full test-split worth,
+    exactly as if the empty-condition row had never been queued."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_validated_row_with_raw_condition_json(repo, "a-legacy-empty", "{}")
+    _seed_validated_candidate(repo, "b-real", condition=_STATE_CONDITION, test_correct_rate=0.9)
+
+    assert promote_validated_heuristic_candidates(repo, _NOW) == 1
+
+    heuristics = _heuristics_by_id(repo)
+    assert set(heuristics) == {"ga-llm:b-real"}
+    assert heuristics["ga-llm:b-real"]["adjustment"] == pytest.approx(0.4)

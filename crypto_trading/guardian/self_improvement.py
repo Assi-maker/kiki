@@ -624,6 +624,56 @@ def propose_candidate_heuristics(
 
 _TRAIN_FRACTION = 0.7
 
+# ---------------------------------------------------------------------------
+# C1 (final whole-branch review, 2026-09-17): the empty-condition guard.
+#
+# `heuristic_condition_matches` (frozen, unmodifiable by this plan) is an
+# `all(...)` over the condition's own keys, so an EMPTY condition `{}` is
+# vacuously true for EVERY factors dict - its own module docstring calls that
+# an "always-on" heuristic. That is a defensible thing for a hand-written,
+# human-reviewed rule to be; it is NOT a defensible thing for an LLM-proposed
+# candidate to be, for three compounding reasons the final review proved
+# end-to-end against the real repository:
+#
+# 1. It clears out-of-sample validation TRIVIALLY. `_split_stats` filters each
+#    split by the condition, so an empty condition filters nothing: train and
+#    test are the WHOLE pool, and the bar degenerates to "is the bot's own
+#    base rate outside [0.35, 0.65]". Any consistently losing strategy passes
+#    that - the candidate would be certified by a test that measured nothing
+#    about the candidate itself.
+# 2. It escapes Cap B's dilution. The rescale divides by the live family
+#    size, and the FIRST promotion lands at family_size == 1 - i.e. at full
+#    earned strength, with no dilution at all.
+# 3. Promoted, it is structurally un-demotable on the veto track. The real
+#    `guardian_authority_heuristics` table has no `target_decision_type`
+#    column and `evaluate_heuristics` reads every row in it, so an
+#    always-true row matches every pre-entry decision AND every tick-time
+#    decision; every entry it successfully vetoes is a position that never
+#    opens, never closes, and therefore never appears in the forward
+#    closed-position pool that would have to accumulate the evidence to
+#    retire it. It silences itself into permanence.
+#
+# The guard is therefore placed at the EARLIEST point the pipeline can see
+# such a row - before any pool is consulted - and routed through the exact
+# same `record_guardian_authority_heuristic_candidate_validation` call every
+# other outcome uses (no second rejection path). `promote_validated_heuristic_
+# candidates` carries a mirror of it for defense in depth, against a row that
+# was already `VALIDATED` before this guard existed.
+#
+# Non-dict conditions (a JSON list, a bare `null`, a string) are refused by
+# the SAME check, for a stronger reason still: `heuristic_condition_matches`
+# raises `AttributeError` on them, so such a row is not merely over-broad but
+# structurally unusable.
+# ---------------------------------------------------------------------------
+_EMPTY_CONDITION_REJECTION_REASON = "empty or non-object condition (vacuously always-true)"
+
+
+def _is_usable_condition(condition: object) -> bool:
+    """A condition that can genuinely discriminate: a dict with at least one
+    key. See the C1 section above for why `{}` specifically must never reach
+    `VALIDATED` or the real heuristics table."""
+    return isinstance(condition, dict) and bool(condition)
+
 
 def _tighten_sl_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
     """`(decided_at, factors, expectation_correct)` for every resolved
@@ -884,6 +934,11 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
     sample-size/miscalibration bar and agree in sign, `REJECTED` with a
     specific reason otherwise.
 
+    An empty or non-object `condition_json` is REJECTED up front, before any
+    pool is consulted (C1, final whole-branch review - see that section
+    above): such a condition is vacuously true for every factors dict, so it
+    would otherwise be "validated" by a test that filtered nothing.
+
     Returns the count of candidate rows actually transitioned (VALIDATED +
     REJECTED) in THIS call - `record_guardian_authority_heuristic_
     candidate_validation`'s own `WHERE status = 'PROPOSED'` guard makes a
@@ -909,6 +964,26 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
         # The candidate's own, unmodified condition_json - never a
         # hand-modified copy (see this module's self-review discipline).
         condition = json.loads(candidate["condition_json"])
+
+        # C1: an empty/non-object condition is rejected HERE, before any pool
+        # is consulted, so it can never reach VALIDATED - see the C1 section
+        # above for the full reasoning. Every sample size and rate is written
+        # as 0: nothing was measured, and the row must never read as if
+        # something had been.
+        if not _is_usable_condition(condition):
+            if repo.record_guardian_authority_heuristic_candidate_validation(
+                candidate_id=candidate["candidate_id"],
+                status="REJECTED",
+                train_sample_size=0,
+                train_correct_rate=0.0,
+                test_sample_size=0,
+                test_correct_rate=0.0,
+                validated_at=now,
+                rejected_reason=_EMPTY_CONDITION_REJECTION_REASON,
+            ):
+                processed += 1
+            continue
+
         # The candidate's own declared target decides its pool, and nothing
         # else: a TIGHTEN_SL candidate is never measured against closed-
         # position PnL, and a PRE_ENTRY_VETO candidate is never measured
@@ -1175,6 +1250,47 @@ def _within_tighten_sl_cardinality_cap(live: list[dict], incoming: list[dict]) -
     return accepted
 
 
+def _with_usable_conditions(validated: list[dict]) -> list[dict]:
+    """`validated` minus every row whose `condition_json` is empty, non-object
+    or unparseable - C1's promotion-time MIRROR of the validation guard (see
+    the C1 section above). This can only ever fire for a row that reached
+    `VALIDATED` WITHOUT passing today's validation guard: a legacy row from
+    before it existed, or one some future writer transitions by another route.
+    It is deliberately a second, independent check rather than trust in the
+    first: this is the last point before a row acts on real capital.
+
+    REFUSAL, NOT FAILURE, exactly like the cardinality cap below: the row is
+    left `VALIDATED`, unwritten and unpromoted, and the refusal is logged. It
+    is not marked REJECTED here - `record_..._validation` only transitions
+    from `PROPOSED`, and inventing a second status-write path for it would be
+    precisely the extra write path into this table the plan forbids.
+
+    An unparseable `condition_json` is refused rather than raised on: promotion
+    is a batch pass, and one corrupt row must not be able to block every other
+    candidate's promotion. (Validation's own stance differs deliberately - it
+    parses outside any try/except, letting a corrupt row fail loudly, which is
+    the sibling self-critique functions' documented precedent. Here the
+    conservative action - don't write it into the live table - is available
+    without failing anything at all.)"""
+    usable: list[dict] = []
+    for row in validated:
+        try:
+            condition = json.loads(row["condition_json"])
+        except (ValueError, TypeError):
+            condition = None
+        if _is_usable_condition(condition):
+            usable.append(row)
+            continue
+        log_event(
+            row["run_id"],
+            event="ga_llm_promotion_refused_unusable_condition",
+            candidate_id=row["candidate_id"],
+            reason=_EMPTY_CONDITION_REJECTION_REASON,
+            condition_json=row["condition_json"],
+        )
+    return usable
+
+
 def _live_promoted_llm_candidates(repo: Repository) -> list[dict]:
     """The promoted candidates whose real heuristic row is still live: not
     demoted, and carrying a `ga-llm:*` heuristic id (the only ids this
@@ -1228,12 +1344,16 @@ def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> i
     true continuously rather than only at the instant of a promotion; see
     the Task 5 module section above for the mechanism and its proof.
 
-    A TIGHTEN_SL-targeted candidate is additionally refused (left VALIDATED,
-    counted in neither the return value nor the divisor) when the live
-    TIGHTEN_SL family already stands at `_MAX_LIVE_TIGHTEN_SL_HEURISTICS` -
+    A candidate whose `condition_json` is empty, non-object or unparseable is
+    refused outright (C1's promotion-time mirror - see `_with_usable_
+    conditions`), and a TIGHTEN_SL-targeted candidate is additionally refused
+    (left VALIDATED, counted in neither the return value nor the divisor) when
+    the live TIGHTEN_SL family already stands at `_MAX_LIVE_TIGHTEN_SL_HEURISTICS` -
     see that constant's own section above for why the cap exists, why it
     lives here, and why its value is 3."""
-    validated = repo.find_validated_guardian_authority_heuristic_candidates()
+    validated = _with_usable_conditions(
+        repo.find_validated_guardian_authority_heuristic_candidates()
+    )
     if not validated:
         # Nothing to promote means nothing to rescale either: the live family
         # is unchanged, so its existing divisor is still correct.

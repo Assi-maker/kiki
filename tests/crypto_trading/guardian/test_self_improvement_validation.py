@@ -559,7 +559,14 @@ def test_validate_pending_heuristic_candidates_does_not_reprocess_an_already_tra
 def test_validate_pending_heuristic_candidates_processes_each_candidate_independently(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_candidate(repo, candidate_id="matches-nothing", condition={"guardian_state": "EXIT"})
-    _seed_candidate(repo, candidate_id="matches-everything", condition={})
+    # Matches every seeded row - but through a real, informative key, not
+    # through an empty condition. `{}` was the original fixture here; C1
+    # (final whole-branch review, 2026-09-17) now rejects an empty condition
+    # up front, and this test is about per-candidate INDEPENDENCE, not about
+    # that guard (which has its own tests below).
+    _seed_candidate(
+        repo, candidate_id="matches-everything", condition={"guardian_state": "PROTECT"}
+    )
 
     for i in range(100):
         decided_at = _BASE + timedelta(minutes=i)
@@ -727,3 +734,124 @@ def test_a_legacy_null_target_decision_type_is_validated_against_the_tighten_sl_
     assert row["status"] == "VALIDATED"
     assert row["train_sample_size"] == 70
     assert row["train_correct_rate"] == 56 / 70
+
+
+# --------------------------------------------------------------------------
+# C1 (final whole-branch review, 2026-09-17): an EMPTY or non-object
+# condition is rejected before it can ever reach VALIDATED.
+#
+# `heuristic_condition_matches`' own (frozen) semantics make `{}` vacuously
+# true for EVERY factors dict (`all([]) is True`), so an empty-condition
+# candidate is measured against its whole pool unfiltered: the out-of-sample
+# bar degenerates into "is the bot's own base rate outside [0.35, 0.65]",
+# which any consistently losing (or consistently winning) strategy clears
+# trivially. The real `guardian_authority_heuristics` table has no
+# `target_decision_type` column, so such a row - promoted from either pool -
+# then matches EVERY real decision of BOTH types. These tests pin the guard
+# that makes that unreachable.
+# --------------------------------------------------------------------------
+def test_an_empty_condition_is_rejected_even_when_the_same_evidence_would_validate(tmp_path):
+    """The primary C1 regression test. The evidence here is byte-for-byte the
+    evidence `test_validate_pending_heuristic_candidates_validates_a_
+    consistent_pattern_in_both_splits` above validates on (100 uniform rows,
+    80% correct), and the control candidate in this same fixture - an
+    informative condition matching the same 100 rows - DOES validate against
+    it. So the empty-condition candidate's REJECTION cannot be explained by
+    thin or uncalibrated evidence: absent the guard it would have validated
+    on exactly these numbers."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate(repo, candidate_id="empty", condition={})
+    _seed_candidate(repo, candidate_id="control", condition={"guardian_state": "PROTECT"})
+
+    for i in range(100):
+        _seed_real_tighten_sl(
+            repo,
+            position_id=f"real-{i:04d}",
+            decided_at=_BASE + timedelta(minutes=i),
+            expectation_correct=i % 5 != 0,
+            factors={"guardian_state": "PROTECT", "momentum_decay": 0.9},
+        )
+
+    assert validate_pending_heuristic_candidates(repo, _NOW) == 2
+
+    empty_row = repo.get_guardian_authority_heuristic_candidate("empty")
+    assert empty_row["status"] == "REJECTED"
+    assert "empty" in empty_row["rejected_reason"]
+    assert "condition" in empty_row["rejected_reason"]
+    # Nothing was measured, and nothing is recorded as if it had been.
+    assert empty_row["train_sample_size"] == 0
+    assert empty_row["test_sample_size"] == 0
+    assert empty_row["train_correct_rate"] == 0.0
+    assert empty_row["test_correct_rate"] == 0.0
+    assert empty_row["validated_at"] == _NOW.isoformat()
+
+    # The control proves the evidence itself is more than sufficient.
+    control_row = repo.get_guardian_authority_heuristic_candidate("control")
+    assert control_row["status"] == "VALIDATED"
+    assert control_row["train_sample_size"] == 70
+    assert control_row["test_sample_size"] == 30
+
+
+def test_an_empty_condition_is_rejected_on_the_pre_entry_veto_pool_too(tmp_path):
+    """The same guard, on the OTHER pool - the one a cold-start deployment
+    actually has evidence in, and the one whose promoted rules veto real
+    entries."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate(
+        repo, candidate_id="empty-veto", condition={}, target_decision_type="PRE_ENTRY_VETO"
+    )
+    for i in range(100):
+        _seed_closed_position(
+            repo,
+            f"pos-{i:04d}",
+            _BASE + timedelta(minutes=i),
+            _LOSS_EXIT if i % 5 != 0 else _WIN_EXIT,
+            candidate_score=0.9,
+        )
+
+    assert validate_pending_heuristic_candidates(repo, _NOW) == 1
+
+    row = repo.get_guardian_authority_heuristic_candidate("empty-veto")
+    assert row["status"] == "REJECTED"
+    assert "empty" in row["rejected_reason"]
+    assert row["train_sample_size"] == 0
+    assert row["test_sample_size"] == 0
+
+
+def test_a_non_object_condition_is_rejected_by_the_same_guard(tmp_path):
+    """`condition_json` that parses to something other than a dict (a list,
+    a bare null, a string) can never be a usable condition either -
+    `heuristic_condition_matches` would raise or behave arbitrarily on it.
+    Rejected by the same single check, with the same reason."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate(repo, candidate_id="list-cond", condition=[])
+    _seed_candidate(repo, candidate_id="null-cond", condition=None)
+    # `_seed_candidate(condition=None)` means "use the default" - write the
+    # literal JSON null row directly instead.
+    repo.save_guardian_authority_heuristic_candidate(
+        candidate_id="json-null",
+        description="a candidate whose condition_json is literally null",
+        condition_json="null",
+        proposed_adjustment=0.2,
+        rationale="seeded directly",
+        run_id="run-llm",
+        proposed_at=_NOW,
+        target_decision_type="TIGHTEN_SL",
+    )
+
+    for i in range(100):
+        _seed_real_tighten_sl(
+            repo,
+            position_id=f"real-{i:04d}",
+            decided_at=_BASE + timedelta(minutes=i),
+            expectation_correct=i % 5 != 0,
+            factors={"guardian_state": "PROTECT", "momentum_decay": 0.9},
+        )
+
+    assert validate_pending_heuristic_candidates(repo, _NOW) == 3
+
+    assert repo.get_guardian_authority_heuristic_candidate("list-cond")["status"] == "REJECTED"
+    assert repo.get_guardian_authority_heuristic_candidate("json-null")["status"] == "REJECTED"
+    # The `condition=None` seed used the helper's own non-empty default and
+    # is therefore unaffected by this guard - the control for it.
+    assert repo.get_guardian_authority_heuristic_candidate("null-cond")["status"] == "VALIDATED"
