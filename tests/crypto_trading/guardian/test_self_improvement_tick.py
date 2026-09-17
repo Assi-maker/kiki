@@ -39,6 +39,23 @@ from tests.crypto_trading.test_market_snapshot import _settings
 
 _NOW = datetime(2026, 9, 17, 12, 0, tzinfo=UTC)
 
+
+def _enabled_settings():
+    """`_settings()` with `guardian.authority_enabled` flipped ON, in memory
+    only (never guardian.yaml, which must stay false).
+
+    Needed since the 2026-09-17 fix wave added a defense-in-depth internal
+    gate to `run_godfather_self_improvement_tick` itself: every test below is
+    about what the orchestrator does when it is ALLOWED to run, so each one
+    now has to say so explicitly. The flag-off behavior has its own test at
+    the end of this file (and its call-site coverage in
+    test_discovery_loop.py)."""
+    settings = _settings()
+    return settings.model_copy(
+        update={"guardian": settings.guardian.model_copy(update={"authority_enabled": True})}
+    )
+
+
 _STEP_NAMES = [
     "propose_candidate_heuristics",
     "validate_pending_heuristic_candidates",
@@ -138,7 +155,7 @@ def test_run_godfather_self_improvement_tick_calls_all_four_steps_in_order(tmp_p
 
     repo = SQLiteRepository(tmp_path / "t.db")
     runner = MockAgentRunner({})
-    settings = _settings()
+    settings = _enabled_settings()
 
     run_godfather_self_improvement_tick(repo, runner, settings, "run-1", _NOW)
 
@@ -184,7 +201,7 @@ def test_a_propose_failure_does_not_block_validate_promote_track(tmp_path, monke
 
     repo = SQLiteRepository(tmp_path / "t.db")
     runner = MockAgentRunner({})
-    settings = _settings()
+    settings = _enabled_settings()
 
     run_godfather_self_improvement_tick(repo, runner, settings, "run-1", _NOW)  # must not raise
 
@@ -209,7 +226,7 @@ def test_a_validate_failure_does_not_block_promote_track(tmp_path, monkeypatch):
 
     repo = SQLiteRepository(tmp_path / "t.db")
     runner = MockAgentRunner({})
-    settings = _settings()
+    settings = _enabled_settings()
 
     run_godfather_self_improvement_tick(repo, runner, settings, "run-1", _NOW)
 
@@ -234,7 +251,7 @@ def test_a_promote_failure_does_not_block_track(tmp_path, monkeypatch):
 
     repo = SQLiteRepository(tmp_path / "t.db")
     runner = MockAgentRunner({})
-    settings = _settings()
+    settings = _enabled_settings()
 
     run_godfather_self_improvement_tick(repo, runner, settings, "run-1", _NOW)
 
@@ -259,7 +276,7 @@ def test_a_track_failure_never_propagates(tmp_path, monkeypatch):
 
     repo = SQLiteRepository(tmp_path / "t.db")
     runner = MockAgentRunner({})
-    settings = _settings()
+    settings = _enabled_settings()
 
     run_godfather_self_improvement_tick(repo, runner, settings, "run-1", _NOW)  # must not raise
 
@@ -290,7 +307,7 @@ def test_each_step_failure_logs_its_own_distinct_event_name(
 
     repo = SQLiteRepository(tmp_path / "t.db")
     runner = MockAgentRunner({})
-    settings = _settings()
+    settings = _enabled_settings()
 
     with caplog.at_level(logging.INFO, logger="crypto_trading"):
         run_godfather_self_improvement_tick(repo, runner, settings, "run-1", _NOW)
@@ -329,10 +346,64 @@ def test_a_candidate_proposed_this_tick_is_validated_in_the_same_call(tmp_path, 
 
     repo = SQLiteRepository(tmp_path / "t.db")
     runner = MockAgentRunner({})
-    settings = _settings()
+    settings = _enabled_settings()
 
     run_godfather_self_improvement_tick(repo, runner, settings, "run-1", _NOW)
 
     row = repo.get_guardian_authority_heuristic_candidate("same-tick-cand")
     assert row is not None
     assert row["status"] == "REJECTED"
+
+
+# ---------------------------------------------------------------------------
+# The orchestrator's OWN authority_enabled gate (Task 7 gap, found by the
+# 2026-09-17 final whole-branch review).
+#
+# Until this fix the flag was consulted at exactly one place - the call site
+# in discovery_loop.py. That is correct but thin for a function with this
+# blast radius: it is a WRITE path into the very table the live decision core
+# reads on every real decision, and anything that calls it directly (a future
+# loop, a maintenance script, a test, a REPL) would run the whole pipeline
+# with the feature switched off. The call-site gate STAYS (see
+# test_discovery_loop.py and the isolation suite's own exclusivity check);
+# this is defense in depth, not a replacement.
+# ---------------------------------------------------------------------------
+def test_the_orchestrator_is_a_complete_no_op_when_authority_is_disabled(tmp_path, monkeypatch):
+    """Called DIRECTLY - no discovery_loop.py anywhere in this test - with
+    authority_enabled False: zero calls to all four pipeline steps."""
+    spies = {name: _CallRecorder() for name in _STEP_NAMES}
+    _monkeypatch_all_steps(monkeypatch, spies)
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner({})
+    settings = _settings()  # guardian.authority_enabled is False by default
+    assert settings.guardian.authority_enabled is False
+
+    run_godfather_self_improvement_tick(repo, runner, settings, "run-1", _NOW)
+
+    for name, spy in spies.items():
+        assert spy.calls == [], f"{name} was called while authority_enabled is False"
+    # And nothing whatsoever was written.
+    assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
+    assert repo.find_guardian_authority_heuristics() == []
+
+
+def test_the_orchestrator_gate_fails_closed_on_an_unreadable_flag(tmp_path, monkeypatch):
+    """The gate must never be the thing that raises inside a trading tick:
+    a settings object without a readable guardian.authority_enabled is
+    treated as OFF, not as an error and not as ON."""
+    spies = {name: _CallRecorder() for name in _STEP_NAMES}
+    _monkeypatch_all_steps(monkeypatch, spies)
+
+    class _BrokenSettings:
+        @property
+        def guardian(self):
+            raise RuntimeError("settings exploded")
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner({})
+
+    run_godfather_self_improvement_tick(repo, runner, _BrokenSettings(), "run-1", _NOW)
+
+    for name, spy in spies.items():
+        assert spy.calls == [], f"{name} was called despite an unreadable flag"

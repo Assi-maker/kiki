@@ -2094,13 +2094,21 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
 # own try/except and its own `log_event` name, so one step's failure can
 # never block, mask, or be confused with another's.
 #
-# This function itself never reads `settings.guardian.authority_enabled` -
-# gating the WHOLE pipeline on that flag is the wiring's job, at the call
-# site in the chosen loop (see discovery_loop.py), exactly the same
-# division of responsibility `run_guardian_authority_shadow_tick`'s own
-# caller in monitoring_loop.py uses for `authority_shadow_enabled`. Calling
-# this function directly always runs all four steps; whether it gets called
-# at all for a given tick is decided one layer up.
+# TWO authority_enabled gates, deliberately (2026-09-17 final-review fix
+# wave - this function originally had none of its own). Gating the WHOLE
+# pipeline at the call site in the chosen loop (see discovery_loop.py) is
+# still the primary mechanism, exactly the same division of responsibility
+# `run_guardian_authority_shadow_tick`'s own caller in monitoring_loop.py
+# uses for `authority_shadow_enabled`, and it STAYS - the isolation suite
+# proves every real call site is gated. The internal early-return below is
+# defense in depth for this function specifically, because of what it is: a
+# WRITE path into `guardian_authority_heuristics`, the one table the live
+# decision core reads on every single real decision. Anything that reaches
+# this function by another route - a future loop, a maintenance script, a
+# REPL - would otherwise run the entire propose/validate/promote/demote
+# pipeline with the feature switched off. The flag is read defensively and
+# fails CLOSED: unreadable means off, and reading it can never raise into
+# the hosting trading tick.
 #
 # Same-tick propose -> validate behavior (deliberate choice, not an
 # accident): validate_pending_heuristic_candidates is called unconditionally
@@ -2135,7 +2143,24 @@ def run_godfather_self_improvement_tick(
     heuristic_candidates` (Task 5), and `track_and_demote_underperforming_
     heuristics` (Task 6) - each in its own try/except with its own
     `log_event` name, so a crash in any one step never prevents the
-    remaining steps from running this same tick. Never raises."""
+    remaining steps from running this same tick. Never raises.
+
+    Returns immediately, having done nothing at all, when
+    `settings.guardian.authority_enabled` is false - see the section above
+    for why this internal gate exists alongside (never instead of) the one at
+    the call site."""
+    # Defense in depth (2026-09-17 final-review fix wave, Task 7 gap). Read
+    # defensively and fail CLOSED: this function is a write path into the
+    # table the live decision core reads on every real decision, and the one
+    # thing a gate on that path must never do is raise inside the trading
+    # tick that hosts it - or default to ON when it cannot tell.
+    try:
+        authority_enabled = bool(settings.guardian.authority_enabled)
+    except Exception:
+        authority_enabled = False
+    if not authority_enabled:
+        return
+
     try:
         propose_candidate_heuristics(repo, runner, settings, run_id, now)
     except Exception as exc:
