@@ -1670,6 +1670,83 @@ def promote_validated_heuristic_candidates(repo: Repository, now: datetime) -> i
 _FORWARD_MIN_SAMPLE_SIZE = 15
 _FORWARD_ADVERSE_DEVIATION = 0.1
 
+# ---------------------------------------------------------------------------
+# I2 (final whole-branch review, 2026-09-17): the time-based "no forward
+# evidence" demotion path, and why a count-based canary alone is not enough.
+#
+# THE HOLE IT CLOSES: `_forward_pre_entry_veto_stats` builds its pool from
+# real CLOSED positions. A PRE_ENTRY_VETO heuristic strong enough to actually
+# veto prevents the position from ever being opened - so every entry it
+# successfully blocks is a position that never opens, never closes, and never
+# enters that pool. The better it works (or the more aggressively it is
+# wrong), the less evidence it generates about itself. Its forward sample
+# size can therefore never reach `_FORWARD_MIN_SAMPLE_SIZE`, and before this
+# fix it could never be demoted by ANY mechanism: the mirror image of the
+# TIGHTEN_SL track's own documented absorbing state, but on the half of the
+# family that acts on every single real entry decision.
+#
+# THE RULE: a promoted, not-yet-demoted `ga-llm:*` heuristic with EXACTLY
+# ZERO forward samples for `_FORWARD_MAX_SILENT_DAYS` days since its own
+# `promoted_at` is demoted on a "no evidence of continued value" basis. It
+# applies alongside - never instead of - the sample-size/adverse-deviation
+# rule above: a heuristic can be retired by either path.
+#
+# ZERO, not "below the floor", is a deliberate boundary. A heuristic with any
+# forward evidence at all, however little, is a MEASURABLE rule that simply
+# has not accumulated enough record yet, and is exactly what the existing
+# count-based canary governs; letting the time rule reach into that range
+# would demote on the evidence of one or two trades, which is the failure
+# mode the `intervention_applied` filter and the n>=15 floor were both added
+# to prevent. The two rules therefore partition the space (n == 0 vs. n > 0)
+# instead of overlapping in an untested way.
+#
+# WHY 14 DAYS: deliberately conservative in the direction this codebase
+# already frames every other threshold here (`_MIN_SAMPLE_SIZE`,
+# `_MAX_LIVE_TIGHTEN_SL_HEURISTICS`) - "demoting too eagerly costs a missed
+# opportunity that promotion can re-earn, while demoting too late costs real
+# capital".
+# - Both tracks generate evidence FAST when there is any to generate.
+#   Positions close within `max_position_hold_hours` (6h by default), so a
+#   veto condition describing a recurring entry pattern should see matching
+#   closed positions within days; a TIGHTEN_SL decision is re-evaluated every
+#   tick (60s). Two full weeks of literally nothing is not "early days", it
+#   is a rule nothing can be said about.
+# - It is not shorter, because a promoted rule deserves a real chance: a
+#   quiet market week, a narrow condition, or a paused bot must not retire
+#   the whole family on the first Monday.
+# - THE ACCEPTED COST, stated rather than glossed: a trading pause longer
+#   than the bar retires every live `ga-llm:*` heuristic. That is the safe
+#   direction (a demoted heuristic contributes exactly 0.0 and a fresh
+#   candidate can re-earn the same pattern), and it is the only available
+#   direction - from inside this pipeline, "successfully preventing losses"
+#   and "silently acting on a pattern that no longer exists" are the SAME
+#   observation: no evidence.
+# ---------------------------------------------------------------------------
+_FORWARD_MAX_SILENT_DAYS = 14
+
+
+def _days_since_promotion(promoted_at: str, now: datetime) -> float | None:
+    """Days elapsed between the ISO-8601 `promoted_at` string this table
+    stores and `now`, or None when that cannot be measured (an unparseable
+    timestamp). None means "no measurable silence", and the caller then does
+    NOT demote - demoting on an unmeasurable record is the one thing this
+    step must not do, the same stance as its existing `not promoted_at` skip.
+
+    A naive/aware mismatch is normalized to UTC rather than raised on:
+    production always writes tz-aware timestamps, but a caller passing a
+    naive `now` must not be able to turn a housekeeping step into an
+    exception inside the trading tick."""
+    try:
+        promoted = datetime.fromisoformat(promoted_at)
+    except (TypeError, ValueError):
+        return None
+    if (promoted.tzinfo is None) != (now.tzinfo is None):
+        if promoted.tzinfo is None:
+            promoted = promoted.replace(tzinfo=now.tzinfo)
+        else:
+            now = now.replace(tzinfo=promoted.tzinfo)
+    return (now - promoted).total_seconds() / 86400.0
+
 
 def _outcome_stats(outcomes: list[bool]) -> tuple[int, float]:
     """`(sample_size, correct_rate)` - the same plain count/ratio tally
@@ -1731,11 +1808,19 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
     record on the track its `target_decision_type` names, and demotes it -
     `mark_guardian_authority_heuristic_candidate_demoted` FIRST, then the
     zeroing `upsert_guardian_authority_heuristic` (the order is binding; see
-    the Task 6 module section above) - when that record reaches
-    `_FORWARD_MIN_SAMPLE_SIZE` samples AND has deviated at least
-    `_FORWARD_ADVERSE_DEVIATION` from the 0.5 baseline in the direction
-    OPPOSITE to the heuristic's own stored adjustment (see the module section
-    for why the bar is sign-aware and not a flat correct_rate floor).
+    the Task 6 module section above) - on EITHER of two independent paths:
+
+    - the count-based canary: the forward record reaches
+      `_FORWARD_MIN_SAMPLE_SIZE` samples AND has deviated at least
+      `_FORWARD_ADVERSE_DEVIATION` from the 0.5 baseline in the direction
+      OPPOSITE to the heuristic's own stored adjustment (see the module
+      section for why the bar is sign-aware and not a flat correct_rate
+      floor);
+    - the time-based silence bar (I2): the forward record is still EMPTY
+      `_FORWARD_MAX_SILENT_DAYS` days after `promoted_at` - the only way a
+      successfully-vetoing PRE_ENTRY_VETO heuristic, which destroys its own
+      forward evidence by preventing the very positions that would produce
+      it, can ever be retired. See that constant's own section above.
 
     Returns the number of heuristics actually demoted by THIS call. A row
     some concurrent/earlier call already demoted is a structural no-op via
@@ -1810,9 +1895,6 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
                 resolved_decisions, heuristic_id, promoted_at
             )
 
-        if sample_size < _FORWARD_MIN_SAMPLE_SIZE:
-            continue
-
         # The forward evidence expressed in the heuristic's OWN direction:
         # positive means it agrees with what the rule predicted, negative
         # means the record has swung the other way. See the module section
@@ -1820,16 +1902,31 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
         promoted_adjustment = live_adjustments[heuristic_id]
         promoted_sign = 1 if promoted_adjustment > 0 else -1
         agreement = promoted_sign * (correct_rate - 0.5)
-        if agreement > -_FORWARD_ADVERSE_DEVIATION:
-            continue
 
-        reason = (
-            f"forward correct_rate {correct_rate:.4f} deviates "
-            f"{agreement:+.4f} in the direction of this heuristic's own "
-            f"adjustment {promoted_adjustment:+.4f} (bar: "
-            f"{-_FORWARD_ADVERSE_DEVIATION}) over n={sample_size} forward "
-            f"{target} samples since promoted_at={promoted_at}"
-        )
+        # Two independent demotion paths, partitioned by sample size so they
+        # can never overlap: n == 0 is the time-based "no evidence of
+        # continued value" rule (I2 - see its own section above), n > 0 is the
+        # original count-based canary. `reason` staying None means neither
+        # fired and the heuristic is left exactly as it was.
+        reason: str | None = None
+        if sample_size == 0:
+            silent_days = _days_since_promotion(promoted_at, now)
+            if silent_days is not None and silent_days >= _FORWARD_MAX_SILENT_DAYS:
+                reason = (
+                    f"no forward evidence: zero forward {target} samples in "
+                    f"{silent_days:.1f} days since promoted_at={promoted_at} "
+                    f"(bar: {_FORWARD_MAX_SILENT_DAYS} days)"
+                )
+        elif sample_size >= _FORWARD_MIN_SAMPLE_SIZE and agreement <= -_FORWARD_ADVERSE_DEVIATION:
+            reason = (
+                f"forward correct_rate {correct_rate:.4f} deviates "
+                f"{agreement:+.4f} in the direction of this heuristic's own "
+                f"adjustment {promoted_adjustment:+.4f} (bar: "
+                f"{-_FORWARD_ADVERSE_DEVIATION}) over n={sample_size} forward "
+                f"{target} samples since promoted_at={promoted_at}"
+            )
+        if reason is None:
+            continue
 
         # ORDER IS BINDING - mark first, zero second. See the module section
         # above for the interleaving this closes.

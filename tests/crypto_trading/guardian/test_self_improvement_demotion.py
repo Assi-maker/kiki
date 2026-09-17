@@ -28,6 +28,8 @@ import pytest
 
 from crypto_trading.guardian.authority import evaluate_heuristics
 from crypto_trading.guardian.self_improvement import (
+    _FORWARD_MAX_SILENT_DAYS,
+    _days_since_promotion,
     promote_validated_heuristic_candidates,
     track_and_demote_underperforming_heuristics,
 )
@@ -828,3 +830,141 @@ def test_the_reverse_write_order_would_have_resurrected_the_demoted_heuristic(tm
     _seed_second_validated_candidate(repo, "cand-3")
     promote_validated_heuristic_candidates(repo, _NOW + timedelta(days=1))
     assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == pytest.approx(0.4)
+
+
+# --------------------------------------------------------------------------
+# I2 (final whole-branch review, 2026-09-17): the time-based "no forward
+# evidence" demotion path.
+#
+# A PRE_ENTRY_VETO heuristic strong enough to actually veto DESTROYS its own
+# forward evidence: every entry it correctly blocks is a position that never
+# opens, never closes, and therefore never enters
+# `_pre_entry_veto_evidence_pool`. Its forward sample size can never reach
+# `_FORWARD_MIN_SAMPLE_SIZE`, so before this fix it could never be demoted at
+# all - the mirror image of the TIGHTEN_SL track's own absorbing state, and
+# the more dangerous of the two, since a veto rule acts on every real entry.
+#
+# The fix is symmetric in spirit to the canary sample-size floor but measured
+# in TIME: a promoted heuristic with ZERO forward samples for longer than
+# `_FORWARD_MAX_SILENT_DAYS` is demoted on a "no evidence of continued value"
+# basis. It applies to BOTH tracks, and only when the forward sample is
+# exactly zero - a heuristic with any forward evidence at all, however little,
+# is governed by the existing sample-size/adverse-deviation rule instead.
+# --------------------------------------------------------------------------
+_PAST_THE_SILENCE_BAR = _PROMOTED_AT + timedelta(days=_FORWARD_MAX_SILENT_DAYS, minutes=1)
+_JUST_INSIDE_THE_SILENCE_BAR = _PROMOTED_AT + timedelta(days=_FORWARD_MAX_SILENT_DAYS, minutes=-1)
+
+
+def test_a_promoted_veto_heuristic_with_zero_forward_samples_is_demoted_after_the_silence_bar(
+    tmp_path,
+):
+    """The I2 case exactly: a veto rule that has been live past the bar with
+    not one matching closed position to show for it. Whether that is because
+    it is successfully blocking every such entry or because its condition
+    describes nothing that happens any more is UNKNOWABLE from here - and
+    that is the point. An un-measurable rule acting on real capital is
+    retired, and can be re-earned by a fresh candidate if the pattern is
+    real."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(
+        repo, "veto-1", condition=_VETO_CONDITION, target_decision_type="PRE_ENTRY_VETO"
+    )
+
+    assert track_and_demote_underperforming_heuristics(repo, _PAST_THE_SILENCE_BAR) == 1
+
+    row = _heuristics_by_id(repo)[heuristic_id]
+    assert row["adjustment"] == 0.0
+    assert row["confidence"] == 0.0
+    assert row["sample_size"] == 0
+    candidate = repo.get_guardian_authority_heuristic_candidate("veto-1")
+    assert candidate["demoted_at"] == _PAST_THE_SILENCE_BAR.isoformat()
+    assert "no forward evidence" in candidate["demotion_reason"]
+    assert str(_FORWARD_MAX_SILENT_DAYS) in candidate["demotion_reason"]
+
+    # Genuinely silent for the real decision core afterwards.
+    score, matched_ids = evaluate_heuristics(
+        {"trigger_reasons": ["momentum_breakout"]}, repo.find_guardian_authority_heuristics()
+    )
+    assert matched_ids == [heuristic_id]
+    assert score == 0.0
+
+
+def test_a_promoted_tighten_sl_heuristic_with_zero_forward_samples_is_demoted_too(tmp_path):
+    """The same path on the other track - the TIGHTEN_SL member diluted below
+    `authority_tighten_threshold` that can never fire again is the mirror
+    case, and gets the same release valve."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(repo, "cand-1", condition=_STATE_CONDITION)
+
+    assert track_and_demote_underperforming_heuristics(repo, _PAST_THE_SILENCE_BAR) == 1
+    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == 0.0
+    assert "TIGHTEN_SL" in (
+        repo.get_guardian_authority_heuristic_candidate("cand-1")["demotion_reason"]
+    )
+
+
+def test_zero_forward_samples_within_the_silence_bar_is_untouched(tmp_path):
+    """One minute on the safe side of the bar: nothing happens at all. The
+    bar is deliberately generous - a young heuristic must be given a real
+    chance to accumulate evidence before it is judged for not having any."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(
+        repo, "veto-1", condition=_VETO_CONDITION, target_decision_type="PRE_ENTRY_VETO"
+    )
+    before = _heuristics_by_id(repo)[heuristic_id]
+
+    assert track_and_demote_underperforming_heuristics(repo, _JUST_INSIDE_THE_SILENCE_BAR) == 0
+    assert _heuristics_by_id(repo)[heuristic_id] == before
+    assert repo.get_guardian_authority_heuristic_candidate("veto-1")["demoted_at"] is None
+
+
+def test_a_nonzero_forward_sample_is_never_subject_to_the_time_based_rule(tmp_path):
+    """The precise boundary between the two rules, so they cannot silently
+    overlap: ONE single forward sample - far below `_FORWARD_MIN_SAMPLE_SIZE`,
+    and adverse (a veto that would have been wrong) - is enough to take this
+    heuristic out of the time-based rule's scope entirely, no matter how long
+    it has been live. It is then governed by the sample-size rule, which its
+    n=1 record does not clear, so it survives. Without the `sample_size == 0`
+    restriction this fixture would demote on a single trade."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(
+        repo, "veto-1", condition=_VETO_CONDITION, target_decision_type="PRE_ENTRY_VETO"
+    )
+    before = _heuristics_by_id(repo)[heuristic_id]
+    _seed_closed_position(repo, "fwd-0000", _PROMOTED_AT + timedelta(minutes=1), _WIN_EXIT)
+
+    # Ten times the silence bar, and still untouched.
+    much_later = _PROMOTED_AT + timedelta(days=_FORWARD_MAX_SILENT_DAYS * 10)
+    assert track_and_demote_underperforming_heuristics(repo, much_later) == 0
+    assert _heuristics_by_id(repo)[heuristic_id] == before
+    assert repo.get_guardian_authority_heuristic_candidate("veto-1")["demoted_at"] is None
+
+
+def test_the_time_based_rule_reads_only_forward_samples(tmp_path):
+    """Pre-promotion evidence does not count as "evidence of continued
+    value": 20 matching positions closed BEFORE promotion leave the forward
+    sample at zero, so the silence bar still fires."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_promoted_heuristic(
+        repo, "veto-1", condition=_VETO_CONDITION, target_decision_type="PRE_ENTRY_VETO"
+    )
+    for index in range(20):
+        _seed_closed_position(
+            repo, f"past-{index:04d}", _BEFORE + timedelta(minutes=index), _LOSS_EXIT
+        )
+
+    assert track_and_demote_underperforming_heuristics(repo, _PAST_THE_SILENCE_BAR) == 1
+    assert _heuristics_by_id(repo)[heuristic_id]["adjustment"] == 0.0
+
+
+def test_an_unparseable_promoted_at_never_triggers_the_time_based_rule(tmp_path):
+    """Defensive: the silence bar is computed from `now - promoted_at`, and a
+    promoted_at this function cannot parse gives no measurable silence at all.
+    Demoting on an unmeasurable record is the one thing this step must not do
+    (the same stance as the existing `not promoted_at` skip)."""
+    assert _days_since_promotion("not a timestamp", _PAST_THE_SILENCE_BAR) is None
+    assert _days_since_promotion("", _PAST_THE_SILENCE_BAR) is None
+    # ...and a real one is measured, in days, both timestamps being the
+    # tz-aware ISO-8601 strings this pipeline actually writes.
+    measured = _days_since_promotion(_PROMOTED_AT.isoformat(), _PAST_THE_SILENCE_BAR)
+    assert measured == pytest.approx(_FORWARD_MAX_SILENT_DAYS + 1 / (24 * 60))
