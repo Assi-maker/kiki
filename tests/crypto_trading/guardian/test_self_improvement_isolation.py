@@ -1275,17 +1275,27 @@ def test_matched_heuristic_ids_json_read_sites_are_limited_to_forward_tracking()
 
 
 # ---------------------------------------------------------------------------
-# Item 6: authority_enabled still defaults false in both crypto_trading/
-# config/guardian.yaml and the settings loader (GuardianConfig). This test
-# suite is written and must pass BEFORE Task 9 flips the flag - a real
-# pre-activation gate, not written after the fact.
+# Item 6 (pre-activation gate, 2026-09-15 to 2026-09-17): this suite was
+# written and passed BEFORE Task 9 flipped authority_enabled, proving the
+# whole pipeline really was inert until that specific, deliberate commit.
+# ACTIVATED 2026-09-17 - see guardian.yaml's own activation comment for the
+# full grep/AST-provable safety guarantees restated at that commit. The
+# bare Pydantic default (GuardianConfig.authority_enabled) still correctly
+# defaults False - only this deployment's own guardian.yaml now overrides
+# it - so test_authority_enabled_defaults_false_in_settings_loader below is
+# unchanged and still green; the other two are inverted to their
+# now-permanent post-activation state.
 # ---------------------------------------------------------------------------
 
 
-def test_authority_enabled_defaults_false_in_guardian_yaml():
+def test_authority_enabled_is_activated_in_guardian_yaml():
+    """Inverted 2026-09-17 (was test_authority_enabled_defaults_false_in_
+    guardian_yaml, the pre-activation gate - see the section comment above).
+    Guards against a future accidental revert: the running guardian.yaml
+    must keep saying `true`, not silently drift back to inert."""
     with (REPO_ROOT / "crypto_trading/config/guardian.yaml").open(encoding="utf-8") as f:
         raw = yaml.safe_load(f)
-    assert raw["authority_enabled"] is False
+    assert raw["authority_enabled"] is True
 
 
 def test_authority_enabled_defaults_false_in_settings_loader():
@@ -1294,15 +1304,17 @@ def test_authority_enabled_defaults_false_in_settings_loader():
     assert GuardianConfig().authority_enabled is False
 
 
-def test_authority_enabled_defaults_false_via_get_settings():
-    """Broader corroboration of the test above: the field as actually
-    resolved through the real settings-loading path (`get_settings`), not
-    just the bare model default - catching a hypothetical guardian.yaml
-    override that flips the flag on disk while the bare Pydantic default
-    stays False."""
+def test_authority_enabled_is_activated_via_get_settings():
+    """Inverted 2026-09-17 (was test_authority_enabled_defaults_false_via_
+    get_settings). Broader corroboration of the test above: the field as
+    actually resolved through the real settings-loading path
+    (`get_settings`), not just the raw YAML - catching a hypothetical
+    loader-layer regression that silently ignores or overrides the YAML's
+    now-activated value while the file on disk still correctly says
+    `true`."""
     from crypto_trading.config.loader import get_settings
 
-    assert get_settings().guardian.authority_enabled is False
+    assert get_settings().guardian.authority_enabled is True
 
 
 _SELF_IMPROVEMENT_TICK_FN = "run_godfather_self_improvement_tick"

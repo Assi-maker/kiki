@@ -44,15 +44,41 @@ assisted_exit_enabled: true
 # authority_enabled: master switch for BOTH integration points (the
 # pre-entry veto hook in guardian/authority.py::
 # maybe_open_position_for_candidate AND the tick-time TIGHTEN_SL/
-# CLOSE_EARLY decision in guardian/tick.py::process_one_position). False
-# here (same "ships inert" discipline as assisted_exit_enabled's own
-# original 2026-09-05 default) - activation is a separate, later, explicit
-# decision, never made within this plan itself.
+# CLOSE_EARLY decision in guardian/tick.py::process_one_position).
 # authority_veto_threshold / authority_tighten_threshold /
 # authority_close_threshold: see config/loader.py::GuardianConfig's own
 # docstring comments for the full reasoning behind each threshold's exact
 # magnitude - not repeated here.
-authority_enabled: false
+#
+# ACTIVATED 2026-09-17 (docs/superpowers/plans/
+# 2026-09-15-guardian-authority-live-autonomy.md, Task 9) after all 8 code
+# tasks + a final whole-branch review that found and required fixing one
+# proven Critical defect (an LLM-proposed empty condition could escape its
+# validated evidence pool and fire on the OTHER decision type in
+# production) plus four Important cross-task issues - all fixed and
+# independently re-derived as correct by a second, scoped re-review before
+# this activation. This makes GODFATHER's real interventions live on BOTH
+# PAPER and LIVE (explicit user choice, no separate PAPER-only proving
+# stage). The following remain true regardless, grep/AST-provable against
+# the live source at activation time:
+#   - The pure decision core (evaluate_heuristics, decide_pre_entry,
+#     decide_open_position, heuristic_condition_matches,
+#     _compute_proposed_new_sl, _groups_for_factors) is byte-identical to
+#     before this whole plan - the self-improvement pipeline only ever
+#     reuses it, never modifies it.
+#   - upsert_guardian_authority_heuristic (the only write path into the
+#     real heuristics table this decision core reads) has exactly 4 call
+#     sites in the whole codebase: the original self-critique, the
+#     self-improvement pipeline's promotion step, its demotion step, and
+#     its crashed-promotion orphan-reconciliation step - no other writer
+#     anywhere.
+#   - No code this plan added calls set_leverage or imports
+#     position_sizing.py; gate/, screening/, position_opening.py,
+#     risk_limits.yaml, and live_execution.yaml's hard limits (leverage,
+#     margin, max_concurrent_positions) all have zero diff across the
+#     whole plan - never touched, never able to be touched by anything
+#     GODFATHER's self-authored heuristics can write.
+authority_enabled: true
 authority_veto_threshold: "0.3"
 authority_tighten_threshold: "0.15"
 authority_close_threshold: "0.45"

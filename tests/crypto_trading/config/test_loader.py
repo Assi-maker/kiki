@@ -258,21 +258,31 @@ def test_get_settings_loads_guardian_assisted_exit_activated():
 
 
 def test_get_settings_loads_guardian_authority_enabled_default_false():
-    """Guardian Authority pre-entry veto (2026-09-14, docs/superpowers/
-    plans/2026-09-14-guardian-authority.md Task 6): this flag is pulled
-    forward from Task 10 (which is the plan's own designated owner of the
-    full config surface - authority_enabled/veto_threshold/tighten_threshold/
-    close_threshold, plus guardian.yaml documentation and the production-
-    isolation tests) because Task 6's wrapper (guardian/authority.py::
-    maybe_open_position_for_candidate) has a hard runtime dependency on
-    settings.guardian.authority_enabled existing NOW, not later. Only the
-    two fields Task 6 actually reads are added here; Task 10 still owns
-    authority_tighten_threshold/authority_close_threshold and the isolation
-    tests. Must default to False - landing Task 6 changes zero runtime
-    behavior until a later, separate, explicit activation decision."""
+    """The bare Pydantic default (GuardianConfig.authority_enabled) must stay
+    False - any environment/test without this deployment's own guardian.yaml
+    override ships inert, same "ships inert" discipline as every other
+    Guardian flag in this codebase. This is a code-level guarantee, not a
+    statement about this deployment's actual running config - see
+    test_get_settings_loads_guardian_authority_enabled_is_activated below
+    for that."""
+    from crypto_trading.config.loader import GuardianConfig
+
+    assert GuardianConfig().authority_enabled is False
+    assert isinstance(get_settings().guardian.authority_veto_threshold, float)
+
+
+def test_get_settings_loads_guardian_authority_enabled_is_activated():
+    """ACTIVATED 2026-09-17 (docs/superpowers/plans/
+    2026-09-15-guardian-authority-live-autonomy.md, Task 9) after the final
+    whole-branch review's findings were fixed and independently re-verified
+    clean - see guardian.yaml's own activation comment for the full
+    grep/AST-provable guarantees restated at that commit. This is the one
+    test in this file that reads the real, running guardian.yaml (not the
+    bare Pydantic default checked above) and must go GREEN only because that
+    specific file's authority_enabled line was deliberately flipped, not
+    because the code-level default changed."""
     settings = get_settings()
-    assert settings.guardian.authority_enabled is False
-    assert isinstance(settings.guardian.authority_veto_threshold, float)
+    assert settings.guardian.authority_enabled is True
 
 
 def test_get_settings_loads_guardian_authority_tighten_close_thresholds_defaults():
@@ -292,35 +302,35 @@ def test_get_settings_loads_guardian_authority_tighten_close_thresholds_defaults
     assert guardian_cfg.authority_close_threshold > guardian_cfg.authority_tighten_threshold
 
 
-def test_get_settings_loads_guardian_authority_yaml_documentation_byte_identical():
-    """Task 10: config/guardian.yaml now carries explicit entries for all
-    four authority_* fields (authority_enabled/veto_threshold/
-    tighten_threshold/close_threshold) - previously undocumented there,
-    existing only as Pydantic defaults on GuardianConfig (Tasks 6/7). The
-    values written to the YAML are DELIBERATELY the exact same values
-    already in effect as Pydantic defaults - this is a documentation-only
-    change, and this test is the explicit byte-identical-behavior proof:
-    loading the real, running guardian.yaml must produce EXACTLY the same
-    GuardianConfig values as the bare Pydantic defaults (GuardianConfig's
-    own field declarations in config/loader.py), not just "close enough"
-    or "the right type" (already covered by the two tests directly above -
-    this one pins the exact numbers)."""
+def test_get_settings_loads_guardian_authority_yaml_thresholds_byte_identical():
+    """Task 10 originally documented all four authority_* fields in
+    guardian.yaml with values DELIBERATELY identical to the Pydantic
+    defaults (a documentation-only change). The three threshold fields are
+    still exactly that - untouched by the 2026-09-17 activation, which only
+    ever changed authority_enabled itself (see
+    test_get_settings_loads_guardian_authority_enabled_is_activated and
+    guardian.yaml's own activation comment). This test now pins only the
+    thresholds' continued byte-identity to the bare Pydantic defaults;
+    authority_enabled is deliberately NOT compared here, since the whole
+    point of activation is that the YAML value and the bare code default no
+    longer agree."""
     settings = get_settings()
     guardian_cfg = settings.guardian
-    assert guardian_cfg.authority_enabled is False
     assert guardian_cfg.authority_veto_threshold == 0.3
     assert guardian_cfg.authority_tighten_threshold == 0.15
     assert guardian_cfg.authority_close_threshold == 0.45
     # Cross-check directly against the Pydantic model's own bare defaults
-    # (no YAML involved at all) - the two must be identical, proving the
-    # new YAML entries genuinely changed nothing about the resulting config.
+    # (no YAML involved at all) - the thresholds must still be identical,
+    # proving the YAML's threshold entries genuinely changed nothing.
     from crypto_trading.config.loader import GuardianConfig
 
     bare_defaults = GuardianConfig()
-    assert guardian_cfg.authority_enabled == bare_defaults.authority_enabled
     assert guardian_cfg.authority_veto_threshold == bare_defaults.authority_veto_threshold
     assert guardian_cfg.authority_tighten_threshold == bare_defaults.authority_tighten_threshold
     assert guardian_cfg.authority_close_threshold == bare_defaults.authority_close_threshold
+    # The one field that now deliberately diverges from the bare default:
+    assert guardian_cfg.authority_enabled is True
+    assert bare_defaults.authority_enabled is False
 
 
 def test_get_settings_loads_guardian_authority_shadow_enabled_default_false():
