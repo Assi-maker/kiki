@@ -309,6 +309,27 @@ class DashboardConfig(BaseModel):
     port: int = Field(gt=0, le=65535)
 
 
+class GodfatherConfig(BaseModel):
+    """GODFATHER's strategy-layer self-improvement (2026-09-18 expansion,
+    beyond Guardian Authority's own safety-kernel-adjacent self-improvement
+    in GuardianConfig above). Deliberately a SEPARATE top-level config
+    section, not a field on GuardianConfig: this is explicitly the part of
+    GODFATHER that sits ABOVE the structurally isolated safety kernel (see
+    crypto_trading/godfather/priority_boost.py's own module docstring), and
+    the user's own explicit requirement is that it stay independently
+    controllable from Guardian's authority_enabled - flipping one must never
+    imply or require flipping the other.
+
+    priority_boost_enabled: master switch for the priority-boost
+    scoring/ranking overlay (crypto_trading/godfather/priority_boost.py +
+    its one read call site in screening/candidate_engine.py::
+    prioritize_and_apply_budget). Defaults to False - ships inert, same
+    "activation is a separate, later, explicit decision" discipline every
+    other flag in this file uses."""
+
+    priority_boost_enabled: bool = False
+
+
 class Settings(BaseModel):
     db_path: Path
     pipeline: PipelineConfig
@@ -323,6 +344,7 @@ class Settings(BaseModel):
     profit_protection_experiment: ProfitProtectionExperimentConfig = Field(
         default_factory=ProfitProtectionExperimentConfig
     )
+    godfather: GodfatherConfig = Field(default_factory=GodfatherConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -356,6 +378,7 @@ def get_settings() -> Settings:
         profit_protection_experiment=_load_yaml_model(
             _CONFIG_DIR / "profit_protection_experiment.yaml", ProfitProtectionExperimentConfig
         ),
+        godfather=_load_yaml_model(_CONFIG_DIR / "godfather.yaml", GodfatherConfig),
     )
 
 

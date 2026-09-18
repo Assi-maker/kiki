@@ -395,3 +395,18 @@ def test_get_settings_loads_live_profit_protection_defaults():
     settings = get_settings()
     assert settings.live_execution.profit_protection_enabled is False
     assert settings.live_execution.profit_protection_threshold_pct == Decimal("0.01")
+
+
+def test_get_settings_loads_godfather_priority_boost_enabled_default_false():
+    """GODFATHER priority-boost (2026-09-18 expansion): the bare Pydantic
+    default (GodfatherConfig.priority_boost_enabled) must stay False -
+    ships inert until a later, separate, explicit activation decision, same
+    discipline as every other flag in this file."""
+    from crypto_trading.config.loader import GodfatherConfig
+
+    assert GodfatherConfig().priority_boost_enabled is False
+
+
+def test_get_settings_loads_godfather_config_from_real_yaml():
+    settings = get_settings()
+    assert settings.godfather.priority_boost_enabled is False

@@ -609,6 +609,64 @@ CREATE TABLE IF NOT EXISTS guardian_authority_heuristic_candidates (
     demotion_reason TEXT,
     run_id TEXT NOT NULL
 );
+
+-- GODFATHER priority-boost scoring/ranking overlay (2026-09-18, GODFATHER
+-- expansion beyond Guardian Authority). Schema-IDENTICAL in shape to
+-- guardian_authority_heuristics above (same 7 columns, same "read fresh, in
+-- full, on every ranking call, never cached" discipline), but a DELIBERATELY,
+-- COMPLETELY SEPARATE table - the separation IS the safety property, the
+-- SAME pattern this file already uses for guardian_authority_shadow_
+-- heuristics above. These heuristics share their factor vocabulary
+-- (instrument/candidate_score/trigger_reasons, via the unmodified
+-- guardian/authority.py::_pre_entry_factors) with Guardian Authority's own
+-- PRE_ENTRY_VETO heuristics, so vocabulary disjointness cannot be what keeps
+-- them from cross-firing - table separation is what does: this table is
+-- READ ONLY by crypto_trading/screening/candidate_engine.py's ranking code
+-- (ONE new call site) and is NEVER read by guardian/authority.py's
+-- evaluate_heuristics call sites (decide_pre_entry/decide_open_position),
+-- and guardian_authority_heuristics is never read by anything in
+-- crypto_trading/godfather/ or candidate_engine.py. Adjustments here can
+-- therefore only ever affect candidate RANKING (which already-eligible
+-- candidates get analyzed first within the existing budget caps) - they can
+-- never veto an entry, tighten/remove a stop-loss, or touch anything Guardian
+-- Authority's own decision core reads.
+CREATE TABLE IF NOT EXISTS godfather_priority_heuristics (
+    heuristic_id TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    condition_json TEXT NOT NULL,
+    adjustment REAL NOT NULL,
+    confidence REAL NOT NULL,
+    sample_size INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Candidate-proposal counterpart of godfather_priority_heuristics, schema-
+-- IDENTICAL in shape/status-lifecycle to guardian_authority_heuristic_
+-- candidates above (PROPOSED -> VALIDATED|REJECTED -> PROMOTED, +demoted_at/
+-- demotion_reason audit trail) but for this single, separate proposal
+-- family - no target_decision_type column is needed here (unlike the
+-- Guardian table, which serves three decision types), since every row in
+-- this table is proposed for exactly one purpose: ranking boost.
+CREATE TABLE IF NOT EXISTS godfather_priority_heuristic_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    proposed_at TEXT NOT NULL,
+    description TEXT NOT NULL,
+    condition_json TEXT NOT NULL,
+    proposed_adjustment REAL NOT NULL,
+    rationale TEXT NOT NULL,
+    status TEXT NOT NULL,
+    train_sample_size INTEGER,
+    train_correct_rate REAL,
+    test_sample_size INTEGER,
+    test_correct_rate REAL,
+    validated_at TEXT,
+    promoted_at TEXT,
+    promoted_heuristic_id TEXT,
+    rejected_reason TEXT,
+    demoted_at TEXT,
+    demotion_reason TEXT,
+    run_id TEXT NOT NULL
+);
 """
 
 

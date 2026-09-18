@@ -436,6 +436,58 @@ class Repository(Protocol):
         self, date_iso: str, updated_at: datetime
     ) -> None: ...
 
+    # --- GODFATHER priority-boost scoring/ranking overlay (2026-09-18) ---
+    # Deliberately separate tables/methods from every guardian_authority_*
+    # declaration above - see storage/db.py's own comment on
+    # godfather_priority_heuristics for why the separation is the safety
+    # property here, not vocabulary disjointness.
+    def find_godfather_priority_heuristics(self) -> list[dict]: ...
+    def upsert_godfather_priority_heuristic(
+        self,
+        heuristic_id: str,
+        description: str,
+        condition_json: str,
+        adjustment: float,
+        confidence: float,
+        sample_size: int,
+        updated_at: datetime,
+    ) -> None: ...
+    def save_godfather_priority_heuristic_candidate(
+        self,
+        candidate_id: str,
+        description: str,
+        condition_json: str,
+        proposed_adjustment: float,
+        rationale: str,
+        run_id: str,
+        proposed_at: datetime,
+    ) -> bool: ...
+    def get_godfather_priority_heuristic_candidate(self, candidate_id: str) -> dict | None: ...
+    def find_proposed_godfather_priority_heuristic_candidates(self) -> list[dict]: ...
+    def find_validated_godfather_priority_heuristic_candidates(self) -> list[dict]: ...
+    def find_promoted_godfather_priority_heuristic_candidates(self) -> list[dict]: ...
+    def record_godfather_priority_heuristic_candidate_validation(
+        self,
+        candidate_id: str,
+        status: str,
+        train_sample_size: int,
+        train_correct_rate: float,
+        test_sample_size: int,
+        test_correct_rate: float,
+        validated_at: datetime,
+        rejected_reason: str | None = None,
+    ) -> bool: ...
+    def promote_godfather_priority_heuristic_candidate(
+        self, candidate_id: str, promoted_heuristic_id: str, promoted_at: datetime
+    ) -> bool: ...
+    def mark_godfather_priority_heuristic_candidate_demoted(
+        self, candidate_id: str, demoted_at: datetime, demotion_reason: str
+    ) -> bool: ...
+    def get_godfather_priority_strategist_last_proposed_date(self) -> str | None: ...
+    def set_godfather_priority_strategist_last_proposed_date(
+        self, date_iso: str, updated_at: datetime
+    ) -> None: ...
+
 
 class SQLiteRepository:
     def __init__(self, path: Path, busy_timeout_ms: int = 5000):
@@ -2644,6 +2696,175 @@ class SQLiteRepository:
         self._conn.execute(
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES "
             "('godfather_strategist_last_proposed_updated_at', ?)",
+            (updated_at.isoformat(),),
+        )
+        self._conn.commit()
+
+    # --- GODFATHER priority-boost scoring/ranking overlay (2026-09-18) ---
+    # Mechanical, byte-for-byte-shape mirrors of the guardian_authority_
+    # heuristic(_candidate) methods above, applied to the separate
+    # godfather_priority_* tables - see storage/db.py's own comment on
+    # godfather_priority_heuristics for why the separation (not vocabulary
+    # disjointness) is what keeps this family safe to share a factor
+    # vocabulary with Guardian Authority's PRE_ENTRY_VETO heuristics.
+
+    def find_godfather_priority_heuristics(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_priority_heuristics"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_godfather_priority_heuristic(
+        self,
+        heuristic_id: str,
+        description: str,
+        condition_json: str,
+        adjustment: float,
+        confidence: float,
+        sample_size: int,
+        updated_at: datetime,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO godfather_priority_heuristics "
+            "(heuristic_id, description, condition_json, adjustment, confidence, "
+            "sample_size, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (
+                heuristic_id,
+                description,
+                condition_json,
+                adjustment,
+                confidence,
+                sample_size,
+                updated_at.isoformat(),
+            ),
+        )
+        self._conn.commit()
+
+    def save_godfather_priority_heuristic_candidate(
+        self,
+        candidate_id: str,
+        description: str,
+        condition_json: str,
+        proposed_adjustment: float,
+        rationale: str,
+        run_id: str,
+        proposed_at: datetime,
+    ) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO godfather_priority_heuristic_candidates "
+            "(candidate_id, proposed_at, description, condition_json, "
+            "proposed_adjustment, rationale, status, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'PROPOSED', ?)",
+            (
+                candidate_id,
+                proposed_at.isoformat(),
+                description,
+                condition_json,
+                proposed_adjustment,
+                rationale,
+                run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_godfather_priority_heuristic_candidate(self, candidate_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM godfather_priority_heuristic_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_proposed_godfather_priority_heuristic_candidates(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_priority_heuristic_candidates WHERE status = 'PROPOSED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_validated_godfather_priority_heuristic_candidates(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_priority_heuristic_candidates WHERE status = 'VALIDATED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_promoted_godfather_priority_heuristic_candidates(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_priority_heuristic_candidates WHERE status = 'PROMOTED'"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def record_godfather_priority_heuristic_candidate_validation(
+        self,
+        candidate_id: str,
+        status: str,
+        train_sample_size: int,
+        train_correct_rate: float,
+        test_sample_size: int,
+        test_correct_rate: float,
+        validated_at: datetime,
+        rejected_reason: str | None = None,
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE godfather_priority_heuristic_candidates SET status = ?, "
+            "train_sample_size = ?, train_correct_rate = ?, test_sample_size = ?, "
+            "test_correct_rate = ?, validated_at = ?, rejected_reason = ? "
+            "WHERE candidate_id = ? AND status = 'PROPOSED'",
+            (
+                status,
+                train_sample_size,
+                train_correct_rate,
+                test_sample_size,
+                test_correct_rate,
+                validated_at.isoformat(),
+                rejected_reason,
+                candidate_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def promote_godfather_priority_heuristic_candidate(
+        self, candidate_id: str, promoted_heuristic_id: str, promoted_at: datetime
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE godfather_priority_heuristic_candidates SET status = 'PROMOTED', "
+            "promoted_heuristic_id = ?, promoted_at = ? "
+            "WHERE candidate_id = ? AND status = 'VALIDATED'",
+            (promoted_heuristic_id, promoted_at.isoformat(), candidate_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def mark_godfather_priority_heuristic_candidate_demoted(
+        self, candidate_id: str, demoted_at: datetime, demotion_reason: str
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE godfather_priority_heuristic_candidates SET demoted_at = ?, "
+            "demotion_reason = ? "
+            "WHERE candidate_id = ? AND status = 'PROMOTED' AND demoted_at IS NULL",
+            (demoted_at.isoformat(), demotion_reason, candidate_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_godfather_priority_strategist_last_proposed_date(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = "
+            "'godfather_priority_strategist_last_proposed_date'"
+        ).fetchone()
+        return row["value"] if row is not None else None
+
+    def set_godfather_priority_strategist_last_proposed_date(
+        self, date_iso: str, updated_at: datetime
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES "
+            "('godfather_priority_strategist_last_proposed_date', ?)",
+            (date_iso,),
+        )
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES "
+            "('godfather_priority_strategist_last_proposed_updated_at', ?)",
             (updated_at.isoformat(),),
         )
         self._conn.commit()

@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
+from crypto_trading.godfather.priority_boost import run_priority_boost_self_improvement_tick
 from crypto_trading.guardian.self_improvement import run_godfather_self_improvement_tick
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.market_snapshot import LiveMarketDataSource, build_live_snapshot
@@ -99,6 +100,21 @@ def run_discovery_tick(
     except Exception as exc:
         log_event(
             run_id, event="godfather_self_improvement_tick_failed",
+            error_type=type(exc).__name__, error=str(exc),
+        )
+    # GODFATHER priority-boost self-improvement (2026-09-18 expansion,
+    # crypto_trading/godfather/priority_boost.py) - its own, completely
+    # separate propose/validate/promote/demote pipeline, gated by its own
+    # settings.godfather.priority_boost_enabled flag (independent of
+    # settings.guardian.authority_enabled above - deliberately, see
+    # config/loader.py::GodfatherConfig's own docstring). Own try/except,
+    # same "one step's failure never blocks another concern's tick" rule
+    # as every other independent concern in this function.
+    try:
+        run_priority_boost_self_improvement_tick(repo, runner, settings, run_id, now)
+    except Exception as exc:
+        log_event(
+            run_id, event="godfather_priority_boost_tick_failed",
             error_type=type(exc).__name__, error=str(exc),
         )
     if live_connector is not None:

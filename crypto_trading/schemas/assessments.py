@@ -117,6 +117,54 @@ class ProposedHeuristic(BaseModel):
     target_decision_type: Literal["TIGHTEN_SL", "PRE_ENTRY_VETO", "TAKE_PROFIT"]
 
 
+class ProposedPriorityHeuristic(BaseModel):
+    """ONE candidate ranking-boost heuristic proposed by the GODFATHER
+    Priority Strategist role (2026-09-18 GODFATHER expansion - the PROPOSE
+    step of crypto_trading/godfather/priority_boost.py's own, separate
+    propose -> validate -> promote -> track/demote pipeline).
+
+    Deliberately NOT a `target_decision_type`-carrying sibling of
+    `ProposedHeuristic` above: this schema is single-purpose (every row
+    proposed through it is a priority-boost candidate, routed to
+    `godfather_priority_heuristic_candidates` - a table wholly separate from
+    `guardian_authority_heuristic_candidates`), so there is nothing to
+    declare a routing target for. `condition` uses the exact same matching
+    semantics as `ProposedHeuristic.condition` (see that field's own
+    docstring and `guardian/authority.py::heuristic_condition_matches`),
+    restricted to PRE_ENTRY_VETO's own vocabulary
+    (`instrument`/`candidate_score`/`trigger_reasons`, via the unmodified
+    `_pre_entry_factors`) - the two proposal families share this vocabulary
+    on purpose (this one asks "which patterns predict WINNING trades worth
+    ranking up", the mirror image of PRE_ENTRY_VETO's "which patterns
+    predict LOSING trades worth vetoing"), but they can never cross-fire on
+    each other because they are validated against different pools and
+    promoted into different, wholly separate live tables - see
+    `crypto_trading/godfather/priority_boost.py`'s module docstring for the
+    full safety reasoning.
+
+    `adjustment` mirrors `godfather_priority_heuristics.adjustment`: signed,
+    positive nudges ranking UP for candidates matching `condition`, negative
+    nudges it down. Carries ZERO effect on any real ranking while the row
+    sits in the candidates table - only promotion (separate, later, after
+    out-of-sample validation) ever copies a candidate into the live
+    `godfather_priority_heuristics` table."""
+
+    description: str
+    condition: dict
+    adjustment: float
+    rationale: str
+
+
+class GodfatherPriorityStrategistAssessment(AssessmentBase):
+    """Output of `.claude/agents/crypto-godfather-priority-strategist.md`.
+    An EMPTY `proposed_heuristics` list with `status="ok"` is a fully valid,
+    expected and often-correct answer ("the supplied history does not
+    support a confident winning pattern") - never treated as a failure by
+    `crypto_trading/godfather/priority_boost.py::propose_priority_candidates`."""
+
+    proposed_heuristics: list[ProposedPriorityHeuristic]
+
+
 class GodfatherStrategistAssessment(AssessmentBase):
     """Output of `.claude/agents/crypto-godfather-strategist.md`. An EMPTY
     `proposed_heuristics` list with `status="ok"` is a fully valid, expected

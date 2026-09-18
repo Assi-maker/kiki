@@ -5,6 +5,8 @@ from decimal import Decimal
 
 from crypto_trading.agents.loader import AgentDefinition
 from crypto_trading.agents.runner import AgentRunner
+from crypto_trading.config.loader import Settings
+from crypto_trading.guardian.authority import _pre_entry_factors, evaluate_heuristics
 from crypto_trading.logging import log_event
 from crypto_trading.schemas.assessments import OpportunityScreenAssessment
 from crypto_trading.schemas.candidate import Candidate
@@ -147,6 +149,25 @@ def process_evidence(
     return _persist_new_candidate(repo, evidence, discovery_run_id, created_at, reference_price)
 
 
+def _priority_boost_adjustment(candidate: Candidate, heuristics: list[dict]) -> float:
+    """GODFATHER priority-boost (2026-09-18 expansion): the summed
+    `godfather_priority_heuristics` score for this candidate's own
+    pre-entry evidence, via the UNMODIFIED `_pre_entry_factors`/
+    `evaluate_heuristics` Guardian Authority's PRE_ENTRY_VETO path already
+    uses - reused, not reimplemented. `heuristics` is read ONCE per
+    `prioritize_and_apply_budget` call (never per-candidate, never cached
+    across calls), mirroring Guardian's own "read heuristics fresh, in
+    full, at the start of every decision" discipline. Returns `0.0`
+    (a pure no-op additive term) when `heuristics` is empty - the state
+    this table starts in and stays in until `godfather.priority_boost_
+    enabled` is turned on AND at least one candidate has been proposed,
+    OOS-validated and promoted."""
+    if not heuristics:
+        return 0.0
+    score, _matched_ids = evaluate_heuristics(_pre_entry_factors(candidate), heuristics)
+    return score
+
+
 def prioritize_and_apply_budget(
     repo: Repository,
     candidates: list[Candidate],
@@ -154,16 +175,55 @@ def prioritize_and_apply_budget(
     max_candidates_per_discovery_run: int,
     evaluated_at: datetime,
     run_id: str,
+    settings: Settings | None = None,
 ) -> tuple[list[Candidate], list[Candidate]]:
     """SPEC §10: deterministisk prioriteringsordning (1) data quality - redan
     garanterat "ok" här (DATA_INVALID-candidates skickas aldrig in i denna
-    funktion), (2) candidate_score fallande, (3) likviditet fallande,
-    (4) färskhet (created_at fallande). Gör inga AI-anrop - candidates inom
-    budget lämnas i status CANDIDATE, redo för Phase 3 att plocka upp."""
+    funktion), (2) candidate_score (+ GODFATHER priority-boost, se nedan)
+    fallande, (3) likviditet fallande, (4) färskhet (created_at fallande).
+    Gör inga AI-anrop - candidates inom budget lämnas i status CANDIDATE,
+    redo för Phase 3 att plocka upp.
+
+    GODFATHER priority-boost (2026-09-18 expansion, optional `settings`
+    param - defaults to `None`, which is BYTE-IDENTICAL to this function's
+    behavior before this feature existed: no heuristics are read, the sort
+    key is exactly `-candidate_score` as before). When `settings` is given
+    and `settings.godfather.priority_boost_enabled` is true, each
+    candidate's transient ranking value becomes `candidate_score +
+    priority_adjustment`, where `priority_adjustment` comes from a
+    completely separate live table (`godfather_priority_heuristics`, read
+    via `repo.find_godfather_priority_heuristics()`) that Guardian
+    Authority's own decision core never reads.
+
+    Three things this can NEVER do, by construction: (a) it never mutates
+    `evidence_record.candidate_score` itself - that value stays exactly
+    what `evaluate_candidate()` computed, still the same value baked into
+    `compute_evidence_hash()`/the candidate idempotency key and still the
+    same value Guardian Authority's own PRE_ENTRY_VETO heuristics condition
+    on; only this function's OWN transient sort key is adjusted. (b) it
+    never reaches `eligibility_filter.py`/`quant_screener.py`'s hard
+    "worth_deeper_analysis" gate - every candidate passed in here already
+    independently qualified before this function ever saw it, and this
+    function can only reorder that already-qualified set, never create or
+    destroy a candidate. (c) it can only shift which already-eligible
+    candidates land inside vs. outside `max_candidates_per_discovery_run`
+    (and, downstream, `apply_opportunity_screening`'s own budgets) - every
+    later step (opportunity screening, the 7-agent analysis, the
+    deterministic Gate, Guardian Authority's own PRE_ENTRY_VETO) runs
+    completely unchanged on whatever candidates come out the other side."""
+    priority_heuristics: list[dict] = []
+    if settings is not None and settings.godfather.priority_boost_enabled:
+        priority_heuristics = repo.find_godfather_priority_heuristics()
+
+    def _ranking_score(c: Candidate) -> float:
+        return c.evidence_record.candidate_score + _priority_boost_adjustment(
+            c, priority_heuristics
+        )
+
     ranked = sorted(
         candidates,
         key=lambda c: (
-            -c.evidence_record.candidate_score,
+            -_ranking_score(c),
             -liquidity_by_instrument.get(c.instrument, Decimal("0")),
             -c.created_at.timestamp(),
         ),

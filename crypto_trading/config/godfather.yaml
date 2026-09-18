@@ -1,0 +1,11 @@
+# GODFATHER strategy-layer self-improvement (2026-09-18 expansion). This is
+# a SEPARATE config surface from guardian.yaml on purpose - see
+# config/loader.py::GodfatherConfig's own docstring: this is explicitly the
+# part of GODFATHER that sits ABOVE Guardian's structurally isolated safety
+# kernel, and must stay independently controllable from authority_enabled.
+#
+# priority_boost_enabled: master switch for the priority-boost scoring/
+# ranking overlay (crypto_trading/godfather/priority_boost.py). Ships
+# inert (False) - not yet activated. Activation is a separate, later,
+# explicit decision, same discipline as every guardian.yaml flag before it.
+priority_boost_enabled: false

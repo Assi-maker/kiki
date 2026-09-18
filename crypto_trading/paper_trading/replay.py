@@ -152,6 +152,7 @@ def run_single_cycle(
         settings.budget_limits.max_candidates_per_discovery_run,
         snapshot.simulated_now,
         run_id,
+        settings=settings,
     )
 
     if screener_runner is not None:
