@@ -949,7 +949,21 @@ def _take_profit_observation_context(
                     "eventual_exit_reason": position.exit_reason,
                 }
             )
-    return observations
+    # Bounded to _MAX_EVIDENCE_ROWS TOTAL (2026-09-18 production fix): the
+    # caller's own `positions` list is already windowed to at most
+    # _MAX_EVIDENCE_ROWS POSITIONS, but a position accumulates one
+    # guardian_observations row per tick for its entire open lifetime
+    # (guardian.check_interval_seconds, ~60s) - a handful of positions held
+    # for hours each already produces thousands of rows, and real
+    # production history hit over a MILLION prompt tokens this way (a live
+    # godfather_strategist_failed/"prompt is too long" 400 error, not a
+    # theoretical concern), permanently blocking every GODFATHER Strategist
+    # proposal call from ever succeeding again. Reuses the same
+    # _most_recent_rows this module's other context lists already apply -
+    # most-recent-150 BY OBSERVATION, not by position, so the LLM still sees
+    # the freshest real behavior regardless of how unevenly it's
+    # distributed across positions.
+    return _most_recent_rows(observations, "observed_at")
 
 
 # The TAKE_PROFIT vocabulary is fixed, unlike the other two lists above

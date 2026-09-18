@@ -26,7 +26,9 @@ import pytest
 
 from crypto_trading.guardian.authority import evaluate_heuristics
 from crypto_trading.guardian.self_improvement import (
+    _MAX_EVIDENCE_ROWS,
     _take_profit_evidence_pool,
+    _take_profit_observation_context,
     promote_validated_heuristic_candidates,
     track_and_demote_underperforming_heuristics,
     validate_pending_heuristic_candidates,
@@ -503,3 +505,33 @@ def test_a_promoted_take_profit_heuristic_with_zero_forward_evidence_is_demoted_
     assert row["adjustment"] == 0.0
     candidate = repo.get_guardian_authority_heuristic_candidate("tp-1")
     assert "no forward evidence" in candidate["demotion_reason"]
+
+
+def test_take_profit_observation_context_is_bounded_to_max_evidence_rows(tmp_path):
+    """Production bug found 2026-09-18 (real LIVE run, first tick):
+    `_take_profit_observation_context` windowed its input to
+    `_MAX_EVIDENCE_ROWS` real CLOSED POSITIONS, but appended one context
+    entry per real `guardian_observations` row on each of those positions -
+    unbounded per position (one row per Guardian tick for the position's
+    entire open lifetime). Real production history produced a
+    GODFATHER Strategist prompt of 1,177,577 tokens (model limit:
+    1,000,000), failing every proposal call with a hard 400 error, forever
+    - not a theoretical risk. A single position held across many ticks
+    must never alone blow the overall bound: the returned list must never
+    exceed `_MAX_EVIDENCE_ROWS` entries regardless of how many observations
+    any one position accumulated."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    many_observations = [
+        (_BEFORE + timedelta(minutes=i), 0.1, "1.0") for i in range(_MAX_EVIDENCE_ROWS * 5)
+    ]
+    _seed_closed_position_with_observations(
+        repo, "pos-1", _BEFORE + timedelta(days=1), Decimal("110"), many_observations
+    )
+
+    context = _take_profit_observation_context(repo, repo.find_closed_positions())
+
+    assert len(context) <= _MAX_EVIDENCE_ROWS
+    # And it's genuinely the MOST RECENT ones, not an arbitrary truncation.
+    observed_at_values = [entry["observed_at"] for entry in context]
+    assert observed_at_values == sorted(observed_at_values, reverse=True)
+    assert observed_at_values[0] == many_observations[-1][0].isoformat()
