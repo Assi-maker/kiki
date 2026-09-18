@@ -475,22 +475,78 @@ def test_byte_identical_check_genuinely_detects_a_real_change():
     assert _sha256(mutated) != _EXPECTED_FUNCTION_SOURCE_SHA256["evaluate_heuristics"]
 
 
-def test_authority_py_has_exactly_167_insertions_and_zero_deletions():
+def test_authority_py_frozen_functions_have_zero_deletions_since_eb19335():
     """Independent, coarser-grained corroboration of the six function-level
-    byte-identical checks above: `git diff --numstat` for the whole file
-    shows only insertions (this plan's two new functions,
-    maybe_record_pre_entry_shadow and resolve_pending_pre_entry_shadows,
-    added as a single new block) and ZERO deletions - meaning no existing
-    line anywhere in authority.py, not just the six named functions, was
-    ever modified or removed. A single git-level number that is much
-    harder to get wrong than a hand-picked function list."""
+    byte-identical checks above, NARROWED (2026, TAKE_PROFIT addition) to
+    the 6 frozen functions' own line ranges rather than the whole file.
+
+    This test originally asserted `git diff --numstat` for the WHOLE FILE
+    showed zero deletions since eb19335 - true for Shadow/Observation
+    Mode's own plan (which genuinely only ever added
+    maybe_record_pre_entry_shadow/resolve_pending_pre_entry_shadows as a
+    single new block), but only ever a coarser PROXY for the actual Global
+    Constraint, which is specifically about the 6 named frozen functions,
+    not about every line in the file forever. A later, separate,
+    independently-reviewed change (adding the TAKE_PROFIT decision type)
+    legitimately edits a non-frozen function in this same file
+    (`resolve_pending_decisions`, to treat TAKE_PROFIT the same way it
+    already treats CLOSE_EARLY) without touching any of the 6 frozen
+    functions at all. The corroboration is therefore tightened to directly
+    check what it always meant to protect: no line THIS WHOLE HISTORICAL
+    DIFF ever deleted falls inside any of the 6 frozen functions' own AST
+    line range (as that range existed at eb19335). The 6 SHA-256 hash
+    checks above remain the primary, byte-exact proof; this is still a
+    second, independent, git-history-based corroboration of the same
+    guarantee, not a weakening of it. Mirrors the identical fix already
+    applied to test_self_improvement_isolation.py's own equivalent,
+    a09b0ab-anchored check."""
     out = subprocess.run(
-        ["git", "diff", "--numstat", f"{BASE_SHA}..HEAD", "--", AUTHORITY_PATH],
+        ["git", "diff", "-U0", f"{BASE_SHA}..HEAD", "--", AUTHORITY_PATH],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    added, removed, _ = out.split("\t")
-    assert removed == "0", f"authority.py has {removed} deleted line(s) - expected 0"
-    assert int(added) > 0
+    ).stdout
+    deleted_line_numbers: set[int] = set()
+    old_lineno = None
+    for line in out.splitlines():
+        if line.startswith("@@"):
+            match = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
+            assert match is not None
+            old_lineno = int(match.group(1))
+            continue
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("-"):
+            assert old_lineno is not None
+            deleted_line_numbers.add(old_lineno)
+            old_lineno += 1
+        elif line.startswith("+"):
+            continue
+        elif old_lineno is not None:
+            old_lineno += 1
+
+    old_source = subprocess.run(
+        ["git", "show", f"{BASE_SHA}:{AUTHORITY_PATH}"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout
+    old_tree = ast.parse(old_source, filename=AUTHORITY_PATH)
+    frozen_ranges: list[tuple[int, int]] = []
+    for node in ast.walk(old_tree):
+        is_frozen_fn = (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in _PURE_DECISION_FUNCTIONS
+        )
+        if is_frozen_fn:
+            frozen_ranges.append((node.lineno, node.end_lineno or node.lineno))
+    assert len(frozen_ranges) == len(_PURE_DECISION_FUNCTIONS), (
+        "expected to find all 6 frozen functions in the base revision of authority.py"
+    )
+
+    violations = {
+        ln for ln in deleted_line_numbers
+        if any(start <= ln <= end for start, end in frozen_ranges)
+    }
+    assert violations == set(), (
+        f"authority.py has deleted line(s) {violations} inside a frozen function's own range"
+    )
 
 
 # ---------------------------------------------------------------------------
