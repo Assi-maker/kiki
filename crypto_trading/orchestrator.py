@@ -214,6 +214,7 @@ def run_discovery_cycle(
     run_id: str,
     news_connector: object | None = None,
     external_data_connector: object | None = None,
+    now: datetime | None = None,
 ) -> list[Candidate]:
     """Discovery-loop-wiring: (1) sveper föräldralösa UNDER_AI_ANALYSIS-
     candidates till ANALYSIS_INTERRUPTED (Fas 0:s sweep_interrupted_analyses,
@@ -235,8 +236,24 @@ def run_discovery_cycle(
     (aldrig REJECTED/NO_TRADE - §8.3) och en ANALYSIS_INTERRUPTED-candidate
     lämnas orörd för nästa cykel (aldrig BUDGET_LIMITED - den fick redan en
     delvis analys innan kraschen, se Beslut 2). En candidate som väl påbörjar
-    sin rollkedja avbryts aldrig i förtid av det dagliga taket (Beslut 3)."""
-    sweep_interrupted_analyses(repo, swept_at=datetime.now(UTC), run_id=run_id)
+    sin rollkedja avbryts aldrig i förtid av det dagliga taket (Beslut 3).
+
+    `now` (2026-09-18, bugfix found via a chronological historical-replay
+    exercise): additive, defaults to `None` - `None` falls back to
+    `datetime.now(UTC)`, byte-identical to this function's behavior before
+    this parameter existed, which is exactly correct for every existing
+    production/live caller (real wall-clock now genuinely IS "today" there).
+    Every production caller today still calls this without `now`. A
+    caller simulating time (e.g. a historical replay walking through many
+    simulated days within a few real minutes) can pass its own simulated
+    `now` so the daily AI-call/cost budget's day boundary - and the sweep/
+    transition timestamps below - are computed against SIMULATED time,
+    never real wall-clock: without this, every simulated day's AI calls
+    landed in the same real-wall-clock "today" bucket, permanently
+    saturating the daily cap after a few simulated days and silently
+    halting all further candidate analysis for the rest of the replay."""
+    effective_now = now if now is not None else datetime.now(UTC)
+    sweep_interrupted_analyses(repo, swept_at=effective_now, run_id=run_id)
 
     orchestrator = Orchestrator(
         repo=repo,
@@ -247,7 +264,7 @@ def run_discovery_cycle(
     )
     daily_cap = settings.budget_limits.max_ai_calls_per_day
     daily_cost_cap = settings.budget_limits.max_daily_ai_cost_usd
-    day_start = _utc_day_start(datetime.now(UTC))
+    day_start = _utc_day_start(effective_now)
     planned_calls_for_candidate = min(
         len(_ROLE_ORDER), settings.budget_limits.max_ai_calls_per_discovery_run
     )
@@ -298,19 +315,18 @@ def run_discovery_cycle(
         allowed, reason = can_transition(candidate.status, "UNDER_AI_ANALYSIS")
         if not allowed:
             raise AssertionError(f"illegal transition attempted: {reason}")
-        now = datetime.now(UTC)
         event = Event(
             event_id=f"CANDIDATE_TRANSITIONED:{candidate.candidate_id}:UNDER_AI_ANALYSIS",
             event_type="CANDIDATE_TRANSITIONED",
             aggregate_type="candidate",
             aggregate_id=candidate.candidate_id,
-            occurred_at=now,
+            occurred_at=effective_now,
             run_id=run_id,
             schema_version=1,
             payload={"from": candidate.status, "to": "UNDER_AI_ANALYSIS"},
         )
         repo.transition_candidate_with_event(
-            candidate.candidate_id, "UNDER_AI_ANALYSIS", now, event
+            candidate.candidate_id, "UNDER_AI_ANALYSIS", effective_now, event
         )
         candidate.status = "UNDER_AI_ANALYSIS"
         results.append(orchestrator.process_candidate(candidate, run_id))

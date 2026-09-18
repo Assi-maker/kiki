@@ -217,6 +217,97 @@ def test_daily_ai_call_cap_is_respected_across_two_separate_discovery_cycles(tmp
     assert "CONFIRMED" in statuses or "NO_TRADE" in statuses or "REJECTED" in statuses
 
 
+def test_daily_ai_call_cap_uses_the_injected_now_not_real_wall_clock(tmp_path):
+    """Bug found 2026-09-18 via a chronological historical-replay exercise:
+    run_discovery_cycle's daily AI-call budget gate computed
+    `day_start = _utc_day_start(datetime.now(UTC))` unconditionally - real
+    wall-clock time, never the caller's own simulated `now`/`evaluated_at`
+    (unlike the rest of this pipeline, e.g. quant_screener's `evaluated_at`
+    look-ahead filtering). Invisible in real production (where wall-clock
+    now always IS "today"), but in a multi-day historical replay executed
+    within a few real minutes, every simulated day's AI calls landed in the
+    SAME real-wall-clock "today" bucket, permanently saturating the daily
+    cap after the first few simulated days and silently halting all further
+    candidate analysis for the rest of the replay - a false, harness-visible
+    correctness bug, not a real trading-decision defect.
+
+    Proof: seed the daily cap's worth of AI_CALL_MADE events on one
+    SIMULATED day, then call run_discovery_cycle with an explicit `now` on
+    THAT SAME simulated day (which is a different calendar day from real
+    wall-clock `datetime.now(UTC)` at test-run time) for a fresh candidate.
+    If `now` is genuinely honored, the seeded events fall inside that day's
+    window and the candidate is BUDGET_LIMITED; if the old
+    always-real-wall-clock behavior were still in effect, `day_start` would
+    be real today, the seeded (simulated-day) events would fall OUTSIDE
+    `count_ai_calls_since(day_start)` entirely, and the candidate would
+    proceed uninterrupted - the wrong outcome for a day that is, from the
+    replay's own perspective, already fully saturated."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    settings = _settings(max_ai_calls_per_day=500)
+    simulated_day = datetime(2026, 8, 25, tzinfo=UTC)
+    simulated_now = datetime(2026, 8, 25, 23, 0, tzinfo=UTC)
+    for i in range(500):
+        repo.record_ai_call_event(
+            Event(
+                event_id=f"AI_CALL_MADE:seed-{i}:risk:run-seed",
+                event_type="AI_CALL_MADE",
+                aggregate_type="candidate",
+                aggregate_id=f"seed-{i}",
+                occurred_at=simulated_day,
+                run_id="run-seed",
+                schema_version=1,
+                payload={"role": "risk", "status": "ok", "cost_usd": "0"},
+            )
+        )
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
+
+    results = run_discovery_cycle(
+        repo=repo,
+        runner=MockAgentRunner(_happy_fixtures()),
+        settings=settings,
+        run_id="run-1",
+        now=simulated_now,
+    )
+
+    assert results[0].status == "BUDGET_LIMITED"
+    assert repo.get_candidate("c-1").status == "BUDGET_LIMITED"
+
+
+def test_daily_ai_call_cap_still_resets_on_a_later_injected_simulated_day(tmp_path):
+    """Sibling of the test above, proving the fix is a genuine day-boundary
+    fix and not an accidental permanent block: a candidate analyzed on the
+    NEXT simulated day (after the prior simulated day's cap was fully used)
+    must proceed normally - the whole point of a DAILY cap."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    settings = _settings(max_ai_calls_per_day=500)
+    day_one = datetime(2026, 8, 25, tzinfo=UTC)
+    day_two_now = datetime(2026, 8, 26, 9, 0, tzinfo=UTC)
+    for i in range(500):
+        repo.record_ai_call_event(
+            Event(
+                event_id=f"AI_CALL_MADE:seed-{i}:risk:run-seed",
+                event_type="AI_CALL_MADE",
+                aggregate_type="candidate",
+                aggregate_id=f"seed-{i}",
+                occurred_at=day_one,
+                run_id="run-seed",
+                schema_version=1,
+                payload={"role": "risk", "status": "ok", "cost_usd": "0"},
+            )
+        )
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
+
+    results = run_discovery_cycle(
+        repo=repo,
+        runner=MockAgentRunner(_happy_fixtures()),
+        settings=settings,
+        run_id="run-1",
+        now=day_two_now,
+    )
+
+    assert results[0].status == "CONFIRMED"
+
+
 def test_daily_ai_cost_cap_allows_analysis_when_well_under_budget(tmp_path):
     """Krav 3/4: en generös dollarbudget ska inte blockera normal analys."""
     repo = SQLiteRepository(tmp_path / "t.db")

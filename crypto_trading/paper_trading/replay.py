@@ -176,6 +176,7 @@ def run_single_cycle(
         run_id,
         news_connector=news_connector,
         external_data_connector=external_data_connector,
+        now=snapshot.simulated_now,
     )
 
     opened = _open_positions_for_confirmed_candidates(processed, snapshot, repo, settings, run_id)
