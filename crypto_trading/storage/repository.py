@@ -93,7 +93,12 @@ class Repository(Protocol):
         self, position_id: str, claimed_at: datetime, margin_usdt: str,
         notional_usdt: str, leverage: str,
     ) -> bool: ...
+    def claim_live_execution_if_symbol_free(
+        self, position_id: str, claimed_at: datetime, margin_usdt: str,
+        notional_usdt: str, leverage: str,
+    ) -> bool: ...
     def get_live_execution(self, position_id: str) -> dict | None: ...
+    def find_active_live_execution_for_instrument(self, instrument: str) -> dict | None: ...
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]: ...
     def get_candidate_confirmed_at(self, candidate_id: str) -> datetime | None: ...
     def find_active_live_executions(self) -> list[dict]: ...
@@ -898,9 +903,67 @@ class SQLiteRepository:
             self._conn.rollback()
             raise
 
+    def claim_live_execution_if_symbol_free(
+        self, position_id: str, claimed_at: datetime, margin_usdt: str,
+        notional_usdt: str, leverage: str,
+    ) -> bool:
+        """Entry-claim-only variant of claim_live_execution(), used
+        exclusively by process_pending_positions' own new-entry claim sites
+        - never by test fixtures or any other module setting up an ACTIVE
+        live position for unrelated purposes (Guardian Authority/PP tests
+        deliberately construct two independent same-instrument ACTIVE
+        positions; that fixture pattern must keep working, so the per-symbol
+        constraint lives here, not in the shared claim_live_execution()).
+        LIVE safety gate: max 1 active LIVE position per symbol. Same
+        statement-level atomicity as claim_live_execution()'s own
+        OPEN_POSITION race defense - an added NOT EXISTS clause refuses the
+        claim if any OTHER position on this instrument already has a
+        CLAIMED/ENTRY_SUBMITTED/ACTIVE live_executions row, so two
+        concurrent candidates for the same symbol can never both claim. This
+        covers only the local-state half of the gate; the exchange-state
+        half (a real position the local DB has no row for at all) lives in
+        live_execution.py's _has_active_live_position_for_symbol pre-check,
+        since this statement cannot make a network call."""
+        try:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO live_executions "
+                "(position_id, phase, margin_usdt, notional_usdt, leverage, "
+                "claimed_at, updated_at) "
+                "SELECT ?, 'CLAIMED', ?, ?, ?, ?, ? WHERE EXISTS ("
+                "SELECT 1 FROM positions WHERE position_id = ? AND status = 'OPEN_POSITION') "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM live_executions le JOIN positions p ON p.position_id = le.position_id "
+                "WHERE p.instrument = (SELECT instrument FROM positions WHERE position_id = ?) "
+                "AND le.phase IN ('CLAIMED', 'ENTRY_SUBMITTED', 'ACTIVE'))",
+                (
+                    position_id, margin_usdt, notional_usdt, leverage,
+                    claimed_at.isoformat(), claimed_at.isoformat(),
+                    position_id, position_id,
+                ),
+            )
+            claimed = cur.rowcount > 0
+            self._conn.commit()
+            return claimed
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def get_live_execution(self, position_id: str) -> dict | None:
         row = self._conn.execute(
             "SELECT * FROM live_executions WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_active_live_execution_for_instrument(self, instrument: str) -> dict | None:
+        """Local-state half of the per-symbol LIVE safety gate: the
+        existing CLAIMED/ENTRY_SUBMITTED/ACTIVE live_executions row (if any)
+        for this instrument, used both to decide and to log which position
+        already occupies the symbol. PAPER-only executions never appear
+        here - this only ever reads live_executions."""
+        row = self._conn.execute(
+            "SELECT le.* FROM live_executions le JOIN positions p ON p.position_id = le.position_id "
+            "WHERE p.instrument = ? AND le.phase IN ('CLAIMED', 'ENTRY_SUBMITTED', 'ACTIVE') LIMIT 1",
+            (instrument,),
         ).fetchone()
         return dict(row) if row is not None else None
 

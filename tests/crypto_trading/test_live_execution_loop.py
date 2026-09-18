@@ -31,10 +31,19 @@ class _SpyConnector:
         }
 
     def get_all_positions(self):
-        return [{"symbol": "BTC-USDT", "positionAmt": "0.002"}] if self._order_status == "FILLED" else []
+        # Gated on place_calls, not _order_status: the new per-symbol LIVE
+        # safety gate (live_execution.py's _has_active_live_position_for_
+        # symbol) queries the exchange BEFORE an entry is ever placed, and
+        # must see nothing there yet - only after place_entry_order_with_sl_
+        # tp has actually been called does a position exist to report.
+        if self.place_calls > 0 and self._order_status == "FILLED":
+            return [{"symbol": "BTC-USDT", "positionAmt": "0.002"}]
+        return []
 
     def get_position(self, symbol):
-        return {"symbol": symbol, "positionAmt": "0.002"} if self._order_status == "FILLED" else None
+        if self.place_calls > 0 and self._order_status == "FILLED":
+            return {"symbol": symbol, "positionAmt": "0.002"}
+        return None
 
     def get_balance(self):
         return {"availableMargin": "100.00"}

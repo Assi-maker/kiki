@@ -203,6 +203,114 @@ def test_process_pending_positions_claims_and_submits_when_capacity_available(tm
     assert row["notional_usdt"] == "100"
 
 
+def test_process_pending_positions_blocks_a_second_symbol_when_one_is_already_active(tmp_path):
+    """Per-symbol LIVE safety gate, scenario 1: pos-1 (BTC-USDT) is already
+    ACTIVE - a second pending BTC-USDT position must never be claimed or
+    submitted, even though account-wide capacity has room."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, position_id="pos-1")
+    repo.claim_live_execution("pos-1", _NOW, "10", "100", "10")
+    repo.update_live_execution_submitted(
+        "pos-1", "cid-1", "ex-1", "0.002", "50000", None, None, _NOW
+    )
+    _open_position(repo, position_id="pos-2")
+    connector = _SpyConnector(
+        balance="100.00",
+        # pos-1 must still look genuinely open on the exchange, or
+        # has_sufficient_live_capacity's own reconciliation pass would
+        # auto-close it as gone-flat before the symbol gate is even reached.
+        all_positions=[{"symbol": "BTC-USDT", "positionAmt": "0.002"}],
+    )
+    settings = get_settings()
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    assert repo.get_live_execution("pos-2") is None  # never even claimed
+    assert connector.calls == []  # never reached order placement
+
+
+def test_process_pending_positions_allows_the_only_pending_symbol(tmp_path):
+    """Scenario 2: no existing LIVE position on the symbol - the gate must
+    never block a legitimate first entry."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, position_id="pos-1")
+    connector = _SpyConnector(balance="100.00", all_positions=[])
+    settings = get_settings()
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    assert repo.get_live_execution("pos-1")["phase"] == "ACTIVE"
+
+
+def test_claim_live_execution_if_symbol_free_is_atomic_across_two_candidates(tmp_path):
+    """Scenario 3 (race-safety): two positions on the same instrument, both
+    otherwise eligible - claim_live_execution_if_symbol_free's own atomic
+    SQL guard (not application-level ordering) must ensure at most one ever
+    claims, regardless of call order. This is the exact method
+    process_pending_positions calls at its entry-claim sites, exercised
+    directly against the repository - the same layer the actual race is
+    defended at."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, position_id="pos-1")
+    _open_position(repo, position_id="pos-2")
+
+    first = repo.claim_live_execution_if_symbol_free("pos-1", _NOW, "10", "100", "10")
+    second = repo.claim_live_execution_if_symbol_free("pos-2", _NOW, "10", "100", "10")
+
+    assert first is True
+    assert second is False  # blocked - pos-1 (same instrument) already CLAIMED
+    assert repo.get_live_execution("pos-2") is None
+
+
+def test_process_pending_positions_allows_a_new_symbol_position_once_the_old_one_is_closed(tmp_path):
+    """Scenario 4: the previous LIVE position on this symbol is CLOSED (not
+    just gone flat on the exchange) - a new one must be allowed to open."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, position_id="pos-1")
+    repo.claim_live_execution("pos-1", _NOW, "10", "100", "10")
+    repo.update_live_execution_submitted(
+        "pos-1", "cid-1", "ex-1", "0.002", "50000", None, None, _NOW
+    )
+    repo.close_live_execution("pos-1", "TIME_LIMIT", "50100", _NOW)
+    _open_position(repo, position_id="pos-2")
+    connector = _SpyConnector(balance="100.00", all_positions=[])  # exchange also flat
+    settings = get_settings()
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    assert repo.get_live_execution("pos-2")["phase"] == "ACTIVE"
+
+
+def test_process_pending_positions_blocks_when_only_the_exchange_knows_about_the_position(tmp_path):
+    """Scenario 5: the real exchange already has a BTC-USDT position, but
+    the local DB has no live_executions row for it at all (e.g. a
+    reconciliation gap) - the exchange-state half of the gate must still
+    block a new entry on that symbol."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, position_id="pos-1")
+    connector = _SpyConnector(
+        balance="100.00", all_positions=[{"symbol": "BTC-USDT", "positionAmt": "0.002"}],
+    )
+    settings = get_settings()
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW,
+    )
+
+    assert repo.get_live_execution("pos-1") is None  # never claimed
+    assert connector.calls == []  # never reached order placement
+
+
 def _with_ttl(settings, ttl_seconds):
     return settings.model_copy(
         update={"live_execution": settings.live_execution.model_copy(

@@ -307,6 +307,51 @@ def _signal_is_fresh(
     return False
 
 
+def _has_active_live_position_for_symbol(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    instrument: str,
+    position_id: str,
+    run_id: str,
+) -> bool:
+    """LIVE-only safety gate: at most one active LIVE position per symbol,
+    independent of (and in addition to) has_sufficient_live_capacity's
+    account-wide count. Checks local LIVE state first (cheap, and gives a
+    concrete existing position_id to log), then the real exchange position
+    for this instrument - the exchange check is what still blocks a
+    duplicate even when the local DB has no record of the existing position
+    at all (e.g. a not-yet-reconciled gap). True race-safety between two
+    concurrent candidates for the same symbol comes from
+    claim_live_execution()'s own atomic SQL guard, not from this pre-check
+    alone - this function only produces the clear, early
+    live_duplicate_symbol_blocked log a bare failed claim wouldn't. PAPER is
+    untouched: this reads only live_executions/positions.instrument and the
+    LIVE exchange connector."""
+    existing = repo.find_active_live_execution_for_instrument(instrument)
+    if existing is not None and existing["position_id"] != position_id:
+        log_event(
+            run_id, event="live_duplicate_symbol_blocked", position_id=position_id,
+            instrument=instrument, existing_position_id=existing["position_id"],
+            existing_phase=existing["phase"], source="local_live_executions",
+        )
+        return True
+    try:
+        live_position = connector.get_position(instrument)
+    except _GUARDED_ERRORS as exc:
+        log_event(
+            run_id, event="live_duplicate_symbol_check_failed", position_id=position_id,
+            instrument=instrument, error_type=type(exc).__name__, error=str(exc),
+        )
+        return True  # fail-closed: never open a position when exchange state is unknown
+    if live_position is not None:
+        log_event(
+            run_id, event="live_duplicate_symbol_blocked", position_id=position_id,
+            instrument=instrument, existing_position_id=None, source="exchange",
+        )
+        return True
+    return False
+
+
 def process_pending_positions(
     repo: Repository,
     connector: BingXLiveTradingConnector,
@@ -333,6 +378,10 @@ def process_pending_positions(
             cfg.margin_per_trade_usdt + cfg.margin_safety_buffer_usdt, run_id, now,
         ):
             break  # stop trying more this tick; PAPER's leg is unaffected
+        if _has_active_live_position_for_symbol(
+            repo, connector, position.instrument, position.position_id, run_id,
+        ):
+            continue  # this symbol only - other pending positions (other symbols) still tried
         precision = quantity_precision_by_symbol.get(position.instrument, 0)
         quantity = _quantity_for_live(
             position.simulated_fill_entry, cfg.margin_per_trade_usdt, cfg.leverage, precision
@@ -340,7 +389,7 @@ def process_pending_positions(
         min_notional = min_notional_by_symbol.get(position.instrument, Decimal("0"))
         notional = quantity * position.simulated_fill_entry
         if quantity <= 0 or notional < min_notional:
-            if not repo.claim_live_execution(
+            if not repo.claim_live_execution_if_symbol_free(
                 position.position_id, now, str(cfg.margin_per_trade_usdt),
                 str(cfg.margin_per_trade_usdt * cfg.leverage), str(cfg.leverage),
             ):
@@ -351,7 +400,7 @@ def process_pending_positions(
                 instrument=position.instrument,
             )
             continue
-        if not repo.claim_live_execution(
+        if not repo.claim_live_execution_if_symbol_free(
             position.position_id, now, str(cfg.margin_per_trade_usdt),
             str(cfg.margin_per_trade_usdt * cfg.leverage), str(cfg.leverage),
         ):
