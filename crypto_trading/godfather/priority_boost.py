@@ -98,6 +98,13 @@ _STRATEGIST_AGENT_FILE = "crypto-godfather-priority-strategist.md"
 # row, mirroring self_improvement.py's own "ga-llm:*"/"ga-hc:*" convention.
 _LIVE_HEURISTIC_ID_PREFIX = "godfather-priority:"
 
+# Orphan reconciliation (see _reconcile_orphan_priority_heuristics below) has
+# no run_id of its own to log under - it is triggered by the STATE of a
+# table, not by a run. A fixed, greppable id is used instead of borrowing an
+# unrelated one, mirroring self_improvement.py's own
+# _ORPHAN_RECONCILIATION_RUN_ID for the identical Guardian Authority fix.
+_ORPHAN_RECONCILIATION_RUN_ID = "godfather-priority-orphan-reconciliation"
+
 
 def _priority_boost_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
     """`(closed_at, pre_entry_factors, would_boosting_have_been_correct)` for
@@ -432,6 +439,83 @@ def promote_validated_priority_candidates(repo: Repository, now: datetime) -> in
     return promoted
 
 
+def _zero_orphan_priority_heuristic(repo: Repository, row: dict, now: datetime) -> None:
+    """Silences one orphaned `godfather-priority:*` heuristic through the
+    same `upsert_godfather_priority_heuristic` every other write in this
+    pipeline uses. The row is preserved verbatim (same description,
+    condition, sample size) - only adjustment/confidence are zeroed, exactly
+    as a demotion does. Mirrors `self_improvement.py::_zero_orphan_llm_
+    heuristic` (Guardian Authority's own I4 fix)."""
+    repo.upsert_godfather_priority_heuristic(
+        heuristic_id=row["heuristic_id"],
+        description=row["description"],
+        condition_json=row["condition_json"],
+        adjustment=0.0,
+        confidence=0.0,
+        sample_size=int(row["sample_size"] or 0),
+        updated_at=now,
+    )
+
+
+def _reconcile_orphan_priority_heuristics(repo: Repository, now: datetime) -> int:
+    """Zeroes every live `godfather_priority_heuristics` row with no
+    PROMOTED candidate referencing it, and returns how many were silenced.
+
+    THE WINDOW this closes (identical in shape to Guardian Authority's own
+    I4 fix, `self_improvement.py::_reconcile_orphan_llm_heuristics`):
+    `promote_validated_priority_candidates` writes the real heuristic row
+    (`upsert_godfather_priority_heuristic`) BEFORE marking its candidate
+    PROMOTED - forced, since the candidate has to record the heuristic id
+    the write produced - and the two writes are separately committed. A
+    crash between them leaves a LIVE ranking heuristic whose candidate is
+    still VALIDATED: invisible to `_live_promoted_priority_candidates`,
+    therefore excluded from Cap B's divisor accounting AND from this
+    function's own demotion sweep below (which iterates candidates, not
+    heuristics) - it would keep nudging candidate ranking indefinitely,
+    unowned and unmeasurable.
+
+    Runs BEFORE this function's own `if not live: return 0` early return,
+    since an orphan's defining feature is that no live candidate points to
+    it - that early return would otherwise skip reconciliation entirely
+    whenever the interrupted promotion was this family's only member.
+
+    Every row in this table is written by this module's own
+    `_LIVE_HEURISTIC_ID_PREFIX` prefix (unlike Guardian Authority's table,
+    which also holds `ga-hc:state:*` self-critique rows with no candidate
+    BY DESIGN) - so no prefix filter is needed here, every row in this
+    table is candidate-owned or it is an orphan. An orphan already at
+    0.0/0.0 is left alone rather than rewritten and re-logged forever."""
+    owned = {
+        str(row["promoted_heuristic_id"] or "")
+        for row in repo.find_promoted_godfather_priority_heuristic_candidates()
+    }
+
+    zeroed = 0
+    for row in repo.find_godfather_priority_heuristics():
+        heuristic_id = str(row["heuristic_id"])
+        if heuristic_id in owned:
+            continue
+        if float(row["adjustment"]) == 0.0 and float(row["confidence"]) == 0.0:
+            continue
+        _zero_orphan_priority_heuristic(repo, row, now)
+        log_event(
+            _ORPHAN_RECONCILIATION_RUN_ID,
+            event="godfather_priority_orphan_heuristic_zeroed",
+            heuristic_id=heuristic_id,
+            previous_adjustment=float(row["adjustment"]),
+            previous_confidence=float(row["confidence"]),
+            reason=(
+                "live godfather_priority_heuristics row with no PROMOTED "
+                "candidate - a promotion that wrote the heuristic row but "
+                "never marked its candidate PROMOTED (crash/failure between "
+                "the two writes)"
+            ),
+        )
+        zeroed += 1
+
+    return zeroed
+
+
 def track_and_demote_underperforming_priority_heuristics(repo: Repository, now: datetime) -> int:
     """TRACK/DEMOTE step. Mirrors the PRE_ENTRY_VETO branch of
     `self_improvement.py::track_and_demote_underperforming_heuristics`
@@ -439,7 +523,11 @@ def track_and_demote_underperforming_priority_heuristics(repo: Repository, now: 
     same `_forward_pre_entry_veto_stats`/`_days_since_promotion` reuse),
     against `_priority_boost_evidence_pool` above instead of Guardian's own
     `_pre_entry_veto_evidence_pool`. Returns the number of heuristics
-    actually demoted by THIS call."""
+    actually demoted by THIS call (orphan reconciliations are not counted -
+    see `_reconcile_orphan_priority_heuristics`, a separate, distinctly
+    logged mechanism)."""
+    _reconcile_orphan_priority_heuristics(repo, now)
+
     live = _live_promoted_priority_candidates(repo)
     if not live:
         return 0

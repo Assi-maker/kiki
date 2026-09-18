@@ -11,6 +11,7 @@ positions + their real candidate records), just with the outcome comparison
 flipped (`pnl > 0` instead of `pnl <= 0`)."""
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -488,3 +489,118 @@ def test_full_propose_validate_promote_demote_round_trip(tmp_path):
     live = repo.find_godfather_priority_heuristics()
     assert len(live) == 1
     assert live[0]["adjustment"] > 0  # a genuine winning pattern promotes a positive nudge
+
+
+# --------------------------------------------------------------------------
+# Orphan reconciliation (mirrors Guardian Authority's own I4 fix -
+# self_improvement.py::_reconcile_orphan_llm_heuristics /
+# test_self_improvement_demotion.py's equivalent tests exactly, for the
+# identical crash window: promote_validated_priority_candidates writes the
+# real heuristic row BEFORE marking its candidate PROMOTED, so a crash
+# between the two writes leaves a live, unowned heuristic row).
+# --------------------------------------------------------------------------
+_ORPHAN_EVENT = "godfather_priority_orphan_heuristic_zeroed"
+_ORPHAN_CONDITION = {"trigger_reasons": ["momentum_breakout"]}
+
+
+def _seed_orphan_priority_heuristic(
+    repo, heuristic_id="godfather-priority:orphan-1", adjustment=0.4
+):
+    """Exactly what a crash between promotion's two writes leaves behind:
+    the real heuristic row, with no PROMOTED candidate referencing it."""
+    repo.upsert_godfather_priority_heuristic(
+        heuristic_id=heuristic_id,
+        description="an orphaned promotion",
+        condition_json=json.dumps(_ORPHAN_CONDITION),
+        adjustment=adjustment,
+        confidence=0.8,
+        sample_size=40,
+        updated_at=_BASE,
+    )
+    return heuristic_id
+
+
+def test_an_orphaned_priority_heuristic_is_zeroed_and_logged(tmp_path, caplog):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_orphan_priority_heuristic(repo)
+    assert repo.find_promoted_godfather_priority_heuristic_candidates() == []
+
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        # Not counted as a demotion: nothing was demoted, an unowned row was
+        # silenced.
+        assert track_and_demote_underperforming_priority_heuristics(repo, _NOW) == 0
+
+    row = {r["heuristic_id"]: r for r in repo.find_godfather_priority_heuristics()}[heuristic_id]
+    assert row["adjustment"] == 0.0
+    assert row["confidence"] == 0.0
+    assert row["updated_at"] == _NOW.isoformat()
+    assert _ORPHAN_EVENT in caplog.text
+    assert heuristic_id in caplog.text
+
+
+def test_a_normal_promoted_priority_heuristic_is_never_touched_by_reconciliation(tmp_path):
+    """The whole point: a row whose candidate really is PROMOTED is owned,
+    measurable and must keep its earned adjustment."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _validated_candidate(repo, "c-1", _ORPHAN_CONDITION, test_correct_rate=0.9)
+    promote_validated_priority_candidates(repo, _BASE)
+    before = repo.find_godfather_priority_heuristics()[0]
+
+    assert track_and_demote_underperforming_priority_heuristics(repo, _BASE) == 0
+
+    after = repo.find_godfather_priority_heuristics()[0]
+    assert after == before
+
+
+def test_reconciliation_runs_even_with_zero_live_candidates(tmp_path):
+    """Orphan reconciliation must run BEFORE the early return for an empty
+    live-candidate list - an orphan's defining feature is precisely that no
+    candidate references it, so it would never be reachable otherwise."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_orphan_priority_heuristic(repo)
+
+    assert repo.find_promoted_godfather_priority_heuristic_candidates() == []
+    assert track_and_demote_underperforming_priority_heuristics(repo, _NOW) == 0
+
+    row = {r["heuristic_id"]: r for r in repo.find_godfather_priority_heuristics()}[heuristic_id]
+    assert row["adjustment"] == 0.0
+
+
+def test_an_already_silent_orphan_priority_heuristic_is_not_rewritten_on_every_pass(
+    tmp_path, caplog
+):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    heuristic_id = _seed_orphan_priority_heuristic(repo)
+    assert track_and_demote_underperforming_priority_heuristics(repo, _NOW) == 0
+    after_first = {r["heuristic_id"]: r for r in repo.find_godfather_priority_heuristics()}[
+        heuristic_id
+    ]
+
+    later = _NOW + timedelta(days=1)
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="crypto_trading"):
+        assert track_and_demote_underperforming_priority_heuristics(repo, later) == 0
+    after_second = {r["heuristic_id"]: r for r in repo.find_godfather_priority_heuristics()}[
+        heuristic_id
+    ]
+    assert after_second == after_first
+    assert _ORPHAN_EVENT not in caplog.text
+
+
+def test_a_demoted_priority_candidates_heuristic_is_not_an_orphan(tmp_path):
+    """A demoted candidate keeps `status='PROMOTED'` (audit trail) and still
+    references its heuristic id, so its row is owned - already at 0.0
+    anyway, but reconciliation must recognize it as accounted-for rather
+    than as an unowned row."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _validated_candidate(repo, "c-1", {"instrument": "ZZZUSDT"}, test_correct_rate=0.9)
+    promote_validated_priority_candidates(repo, _BASE)
+    demoted = track_and_demote_underperforming_priority_heuristics(
+        repo, _BASE + timedelta(days=15)
+    )
+    assert demoted == 1
+    after_demotion = repo.find_godfather_priority_heuristics()[0]
+
+    later = _BASE + timedelta(days=16)
+    assert track_and_demote_underperforming_priority_heuristics(repo, later) == 0
+    assert repo.find_godfather_priority_heuristics()[0] == after_demotion
