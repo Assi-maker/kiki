@@ -45,6 +45,7 @@ writing into one shared repo), not a filter that could be forgotten.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -167,8 +168,14 @@ class HistoricalDataSource:
         return [contracts_raw[s] for s in self._universe if s in contracts_raw]
 
     def _visible_klines(self, symbol: str, interval: str) -> list[Kline]:
+        """O(log n) via `bisect_right` on the pre-sorted-ascending series
+        (guaranteed by `fetch_historical_fetch.py::fetch_historical_klines`'s
+        own sort) - required for real production-scale data (a 21-day 1m
+        series is ~30k candles; a linear filter per call, called on every
+        tick, does not scale to a multi-week replay)."""
         series = self._dataset.klines.get((symbol, interval), [])
-        return [k for k in series if k.observed_at <= self._now]
+        idx = bisect_right(series, self._now, key=lambda k: k.observed_at)
+        return series[:idx]
 
     def get_klines(
         self,
@@ -183,15 +190,19 @@ class HistoricalDataSource:
             visible = [k for k in visible if int(k.observed_at.timestamp() * 1000) >= start_time_ms]
         if end_time_ms is not None:
             visible = [k for k in visible if int(k.observed_at.timestamp() * 1000) <= end_time_ms]
-        # Real BingX returns newest-first (see market_snapshot.py's own
-        # documented discovery of this) - mirrored here for fidelity, though
-        # every real caller already re-sorts ascending itself.
-        newest_first = sorted(visible, key=lambda k: k.observed_at, reverse=True)
-        return [_kline_to_raw(k) for k in newest_first[:limit]]
+        # `visible` is already ascending - slice the last `limit` then
+        # reverse (not re-sort) to match real BingX's newest-first response
+        # order (see market_snapshot.py's own documented discovery of this);
+        # every real caller already re-sorts ascending itself regardless.
+        # Python slicing handles limit >= len(visible) gracefully (returns
+        # everything), so no separate branch is needed.
+        newest_first = list(reversed(visible[-limit:])) if limit > 0 else []
+        return [_kline_to_raw(k) for k in newest_first]
 
     def _visible_funding(self, symbol: str) -> list[FundingRate]:
         series = self._dataset.funding.get(symbol, [])
-        return [f for f in series if f.observed_at <= self._now]
+        idx = bisect_right(series, self._now, key=lambda f: f.observed_at)
+        return series[:idx]
 
     def get_funding_rate(
         self,
