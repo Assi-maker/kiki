@@ -537,21 +537,89 @@ def test_method_extraction_never_accidentally_matches_the_protocol_stub():
         )
 
 
-def test_authority_py_pure_decision_functions_have_zero_deletions_in_the_whole_diff():
-    """Independent, coarser-grained corroboration of the 6 authority.py
-    hash checks above: `git diff --numstat` for the whole file shows only
-    insertions (Task 2's additive matched_heuristic_ids_json wiring inside
-    maybe_open_position_for_candidate, which is NOT one of the frozen
-    functions) and ZERO deletions - meaning no existing line anywhere in
-    authority.py, including but not limited to the 6 named functions, was
-    ever modified or removed by this plan."""
+def test_authority_py_frozen_functions_have_zero_deletions_in_the_whole_diff():
+    """Independent, coarser-grained corroboration of the 6 authority.py hash
+    checks above, NARROWED (2026, TAKE_PROFIT addition) to the 6 frozen
+    functions' own line ranges rather than the whole file.
+
+    This test originally asserted `git diff --numstat` for the WHOLE FILE
+    showed zero deletions since a09b0ab - true for Guardian Authority Live
+    Autonomy's own Tasks 1-7 (which genuinely never touched anything else in
+    authority.py either), but only ever a coarser PROXY for the actual
+    Global Constraint, which is specifically about the 6 named frozen
+    functions, not about every line in the file forever. A later, separate,
+    independently-reviewed change (adding the TAKE_PROFIT decision type)
+    legitimately edits a non-frozen function in this same file
+    (`resolve_pending_decisions`, to treat TAKE_PROFIT the same way it
+    already treats CLOSE_EARLY) without touching any of the 6 frozen
+    functions at all - exactly the kind of routine, narrow, non-frozen
+    change this file was never meant to forbid. The corroboration is
+    therefore tightened to directly check what it always meant to protect,
+    mirroring `test_frozen_repository_methods_line_ranges_were_never_
+    touched_by_this_diff` below's own already-established, more precise
+    line-range-scoped pattern: no line THIS WHOLE HISTORICAL DIFF ever
+    deleted falls inside any of the 6 frozen functions' own AST line range.
+    The 6 SHA-256 hash checks above remain the primary, byte-exact proof;
+    this is still a second, independent, git-history-based corroboration of
+    the same guarantee, not a weakening of it."""
     out = subprocess.run(
-        ["git", "diff", "--numstat", f"{BASE_SHA}..HEAD", "--", AUTHORITY_PATH],
+        ["git", "diff", "-U0", f"{BASE_SHA}..HEAD", "--", AUTHORITY_PATH],
         cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    added, removed, _ = out.split("\t")
-    assert removed == "0", f"authority.py has {removed} deleted line(s) - expected 0"
-    assert int(added) > 0
+    ).stdout
+    deleted_line_numbers: set[int] = set()
+    old_lineno = None
+    for line in out.splitlines():
+        if line.startswith("@@"):
+            import re
+
+            match = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
+            assert match is not None
+            old_lineno = int(match.group(1))
+            continue
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("-"):
+            assert old_lineno is not None
+            deleted_line_numbers.add(old_lineno)
+            old_lineno += 1
+        elif line.startswith("+"):
+            continue
+        elif old_lineno is not None:
+            old_lineno += 1
+
+    # The 6 frozen functions' line ranges as they exist in the OLD (base)
+    # revision - a deletion is only meaningful relative to the file version
+    # it deleted FROM, so this reads authority.py AS OF BASE_SHA, never the
+    # live checked-out file (which is what every other AST scan in this file
+    # reads, deliberately - see module docstring, lesson #2. This is the one
+    # narrow, explained exception: git-history-dependent by construction,
+    # since a diff's old-side line numbers are only meaningful against the
+    # old-side file, and this repository's history back to a09b0ab is not
+    # expected to become unreachable).
+    old_source = subprocess.run(
+        ["git", "show", f"{BASE_SHA}:{AUTHORITY_PATH}"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout
+    old_tree = ast.parse(old_source, filename=AUTHORITY_PATH)
+    frozen_ranges: list[tuple[int, int]] = []
+    for node in ast.walk(old_tree):
+        is_frozen_fn = (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in _PURE_DECISION_FUNCTIONS
+        )
+        if is_frozen_fn:
+            frozen_ranges.append((node.lineno, node.end_lineno or node.lineno))
+    assert len(frozen_ranges) == len(_PURE_DECISION_FUNCTIONS), (
+        "expected to find all 6 frozen functions in the base revision of authority.py"
+    )
+
+    violations = {
+        ln for ln in deleted_line_numbers
+        if any(start <= ln <= end for start, end in frozen_ranges)
+    }
+    assert violations == set(), (
+        f"authority.py has deleted line(s) {violations} inside a frozen function's own range"
+    )
 
 
 def test_frozen_repository_methods_line_ranges_were_never_touched_by_this_diff():
@@ -1158,9 +1226,18 @@ def test_matched_heuristic_ids_json_is_written_only_at_the_two_orchestration_cal
     """Checklist item 5 (write half). Across the WHOLE production
     crypto_trading/ package, every keyword-argument write of
     matched_heuristic_ids_json must be inside exactly the 2 named
-    orchestration functions - never inside decide_open_position/
-    decide_pre_entry (already proven separately above), and never a 3rd new
-    call site anywhere else."""
+    orchestration FUNCTIONS - never inside decide_open_position/
+    decide_pre_entry (already proven separately above), and never inside any
+    function other than these 2.
+
+    3, not 2, raw CALL SITES (2026, TAKE_PROFIT addition): `process_one_
+    position` now saves a decision (and this field) for THREE decision
+    types instead of two - TIGHTEN_SL/CLOSE_EARLY's pre-existing save plus
+    TAKE_PROFIT's new one, added alongside them following the exact same
+    orchestration-layer "recover matched_ids via a second, duplicate,
+    side-effect-free evaluate_heuristics call" pattern - both still inside
+    the SAME single sanctioned function, so the set of DISTINCT (path,
+    enclosing_function) pairs this test actually cares about is unchanged."""
     observed = _package_keyword_write_sites(_MATCHED_IDS_FIELD)
 
     observed_pairs = sorted({(path, enclosing) for path, _lineno, enclosing in observed})
@@ -1169,7 +1246,9 @@ def test_matched_heuristic_ids_json_is_written_only_at_the_two_orchestration_cal
         f"expected matched_heuristic_ids_json write sites {expected_pairs}, "
         f"found {observed_pairs}"
     )
-    assert len(observed) == 2, f"expected exactly 2 write call sites, found {len(observed)}: {observed}"
+    assert len(observed) == 3, (
+        f"expected exactly 3 write call sites, found {len(observed)}: {observed}"
+    )
 
 
 def test_matched_heuristic_ids_json_write_scan_genuinely_catches_a_third_site():

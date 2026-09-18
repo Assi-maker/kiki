@@ -236,6 +236,20 @@ class GuardianConfig(BaseModel):
     # close_threshold >= tighten_threshold").
     authority_close_threshold: float = 0.45
 
+    # authority_take_profit_threshold (TAKE_PROFIT decision type, added
+    # alongside TIGHTEN_SL/CLOSE_EARLY): the summed TAKE_PROFIT-vocabulary
+    # heuristic score (guardian/authority.py::decide_take_profit) must
+    # STRICTLY exceed this for TAKE_PROFIT to be considered. Gated by the
+    # SAME authority_enabled flag as TIGHTEN_SL/CLOSE_EARLY - no separate
+    # enable flag, per the "don't overcomplicate" design choice. Same
+    # default magnitude as authority_tighten_threshold and the same
+    # reasoning: locking in an already-realized gain by closing early is a
+    # safety-neutral-or-positive action (unlike CLOSE_EARLY's cutting of an
+    # active loss, which needs the much higher 0.45 bar above), so it is
+    # intentionally cheap to trigger - roughly one moderate-adjustment
+    # heuristic is enough to justify taking profit on its own.
+    authority_take_profit_threshold: float = 0.15
+
 
 class LiveExecutionConfig(BaseModel):
     # BingX Live execution (2026-09-06) - a tightly bounded, real-money

@@ -11,6 +11,7 @@ from crypto_trading.connectors.bingx_live_trading import BingXLiveTradingConnect
 from crypto_trading.guardian.ai_context import build_ai_context, should_invoke_ai
 from crypto_trading.guardian.authority import (
     decide_open_position,
+    decide_take_profit,
     evaluate_heuristics,
     resolve_pending_decisions,
     update_heuristics_from_resolved_decisions,
@@ -312,6 +313,59 @@ def process_one_position(
                     decision_id=decision_id, confidence=confidence,
                 )
                 return exit_observation
+        else:
+            # TAKE_PROFIT (added alongside TIGHTEN_SL/CLOSE_EARLY): only
+            # ever evaluated once decide_open_position's own downside-
+            # protection decision comes back NO_ACTION this tick - downside
+            # protection (tightening/closing on decay) always takes
+            # precedence over profit-locking. Uses a completely separate,
+            # disjoint factor vocabulary (progress_ratio/
+            # unrealized_pnl_positive, neither of which is part of
+            # `factors`/guardian_state above) and its own pure function/
+            # threshold (decide_take_profit) - see that function's own
+            # docstring for why this is safe to layer on top of the same
+            # untyped live heuristics table `heuristics` already read above.
+            profit_factors = {
+                "progress_ratio": float(progress_ratio),
+                "unrealized_pnl_positive": unrealized_pnl > 0,
+            }
+            tp_decision, tp_expected_outcome, tp_expected_direction, tp_confidence = (
+                decide_take_profit(
+                    profit_factors, heuristics, guardian_cfg.authority_take_profit_threshold,
+                )
+            )
+            if tp_decision == "TAKE_PROFIT":
+                _, tp_matched_ids = evaluate_heuristics(profit_factors, heuristics)
+                tp_decision_id = f"ga:{position.position_id}:{now.isoformat()}"
+                repo.save_guardian_authority_decision(
+                    tp_decision_id, position.position_id, position.candidate_id,
+                    "TAKE_PROFIT", now,
+                    reasoning=tp_expected_outcome, expected_outcome=tp_expected_outcome,
+                    expected_direction=tp_expected_direction, confidence=tp_confidence,
+                    run_id=run_id,
+                    # No SL is ever touched by TAKE_PROFIT.
+                    old_sl=None, new_sl=None,
+                    # Known-successful by construction, same reasoning as
+                    # CLOSE_EARLY above: this closes via the guaranteed-
+                    # success EXIT-observation mechanism below, never an
+                    # exchange order, so there is no write-attempt outcome
+                    # to determine later.
+                    intervention_applied=True,
+                    matched_heuristic_ids_json=json.dumps(tp_matched_ids),
+                )
+                tp_exit_observation = GuardianObservation(
+                    observation_id=f"ga-exit:{position.position_id}:{now.isoformat()}",
+                    position_id=position.position_id, observed_at=now, state="EXIT",
+                    decay_score=decay_score, progress_ratio=progress_ratio,
+                    unrealized_pnl=unrealized_pnl,
+                    factors={name: float(value) for name, value in factors.items()}, run_id=run_id,
+                )
+                repo.save_guardian_observation(tp_exit_observation)
+                log_event(
+                    run_id, event="ga_tick_take_profit", position_id=position.position_id,
+                    decision_id=tp_decision_id, confidence=tp_confidence,
+                )
+                return tp_exit_observation
 
     previous = repo.find_latest_guardian_observation(position.position_id)
     ai_reasoning: str | None = None

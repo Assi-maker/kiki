@@ -1055,3 +1055,157 @@ def test_authority_wiring_flag_off_never_calls_resolve_or_update_heuristics(tmp_
 
     mock_resolve.assert_not_called()
     mock_update.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TAKE_PROFIT wiring (added alongside TIGHTEN_SL/CLOSE_EARLY). Position from
+# _seed_candidate_and_position: simulated_fill_entry=100, target=120,
+# stop_loss=90 -> at current_price=118, progress_ratio=(118-100)/20=0.9 and
+# unrealized_pnl=1000*(118-100)/100=180 (positive) - matches a
+# progress_ratio_min=0.5 condition, and stays far below any decay-vocabulary
+# TIGHTEN_SL/CLOSE_EARLY threshold since _StubConnector's flat klines keep
+# every decay factor at 0 regardless of price (decay factors are computed
+# from momentum/volume/funding evidence, never from price directly).
+# ---------------------------------------------------------------------------
+
+
+def _seed_take_profit_heuristic(repo, heuristic_id="h-tp-1", adjustment=0.5,
+                                 condition=None):
+    repo.upsert_guardian_authority_heuristic(
+        heuristic_id=heuristic_id,
+        description="deep into target, take profit now",
+        condition_json=json.dumps(
+            condition if condition is not None else {"progress_ratio_min": 0.5}
+        ),
+        adjustment=adjustment,
+        confidence=0.8,
+        sample_size=10,
+        updated_at=_NOW,
+    )
+
+
+def _take_profit_settings(take_profit_threshold=0.3):
+    return _settings().model_copy(
+        update={
+            "guardian": GuardianConfig(
+                authority_enabled=True,
+                authority_take_profit_threshold=take_profit_threshold,
+            )
+        }
+    )
+
+
+def test_authority_take_profit_fires_and_closes_the_position(tmp_path):
+    """A matched progress_ratio-vocabulary heuristic pushes the TAKE_PROFIT
+    score (0.5) above authority_take_profit_threshold (0.3) -> TAKE_PROFIT.
+    Closes via the SAME EXIT-observation mechanism CLOSE_EARLY uses (a
+    single EXIT observation for this tick, no second HOLD/AI-narrated
+    observation), and saves a TAKE_PROFIT decision row with no SL touched."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)  # entry=100, target=120, stop_loss=90
+    _seed_take_profit_heuristic(repo)
+    connector = _StubConnector(price="118")  # progress_ratio=0.9, unrealized_pnl=180>0
+
+    observations = run_guardian_tick_body(
+        repo, connector, _FakeRunner(), _take_profit_settings(), "run-1", _NOW
+    )
+
+    assert len(observations) == 1
+    assert observations[0].state == "EXIT"
+    assert _observation_count(repo, "pos-1") == 1  # exactly one observation this tick
+
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TAKE_PROFIT"
+    assert decisions[0]["position_id"] == "pos-1"
+    assert decisions[0]["expected_direction"] == "unfavorable"
+    assert decisions[0]["old_sl"] is None
+    assert decisions[0]["new_sl"] is None
+    assert decisions[0]["intervention_applied"] == 1
+
+    position = repo.get_position("pos-1")
+    assert position.stop_loss == Decimal("90")  # untouched - TAKE_PROFIT never touches SL
+
+
+def test_authority_take_profit_no_action_when_score_below_threshold(tmp_path):
+    """Same heuristic, but a higher threshold the score (0.5) does not
+    clear -> NO_ACTION, byte-identical fallthrough to the pre-existing
+    HOLD/AI-narration path (same shape as
+    test_authority_flag_on_no_heuristics_matched_is_no_action)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _seed_take_profit_heuristic(repo, adjustment=0.5)
+    connector = _StubConnector(price="118")
+
+    settings = _take_profit_settings(take_profit_threshold=0.9)
+    observations = run_guardian_tick_body(
+        repo, connector, _FakeRunner(), settings, "run-1", _NOW
+    )
+
+    assert len(observations) == 1
+    assert observations[0].state != "EXIT"
+    assert _decision_rows(repo) == []
+
+
+def test_authority_take_profit_vocabulary_heuristic_never_fires_tighten_sl_or_close_early(tmp_path):
+    """A TAKE_PROFIT-shaped heuristic (progress_ratio_min) must never
+    contribute to decide_open_position's TIGHTEN_SL/CLOSE_EARLY score -
+    fail-closed on the missing progress_ratio key in that decision's own
+    factors dict. Proven end-to-end through the real tick, with a threshold
+    low enough that ANY cross-contamination would trigger TIGHTEN_SL."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _seed_take_profit_heuristic(repo, adjustment=0.9)  # would trivially exceed 0.15 if it leaked
+    connector = _StubConnector(price="118")
+    settings = _settings().model_copy(
+        update={
+            "guardian": GuardianConfig(
+                authority_enabled=True,
+                authority_tighten_threshold=0.15,
+                authority_close_threshold=0.45,
+                authority_take_profit_threshold=1000.0,  # never fires TAKE_PROFIT itself here
+            )
+        }
+    )
+
+    observations = run_guardian_tick_body(repo, connector, _FakeRunner(), settings, "run-1", _NOW)
+
+    assert len(observations) == 1
+    assert observations[0].state != "EXIT"
+    assert _decision_rows(repo) == []  # no TIGHTEN_SL/CLOSE_EARLY/TAKE_PROFIT decision at all
+
+
+def test_authority_tighten_sl_takes_precedence_over_take_profit_in_the_same_tick(tmp_path):
+    """Downside protection (TIGHTEN_SL) must win over profit-locking
+    (TAKE_PROFIT) when both would otherwise fire in the same tick - proven
+    by seeding both an always-on TIGHTEN_SL-vocabulary heuristic AND a
+    progress_ratio-vocabulary TAKE_PROFIT heuristic, and asserting only ONE
+    decision (TIGHTEN_SL) is ever saved, decide_take_profit is never even
+    called, and the position is NOT closed (it is tightened and stays
+    open)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_candidate_and_position(repo)
+    _seed_always_on_heuristic(repo, heuristic_id="h-tighten", adjustment=0.2)  # -> TIGHTEN_SL
+    _seed_take_profit_heuristic(repo, heuristic_id="h-tp", adjustment=0.9)
+    connector = _StubConnector(price="118")
+    settings = _settings().model_copy(
+        update={
+            "guardian": GuardianConfig(
+                authority_enabled=True,
+                authority_tighten_threshold=0.15,
+                authority_close_threshold=0.45,
+                authority_take_profit_threshold=0.3,
+            )
+        }
+    )
+
+    with patch("crypto_trading.guardian.tick.decide_take_profit") as mock_take_profit:
+        run_guardian_tick_body(repo, connector, _FakeRunner(), settings, "run-1", _NOW)
+
+    mock_take_profit.assert_not_called()
+    decisions = _decision_rows(repo)
+    assert len(decisions) == 1
+    assert decisions[0]["decision_type"] == "TIGHTEN_SL"
+    position = repo.get_position("pos-1")
+    assert position.status == "OPEN_POSITION"
+    assert position.stop_loss > Decimal("90")

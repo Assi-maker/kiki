@@ -68,7 +68,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.runner import AgentRunner
@@ -377,6 +377,11 @@ def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
         "pre_entry_factor_names": sorted(
             {name for entry in entry_outcomes for name in entry["factors"]}
         ),
+        # A third, deliberately separate vocabulary (see _TAKE_PROFIT_
+        # FACTOR_NAMES's own comment): TAKE_PROFIT candidates may use ONLY
+        # these two names, never mixed with either vocabulary above.
+        "take_profit_factor_names": _TAKE_PROFIT_FACTOR_NAMES,
+        "take_profit_observations": _take_profit_observation_context(repo, closed_positions),
     }
 
 
@@ -796,6 +801,7 @@ def _tighten_sl_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
 # model's own explicit declaration).
 _TARGET_TIGHTEN_SL = "TIGHTEN_SL"
 _TARGET_PRE_ENTRY_VETO = "PRE_ENTRY_VETO"
+_TARGET_TAKE_PROFIT = "TAKE_PROFIT"
 
 
 def _pre_entry_veto_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
@@ -846,6 +852,112 @@ def _pre_entry_veto_evidence_pool(repo: Repository) -> list[tuple[str, dict, boo
         )
 
     return pool
+
+
+def _take_profit_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]:
+    """`(observed_at, profit_factors, would_take_profit_have_been_correct)`
+    for every real `guardian_observations` row belonging to a real CLOSED
+    position - available at cold start exactly like
+    `_pre_entry_veto_evidence_pool` above, and for the same structural
+    reason: a TAKE_PROFIT heuristic strong enough to actually fire prevents
+    a position from generating any FURTHER observations, but every
+    observation recorded on any closed position - including one where no
+    TAKE_PROFIT heuristic has ever existed - is real, already-persisted
+    ground truth, independent of whether the pipeline has ever proposed a
+    TAKE_PROFIT candidate at all.
+
+    `profit_factors` is exactly `{"progress_ratio": ..., "unrealized_pnl_
+    positive": ...}` - the SAME two-field vocabulary `decide_take_profit`
+    itself is evaluated against (see that function's own docstring), read
+    straight off the observation's own persisted `progress_ratio`/
+    `unrealized_pnl` columns, never recomputed. The outcome is `this
+    observation's own unrealized_pnl > the position's own real, eventual
+    realized PnL` (via the UNMODIFIED `compute_pnl`) - i.e. "would closing
+    right here have captured more than what the position's real, eventual
+    close actually captured?" Nothing is synthesized: every factor and
+    every PnL input is the row's own real, persisted data - the only
+    counterfactual thing is the TAKE_PROFIT ACTION ITSELF (which never
+    fired for these observations), the same kind of counterfactual
+    `_pre_entry_veto_evidence_pool` above already treats as legitimate
+    evidence.
+
+    Skips: a CLOSED position with no `closed_at` (defensive - mirrors the
+    veto pool's own skip; no production path produces this), an exposure-
+    blocked position (its `compute_pnl` is `0 - fees - funding`, which
+    would systematically bias this pool's `>` comparison toward "TAKE_
+    PROFIT would have been correct" for reasons that have nothing to do
+    with the position's own real market behavior - same reasoning
+    `_pre_entry_veto_evidence_pool` documents for its own identical skip),
+    and an observation row whose `unrealized_pnl`/`progress_ratio` cannot
+    be parsed (defensive - no production path produces this; skip, never
+    guess)."""
+    pool: list[tuple[str, dict, bool]] = []
+
+    for position in repo.find_closed_positions():
+        if position.closed_at is None:
+            continue
+        if _is_blocked_by_exposure(position):
+            continue
+        eventual_pnl = compute_pnl(position)
+        for observation in repo.find_guardian_observations_for_position(position.position_id):
+            try:
+                observed_pnl = Decimal(observation["unrealized_pnl"])
+                progress_ratio = float(observation["progress_ratio"])
+            except (TypeError, ValueError, InvalidOperation):
+                continue
+            pool.append(
+                (
+                    observation["observed_at"],
+                    {
+                        "progress_ratio": progress_ratio,
+                        "unrealized_pnl_positive": observed_pnl > Decimal("0"),
+                    },
+                    observed_pnl > eventual_pnl,
+                )
+            )
+
+    return pool
+
+
+def _take_profit_observation_context(
+    repo: Repository, positions: list[Position]
+) -> list[dict]:
+    """Real per-observation evidence for the LLM to reason about TAKE_PROFIT
+    patterns from, for the SAME already-windowed `positions` list
+    `_build_context` uses everywhere else (no additional unbounded read) -
+    exposure-blocked positions excluded via the SAME unmodified `_is_
+    blocked_by_exposure`, for the SAME reason `_closed_position_entry_
+    outcomes` excludes them. Each entry is one real `guardian_observations`
+    row: `progress_ratio`/`unrealized_pnl` read straight off that row's own
+    persisted columns (the SAME two values `decide_take_profit`'s own
+    factors are built from), paired with the position's own real, eventual
+    `pnl_usdt`/`exit_reason` - the exact same shape `_take_profit_evidence_
+    pool` validates against, so what the model reasons about and what it is
+    later graded against are the same view of the same data."""
+    observations: list[dict] = []
+    for position in positions:
+        if _is_blocked_by_exposure(position):
+            continue
+        eventual_pnl = compute_pnl(position)
+        for observation in repo.find_guardian_observations_for_position(position.position_id):
+            observations.append(
+                {
+                    "progress_ratio": observation["progress_ratio"],
+                    "unrealized_pnl": observation["unrealized_pnl"],
+                    "observed_at": observation["observed_at"],
+                    "eventual_pnl_usdt": str(eventual_pnl),
+                    "eventual_exit_reason": position.exit_reason,
+                }
+            )
+    return observations
+
+
+# The TAKE_PROFIT vocabulary is fixed, unlike the other two lists above
+# (which are derived from whatever has actually occurred): progress_ratio
+# and unrealized_pnl are computed every single tick regardless of whether
+# any TAKE_PROFIT heuristic has ever existed, so the vocabulary a proposal
+# may use is always exactly these two names, cold start or not.
+_TAKE_PROFIT_FACTOR_NAMES = ["progress_ratio", "unrealized_pnl_positive"]
 
 
 def _split_pool_chronologically(
@@ -957,6 +1069,7 @@ def validate_pending_heuristic_candidates(repo: Repository, now: datetime) -> in
     splits_by_target = {
         _TARGET_TIGHTEN_SL: _split_pool_chronologically(_tighten_sl_evidence_pool(repo)),
         _TARGET_PRE_ENTRY_VETO: _split_pool_chronologically(_pre_entry_veto_evidence_pool(repo)),
+        _TARGET_TAKE_PROFIT: _split_pool_chronologically(_take_profit_evidence_pool(repo)),
     }
 
     processed = 0
@@ -1969,6 +2082,10 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
     }
     resolved_decisions: list[dict] | None = None
     veto_pool: list[tuple[str, dict, bool]] | None = None
+    # Lazily built exactly like veto_pool above, for the same reason: a
+    # family with no TAKE_PROFIT members should not pay for a full
+    # find_closed_positions()+observations scan.
+    take_profit_pool: list[tuple[str, dict, bool]] | None = None
 
     demoted = 0
     for candidate in sorted(live, key=lambda row: row["candidate_id"]):
@@ -2006,6 +2123,28 @@ def track_and_demote_underperforming_heuristics(repo: Repository, now: datetime)
             )
             sample_size, correct_rate = _forward_pre_entry_veto_stats(
                 veto_pool, json.loads(promoted_row["condition_json"]), promoted_at
+            )
+        elif target == _TARGET_TAKE_PROFIT:
+            # Same closed-position-counterfactual mechanism as PRE_ENTRY_
+            # VETO immediately above (reused via the same generic `_forward_
+            # pre_entry_veto_stats` - its own body has no PRE_ENTRY_VETO-
+            # specific logic, it is generic over any `list[tuple[str, dict,
+            # bool]]` pool), NOT the TIGHTEN_SL firing-attribution track:
+            # TAKE_PROFIT's forward evidence is `_take_profit_evidence_pool`,
+            # built from every real guardian_observations row on a closed
+            # position, which accumulates whether or not this heuristic ever
+            # actually fired. This is also why TAKE_PROFIT needs no
+            # TIGHTEN_SL-style cardinality cap at promotion time (see
+            # `_MAX_LIVE_TIGHTEN_SL_HEURISTICS`'s own section): only
+            # TIGHTEN_SL's forward-tracking is firing-attribution-based and
+            # can reach the absorbing state that cap exists to prevent.
+            if take_profit_pool is None:
+                take_profit_pool = _take_profit_evidence_pool(repo)
+            promoted_row = repo.get_guardian_authority_heuristic_candidate(
+                candidate["candidate_id"]
+            )
+            sample_size, correct_rate = _forward_pre_entry_veto_stats(
+                take_profit_pool, json.loads(promoted_row["condition_json"]), promoted_at
             )
         else:
             if resolved_decisions is None:

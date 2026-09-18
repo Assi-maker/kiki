@@ -400,6 +400,58 @@ def decide_open_position(
     )
 
 
+def decide_take_profit(
+    profit_factors: dict,
+    heuristics: list[dict],
+    take_profit_threshold: float,
+) -> tuple[str, str, str, float]:
+    """Returns `(decision, expected_outcome_text, expected_direction,
+    confidence)`. `decision` is `"NO_ACTION"` (default) or `"TAKE_PROFIT"` -
+    deterministically `"TAKE_PROFIT"` iff the summed heuristic score
+    strictly exceeds `take_profit_threshold`. Structurally parallel to
+    `decide_pre_entry` above (a single threshold, a single alternate
+    decision) - NOT `decide_open_position` (no precedence chain, no
+    proposed-value computation, no SL involved at all): this decision never
+    touches a stop-loss, it only ever closes a position early to lock in an
+    already-observed gain.
+
+    `expected_direction` is always `"unfavorable"` when deciding
+    `TAKE_PROFIT`: per this module's own documented `expected_direction`
+    vocabulary above, closing a position leaves no further P/L to predict,
+    so a closing decision predicts a counterfactual of INACTION -
+    "continuing to hold would have gone unfavorably" (here: would likely
+    have given back the observed gain, or reversed it into a loss). This is
+    the same semantic slot `CLOSE_EARLY` already occupies for exactly this
+    reason, just motivated by protecting an upside instead of cutting a
+    downside.
+
+    `profit_factors` is a small, deliberately NEW vocabulary - exactly
+    `{"progress_ratio": float, "unrealized_pnl_positive": bool}` - chosen to
+    share ZERO field names with either existing heuristic vocabulary
+    (TIGHTEN_SL/CLOSE_EARLY's decay-factor + `guardian_state` vocabulary, or
+    PRE_ENTRY_VETO's `instrument`/`candidate_score`/`trigger_reasons`
+    vocabulary). This is what lets a TAKE_PROFIT-targeted heuristic safely
+    share the same untyped live `guardian_authority_heuristics` table as the
+    other two families without any of them ever being able to cross-fire on
+    each other's factors dict (fail-closed missing-key matching on disjoint
+    vocabularies - see `guardian/self_improvement.py`'s Task 5 module
+    comment, "R3" section, for the full existing proof this extends)."""
+    score, matched_ids = evaluate_heuristics(profit_factors, heuristics)
+    matched = _matched_heuristics(heuristics, matched_ids)
+    if score > take_profit_threshold:
+        decision = "TAKE_PROFIT"
+        expected_direction = "unfavorable"
+    else:
+        decision = "NO_ACTION"
+        expected_direction = "neutral"
+    return (
+        decision,
+        _build_expected_outcome_text(decision, matched),
+        expected_direction,
+        _aggregate_confidence(matched),
+    )
+
+
 def _pre_entry_factors(candidate: Candidate) -> dict:
     """The candidate's own evidence, reshaped into the flat factor dict
     `decide_pre_entry`/`evaluate_heuristics` match heuristic conditions
@@ -725,25 +777,29 @@ def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
     taken (the position stays open under the tightened stop), so the
     realized P/L IS the thing the prediction was about.
 
-    `CLOSE_EARLY` rows get `expectation_correct=None` (SQL NULL) instead -
-    deliberately NOT computed, even though the brief's own literal
-    instruction would naively sign-compare here too. Per this module's own
-    `expected_direction` vocabulary (see the docstring section above),
-    `CLOSE_EARLY` always predicts `"unfavorable"`, meaning "continuing to
-    hold would have gone unfavorably" - a counterfactual of INACTION. But
-    the `actual_pnl_usdt` computed here comes from the position that was
-    actually closed early - it measures the outcome of the close itself
-    (typically a small or contained result, precisely because closing
-    early is what limited the damage), never the counterfactual of what
-    would have happened had the position stayed open. Sign-comparing
-    "unfavorable" against that realized P/L would systematically misscore
-    a *correct* early close (one that successfully avoided a worse loss)
-    as a wrong expectation. A true counterfactual would require re-fetching
-    forward price data past the actual exit - a meaningfully bigger task,
-    out of scope here. `actual_exit_reason`/`actual_pnl_usdt` are still
-    real and still filled in (worth keeping for later analysis, e.g. Task
-    9's self-critique step), and the row is still marked `RESOLVED` - only
-    `expectation_correct` is withheld.
+    `CLOSE_EARLY` and `TAKE_PROFIT` rows both get `expectation_correct=None`
+    (SQL NULL) instead - deliberately NOT computed, even though the brief's
+    own literal instruction would naively sign-compare here too. Per this
+    module's own `expected_direction` vocabulary (see the docstring section
+    above), both always predict `"unfavorable"`, meaning "continuing to
+    hold would have gone unfavorably" - a counterfactual of INACTION (for
+    `CLOSE_EARLY`, protecting against a further loss; for `TAKE_PROFIT`,
+    protecting an already-observed gain from being given back or
+    reversed). But the `actual_pnl_usdt` computed here comes from the
+    position that was actually closed early - it measures the outcome of
+    the close itself (typically a small/contained result for `CLOSE_EARLY`,
+    or the locked-in gain itself for `TAKE_PROFIT`, precisely because
+    closing early is what captured/limited it), never the counterfactual of
+    what would have happened had the position stayed open. Sign-comparing
+    "unfavorable" against that realized P/L would systematically misscore a
+    *correct* early close (one that successfully avoided a worse loss, or
+    successfully locked in a gain) as a wrong expectation. A true
+    counterfactual would require re-fetching forward price data past the
+    actual exit - a meaningfully bigger task, out of scope here.
+    `actual_exit_reason`/`actual_pnl_usdt` are still real and still filled
+    in (worth keeping for later analysis, e.g. Task 9's self-critique step
+    and TAKE_PROFIT's own forward-tracking pool), and the row is still
+    marked `RESOLVED` - only `expectation_correct` is withheld.
 
     Returns the count of rows actually resolved in THIS call - still-open
     skips and PRE_ENTRY_VETO skips are not counted.
@@ -758,7 +814,15 @@ def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
         actual_pnl = compute_pnl(position)
         actual_pnl_usdt = str(actual_pnl)
 
-        if decision["decision_type"] == "CLOSE_EARLY":
+        if decision["decision_type"] in ("CLOSE_EARLY", "TAKE_PROFIT"):
+            # TAKE_PROFIT (added alongside TIGHTEN_SL/CLOSE_EARLY) is
+            # exactly analogous to CLOSE_EARLY here, just motivated by
+            # protecting an upside instead of cutting a downside: it also
+            # closes the position, so the realized P/L measures the outcome
+            # of the close itself, never the counterfactual of what would
+            # have happened had the position stayed open - the same reason
+            # CLOSE_EARLY gets expectation_correct=None instead of a sign
+            # comparison (see the paragraph above).
             expectation_correct = None
         else:
             predicted_favorable = decision["expected_direction"] == "favorable"
