@@ -158,6 +158,9 @@ class Repository(Protocol):
         closed_at: datetime,
         event: Event,
     ) -> bool: ...
+    def close_position_for_live_exit(
+        self, position_id: str, exit_reason: str, closed_at: datetime
+    ) -> bool: ...
     def get_recovery_sweep_activated_at(self) -> datetime | None: ...
     def set_recovery_sweep_activated_at_if_missing(self, activated_at: datetime) -> bool: ...
     def get_profit_protection_activated_at(self) -> datetime | None: ...
@@ -1201,6 +1204,28 @@ class SQLiteRepository:
         except Exception:
             self._conn.rollback()
             raise
+
+    def close_position_for_live_exit(
+        self, position_id: str, exit_reason: str, closed_at: datetime
+    ) -> bool:
+        """LIVE-only reconciliation: mirrors the real exchange closure a
+        live_execution.py close (e.g. close_time_limit_positions) has
+        already confirmed onto the shared `positions` row, so Guardian
+        stops observing a position that is already flat on the exchange.
+        Deliberately minimal - unlike close_position_with_event, never
+        touches theoretical_exit/simulated_fill_exit/fees/funding (PAPER's
+        own simulated-fill fields; this row has no real PAPER exit here) and
+        never inserts a POSITION_CLOSED event. Same atomic
+        WHERE status = 'OPEN_POSITION' race guard as
+        close_position_with_event, so a concurrent close of the same row
+        (PAPER or a second LIVE pass) is never clobbered or double-applied."""
+        cur = self._conn.execute(
+            "UPDATE positions SET status = 'CLOSED', exit_reason = ?, closed_at = ? "
+            "WHERE position_id = ? AND status = 'OPEN_POSITION'",
+            (exit_reason, closed_at.isoformat(), position_id),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
 
     def get_recovery_sweep_activated_at(self) -> datetime | None:
         row = self._conn.execute(

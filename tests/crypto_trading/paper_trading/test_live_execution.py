@@ -715,6 +715,59 @@ def test_close_time_limit_positions_uses_the_passed_in_hold_hours(tmp_path):
     assert row["phase"] == "CLOSED"
     assert row["exit_reason"] == "TIME_LIMIT"
 
+    # Reconciliation fix regression: the shared `positions` row must be
+    # closed in the same pass - never left OPEN_POSITION once the real
+    # exchange position is confirmed closed (the bug Guardian kept
+    # observing already-flat LIVE positions through).
+    position = repo.get_position("pos-1")
+    assert position.status == "CLOSED"
+    assert position.exit_reason == "TIME_LIMIT"
+    assert position.closed_at == _NOW
+
+
+def test_close_time_limit_positions_never_touches_paper_only_simulated_fields(tmp_path):
+    """The new positions-row update must stay minimal: PAPER's own
+    theoretical_exit/simulated_fill_exit/fees/funding fields belong to a
+    separate, independent simulated exit and must be left untouched by a
+    LIVE time-limit close."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, opened_at=_NOW - timedelta(hours=3))
+    repo.claim_live_execution("pos-1", _NOW, "10", "100", "10")
+    repo.update_live_execution_submitted(
+        "pos-1", "cid-1", "ex-1", "0.002", "50000", None, None, _NOW
+    )
+    connector = _SpyConnector()
+
+    close_time_limit_positions(repo, connector, max_position_hold_hours=2, run_id="r1", now=_NOW)
+
+    position = repo.get_position("pos-1")
+    assert position.theoretical_exit is None
+    assert position.simulated_fill_exit is None
+    assert position.fees is None
+    assert position.funding is None
+
+
+def test_close_time_limit_positions_positions_row_update_is_idempotent(tmp_path):
+    """A second close_time_limit_positions pass over an already-closed
+    live_execution must never re-touch or error on the positions row (the
+    WHERE status = 'OPEN_POSITION' guard makes the second call a no-op)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, opened_at=_NOW - timedelta(hours=3))
+    repo.claim_live_execution("pos-1", _NOW, "10", "100", "10")
+    repo.update_live_execution_submitted(
+        "pos-1", "cid-1", "ex-1", "0.002", "50000", None, None, _NOW
+    )
+    connector = _SpyConnector()
+
+    close_time_limit_positions(repo, connector, max_position_hold_hours=2, run_id="r1", now=_NOW)
+    # live_executions is already CLOSED, so find_active_live_executions()
+    # naturally excludes it on the second pass - this call must be a no-op.
+    close_time_limit_positions(repo, connector, max_position_hold_hours=2, run_id="r1", now=_NOW)
+
+    position = repo.get_position("pos-1")
+    assert position.status == "CLOSED"
+    assert position.closed_at == _NOW
+
 
 def test_recover_stale_claims_promotes_to_active_when_lookup_confirms_filled(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")

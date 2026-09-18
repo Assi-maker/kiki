@@ -489,6 +489,12 @@ def close_time_limit_positions(
             repo.close_live_execution(
                 position.position_id, "TIME_LIMIT", str(result.get("avgPrice", "")), now
             )
+            # Reconciliation fix (2026-09-18): the LIVE position is now
+            # confirmed closed on the exchange above - mirror that onto the
+            # shared `positions` row too, or it stays OPEN_POSITION forever
+            # (PAPER's own close only fires at its independent 24h limit)
+            # and Guardian keeps observing an already-flat position.
+            repo.close_position_for_live_exit(position.position_id, "TIME_LIMIT", now)
             log_event(run_id, event="live_time_limit_closed", position_id=position.position_id)
         except _GUARDED_ERRORS as exc:
             log_event(
