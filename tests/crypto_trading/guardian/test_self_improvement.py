@@ -611,12 +611,12 @@ def test_propose_candidate_heuristics_treats_an_empty_proposal_list_as_a_success
 
 
 # --------------------------------------------------------------------------
-# Failure paths: zero candidates, watermark STILL advances
+# Failure paths: zero candidates, and a failed AI CALL releases the day's slot
+# (2026-09-19: an unusable call - failed/timed out/raised - produced no
+# proposal, so it must not burn the once-per-day slot; only a call that
+# actually returned an answer, even an empty one, consumes it).
 # --------------------------------------------------------------------------
-def test_propose_candidate_heuristics_advances_the_watermark_on_a_failed_agent_response(tmp_path):
-    """Easy to get backwards: a failed call has already spent real money/time,
-    so it must consume today's proposal slot rather than retry every tick for
-    the rest of the day against an API that is currently failing."""
+def test_propose_candidate_heuristics_releases_the_slot_on_a_failed_agent_response(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_history(repo)
     runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
@@ -627,10 +627,13 @@ def test_propose_candidate_heuristics_advances_the_watermark_on_a_failed_agent_r
     assert saved == 0
     assert len(runner.calls) == 1
     assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
-    assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-15"
+    assert repo.get_guardian_authority_strategist_last_proposed_date() is None
+    # a later tick the same day really does try again
+    propose_candidate_heuristics(repo, runner, _settings(), "run-2", _NOW + timedelta(minutes=10))
+    assert len(runner.calls) == 2
 
 
-def test_propose_candidate_heuristics_advances_the_watermark_on_a_timed_out_agent_response(
+def test_propose_candidate_heuristics_releases_the_slot_on_a_timed_out_agent_response(
     tmp_path,
 ):
     repo = SQLiteRepository(tmp_path / "t.db")
@@ -643,10 +646,12 @@ def test_propose_candidate_heuristics_advances_the_watermark_on_a_timed_out_agen
     assert saved == 0
     assert len(runner.calls) == 1
     assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
-    assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-15"
+    assert repo.get_guardian_authority_strategist_last_proposed_date() is None
 
 
-def test_propose_candidate_heuristics_never_raises_when_the_runner_explodes(tmp_path):
+def test_propose_candidate_heuristics_never_raises_and_releases_the_slot_when_the_runner_explodes(
+    tmp_path,
+):
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_history(repo)
     runner = _RaisingRunner()
@@ -656,7 +661,21 @@ def test_propose_candidate_heuristics_never_raises_when_the_runner_explodes(tmp_
     assert saved == 0
     assert runner.call_count == 1
     assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
-    assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-15"
+    assert repo.get_guardian_authority_strategist_last_proposed_date() is None
+
+
+def test_propose_candidate_heuristics_failed_call_restores_the_previous_days_watermark(tmp_path):
+    """A release must put back what was there before the claim (yesterday's
+    watermark), not blank it."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    repo.set_guardian_authority_strategist_last_proposed_date("2026-09-14", _NOW - timedelta(days=1))
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
+    runner._fail_agents = {_AGENT_NAME}
+
+    propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+
+    assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-14"
 
 
 def test_propose_candidate_heuristics_never_raises_when_the_repository_read_explodes(tmp_path):

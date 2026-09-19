@@ -403,7 +403,7 @@ class Repository(Protocol):
         self,
         shadow_id: str,
         actual_exit_reason: str,
-        actual_pnl_usdt: Decimal,
+        actual_pnl_usdt: Decimal | None,
         actual_closed_at: datetime,
         updated_at: datetime,
     ) -> bool: ...
@@ -444,6 +444,7 @@ class Repository(Protocol):
     def set_guardian_authority_strategist_last_proposed_date(
         self, date_iso: str, updated_at: datetime
     ) -> None: ...
+    def clear_guardian_authority_strategist_last_proposed_date(self) -> None: ...
 
     # --- GODFATHER priority-boost scoring/ranking overlay (2026-09-18) ---
     # Deliberately separate tables/methods from every guardian_authority_*
@@ -2562,7 +2563,7 @@ class SQLiteRepository:
         self,
         shadow_id: str,
         actual_exit_reason: str,
-        actual_pnl_usdt: Decimal,
+        actual_pnl_usdt: Decimal | None,
         actual_closed_at: datetime,
         updated_at: datetime,
     ) -> bool:
@@ -2581,7 +2582,7 @@ class SQLiteRepository:
             "WHERE shadow_id = ? AND status = 'PENDING'",
             (
                 actual_exit_reason,
-                str(actual_pnl_usdt),
+                str(actual_pnl_usdt) if actual_pnl_usdt is not None else None,
                 actual_closed_at.isoformat(),
                 updated_at.isoformat(),
                 shadow_id,
@@ -2794,6 +2795,17 @@ class SQLiteRepository:
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES "
             "('godfather_strategist_last_proposed_updated_at', ?)",
             (updated_at.isoformat(),),
+        )
+        self._conn.commit()
+
+    def clear_guardian_authority_strategist_last_proposed_date(self) -> None:
+        """Releases a claimed day slot when the strategist AI call produced
+        nothing (see guardian/self_improvement.py::propose_candidate_
+        heuristics) - only used to undo a claim that had no previous value."""
+        self._conn.execute(
+            "DELETE FROM schema_meta WHERE key IN "
+            "('godfather_strategist_last_proposed_date', "
+            "'godfather_strategist_last_proposed_updated_at')"
         )
         self._conn.commit()
 

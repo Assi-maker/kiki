@@ -1029,6 +1029,34 @@ def test_resolve_pending_pre_entry_shadows_resolves_with_real_pnl_and_exit_reaso
     assert row["updated_at"] == resolved_at.isoformat()
 
 
+def test_resolve_pending_pre_entry_shadows_resolves_a_live_closed_position_without_paper_exit_data(
+    tmp_path,
+):
+    """Regression (2026-09-19, MYX): a position closed by the LIVE exit mirror
+    (`close_position_for_live_exit`) is CLOSED but carries no PAPER
+    simulated_fill_exit/fees/funding, so `compute_pnl` raised TypeError
+    (NoneType - Decimal) every tick and the shadow row stayed PENDING
+    forever. It must resolve with the real exit_reason/closed_at and an
+    unknown (NULL) P/L instead."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, "cand-live-closed")
+    closed_at = _NOW + timedelta(hours=2)
+    assert repo.close_position_for_live_exit("cand-live-closed", "stop_loss", closed_at) is True
+    _save_pre_entry_shadow(repo, "cand-live-closed")
+
+    resolved_at = _NOW + timedelta(hours=3)
+    with patch("crypto_trading.guardian.authority.log_event") as mock_log_event:
+        count = resolve_pending_pre_entry_shadows(repo, resolved_at, "run-2")
+
+    assert count == 1
+    row = repo.get_guardian_authority_pre_entry_shadow("cand-live-closed")
+    assert row["status"] == "RESOLVED"
+    assert row["actual_exit_reason"] == "stop_loss"
+    assert row["actual_pnl_usdt"] is None
+    assert row["actual_closed_at"] == closed_at.isoformat()
+    mock_log_event.assert_not_called()
+
+
 def test_resolve_pending_pre_entry_shadows_is_idempotent(tmp_path):
     """A second tick after resolution is a no-op - WHERE status='PENDING'
     (Task 2) already enforces this at the DB level; this confirms it holds

@@ -712,10 +712,20 @@ def resolve_pending_pre_entry_shadows(repo: Repository, now: datetime, run_id: s
             if position is None or position.status != "CLOSED":
                 continue
 
+            # A position closed by the LIVE exit mirror (`repo.close_position_
+            # for_live_exit`) is CLOSED but has no PAPER simulated_fill_exit/
+            # fees/funding, so its P/L is unknown here - resolve it with a
+            # NULL P/L rather than letting `compute_pnl` raise on every tick
+            # and leaving the row PENDING forever.
+            has_paper_exit_data = (
+                position.simulated_fill_exit is not None
+                and position.fees is not None
+                and position.funding is not None
+            )
             repo.resolve_guardian_authority_pre_entry_shadow(
                 shadow_id=row["shadow_id"],
                 actual_exit_reason=position.exit_reason,
-                actual_pnl_usdt=compute_pnl(position),
+                actual_pnl_usdt=compute_pnl(position) if has_paper_exit_data else None,
                 actual_closed_at=position.closed_at,
                 updated_at=now,
             )

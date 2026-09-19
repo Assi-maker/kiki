@@ -385,6 +385,17 @@ def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
     }
 
 
+def _release_day_slot(repo: Repository, previous: str | None, now: datetime) -> None:
+    """A strategist AI call that failed/timed out/raised produced no answer,
+    so it must not burn the once-per-UTC-day slot claimed just before it:
+    put back exactly what was there before the claim (2026-09-19: a
+    persistent failure used to lock proposals out for the whole day)."""
+    if previous is not None:
+        repo.set_guardian_authority_strategist_last_proposed_date(previous, now)
+    else:
+        repo.clear_guardian_authority_strategist_last_proposed_date()
+
+
 def propose_candidate_heuristics(
     repo: Repository,
     runner: AgentRunner,
@@ -435,9 +446,13 @@ def propose_candidate_heuristics(
 
         context = _build_context(repo, settings, run_id)
         agent_def = load_agent_definition(_STRATEGIST_AGENT_FILE)
-        assessment: GodfatherStrategistAssessment = runner.run(
-            agent_def, context, GodfatherStrategistAssessment
-        )
+        try:
+            assessment: GodfatherStrategistAssessment = runner.run(
+                agent_def, context, GodfatherStrategistAssessment
+            )
+        except Exception:
+            _release_day_slot(repo, last_proposed, now)
+            raise
 
         billed = getattr(runner, "last_call_billed", True)
         cost = getattr(runner, "last_call_cost_usd", Decimal("0"))
@@ -468,6 +483,7 @@ def propose_candidate_heuristics(
                 event="godfather_strategist_assessment_unusable",
                 status=assessment.status,
             )
+            _release_day_slot(repo, last_proposed, now)
             return 0
 
         saved = 0
@@ -499,8 +515,9 @@ def propose_candidate_heuristics(
         return saved
     except Exception as exc:
         # Same fail-safe discipline as every other AI call site here: the
-        # day's slot stays claimed (the attempt already cost time/money),
-        # and the caller gets 0 instead of an exception.
+        # caller gets 0 instead of an exception. A failure while BUILDING
+        # the context still leaves the day's slot claimed; a failed AI call
+        # itself already released it above.
         log_event(
             run_id,
             event="godfather_strategist_failed",
