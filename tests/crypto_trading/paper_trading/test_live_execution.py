@@ -69,6 +69,7 @@ class _SpyConnector:
     def __init__(
         self, balance="123.45", all_positions=None, order_status="FILLED",
         executed_qty="0.002", place_raises=None, lookup_raises=None, lookup_returns_none=False,
+        history=None, history_raises=None,
     ):
         self.calls = []
         self.lookup_calls = 0
@@ -80,6 +81,11 @@ class _SpyConnector:
         self._lookup_raises = lookup_raises
         self._lookup_returns_none = lookup_returns_none
         self.leverage_calls = []
+        # history: what the exchange's order history (GET allOrders) returns -
+        # the ground truth for HOW a LIVE position actually closed.
+        self._history = history if history is not None else []
+        self._history_raises = history_raises
+        self.history_calls = []
 
     def set_leverage(self, symbol, leverage=10, side="LONG"):
         self.leverage_calls.append((symbol, leverage))
@@ -102,6 +108,12 @@ class _SpyConnector:
             "executedQty": self._executed_qty, "avgPrice": "50030",
         }
 
+    def get_order_history(self, symbol, start_time_ms, limit=50):
+        self.history_calls.append((symbol, start_time_ms))
+        if self._history_raises is not None:
+            raise self._history_raises
+        return list(self._history)
+
     def get_all_positions(self):
         return self._all_positions
 
@@ -122,8 +134,11 @@ class _SpyConnector:
 
 
 class _SpyMarketDataConnector:
+    def __init__(self, last_price="50000"):
+        self._last_price = last_price
+
     def get_ticker(self, symbol):
-        return {"lastPrice": "50000"}
+        return {"lastPrice": self._last_price}
 
 
 def test_has_sufficient_live_capacity_true_when_room_and_margin(tmp_path):
@@ -919,3 +934,208 @@ def test_recover_stale_claims_marks_failed_only_on_confirmed_rejection(tmp_path)
     row = repo.get_live_execution("pos-1")
     assert row["phase"] == "FAILED"
     assert connector.calls == []
+
+
+# =========================================================================
+# 2026-09-19 LIVE reconciliation: EVERY verified LIVE exit path must mirror
+# onto the shared positions row (not just TIME_LIMIT), and the exit reason
+# must come from how the position REALLY closed on the exchange, not from a
+# ticker-distance guess (ENA-USDT: a real TAKE_PROFIT_MARKET fill was
+# recorded as stop_loss because the last price happened to be 0.00002 closer
+# to the PAPER stop than to the PAPER target).
+# =========================================================================
+
+_EXIT_NOW = _NOW + timedelta(minutes=10)
+_EXIT_MS = int((_NOW + timedelta(minutes=5)).timestamp() * 1000)
+
+
+def _active_live_position(repo, position_id="pos-1"):
+    position = _open_position(repo, position_id)
+    repo.claim_live_execution(position_id, _NOW, "10", "100", "10")
+    repo.update_live_execution_submitted(
+        position_id, "cid-1", "ex-1", "0.002", "50000", None, None, _NOW
+    )
+    return position
+
+
+def _filled_exit(order_type, avg_price, update_ms=_EXIT_MS, **overrides):
+    order = {
+        "orderId": "exit-1", "type": order_type, "side": "SELL", "positionSide": "LONG",
+        "status": "FILLED", "avgPrice": avg_price, "updateTime": update_ms,
+    }
+    order.update(overrides)
+    return order
+
+
+def _assert_positions_row_mirrored(repo, position_id, exit_reason, closed_at):
+    position = repo.get_position(position_id)
+    assert position.status == "CLOSED"
+    assert position.exit_reason == exit_reason
+    assert position.closed_at == closed_at
+    # PAPER-only simulated fields are never touched by a LIVE close
+    assert position.theoretical_exit is None
+    assert position.simulated_fill_exit is None
+    assert position.fees is None
+    assert position.funding is None
+
+
+def test_reconcile_stop_loss_exit_mirrors_positions_row(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+    connector = _SpyConnector(history=[_filled_exit("STOP_MARKET", "49010")])
+
+    reconcile_active_executions(repo, connector, _SpyMarketDataConnector("49500"), "r1", _EXIT_NOW)
+
+    live = repo.get_live_execution("pos-1")
+    assert live["phase"] == "CLOSED"
+    assert live["exit_reason"] == "stop_loss"
+    assert live["exchange_fill_exit"] == "49010"  # the REAL fill, not the ticker
+    _assert_positions_row_mirrored(repo, "pos-1", "stop_loss", _EXIT_NOW)
+
+
+def test_reconcile_target_exit_mirrors_positions_row(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+    connector = _SpyConnector(history=[_filled_exit("TAKE_PROFIT_MARKET", "52010")])
+
+    reconcile_active_executions(repo, connector, _SpyMarketDataConnector("51500"), "r1", _EXIT_NOW)
+
+    live = repo.get_live_execution("pos-1")
+    assert live["exit_reason"] == "target"
+    assert live["exchange_fill_exit"] == "52010"
+    _assert_positions_row_mirrored(repo, "pos-1", "target", _EXIT_NOW)
+
+
+def test_reconcile_ena_regression_real_take_profit_is_not_misclassified_by_ticker_distance(tmp_path):
+    """The ENA-USDT anomaly: the exchange's closing order was a
+    TAKE_PROFIT_MARKET, but the last price (50500) sits exactly between the
+    PAPER stop (49000) and target (52000) - the old ticker heuristic
+    resolves that tie to 'stop_loss'. The exchange's own order type must
+    win."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+    connector = _SpyConnector(history=[_filled_exit("TAKE_PROFIT_MARKET", "50500")])
+
+    reconcile_active_executions(repo, connector, _SpyMarketDataConnector("50500"), "r1", _EXIT_NOW)
+
+    assert repo.get_live_execution("pos-1")["exit_reason"] == "target"
+    _assert_positions_row_mirrored(repo, "pos-1", "target", _EXIT_NOW)
+
+
+def test_reconcile_exchange_stop_wins_even_when_ticker_is_nearer_the_target(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+    connector = _SpyConnector(history=[_filled_exit("STOP_MARKET", "50100")])  # e.g. break-even SL
+
+    reconcile_active_executions(repo, connector, _SpyMarketDataConnector("51900"), "r1", _EXIT_NOW)
+
+    assert repo.get_live_execution("pos-1")["exit_reason"] == "stop_loss"
+
+
+def test_reconcile_falls_back_to_ticker_heuristic_when_history_has_no_matching_exit(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+
+    reconcile_active_executions(
+        repo, _SpyConnector(history=[]), _SpyMarketDataConnector("49500"), "r1", _EXIT_NOW,
+    )
+    assert repo.get_live_execution("pos-1")["exit_reason"] == "stop_loss"
+    _assert_positions_row_mirrored(repo, "pos-1", "stop_loss", _EXIT_NOW)
+
+    repo2 = SQLiteRepository(tmp_path / "t2.db")
+    _active_live_position(repo2)
+    reconcile_active_executions(
+        repo2, _SpyConnector(history=[]), _SpyMarketDataConnector("51500"), "r1", _EXIT_NOW,
+    )
+    assert repo2.get_live_execution("pos-1")["exit_reason"] == "target"
+    _assert_positions_row_mirrored(repo2, "pos-1", "target", _EXIT_NOW)
+
+
+def test_reconcile_still_closes_out_when_order_history_is_unavailable(tmp_path):
+    """Capacity accounting must never depend on the history endpoint: a
+    failing lookup degrades to the previous heuristic, it never leaves a
+    flat position looking open."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+    connector = _SpyConnector(history_raises=ConnectorUnavailableError("history down"))
+
+    count = reconcile_active_executions(repo, connector, _SpyMarketDataConnector("49500"), "r1", _EXIT_NOW)
+
+    assert count == 0
+    assert repo.get_live_execution("pos-1")["phase"] == "CLOSED"
+    _assert_positions_row_mirrored(repo, "pos-1", "stop_loss", _EXIT_NOW)
+
+
+def test_reconcile_ignores_exit_orders_from_before_this_position_was_claimed(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+    stale_ms = int((_NOW - timedelta(hours=2)).timestamp() * 1000)
+    connector = _SpyConnector(history=[_filled_exit("TAKE_PROFIT_MARKET", "52000", update_ms=stale_ms)])
+
+    reconcile_active_executions(repo, connector, _SpyMarketDataConnector("49500"), "r1", _EXIT_NOW)
+
+    assert repo.get_live_execution("pos-1")["exit_reason"] == "stop_loss"  # heuristic, not the stale order
+
+
+def test_reconcile_is_idempotent_and_never_clobbers_the_mirrored_row(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+    connector = _SpyConnector(history=[_filled_exit("TAKE_PROFIT_MARKET", "52010")])
+    market = _SpyMarketDataConnector("51500")
+
+    reconcile_active_executions(repo, connector, market, "r1", _EXIT_NOW)
+    first_live = repo.get_live_execution("pos-1")
+    later = _EXIT_NOW + timedelta(minutes=30)
+    count = reconcile_active_executions(repo, connector, market, "r1", later)
+
+    assert count == 0
+    assert repo.get_live_execution("pos-1") == first_live
+    _assert_positions_row_mirrored(repo, "pos-1", "target", _EXIT_NOW)  # closed_at not moved to `later`
+
+
+def test_reconcile_never_overwrites_a_position_paper_already_closed(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _active_live_position(repo)
+    repo.close_position_with_event(
+        position_id="pos-1", theoretical_exit=Decimal("49500"),
+        simulated_fill_exit=Decimal("49500"), exit_reason="guardian_exit",
+        fees=Decimal("1"), funding=Decimal("0"), closed_at=_NOW,
+        event=Event(event_id="POSITION_CLOSED:pos-1", event_type="POSITION_CLOSED",
+                    aggregate_type="position", aggregate_id="pos-1", occurred_at=_NOW,
+                    run_id="seed", schema_version=1, payload={}),
+    )
+    connector = _SpyConnector(history=[_filled_exit("STOP_MARKET", "49010")])
+
+    reconcile_active_executions(repo, connector, _SpyMarketDataConnector("49500"), "r1", _EXIT_NOW)
+
+    position = repo.get_position("pos-1")
+    assert position.exit_reason == "guardian_exit"  # PAPER's own close is left alone
+    assert position.simulated_fill_exit == Decimal("49500")
+    assert position.closed_at == _NOW
+
+
+def test_close_guardian_exit_positions_is_idempotent_and_preserves_paper_close(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    position = _active_live_position(repo)
+    repo.close_position_with_event(
+        position_id="pos-1", theoretical_exit=Decimal("49500"),
+        simulated_fill_exit=Decimal("49500"), exit_reason="guardian_exit",
+        fees=Decimal("0"), funding=Decimal("0"), closed_at=_NOW,
+        event=Event(event_id="POSITION_CLOSED:pos-1", event_type="POSITION_CLOSED",
+                    aggregate_type="position", aggregate_id="pos-1", occurred_at=_NOW,
+                    run_id="seed", schema_version=1, payload={}),
+    )
+    connector = _SpyConnector()
+
+    close_guardian_exit_positions(repo, connector, "r1", _EXIT_NOW)
+    close_guardian_exit_positions(repo, connector, "r1", _EXIT_NOW + timedelta(minutes=5))
+
+    live = repo.get_live_execution("pos-1")
+    assert live["phase"] == "CLOSED"
+    assert live["exit_reason"] == "GUARDIAN_EXIT"
+    closed = repo.get_position("pos-1")
+    assert closed.status == "CLOSED"
+    assert closed.exit_reason == "guardian_exit"
+    assert closed.simulated_fill_exit == Decimal("49500")
+    assert closed.closed_at == _NOW
+    assert position.position_id == "pos-1"

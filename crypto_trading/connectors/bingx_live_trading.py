@@ -18,6 +18,7 @@ _ALL_OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/allOpenOrders"
 _LEVERAGE_PATH = "/openApi/swap/v2/trade/leverage"
 _POSITIONS_PATH = "/openApi/swap/v2/user/positions"
 _OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
+_ALL_ORDERS_PATH = "/openApi/swap/v2/trade/allOrders"
 _BALANCE_PATH = "/openApi/swap/v2/user/balance"
 
 
@@ -221,6 +222,21 @@ class BingXLiveTradingConnector:
 
     def get_open_orders(self, symbol: str) -> list[dict]:
         data = self._request("GET", _OPEN_ORDERS_PATH, {"symbol": symbol}) or {}
+        if isinstance(data, list):
+            return data
+        return data.get("orders", [])
+
+    def get_order_history(self, symbol: str, start_time_ms: int, limit: int = 50) -> list[dict]:
+        """Read-only. The exchange's own order history for `symbol` since
+        `start_time_ms` (GET allOrders) - the ground truth for HOW a position
+        actually closed (which order type filled, and at what price). Unlike
+        get_order_by_client_order_id/get_order_status, an API error is NOT
+        collapsed into an empty result: it raises ConnectorUnavailableError so a
+        caller can tell 'no such orders' from 'the exchange did not answer'."""
+        data = self._request(
+            "GET", _ALL_ORDERS_PATH,
+            {"symbol": symbol, "startTime": start_time_ms, "limit": limit},
+        ) or {}
         if isinstance(data, list):
             return data
         return data.get("orders", [])

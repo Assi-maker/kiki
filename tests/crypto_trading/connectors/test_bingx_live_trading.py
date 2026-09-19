@@ -288,3 +288,49 @@ def test_cancel_order_sends_delete_with_symbol_and_order_id():
     params = parse_qs(query_str)
     assert params["symbol"] == ["BTC-USDT"]
     assert params["orderId"] == ["999"]
+
+
+@respx.mock
+def test_get_order_history_is_a_read_only_get_of_all_orders_since_start_time():
+    route = respx.get(f"{_LIVE_BASE}/openApi/swap/v2/trade/allOrders").mock(
+        return_value=Response(
+            200,
+            json={"code": 0, "msg": "", "data": {"orders": [
+                {"orderId": 1, "type": "TAKE_PROFIT_MARKET", "status": "FILLED", "avgPrice": "0.19399"},
+            ]}},
+        )
+    )
+
+    orders = _connector().get_order_history("ENA-USDT", 1789800000000, limit=20)
+
+    assert orders == [
+        {"orderId": 1, "type": "TAKE_PROFIT_MARKET", "status": "FILLED", "avgPrice": "0.19399"}
+    ]
+    request = route.calls[0].request
+    assert request.method == "GET"
+    params = parse_qs(urlparse(str(request.url)).query)
+    assert params["symbol"] == ["ENA-USDT"]
+    assert params["startTime"] == ["1789800000000"]
+    assert params["limit"] == ["20"]
+    assert "signature" in params
+
+
+@respx.mock
+def test_get_order_history_returns_empty_list_when_exchange_returns_no_orders():
+    respx.get(f"{_LIVE_BASE}/openApi/swap/v2/trade/allOrders").mock(
+        return_value=Response(200, json={"code": 0, "msg": "", "data": {"orders": []}})
+    )
+
+    assert _connector().get_order_history("ENA-USDT", 1789800000000) == []
+
+
+@respx.mock
+def test_get_order_history_raises_connector_unavailable_on_api_error_code():
+    """Not swallowed into an empty list: callers must be able to tell 'the
+    exchange has no such orders' from 'the exchange did not answer'."""
+    respx.get(f"{_LIVE_BASE}/openApi/swap/v2/trade/allOrders").mock(
+        return_value=Response(200, json={"code": 100500, "msg": "internal", "data": {}})
+    )
+
+    with pytest.raises(ConnectorUnavailableError):
+        _connector().get_order_history("ENA-USDT", 1789800000000)

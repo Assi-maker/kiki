@@ -40,6 +40,81 @@ def _client_order_id(position_id: str, suffix: str) -> str:
     return f"lv{position_id[:24]}{suffix}"[:32]
 
 
+# How the exchange itself reports a closing order, by order type. Only these
+# two are trusted to classify an exit; anything else (a MARKET close, an
+# unknown type, nothing found) falls back to the ticker-distance heuristic.
+_EXIT_REASON_BY_ORDER_TYPE = {
+    "STOP_MARKET": "stop_loss",
+    "STOP": "stop_loss",
+    "TAKE_PROFIT_MARKET": "target",
+    "TAKE_PROFIT": "target",
+}
+
+
+def _finalize_live_close(
+    repo: Repository,
+    position_id: str,
+    exit_reason: str,
+    exchange_fill_exit: str,
+    now: datetime,
+) -> None:
+    """The ONE place every verified LIVE exit path (exchange SL/TP found flat,
+    Guardian EXIT, TIME_LIMIT) records its close: the live_executions row AND
+    the shared `positions` row. Before 2026-09-19 only TIME_LIMIT mirrored
+    onto `positions`, so stop_loss/target closes left it OPEN_POSITION forever
+    and Guardian kept observing an already-flat position.
+
+    live_executions is closed FIRST on purpose: a crash between the two writes
+    must leave the live row CLOSED (never re-closed) rather than a still-open
+    live row whose positions row is already CLOSED (which would make
+    close_time_limit_positions skip a genuinely open position).
+    close_position_for_live_exit is idempotent and only touches a row that is
+    still OPEN_POSITION - a position PAPER already closed keeps PAPER's own
+    exit data - and never writes PAPER's simulated-fill fields."""
+    repo.close_live_execution(position_id, exit_reason, exchange_fill_exit, now)
+    repo.close_position_for_live_exit(position_id, exit_reason, now)
+
+
+def _find_exchange_exit(
+    connector: BingXLiveTradingConnector, instrument: str, since: datetime
+) -> tuple[str, Decimal] | None:
+    """How did this position REALLY close? Looks in the exchange's own order
+    history for the most recent FILLED SELL/LONG stop or take-profit order
+    updated at/after `since` (the moment this LIVE execution was claimed, so
+    an older position's exit on the same symbol is never picked up).
+    Returns (exit_reason, real_fill_price), or None when the history is
+    unavailable or has no such order - the caller then keeps the previous
+    ticker-distance heuristic, so a failing history endpoint can never stop a
+    flat position from being closed out."""
+    since_ms = int(since.timestamp() * 1000)
+    try:
+        orders = connector.get_order_history(instrument, since_ms)
+    except _ORDER_STATE_UNKNOWN_ERRORS:
+        return None
+    candidates = []
+    for order in orders:
+        reason = _EXIT_REASON_BY_ORDER_TYPE.get(str(order.get("type")))
+        if (
+            reason is None
+            or order.get("status") != "FILLED"
+            or order.get("side") != "SELL"
+            or order.get("positionSide") != "LONG"
+        ):
+            continue
+        try:
+            updated_ms = int(order.get("updateTime") or 0)
+            fill_price = Decimal(str(order.get("avgPrice")))
+        except (ValueError, ArithmeticError):
+            continue
+        if updated_ms < since_ms or fill_price <= 0:
+            continue
+        candidates.append((updated_ms, reason, fill_price))
+    if not candidates:
+        return None
+    _, reason, fill_price = max(candidates, key=lambda candidate: candidate[0])
+    return reason, fill_price
+
+
 def _quantity_for_live(entry_price: Decimal, margin_usdt: Decimal, leverage: int, precision: int) -> Decimal:
     """Fixed sizing, independent of PAPER's dynamic position.size (spec §4/§8):
     quantity = (margin * leverage) / entry_price, rounded down."""
@@ -72,14 +147,30 @@ def reconcile_active_executions(
         if connector.get_position(position.instrument) is not None:
             active_count += 1  # still genuinely open on the exchange
             continue
-        exit_price = Decimal(str(market_data_connector.get_ticker(position.instrument)["lastPrice"]))
-        distance_to_stop = abs(exit_price - position.stop_loss)
-        distance_to_target = abs(exit_price - position.target)
-        exit_reason = "stop_loss" if distance_to_stop <= distance_to_target else "target"
-        repo.close_live_execution(position.position_id, exit_reason, str(exit_price), now)
+        # 2026-09-19: the exchange's own closing order is authoritative for BOTH
+        # the reason and the fill price (ENA-USDT: a real TAKE_PROFIT_MARKET
+        # fill was recorded as stop_loss because the last price sat 0.00002
+        # closer to the PAPER stop than to the PAPER target). Only when the
+        # history is unavailable/has no such order does the previous ticker-
+        # distance heuristic still apply.
+        exchange_exit = _find_exchange_exit(
+            connector, position.instrument, datetime.fromisoformat(row["claimed_at"])
+        )
+        if exchange_exit is not None:
+            exit_reason, exit_price = exchange_exit
+            classified_by = "exchange_order"
+        else:
+            exit_price = Decimal(
+                str(market_data_connector.get_ticker(position.instrument)["lastPrice"])
+            )
+            distance_to_stop = abs(exit_price - position.stop_loss)
+            distance_to_target = abs(exit_price - position.target)
+            exit_reason = "stop_loss" if distance_to_stop <= distance_to_target else "target"
+            classified_by = "ticker_heuristic"
+        _finalize_live_close(repo, position.position_id, exit_reason, str(exit_price), now)
         log_event(
             run_id, event="live_position_closed", position_id=position.position_id,
-            exit_reason=exit_reason,
+            exit_reason=exit_reason, classified_by=classified_by,
         )
     return active_count
 
@@ -496,8 +587,8 @@ def close_guardian_exit_positions(
                 position.instrument, quantity=row.get("entry_quantity") or "0",
                 client_order_id=client_order_id,
             )
-            repo.close_live_execution(
-                position.position_id, "GUARDIAN_EXIT", str(result.get("avgPrice", "")), now
+            _finalize_live_close(
+                repo, position.position_id, "GUARDIAN_EXIT", str(result.get("avgPrice", "")), now
             )
             log_event(run_id, event="live_guardian_exit_closed", position_id=position.position_id)
         except _GUARDED_ERRORS as exc:
@@ -535,15 +626,13 @@ def close_time_limit_positions(
                 position.instrument, quantity=row.get("entry_quantity") or "0",
                 client_order_id=client_order_id,
             )
-            repo.close_live_execution(
-                position.position_id, "TIME_LIMIT", str(result.get("avgPrice", "")), now
+            # Reconciliation (2026-09-18, generalized 2026-09-19): the LIVE
+            # position is confirmed closed on the exchange above - close the live
+            # row and mirror onto the shared `positions` row in one place, same as
+            # every other LIVE exit path.
+            _finalize_live_close(
+                repo, position.position_id, "TIME_LIMIT", str(result.get("avgPrice", "")), now
             )
-            # Reconciliation fix (2026-09-18): the LIVE position is now
-            # confirmed closed on the exchange above - mirror that onto the
-            # shared `positions` row too, or it stays OPEN_POSITION forever
-            # (PAPER's own close only fires at its independent 24h limit)
-            # and Guardian keeps observing an already-flat position.
-            repo.close_position_for_live_exit(position.position_id, "TIME_LIMIT", now)
             log_event(run_id, event="live_time_limit_closed", position_id=position.position_id)
         except _GUARDED_ERRORS as exc:
             log_event(

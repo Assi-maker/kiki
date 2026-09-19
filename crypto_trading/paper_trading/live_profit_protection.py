@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from typing import NamedTuple
 
 import httpx
 
@@ -30,6 +32,18 @@ from crypto_trading.storage.repository import Repository
 # verbatim after exhausting retries. Never guess, never blind-retry a write
 # whose outcome is unknown.
 _UNKNOWN_OUTCOME_ERRORS = (ConnectorUnavailableError, LiveExecutionGuardError, httpx.TransportError)
+
+# 2026-09-19: verification of a freshly placed SL is a ladder, retried a small
+# bounded number of times (the sleep is a module attribute so tests never
+# wait for real). Root cause this exists for: BingX's GET /trade/order
+# ?clientOrderID=... answers "109421 order not exist" for a conditional
+# STOP_MARKET order that DOES exist (live-verified on ENA-USDT: present in
+# allOrders and answering a lookup BY orderId), so a client-order-id-only
+# lookup can never confirm a new SL and every PP attempt used to end
+# UNCERTAIN_NEW_SL_STATUS.
+_VERIFY_ATTEMPTS = 3
+_VERIFY_RETRY_DELAY_SECONDS = 0.5
+_sleep = time.sleep
 
 _ACTIVE_SL_STATUSES = frozenset({"NEW", "PENDING"})
 
@@ -63,19 +77,162 @@ def _client_order_id(position_id: str, suffix: str) -> str:
     return f"lv{position_id[:24]}{suffix}"[:32]
 
 
-def _lookup_new_sl_order(
-    connector: BingXLiveTradingConnector, instrument: str, client_order_id: str
-) -> dict | None:
-    """Read-only lookup by the deterministic clientOrderID - the one and
-    only way this module ever tries to learn the new SL's true state,
-    exactly mirroring live_execution.py's own _lookup_order()/
-    _resolve_uncertain_entry() discipline: look up, never resubmit blindly.
-    Any error collapses to None here, deliberately identical to "order not
-    found" - both mean "cannot determine the true state right now"."""
+class _Verification(NamedTuple):
+    order: dict | None
+    source: str | None  # which rung confirmed it; None when nothing did
+    had_error: bool  # True when any rung raised (outcome unknown, not merely "not found")
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
     try:
-        return connector.get_order_by_client_order_id(instrument, client_order_id)
-    except _UNKNOWN_OUTCOME_ERRORS:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
         return None
+
+
+def _is_our_new_sl(
+    order: dict | None,
+    client_order_id: str,
+    old_sl_order_id: str | None,
+    breakeven_price: Decimal | None,
+) -> bool:
+    """Identity check for an order found by orderId or by scanning the open
+    orders: it must be a STOP_MARKET that is not the old SL, must not carry
+    someone else's clientOrderId, and (when we know it) must sit at exactly
+    the break-even price. Never accepts a lookalike."""
+    if not order or order.get("type") != "STOP_MARKET":
+        return False
+    if old_sl_order_id is not None and str(order.get("orderId")) == str(old_sl_order_id):
+        return False
+    order_client_id = order.get("clientOrderId") or order.get("clientOrderID") or ""
+    if order_client_id and order_client_id != client_order_id:
+        return False
+    if breakeven_price is not None:
+        stop_price = _decimal_or_none(order.get("stopPrice"))
+        if stop_price is None or stop_price != breakeven_price:
+            return False
+    return True
+
+
+def _scan_open_orders_for_new_sl(
+    connector: BingXLiveTradingConnector,
+    instrument: str,
+    client_order_id: str,
+    old_sl_order_id: str | None,
+    breakeven_price: Decimal | None,
+) -> dict | None:
+    """Last rung: find the new SL in the exchange's open-order list. A match
+    by our own deterministic clientOrderId wins; otherwise exactly ONE
+    STOP_MARKET at the break-even price (different from the old SL) is
+    accepted. Zero or several candidates -> None (never a guess)."""
+    open_orders = connector.get_open_orders(instrument)
+    stops = [
+        order for order in open_orders
+        if order.get("type") == "STOP_MARKET"
+        and (old_sl_order_id is None or str(order.get("orderId")) != str(old_sl_order_id))
+    ]
+    by_client_id = [
+        order for order in stops
+        if (order.get("clientOrderId") or order.get("clientOrderID")) == client_order_id
+    ]
+    if len(by_client_id) == 1:
+        return by_client_id[0]
+    by_price = [
+        order for order in stops
+        if _is_our_new_sl(order, client_order_id, old_sl_order_id, breakeven_price)
+    ] if breakeven_price is not None else []
+    if len(by_client_id) == 0 and len(by_price) == 1:
+        return by_price[0]
+    return None
+
+
+def _verify_new_sl_once(
+    connector: BingXLiveTradingConnector,
+    instrument: str,
+    client_order_id: str,
+    order_id: object,
+    old_sl_order_id: str | None,
+    breakeven_price: Decimal | None,
+) -> _Verification:
+    """One pass over the verification rungs, cheapest first:
+    1. by clientOrderID (works for plain orders; blind to conditional ones),
+    2. by orderId - the one the exchange returned when we placed the SL,
+    3. scan of the open orders.
+    Each rung is read-only. An error on a rung is remembered (had_error) and
+    the next rung is still tried - one blind endpoint must not hide the
+    order."""
+    had_error = False
+
+    try:
+        order = connector.get_order_by_client_order_id(instrument, client_order_id)
+    except _UNKNOWN_OUTCOME_ERRORS:
+        order, had_error = None, True
+    if _classify_new_sl_state(order) != "UNKNOWN":
+        return _Verification(order, "client_order_id", had_error)
+
+    if order_id:
+        try:
+            order = connector.get_order_status(instrument, str(order_id))
+        except _UNKNOWN_OUTCOME_ERRORS:
+            order, had_error = None, True
+        if _classify_new_sl_state(order) != "UNKNOWN" and _is_our_new_sl(
+            order, client_order_id, old_sl_order_id, breakeven_price
+        ):
+            return _Verification(order, "order_id", had_error)
+
+    try:
+        order = _scan_open_orders_for_new_sl(
+            connector, instrument, client_order_id, old_sl_order_id, breakeven_price
+        )
+    except _UNKNOWN_OUTCOME_ERRORS:
+        order, had_error = None, True
+    if _classify_new_sl_state(order) != "UNKNOWN":
+        return _Verification(order, "open_orders_scan", had_error)
+
+    return _Verification(None, None, had_error)
+
+
+def _verify_new_sl(
+    connector: BingXLiveTradingConnector,
+    instrument: str,
+    client_order_id: str,
+    order_id: object = None,
+    old_sl_order_id: str | None = None,
+    breakeven_price: Decimal | None = None,
+    attempts: int = _VERIFY_ATTEMPTS,
+) -> _Verification:
+    """Read-only verification of the new SL's true exchange state, retried
+    up to `attempts` times (with a short delay) while it cannot be
+    confirmed. Never places or cancels anything."""
+    result = _Verification(None, None, False)
+    had_error = False
+    for attempt in range(attempts):
+        result = _verify_new_sl_once(
+            connector, instrument, client_order_id, order_id, old_sl_order_id, breakeven_price
+        )
+        had_error = had_error or result.had_error
+        if result.order is not None:
+            return _Verification(result.order, result.source, had_error)
+        if attempt < attempts - 1:
+            _sleep(_VERIFY_RETRY_DELAY_SECONDS)
+    return _Verification(None, None, had_error)
+
+
+def _lookup_new_sl_order(
+    connector: BingXLiveTradingConnector,
+    instrument: str,
+    client_order_id: str,
+    order_id: object = None,
+    old_sl_order_id: str | None = None,
+    breakeven_price: Decimal | None = None,
+    attempts: int = _VERIFY_ATTEMPTS,
+) -> dict | None:
+    """Verification ladder (see _verify_new_sl), collapsing "cannot tell"
+    and "not found" into None - identical semantics to the previous
+    client-order-id-only version, for callers that treat both the same."""
+    return _verify_new_sl(
+        connector, instrument, client_order_id, order_id, old_sl_order_id, breakeven_price, attempts
+    ).order
 
 
 def _classify_new_sl_state(order: dict | None) -> str:
@@ -227,28 +384,76 @@ def _finalize_verified_active_new_sl(
         )
         return
 
-    # Deep-review fix 4: the cancel above is the last IRREVERSIBLE step -
-    # the replacement is already a real, complete success at this point.
-    # Record that success FIRST. The final-state read below is purely
-    # informational (for log visibility); it must never be able to leave a
-    # genuinely successful replacement recorded as anything other than
-    # SL_REPLACED if it happens to fail.
-    repo.set_live_profit_protection_status(position_id, "SL_REPLACED", now)
-    log_event(
-        run_id, event="live_pp_sl_replaced", position_id=position_id, instrument=instrument,
-        old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id, status="SL_REPLACED",
-    )
+    # 2026-09-19: the cancel above is the last IRREVERSIBLE step, so the
+    # final state is now VERIFIED against the exchange before success is
+    # ever recorded (this replaces deep-review fix 4, which recorded
+    # SL_REPLACED before an informational, failure-tolerant final read).
+    # Success requires: the new SL is listed among the open STOP_MARKET
+    # orders AND the old SL is not. If the final state cannot be read or
+    # does not match, the row is UNCERTAIN_FINAL_STATE - the cancel is never
+    # retried blindly and no third order is ever placed.
     try:
         remaining_orders = connector.get_open_orders(instrument)
+        remaining_stop_ids = {
+            str(order.get("orderId")) for order in remaining_orders
+            if order.get("type") == "STOP_MARKET"
+        }
+        final_state_ok = (
+            str(new_sl_order_id) in remaining_stop_ids
+            and str(old_sl_order_id) not in remaining_stop_ids
+        )
+        final_position = None if final_state_ok else connector.get_position(instrument)
+    except _UNKNOWN_OUTCOME_ERRORS as exc:
+        repo.set_live_profit_protection_status(
+            position_id, "UNCERTAIN_FINAL_STATE", now,
+            last_error=f"final exchange state could not be read after cancelling the old SL: {exc}",
+        )
+        log_event(
+            run_id, event="live_pp_final_state_check_failed", position_id=position_id,
+            instrument=instrument, error_type=type(exc).__name__, error=str(exc),
+            status="UNCERTAIN_FINAL_STATE",
+        )
+        return
+
+    if final_state_ok:
+        repo.set_live_profit_protection_status(position_id, "SL_REPLACED", now)
+        log_event(
+            run_id, event="live_pp_sl_replaced", position_id=position_id, instrument=instrument,
+            old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id, status="SL_REPLACED",
+        )
         log_event(
             run_id, event="live_pp_final_state_check", position_id=position_id, instrument=instrument,
             remaining_open_order_types=[order.get("type") for order in remaining_orders],
         )
-    except _UNKNOWN_OUTCOME_ERRORS as exc:
-        log_event(
-            run_id, event="live_pp_final_state_check_failed", position_id=position_id,
-            instrument=instrument, error_type=type(exc).__name__, error=str(exc),
+        return
+
+    if final_position is None:
+        # Position went flat around the cancel (e.g. the new SL just filled):
+        # verified exchange state, nothing left to protect or to verify.
+        repo.set_live_profit_protection_status(
+            position_id, "POSITION_CLOSED_DURING_REPLACEMENT", now,
+            last_error="position closed on the exchange while the old SL was being cancelled",
         )
+        log_event(
+            run_id, event="live_pp_position_closed_before_cancel", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+            status="POSITION_CLOSED_DURING_REPLACEMENT",
+        )
+        return
+
+    repo.set_live_profit_protection_status(
+        position_id, "UNCERTAIN_FINAL_STATE", now,
+        last_error=(
+            "final exchange state does not match expectation after cancelling the old SL: "
+            f"open STOP_MARKET order ids={sorted(remaining_stop_ids)}, expected only {new_sl_order_id}"
+        ),
+    )
+    log_event(
+        run_id, event="live_pp_final_state_uncertain", position_id=position_id, instrument=instrument,
+        old_sl_order_id=old_sl_order_id, new_sl_order_id=new_sl_order_id,
+        status="UNCERTAIN_FINAL_STATE", severity="ERROR",
+        remaining_open_order_types=[order.get("type") for order in remaining_orders],
+    )
 
 
 def _place_and_verify_new_sl(
@@ -322,7 +527,7 @@ def _place_and_verify_new_sl(
         return
 
     try:
-        connector.place_stop_loss_order(
+        placed_order = connector.place_stop_loss_order(
             instrument, quantity=str(entry_quantity), stop_price=str(breakeven_price),
             client_order_id=new_sl_client_order_id,
         )
@@ -341,8 +546,18 @@ def _place_and_verify_new_sl(
 
     # Step 6 (spec step 4): verify the new SL is genuinely active before
     # ever touching the old one - the single most important invariant here.
-    new_sl_order = _lookup_new_sl_order(connector, instrument, new_sl_client_order_id)
+    verification = _verify_new_sl(
+        connector, instrument, new_sl_client_order_id,
+        order_id=(placed_order or {}).get("orderId"),
+        old_sl_order_id=old_sl_order_id, breakeven_price=breakeven_price,
+    )
+    new_sl_order = verification.order
     state = _classify_new_sl_state(new_sl_order)
+    if verification.source is not None:
+        log_event(
+            run_id, event="live_pp_new_sl_verification_source", position_id=position_id,
+            instrument=instrument, source=verification.source,
+        )
 
     if state == "UNKNOWN":
         repo.set_live_profit_protection_status(
@@ -525,23 +740,30 @@ def _recover_case_b(
         return
 
     new_sl_client_order_id = row["new_sl_client_order_id"]
+    breakeven_price = Decimal(str(row["breakeven_price"]))
     # Fix 3 (deep review): a genuine lookup error must NEVER be collapsed
     # into "not found" here - that would silently downgrade an unknown
     # outcome into a real placement attempt, a severity regression from
     # Task 5's original fail-closed discipline (_resolve_uncertain_entry:
     # look up, never resubmit, when the true state can't be determined).
-    # Deliberately does NOT use _lookup_new_sl_order (which swallows every
-    # _UNKNOWN_OUTCOME_ERRORS into None, identical to "not found") - the
-    # raise is caught here, explicitly, so it can be handled differently.
-    try:
-        new_sl_order = connector.get_order_by_client_order_id(instrument, new_sl_client_order_id)
-    except _UNKNOWN_OUTCOME_ERRORS as exc:
+    # 2026-09-19: the lookup is now the read-only verification ladder
+    # (client order id -> open-orders scan; the by-orderId rung has no id to
+    # use here - the crash happened before one was ever recorded). A rung
+    # that RAISED is reported via had_error, so "cannot tell" is still
+    # distinguished from a determinate "not found" - only the latter may
+    # ever lead to a placement retry below.
+    verification = _verify_new_sl(
+        connector, instrument, new_sl_client_order_id,
+        old_sl_order_id=old_sl_order_id, breakeven_price=breakeven_price, attempts=1,
+    )
+    new_sl_order = verification.order
+    if new_sl_order is None and verification.had_error:
         # Leave the row CLAIMED; a later tick's recovery pass will retry
         # the lookup once the exchange is reachable again. Never guess.
         log_event(
             run_id, event="live_pp_recovery_new_sl_lookup_failed", position_id=position_id,
             instrument=instrument, old_sl_order_id=old_sl_order_id,
-            error_type=type(exc).__name__, error=str(exc), recovery_case="B",
+            error_type="VerificationError", error="a verification rung raised", recovery_case="B",
         )
         return
 
@@ -567,7 +789,6 @@ def _recover_case_b(
     # placed - safe to retry placement using the row's stored
     # old_sl_order_id/breakeven_price/new_sl_client_order_id (the SAME id,
     # never a new one).
-    breakeven_price = Decimal(str(row["breakeven_price"]))
     _place_and_verify_new_sl(
         repo, connector, position_id, instrument, old_sl_order_id, breakeven_price,
         new_sl_client_order_id, position_amt, run_id, now,
@@ -683,7 +904,11 @@ def _recover_case_c(
         # SL is NEVER cancelled purely because it happens to still be
         # present; only a freshly, positively confirmed new SL unlocks that.
         new_sl_client_order_id = row["new_sl_client_order_id"]
-        new_sl_order = _lookup_new_sl_order(connector, instrument, new_sl_client_order_id)
+        new_sl_order = _lookup_new_sl_order(
+            connector, instrument, new_sl_client_order_id, order_id=new_sl_order_id,
+            old_sl_order_id=old_sl_order_id,
+            breakeven_price=Decimal(str(row["breakeven_price"])), attempts=1,
+        )
         state = _classify_new_sl_state(new_sl_order)
 
         if state == "ACTIVE":

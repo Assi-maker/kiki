@@ -3,6 +3,9 @@ from decimal import Decimal
 
 from crypto_trading.connectors.bingx_live_trading import OrderRejectedError
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
+import pytest
+
+from crypto_trading.paper_trading import live_profit_protection as pp_module
 from crypto_trading.paper_trading.live_profit_protection import (
     run_live_profit_protection_tick,
     unrealized_profit_pct,
@@ -13,6 +16,13 @@ from crypto_trading.storage.repository import SQLiteRepository
 
 _NOW = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
 _THRESHOLD = Decimal("0.01")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_verification_sleep(monkeypatch):
+    """The new-SL verification ladder retries with a short real sleep in
+    production; tests must never actually wait."""
+    monkeypatch.setattr(pp_module, "_sleep", lambda _seconds: None)
 
 
 def test_unrealized_profit_pct_positive_when_mark_above_entry():
@@ -78,6 +88,12 @@ class _SpyConnector:
         lookup_sequence=None,
         lookup_raises=None,
         cancel_raises=None,
+        stateful_orders=False,
+        order_status_by_id=None,
+        place_response=None,
+        final_open_orders=None,
+        place_appends=None,
+        order_status_sequence=None,
     ):
         self.calls: list[tuple] = []
         self.place_calls: list[dict] = []
@@ -85,7 +101,28 @@ class _SpyConnector:
         self.lookup_calls = 0
         self._positions = positions if positions is not None else []
         self._position_sequence = list(position_sequence) if position_sequence is not None else None
-        self._open_orders = open_orders if open_orders is not None else []
+        self._open_orders = list(open_orders) if open_orders is not None else []
+        # stateful_orders: place_stop_loss_order appends the new SL to the
+        # open-order list and cancel_order removes the cancelled one, i.e. the
+        # spy behaves like a real exchange for the post-cancel final-state
+        # verification. final_open_orders overrides what get_open_orders
+        # returns once a cancel has happened (to model a final state that
+        # does NOT match expectations).
+        self._stateful_orders = stateful_orders
+        self._place_appends = list(place_appends) if place_appends is not None else []
+        self._order_status_sequence = (
+            list(order_status_sequence) if order_status_sequence is not None else None
+        )
+        self._final_open_orders = final_open_orders
+        self._cancelled = False
+        # order_status_by_id: what get_order_status(order_id) returns - the
+        # real BingX answers a lookup BY ORDER ID for a conditional
+        # (STOP_MARKET) order even though the same order is "not exist" by
+        # clientOrderID (observed live 2026-09-19).
+        self._order_status_by_id = order_status_by_id or {}
+        self._place_response = (
+            place_response if place_response is not None else {"orderId": "new-sl-1", "status": "NEW"}
+        )
         self._open_orders_call_count = 0
         self._open_orders_raises_from_call = open_orders_raises_from_call
         self._place_sl_raises = place_sl_raises
@@ -114,12 +151,20 @@ class _SpyConnector:
     def get_open_orders(self, symbol):
         self._open_orders_call_count += 1
         self.calls.append(("get_open_orders", symbol))
+        if self._cancelled and self._final_open_orders is not None:
+            return list(self._final_open_orders)
         if (
             self._open_orders_raises_from_call is not None
             and self._open_orders_call_count >= self._open_orders_raises_from_call
         ):
             raise ConnectorUnavailableError("get_open_orders failed on a later call")
-        return self._open_orders
+        return list(self._open_orders)
+
+    def get_order_status(self, symbol, order_id):
+        self.calls.append(("get_order_status", str(order_id)))
+        if self._order_status_sequence:
+            return self._order_status_sequence.pop(0)
+        return self._order_status_by_id.get(str(order_id))
 
     def place_stop_loss_order(self, symbol, quantity, stop_price, client_order_id):
         call = {
@@ -130,7 +175,13 @@ class _SpyConnector:
         self.calls.append(("place_stop_loss_order", client_order_id))
         if self._place_sl_raises is not None:
             raise self._place_sl_raises
-        return {"orderId": "new-sl-1", "status": "NEW"}
+        self._open_orders.extend(self._place_appends)
+        if self._stateful_orders:
+            self._open_orders.append({
+                "type": "STOP_MARKET", "orderId": self._place_response.get("orderId", "new-sl-1"),
+                "stopPrice": stop_price, "clientOrderId": client_order_id, "status": "NEW",
+            })
+        return self._place_response
 
     def get_order_by_client_order_id(self, symbol, client_order_id):
         self.lookup_calls += 1
@@ -148,6 +199,9 @@ class _SpyConnector:
         self.calls.append(("cancel_order", order_id))
         if self._cancel_raises is not None:
             raise self._cancel_raises
+        self._cancelled = True
+        if self._stateful_orders or self._place_appends:
+            self._open_orders = [o for o in self._open_orders if str(o.get("orderId")) != str(order_id)]
         return {}
 
 
@@ -170,6 +224,7 @@ def test_run_tick_normal_success_yields_sl_replaced(tmp_path):
         positions=[_ABOVE_THRESHOLD_POSITION],
         open_orders=_ONE_OLD_SL,
         lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+        stateful_orders=True,
     )
 
     run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
@@ -433,6 +488,7 @@ def test_run_tick_one_malformed_position_never_blocks_the_rest_of_the_batch(tmp_
         ],
         open_orders=_ONE_OLD_SL,
         lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+        stateful_orders=True,
     )
 
     run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
@@ -471,29 +527,9 @@ def test_run_tick_position_closes_after_new_sl_verified_skips_cancel(tmp_path):
     assert connector.cancel_calls == []  # cancel skipped entirely, not attempted and failed
 
 
-# --- Deep-review fix 4: SL_REPLACED must be written before the ------------
-# --- informational final-state read, not after ----------------------------
-
-def test_run_tick_final_state_read_failure_does_not_undo_sl_replaced(tmp_path):
-    """The old SL cancel (the last IRREVERSIBLE step) already succeeded by
-    the time the purely informational final get_open_orders() read runs.
-    If that read throws, the already-true success must still be recorded
-    as SL_REPLACED, never left stuck at CLAIMED."""
-    repo = SQLiteRepository(tmp_path / "t.db")
-    _open_active_live_position(repo)
-    connector = _SpyConnector(
-        positions=[_ABOVE_THRESHOLD_POSITION],
-        open_orders=_ONE_OLD_SL,
-        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
-        open_orders_raises_from_call=2,  # 1st call (ambiguous-SL check) OK, 2nd (final check) raises
-    )
-
-    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
-
-    row = repo.get_live_profit_protection("pos-1")
-    assert row["status"] == "SL_REPLACED"
-    assert connector.cancel_calls == ["old-sl-1"]  # the real, irreversible cancel did happen
-
+# --- Deep-review fix 4 (SL_REPLACED before the informational final read) is
+# --- superseded 2026-09-19: success is only recorded on VERIFIED final state,
+# --- see test_final_state_read_failure_is_uncertain_not_success below. -------
 
 # --- Deep-review fix 5: entry_quantity must match the real position size -
 
@@ -555,6 +591,7 @@ def test_recovery_case_a_position_still_open_retries_from_scratch(tmp_path):
         positions=[_ABOVE_THRESHOLD_POSITION],
         open_orders=_ONE_OLD_SL,
         lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+        stateful_orders=True,
     )
 
     run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
@@ -607,6 +644,7 @@ def test_recovery_case_b_new_sl_not_found_retries_placement_and_completes(tmp_pa
         # matching "new SL never confirmed placed yet".
         open_orders=_ONE_OLD_SL,
         lookup_sequence=[None, {"orderId": "new-sl-1", "status": "NEW"}],
+        stateful_orders=True,
     )
 
     run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
@@ -635,6 +673,7 @@ def test_recovery_case_b_new_sl_found_active_resumes_at_verified_tail(tmp_path):
         positions=[_ABOVE_THRESHOLD_POSITION],
         open_orders=_ONE_OLD_SL,  # Fix 2: Case B's zero-protective-orders anomaly gate reads this first
         lookup_order={"orderId": "new-sl-1", "status": "PENDING"},
+        final_open_orders=[{"type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": "50000", "status": "NEW"}],
     )
 
     run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
@@ -748,6 +787,7 @@ def test_recovery_case_c_both_orders_exist_cancel_succeeds(tmp_path):
             {"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"},
             {"type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": "50000"},
         ],
+        stateful_orders=True,
     )
 
     run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
@@ -930,6 +970,7 @@ def test_recovery_case_c_new_sl_missing_from_open_orders_but_confirmed_active_vi
         positions=[_ABOVE_THRESHOLD_POSITION],
         open_orders=[{"type": "STOP_MARKET", "orderId": "old-sl-1", "stopPrice": "49000"}],
         lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+        final_open_orders=[{"type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": "50000", "status": "NEW"}],
     )
 
     run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
@@ -1018,3 +1059,220 @@ def test_module_never_imports_forbidden_production_modules():
         if any(m == prefix or m.startswith(prefix + ".") for prefix in forbidden_prefixes)
     ]
     assert offenders == [], f"live_profit_protection.py imports forbidden modules: {offenders}"
+
+
+# =========================================================================
+# 2026-09-19 robust verification: place -> verify -> cancel old -> verify
+# final state. Root cause (forensics on ENA-USDT, all 8 prior PP rows):
+# BingX's GET /trade/order?clientOrderID=... answers "109421 order not
+# exist" for a conditional STOP_MARKET order that DOES exist (it is present
+# in allOrders and answers a lookup BY orderId), so the client-id-only
+# verification always collapsed to UNCERTAIN_NEW_SL_STATUS.
+# =========================================================================
+
+_BREAKEVEN = "50000"
+
+
+def _new_sl_by_id(**overrides):
+    order = {
+        "orderId": "new-sl-1", "status": "NEW", "type": "STOP_MARKET", "side": "SELL",
+        "positionSide": "LONG", "stopPrice": _BREAKEVEN, "clientOrderId": "",
+    }
+    order.update(overrides)
+    return order
+
+
+def _run_pp(tmp_path, **connector_kwargs):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    connector = _SpyConnector(positions=[_ABOVE_THRESHOLD_POSITION], **connector_kwargs)
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+    return repo, connector
+
+
+def test_verification_uses_order_id_when_client_order_id_lookup_finds_nothing(tmp_path):
+    """The exact live failure shape: by-clientOrderID -> nothing, by-orderId
+    -> the real, active STOP_MARKET. Must verify, cancel old, verify final
+    state, and only then report SL_REPLACED."""
+    repo, connector = _run_pp(
+        tmp_path, open_orders=_ONE_OLD_SL, stateful_orders=True, lookup_order=None,
+        order_status_by_id={"new-sl-1": _new_sl_by_id()},
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert row["new_sl_order_id"] == "new-sl-1"
+    assert connector.cancel_calls == ["old-sl-1"]
+    names = [c[0] for c in connector.calls]
+    place_i = names.index("place_stop_loss_order")
+    cancel_i = names.index("cancel_order")
+    assert place_i < names.index("get_order_status") < cancel_i
+    assert "get_open_orders" in names[cancel_i + 1:]  # final state read AFTER the cancel
+
+
+def test_verification_falls_back_to_open_orders_scan_by_client_order_id(tmp_path):
+    repo, connector = _run_pp(
+        tmp_path, open_orders=_ONE_OLD_SL, stateful_orders=True, lookup_order=None,
+        place_response={},  # placement response carries no orderId at all
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert row["new_sl_order_id"] == "new-sl-1"
+    assert connector.cancel_calls == ["old-sl-1"]
+
+
+def test_verification_scan_accepts_unique_breakeven_stop_when_exchange_omits_client_id(tmp_path):
+    """The open-orders payload can carry an empty clientOrderId (it does for
+    the engine-placed SL/TP); a single new STOP_MARKET at exactly the
+    breakeven price, different from the old SL, is still verified exchange
+    state."""
+    repo, connector = _run_pp(
+        tmp_path, lookup_order=None, place_response={}, open_orders=_ONE_OLD_SL,
+        place_appends=[{
+            "type": "STOP_MARKET", "orderId": "new-sl-9", "stopPrice": _BREAKEVEN,
+            "clientOrderId": "", "status": "NEW",
+        }],
+        stateful_orders=False,
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert row["new_sl_order_id"] == "new-sl-9"
+
+
+def test_verification_scan_rejects_stop_at_a_different_price(tmp_path):
+    repo, connector = _run_pp(
+        tmp_path, lookup_order=None, place_response={}, open_orders=_ONE_OLD_SL,
+        place_appends=[{
+            "type": "STOP_MARKET", "orderId": "other", "stopPrice": "48000",
+            "clientOrderId": "", "status": "NEW",
+        }],
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "UNCERTAIN_NEW_SL_STATUS"
+    assert connector.cancel_calls == []
+
+
+def test_verification_rejects_order_id_lookup_that_is_not_our_stop(tmp_path):
+    repo, connector = _run_pp(
+        tmp_path, open_orders=_ONE_OLD_SL, lookup_order=None,
+        order_status_by_id={"new-sl-1": _new_sl_by_id(type="TAKE_PROFIT_MARKET")},
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "UNCERTAIN_NEW_SL_STATUS"
+    assert connector.cancel_calls == []
+
+
+def test_verification_retries_transient_miss_before_giving_up(tmp_path):
+    new_sl = _new_sl_by_id()
+    repo, connector = _run_pp(
+        tmp_path, open_orders=_ONE_OLD_SL, lookup_order=None,
+        order_status_sequence=[None, new_sl],  # 1st attempt: not visible yet; 2nd: visible
+        final_open_orders=[{
+            "type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": _BREAKEVEN,
+            "clientOrderId": "", "status": "NEW",
+        }],
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert [c for c in connector.calls if c[0] == "get_order_status"] == [
+        ("get_order_status", "new-sl-1")
+    ] * 2
+    assert len(connector.place_calls) == 1  # verification retries never re-place
+
+
+def test_unverifiable_new_sl_stays_uncertain_after_every_rung_and_retry(tmp_path):
+    repo, connector = _run_pp(tmp_path, open_orders=_ONE_OLD_SL, lookup_order=None)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "UNCERTAIN_NEW_SL_STATUS"
+    assert connector.lookup_calls == 3  # bounded retries, never unbounded
+    assert len(connector.place_calls) == 1
+    assert connector.cancel_calls == []  # old SL never cancelled on an unverified new SL
+
+
+def test_final_state_with_old_sl_still_open_is_uncertain_not_success(tmp_path):
+    old = _ONE_OLD_SL[0]
+    new = {"type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": _BREAKEVEN, "clientOrderId": "x"}
+    repo, connector = _run_pp(
+        tmp_path, open_orders=_ONE_OLD_SL, stateful_orders=True,
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+        final_open_orders=[old, new],  # exchange still lists the old SL after our cancel
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "UNCERTAIN_FINAL_STATE"
+    assert row["new_sl_order_id"] == "new-sl-1"
+    assert connector.cancel_calls == ["old-sl-1"]  # cancelled exactly once, never blindly retried
+
+
+def test_final_state_missing_new_sl_on_a_still_open_position_is_uncertain(tmp_path):
+    repo, connector = _run_pp(
+        tmp_path, open_orders=_ONE_OLD_SL, stateful_orders=True,
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+        final_open_orders=[],  # neither SL listed, yet position still open
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "UNCERTAIN_FINAL_STATE"
+
+
+def test_final_state_read_failure_is_uncertain_not_success(tmp_path):
+    """Replaces the old deep-review-fix-4 behaviour (record SL_REPLACED even
+    if the final read fails): success is now only ever recorded on VERIFIED
+    exchange state."""
+    repo, connector = _run_pp(
+        tmp_path, open_orders=_ONE_OLD_SL, stateful_orders=True,
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"},
+        open_orders_raises_from_call=2,
+    )
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "UNCERTAIN_FINAL_STATE"
+    assert connector.cancel_calls == ["old-sl-1"]
+
+
+def test_final_state_position_flat_is_recorded_as_closed_during_replacement(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    connector = _SpyConnector(
+        position_sequence=[_ABOVE_THRESHOLD_POSITION, _ABOVE_THRESHOLD_POSITION, None],
+        open_orders=_ONE_OLD_SL, stateful_orders=True,
+        lookup_order={"orderId": "new-sl-1", "status": "NEW"}, final_open_orders=[],
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "POSITION_CLOSED_DURING_REPLACEMENT"
+
+
+def test_recovery_case_b_finds_new_sl_by_open_order_scan_and_never_replaces_it(tmp_path):
+    """Regression for the recovery path: with client-id lookup blind to
+    conditional orders, Case B used to read 'not found' as 'never placed'
+    and place a SECOND stop. It must now find the already-placed stop in the
+    open orders instead."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_active_live_position(repo)
+    _claim_row(repo)
+    repo.update_live_profit_protection_old_sl(
+        "pos-1", old_sl_order_id="old-sl-1", old_sl_price="49000", updated_at=_NOW
+    )
+    connector = _SpyConnector(
+        positions=[_ABOVE_THRESHOLD_POSITION], stateful_orders=True, lookup_order=None,
+        open_orders=_ONE_OLD_SL + [{
+            "type": "STOP_MARKET", "orderId": "new-sl-1", "stopPrice": _BREAKEVEN,
+            "clientOrderId": "existing-cid-pp", "status": "NEW",
+        }],
+    )
+
+    run_live_profit_protection_tick(repo, connector, _THRESHOLD, "r1", _NOW)
+
+    row = repo.get_live_profit_protection("pos-1")
+    assert row["status"] == "SL_REPLACED"
+    assert connector.place_calls == []  # no duplicate stop
+    assert connector.cancel_calls == ["old-sl-1"]
