@@ -26,3 +26,11 @@ signal_ttl_seconds: 1800
 # this flag ONLY arms the break-even SL replacement mechanism.
 profit_protection_enabled: true
 profit_protection_threshold_pct: "0.01"
+
+# Discovery-side AI-cost gate (2026-09-19, paper_trading/live_discovery_gate.py).
+# Not trading limits - they only shape how many candidates a discovery tick
+# may send to full AI analysis (free-and-affordable LIVE slots, from the real
+# BingX balance). The hard caps above are untouched. Cooldown debounces
+# SUPPRESSED decisions only; buffer = extra candidates on top of usable slots.
+discovery_gate_cooldown_seconds: 300
+discovery_candidate_buffer: 0

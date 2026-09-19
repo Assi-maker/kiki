@@ -71,7 +71,12 @@ def _persist_new_candidate(
 
 
 def _transition_to_terminal(
-    repo: Repository, candidate: Candidate, target_status: str, at: datetime, run_id: str
+    repo: Repository,
+    candidate: Candidate,
+    target_status: str,
+    at: datetime,
+    run_id: str,
+    reason: str | None = None,
 ) -> Candidate:
     allowed, reason = can_transition(candidate.status, target_status)
     if not allowed:
@@ -84,7 +89,8 @@ def _transition_to_terminal(
         occurred_at=at,
         run_id=run_id,
         schema_version=1,
-        payload={"from": candidate.status, "to": target_status},
+        payload={"from": candidate.status, "to": target_status}
+        | ({"reason": reason} if reason is not None else {}),
     )
     repo.transition_candidate_with_event(candidate.candidate_id, target_status, at, event)
     return candidate.model_copy(update={"status": target_status, "updated_at": at})
@@ -176,6 +182,7 @@ def prioritize_and_apply_budget(
     evaluated_at: datetime,
     run_id: str,
     settings: Settings | None = None,
+    limited_reason: str | None = None,
 ) -> tuple[list[Candidate], list[Candidate]]:
     """SPEC §10: deterministisk prioriteringsordning (1) data quality - redan
     garanterat "ok" här (DATA_INVALID-candidates skickas aldrig in i denna
@@ -234,7 +241,9 @@ def prioritize_and_apply_budget(
     limited: list[Candidate] = []
     for candidate in over_budget:
         limited.append(
-            _transition_to_terminal(repo, candidate, "BUDGET_LIMITED", evaluated_at, run_id)
+            _transition_to_terminal(
+                repo, candidate, "BUDGET_LIMITED", evaluated_at, run_id, limited_reason
+            )
         )
     return within_budget, limited
 

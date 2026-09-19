@@ -285,6 +285,16 @@ class LiveExecutionConfig(BaseModel):
     # itself is not tuned in this change" guidance.
     profit_protection_enabled: bool = Field(default=False)
     profit_protection_threshold_pct: Decimal = Field(default=Decimal("0.01"), gt=0, le=1)
+    # Discovery-side AI-cost gate (2026-09-19, paper_trading/
+    # live_discovery_gate.py). Neither field is a trading limit: they only
+    # shape how many candidates a discovery tick may send to full AI
+    # analysis, never an order's size, leverage, SL/TP or the hard caps
+    # above. discovery_gate_cooldown_seconds debounces SUPPRESSED decisions
+    # only (a permissive decision is always re-derived from fresh exchange
+    # state). discovery_candidate_buffer is extra candidates on top of the
+    # number of usable LIVE slots (0 = exactly one candidate per usable slot).
+    discovery_gate_cooldown_seconds: int = Field(ge=0, default=300)
+    discovery_candidate_buffer: int = Field(ge=0, default=0)
 
 
 class ProfitProtectionExperimentConfig(BaseModel):

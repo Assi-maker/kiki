@@ -222,6 +222,7 @@ class Repository(Protocol):
         instruments_scanned: int | None = None,
     ) -> None: ...
     def record_ai_call_event(self, event: Event) -> None: ...
+    def record_event(self, event: Event) -> None: ...
     def count_ai_calls_since(self, cutoff: datetime) -> int: ...
     def sum_ai_cost_since(self, cutoff: datetime) -> Decimal: ...
     def save_forecast_record(self, record: ForecastRecord) -> None: ...
@@ -1540,6 +1541,14 @@ class SQLiteRepository:
         return ForecastRecord(**data)
 
     def record_ai_call_event(self, event: Event) -> None:
+        self._insert_event(event)
+        self._conn.commit()
+
+    def record_event(self, event: Event) -> None:
+        """Generic append-only event write (2026-09-19): used for pure
+        measurement events such as DISCOVERY_LIVE_GATE that belong to no
+        aggregate's state transition. INSERT OR IGNORE on event_id, so a
+        repeated write with the same id is a harmless no-op."""
         self._insert_event(event)
         self._conn.commit()
 

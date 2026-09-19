@@ -81,6 +81,8 @@ def run_single_cycle(
     news_connector: object | None = None,
     external_data_connector: object | None = None,
     screener_runner: AgentRunner | None = None,
+    live_analysis_cap: int | None = None,
+    stale_candidate_after_seconds: int | None = None,
 ) -> list[Position]:
     """En enda discovery->gate->paper-trading-cykel mot EN snapshot (Fas 5,
     PLAN_CRYPTO_PHASE5.md Task 5/Beslut 1) - faktoriserad ut ur run_replay()
@@ -96,7 +98,20 @@ def run_single_cycle(
     4.5). `None` (default) = exakt samma beteende som innan denna etapp
     fanns - varje befintligt anrop utan denna parameter är opåverkat.
     replay.py:s egen `run_replay()` skickar aldrig in den (samma
-    determinism-skäl som news_connector ovan)."""
+    determinism-skäl som news_connector ovan).
+
+    `live_analysis_cap` / `stale_candidate_after_seconds` (2026-09-19,
+    AI-cost optimization; both default None = unchanged behavior, replay
+    never passes them): the LIVE-armed discovery tick's analysis budget -
+    number of free-and-affordable LIVE slots, and LIVE's signal TTL. The cap
+    is applied at TWO points so it is never bypassed: as the candidate
+    budget handed to prioritize_and_apply_budget() (the BEST-ranked
+    candidates are the ones kept, the rest become BUDGET_LIMITED with reason
+    "live_slot_budget" and are never sent to the Haiku prescreen or the
+    7-role chain), and as a hard ceiling inside run_discovery_cycle() (which
+    also covers leftover ANALYSIS_INTERRUPTED candidates). It only limits
+    HOW MANY qualified candidates get analysed - it never changes what the
+    analysis, the Gate, sizing or any risk limit does."""
     eligible_tickers = _select_eligible_tickers(snapshot, settings)
     top_n_symbols = select_top_n(eligible_tickers, settings.pipeline.top_n)
 
@@ -145,14 +160,19 @@ def run_single_cycle(
             new_candidates.append(candidate)
 
     liquidity_by_instrument = {t.instrument: t.quote_volume for t in eligible_tickers}
+    candidate_budget = settings.budget_limits.max_candidates_per_discovery_run
+    cap_is_binding = live_analysis_cap is not None and live_analysis_cap < candidate_budget
+    if cap_is_binding:
+        candidate_budget = live_analysis_cap
     within_budget, _over_budget = prioritize_and_apply_budget(
         repo,
         new_candidates,
         liquidity_by_instrument,
-        settings.budget_limits.max_candidates_per_discovery_run,
+        candidate_budget,
         snapshot.simulated_now,
         run_id,
         settings=settings,
+        limited_reason="live_slot_budget" if cap_is_binding else None,
     )
 
     if screener_runner is not None:
@@ -177,6 +197,8 @@ def run_single_cycle(
         news_connector=news_connector,
         external_data_connector=external_data_connector,
         now=snapshot.simulated_now,
+        max_analyses=live_analysis_cap,
+        stale_after_seconds=stale_candidate_after_seconds,
     )
 
     opened = _open_positions_for_confirmed_candidates(processed, snapshot, repo, settings, run_id)

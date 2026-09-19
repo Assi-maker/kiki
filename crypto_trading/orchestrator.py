@@ -215,6 +215,8 @@ def run_discovery_cycle(
     news_connector: object | None = None,
     external_data_connector: object | None = None,
     now: datetime | None = None,
+    max_analyses: int | None = None,
+    stale_after_seconds: int | None = None,
 ) -> list[Candidate]:
     """Discovery-loop-wiring: (1) sveper föräldralösa UNDER_AI_ANALYSIS-
     candidates till ANALYSIS_INTERRUPTED (Fas 0:s sweep_interrupted_analyses,
@@ -251,7 +253,22 @@ def run_discovery_cycle(
     never real wall-clock: without this, every simulated day's AI calls
     landed in the same real-wall-clock "today" bucket, permanently
     saturating the daily cap after a few simulated days and silently
-    halting all further candidate analysis for the rest of the replay."""
+    halting all further candidate analysis for the rest of the replay.
+
+    `max_analyses` / `stale_after_seconds` (2026-09-19, AI-cost optimization,
+    both default None = byte-identical prior behavior, so replay/backtest and
+    every non-LIVE caller are unaffected): the LIVE-armed discovery tick
+    passes them so credits are only spent where a LIVE position can result.
+    `max_analyses` is the number of free-and-affordable LIVE slots (from
+    paper_trading/live_discovery_gate.py) - at most that many candidates get
+    the expensive 7-role chain this call; further CANDIDATE-status ones go to
+    BUDGET_LIMITED (reason "live_slot_budget"), never REJECTED/NO_TRADE.
+    `stale_after_seconds` is LIVE's signal TTL: a waiting candidate whose
+    evidence is older than that never consumes AI - a CANDIDATE goes to
+    BUDGET_LIMITED (reason "stale_signal"); an ANALYSIS_INTERRUPTED one (no
+    legal terminal transition exists for it) is left untouched and skipped,
+    like the daily-budget deferral below. Both checks run BEFORE the
+    dollar/call budget gates and never alter an in-flight chain."""
     effective_now = now if now is not None else datetime.now(UTC)
     sweep_interrupted_analyses(repo, swept_at=effective_now, run_id=run_id)
 
@@ -287,7 +304,35 @@ def run_discovery_cycle(
         )
 
     results: list[Candidate] = []
+    analyses_started = 0
     for candidate in to_analyze:
+        if (
+            stale_after_seconds is not None
+            and (effective_now - candidate.created_at).total_seconds() > stale_after_seconds
+        ):
+            if candidate.status == "CANDIDATE":
+                results.append(
+                    _send_to_budget_limited(repo, candidate, run_id, "stale_signal")
+                )
+            else:
+                log_event(
+                    run_id,
+                    event="stale_interrupted_candidate_skipped",
+                    candidate_id=candidate.candidate_id,
+                )
+            continue
+        if max_analyses is not None and analyses_started >= max_analyses:
+            if candidate.status == "CANDIDATE":
+                results.append(
+                    _send_to_budget_limited(repo, candidate, run_id, "live_slot_budget")
+                )
+            else:
+                log_event(
+                    run_id,
+                    event="live_slot_budget_reached_interrupted_deferred",
+                    candidate_id=candidate.candidate_id,
+                )
+            continue
         calls_would_exceed = (
             repo.count_ai_calls_since(day_start) + planned_calls_for_candidate > daily_cap
         )
@@ -329,6 +374,7 @@ def run_discovery_cycle(
             candidate.candidate_id, "UNDER_AI_ANALYSIS", effective_now, event
         )
         candidate.status = "UNDER_AI_ANALYSIS"
+        analyses_started += 1
         results.append(orchestrator.process_candidate(candidate, run_id))
     return results
 
