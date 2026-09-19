@@ -198,6 +198,45 @@ def test_format_closed_message_handles_missing_forecast_record_gracefully():
     assert "BTCUSDT" in text
 
 
+def _live_closed_position() -> Position:
+    """Closed by the LIVE exit mirror: no PAPER simulated_fill_exit/fees/funding."""
+    return Position(
+        position_id="cand-1",
+        candidate_id="cand-1",
+        instrument="MYX-USDT",
+        direction="LONG",
+        status="CLOSED",
+        theoretical_entry="0.09068",
+        simulated_fill_entry="0.09077",
+        stop_loss="0.0862",
+        target="0.098",
+        size="500",
+        fill_model_version="v1",
+        opened_at=_NOW,
+        exit_reason="stop_loss",
+        closed_at=_NOW,
+    )
+
+
+def test_format_closed_message_handles_a_live_closed_position_without_paper_exit_data():
+    """Regression (2026-09-19, MYX): compute_pnl raised NoneType - Decimal
+    and notify_tick_failed on every tick."""
+    text = format_closed_message(_live_closed_position(), _forecast_record())
+
+    assert "MYX-USDT" in text
+    assert "stop_loss" in text
+    assert "PnL: n/a" in text
+
+
+def test_format_closed_message_shows_the_verified_live_exit_fill_when_given():
+    text = format_closed_message(
+        _live_closed_position(), _forecast_record(), live_exit_fill="0.08572"
+    )
+
+    assert "0.08572" in text
+    assert "PnL: n/a" in text  # still no invented P/L
+
+
 def _no_trade_candidate() -> Candidate:
     return Candidate(
         candidate_id="cand-no-trade",

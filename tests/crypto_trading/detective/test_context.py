@@ -97,6 +97,44 @@ def test_build_position_analysis_context_includes_core_trade_fields():
     assert Decimal(context["realized_pnl_usdt"]) > 0
 
 
+def _live_closed_position() -> Position:
+    return Position(
+        position_id="cand-live",
+        candidate_id="cand-live",
+        instrument="MYX-USDT",
+        direction="LONG",
+        status="CLOSED",
+        theoretical_entry=Decimal("0.09068"),
+        simulated_fill_entry=Decimal("0.09077"),
+        stop_loss=Decimal("0.0862"),
+        target=Decimal("0.098"),
+        size=Decimal("500"),
+        fill_model_version="v1",
+        opened_at=_NOW,
+        exit_reason="stop_loss",
+        closed_at=_LATER,
+    )
+
+
+def test_build_position_analysis_context_handles_a_live_closed_position_without_paper_exit_data():
+    """Regression (2026-09-19, MYX): compute_pnl raised NoneType - Decimal."""
+    context = build_position_analysis_context(_live_closed_position(), _candidate(), None)
+
+    assert context["exit_reason"] == "stop_loss"
+    assert context["realized_pnl_usdt"] is None  # unknown, never invented
+    assert context["exit"] is None
+    assert "live_exit_fill" not in context
+
+
+def test_build_position_analysis_context_includes_the_verified_live_exit_fill_when_given():
+    context = build_position_analysis_context(
+        _live_closed_position(), _candidate(), None, live_exit_fill="0.08572"
+    )
+
+    assert context["live_exit_fill"] == "0.08572"
+    assert context["realized_pnl_usdt"] is None
+
+
 def test_build_position_analysis_context_includes_all_seven_assessments_when_present():
     context = build_position_analysis_context(_closed_position(), _candidate(), None)
 

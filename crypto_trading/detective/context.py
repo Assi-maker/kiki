@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.paper_trading.execution import compute_pnl_or_none
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.trade import Position
 
@@ -20,6 +20,7 @@ def build_position_analysis_context(
     candidate: Candidate | None,
     gate_decision: dict | None,
     guardian_observations: list[dict] | None = None,
+    live_exit_fill: str | None = None,
 ) -> dict:
     """Ren funktion: bygger EN stängd positions fulla analysunderlag åt
     Detective, uteslutande genom att LÄSA redan persisterad Position/
@@ -49,13 +50,19 @@ def build_position_analysis_context(
         "target": str(position.target),
         "size": str(position.size),
         "realized_pnl_usdt": (
-            str(compute_pnl(position)) if position.status == "CLOSED" else None
-        ),
+            str(pnl) if (pnl := compute_pnl_or_none(position)) is not None else None
+        )
+        if position.status == "CLOSED"
+        else None,
         "exit_reason": position.exit_reason,
         "hold_hours": hold_hours,
         "fees": str(position.fees) if position.fees is not None else None,
         "funding": str(position.funding) if position.funding is not None else None,
     }
+    if live_exit_fill is not None:
+        # The exchange-verified LIVE exit price, for a position with no PAPER
+        # exit data (realized_pnl_usdt above is then None, never invented).
+        context["live_exit_fill"] = live_exit_fill
     if candidate is not None:
         context["evidence_record"] = candidate.evidence_record.model_dump(mode="json")
         context["trigger_reasons"] = candidate.evidence_record.trigger_reasons

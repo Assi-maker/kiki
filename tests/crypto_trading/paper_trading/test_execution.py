@@ -7,6 +7,7 @@ from crypto_trading.paper_trading.execution import (
     compute_fill_price,
     compute_funding,
     compute_pnl,
+    compute_pnl_or_none,
 )
 from crypto_trading.schemas.trade import Position
 
@@ -129,3 +130,34 @@ def test_compute_pnl_is_negative_when_exit_below_entry():
     position = _closed_position(simulated_fill_exit="49500")
     # (49500-50000)/50000 = -1% * 5000 = -50 gross - 2 fees - 1 funding = -53 net.
     assert compute_pnl(position) == Decimal("-53")
+
+
+def _live_closed_position() -> Position:
+    """A position closed by the LIVE exit mirror
+    (repo.close_position_for_live_exit): CLOSED with an exit_reason/closed_at
+    but none of PAPER's simulated_fill_exit/fees/funding."""
+    return Position(
+        position_id="live-1",
+        candidate_id="live-1",
+        instrument="BTC-USDT",
+        direction="LONG",
+        status="CLOSED",
+        theoretical_entry="50000",
+        simulated_fill_entry="50000",
+        stop_loss="49000",
+        target="52000",
+        size="5000",
+        fill_model_version="v1",
+        opened_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+        exit_reason="stop_loss",
+        closed_at=datetime(2026, 8, 29, 14, 0, tzinfo=UTC),
+    )
+
+
+def test_compute_pnl_or_none_is_none_for_a_live_closed_position_without_paper_exit_data():
+    assert compute_pnl_or_none(_live_closed_position()) is None
+
+
+def test_compute_pnl_or_none_equals_compute_pnl_for_a_paper_closed_position():
+    position = _closed_position()
+    assert compute_pnl_or_none(position) == compute_pnl(position) == Decimal("97")

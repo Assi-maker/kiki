@@ -123,6 +123,9 @@ def run_detective_batch(
             candidates_by_id.get(position.candidate_id),
             gate_decisions_by_position.get(position.position_id),
             guardian_observations=repo.find_guardian_observations_for_position(position.position_id),
+            live_exit_fill=(repo.get_live_execution(position.position_id) or {}).get(
+                "exchange_fill_exit"
+            ),
         )
         for position in batch_positions
     ]

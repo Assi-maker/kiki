@@ -8,7 +8,7 @@ import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from crypto_trading.logging import redact_error_list
-from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.paper_trading.execution import compute_pnl_or_none
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.forecast import ForecastRecord
 from crypto_trading.schemas.trade import Position
@@ -78,22 +78,28 @@ def format_confirmed_message(candidate: Candidate, position: Position) -> str:
     )
 
 
-def format_closed_message(position: Position, forecast: ForecastRecord | None) -> str:
+def format_closed_message(
+    position: Position,
+    forecast: ForecastRecord | None,
+    live_exit_fill: str | None = None,
+) -> str:
     """SPEC §12 CLOSED-notis. `forecast` kan vara None (fail-safe - ska
     strukturellt aldrig hända för en position som gick via CONFIRMED, men
     formateringen kraschar aldrig om den ändå saknas, se
     test_format_closed_message_handles_missing_forecast_record_gracefully)."""
-    pnl = compute_pnl(position).quantize(Decimal("0.01"))
+    pnl = compute_pnl_or_none(position)
+    pnl_text = "n/a (no PAPER exit data)" if pnl is None else str(pnl.quantize(Decimal("0.01")))
+    exit_price = position.simulated_fill_exit if pnl is not None else live_exit_fill
     hold_hours = (position.closed_at - position.opened_at).total_seconds() / 3600
     lines = [
         f"🔒 CLOSED — {position.instrument} {position.direction}",
-        f"Entry: {position.simulated_fill_entry}  Exit: {position.simulated_fill_exit}",
-        f"PnL: {pnl}",
+        f"Entry: {position.simulated_fill_entry}  Exit: {exit_price}",
+        f"PnL: {pnl_text}",
         f"Fees: {position.fees}  Funding: {position.funding}",
         f"Hold time: {hold_hours:.1f}h",
         f"Exit reason: {position.exit_reason}",
     ]
-    if forecast is not None:
+    if forecast is not None and pnl is not None:
         dominant_scenario = max(
             forecast.scenario_probabilities, key=forecast.scenario_probabilities.get
         )

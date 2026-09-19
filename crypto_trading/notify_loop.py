@@ -96,8 +96,10 @@ def run_notify_tick(notifier: NotifierProtocol, repo: Repository, settings: Sett
         for position in repo.find_positions_pending_notification():
             telegram_event_id = f"CLOSED:{position.position_id}"
             forecast = repo.get_forecast_record(position.candidate_id)
+            live_execution = repo.get_live_execution(position.position_id)
+            live_exit_fill = live_execution["exchange_fill_exit"] if live_execution else None
             try:
-                notifier.send(format_closed_message(position, forecast))
+                notifier.send(format_closed_message(position, forecast, live_exit_fill))
                 repo.record_telegram_event(telegram_event_id, "CLOSED", datetime.now(UTC))
                 sent_count += 1
             except TelegramSendError as exc:

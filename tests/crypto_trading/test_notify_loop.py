@@ -492,3 +492,56 @@ def test_run_notify_tick_error_run_notification_is_idempotent(tmp_path):
     second = run_notify_tick(notifier, repo, _settings_with_level("debug"))
 
     assert second == 0  # allt redan skickat idag (error_run + daily report)
+
+
+def _seed_live_closed_position(repo, position_id, exchange_fill_exit=None):
+    """Closed through the LIVE exit mirror only (no PAPER exit data)."""
+    position = Position(
+        position_id=position_id,
+        candidate_id=position_id,
+        instrument="MYX-USDT",
+        direction="LONG",
+        status="OPEN_POSITION",
+        theoretical_entry="0.09068",
+        simulated_fill_entry="0.09077",
+        stop_loss="0.0862",
+        target="0.098",
+        size="500",
+        fill_model_version="v1",
+        opened_at=_NOW,
+    )
+    repo.create_position_with_event(
+        position,
+        Event(
+            event_id=f"POSITION_CREATED:{position_id}",
+            event_type="POSITION_CREATED",
+            aggregate_type="position",
+            aggregate_id=position_id,
+            occurred_at=_NOW,
+            run_id="run-1",
+            schema_version=1,
+            payload={},
+        ),
+    )
+    assert repo.close_position_for_live_exit(position_id, "stop_loss", _NOW) is True
+    if exchange_fill_exit is not None:
+        repo._conn.execute(
+            "INSERT INTO live_executions (position_id, phase, exchange_fill_exit, "
+            "claimed_at, updated_at) VALUES (?, 'CLOSED', ?, ?, ?)",
+            (position_id, exchange_fill_exit, _NOW.isoformat(), _NOW.isoformat()),
+        )
+        repo._conn.commit()
+
+
+def test_run_notify_tick_sends_closed_notification_for_a_live_closed_position(tmp_path):
+    """Regression (2026-09-19, MYX): compute_pnl raised NoneType - Decimal
+    -> notify_tick_failed and no CLOSED notification, every tick."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_live_closed_position(repo, "live-1", exchange_fill_exit="0.08572")
+    notifier = _StubNotifier()
+
+    run_notify_tick(notifier, repo, _settings())
+
+    assert repo.has_telegram_event_been_sent("CLOSED:live-1") is True
+    closed = next(m for m in notifier.sent if "CLOSED" in m)
+    assert "MYX-USDT" in closed and "PnL: n/a" in closed and "0.08572" in closed

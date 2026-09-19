@@ -58,3 +58,20 @@ def compute_pnl(position: Position) -> Decimal:
     )
     gross_pnl = position.size * price_return
     return gross_pnl - position.fees - position.funding
+
+
+def has_paper_exit_data(position: Position) -> bool:
+    """False for a position closed only by the LIVE exit mirror
+    (`repo.close_position_for_live_exit`), which never writes PAPER's
+    simulated_fill_exit/fees/funding - `compute_pnl` cannot be evaluated."""
+    return (
+        position.simulated_fill_exit is not None
+        and position.fees is not None
+        and position.funding is not None
+    )
+
+
+def compute_pnl_or_none(position: Position) -> Decimal | None:
+    """`compute_pnl`, or None (unknown - never an invented value) when the
+    position has no PAPER exit data. Same formula, no new one."""
+    return compute_pnl(position) if has_paper_exit_data(position) else None

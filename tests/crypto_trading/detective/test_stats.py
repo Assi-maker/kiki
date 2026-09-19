@@ -262,3 +262,53 @@ def test_compute_breakdown_by_signal_type_excludes_zero_size_positions_blocked_b
     # exkluderas helt, spär inte ut win_rate/profit_factor/expectancy.
     assert breakdown["momentum_breakout"]["trade_count"] == 1
     assert breakdown["momentum_breakout"]["win_rate"] == "1"
+
+
+def _live_closed_position(position_id: str) -> Position:
+    """Closed by the LIVE exit mirror: no PAPER simulated_fill_exit/fees/funding."""
+    return Position(
+        position_id=position_id,
+        candidate_id=position_id,
+        instrument="MYX-USDT",
+        direction="LONG",
+        status="CLOSED",
+        theoretical_entry=Decimal("0.09068"),
+        simulated_fill_entry=Decimal("0.09077"),
+        stop_loss=Decimal("0.0862"),
+        target=Decimal("0.098"),
+        size=Decimal("500"),
+        fill_model_version="v1",
+        opened_at=_NOW,
+        exit_reason="stop_loss",
+        closed_at=_LATER,
+    )
+
+
+def test_compute_batch_win_loss_counts_skips_live_closed_positions_without_paper_exit_data():
+    """Regression (2026-09-19, MYX): trade_pnls -> compute_pnl raised
+    NoneType - Decimal for the whole Detective batch. A position whose P/L is
+    unknown is left out of win/loss/breakeven rather than given an invented
+    value."""
+    positions = [_position("p1", win=True), _live_closed_position("live-1")]
+
+    counts = compute_batch_win_loss_counts(positions)
+
+    assert counts == {
+        "win_count": 1,
+        "loss_count": 0,
+        "breakeven_count": 0,
+        "blocked_by_exposure_count": 0,
+    }
+
+
+def test_compute_breakdown_by_signal_type_skips_live_closed_positions_without_paper_exit_data():
+    candidates_by_id = {
+        "p1": _candidate("p1", ["momentum_breakout"]),
+        "live-1": _candidate("live-1", ["momentum_breakout"]),
+    }
+
+    breakdown = compute_breakdown_by_signal_type(
+        [_position("p1", win=True), _live_closed_position("live-1")], candidates_by_id
+    )
+
+    assert breakdown["momentum_breakout"]["trade_count"] == 1

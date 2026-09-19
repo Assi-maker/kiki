@@ -9,12 +9,21 @@ from crypto_trading.performance.metrics import (
     compute_win_rate,
     trade_pnls,
 )
+from crypto_trading.paper_trading.execution import has_paper_exit_data
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.trade import Position
 
 
 def _optional_str(value: Decimal | None) -> str | None:
     return str(value) if value is not None else None
+
+
+def _paper_pnls(positions: list[Position]) -> list[Decimal]:
+    """`trade_pnls` over only the positions whose P/L is known. A position
+    closed by the LIVE exit mirror has no PAPER exit data (2026-09-19, MYX:
+    compute_pnl raised NoneType - Decimal for the whole Detective batch); its
+    P/L is unknown, so it is left out of these statistics, never invented."""
+    return trade_pnls([p for p in positions if has_paper_exit_data(p)])
 
 
 def _is_blocked_by_exposure(position: Position) -> bool:
@@ -35,7 +44,7 @@ def compute_batch_win_loss_counts(positions: list[Position]) -> dict:
     räknas som break-even (2026-09-03, explicit användarkrav)."""
     closed = [p for p in positions if p.status == "CLOSED"]
     real_positions = [p for p in closed if not _is_blocked_by_exposure(p)]
-    pnls = trade_pnls(real_positions)
+    pnls = _paper_pnls(real_positions)
     return {
         "win_count": sum(1 for p in pnls if p > 0),
         "loss_count": sum(1 for p in pnls if p < 0),
@@ -69,7 +78,7 @@ def compute_guardian_exit_effectiveness(
     def _summary(group: list[Position]) -> dict | None:
         if not group:
             return None
-        pnls = trade_pnls(group)
+        pnls = _paper_pnls(group)
         avg_hold_hours = sum(_hold_hours(p) for p in group) / len(group)
         return {
             "trade_count": len(group),
@@ -109,7 +118,7 @@ def compute_breakdown_by_signal_type(
 
     result = {}
     for signal_type, group in grouped.items():
-        pnls = trade_pnls(group)
+        pnls = _paper_pnls(group)
         result[signal_type] = {
             "trade_count": len(pnls),
             "win_rate": _optional_str(compute_win_rate(pnls)),
