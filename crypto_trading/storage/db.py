@@ -958,6 +958,40 @@ BEFORE DELETE ON godfather_policy_transitions
 BEGIN
     SELECT RAISE(ABORT, 'godfather_policy_transitions is append-only: DELETE is not permitted');
 END;
+
+-- Exchange 1m klines archived for every traded instrument window
+-- (Fas 2A.1). Market history, not a decision: GODFATHER verifies exits and
+-- reconstructs price paths from it where monitoring/Guardian had gaps.
+-- Only rows the exchange actually returned are stored - a missing minute
+-- stays missing.
+CREATE TABLE IF NOT EXISTS exchange_klines_1m (
+    instrument TEXT NOT NULL,
+    open_time TEXT NOT NULL,
+    open TEXT NOT NULL,
+    high TEXT NOT NULL,
+    low TEXT NOT NULL,
+    close TEXT NOT NULL,
+    volume TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (instrument, open_time)
+);
+
+-- The moment a position row actually came into existence (Fas 2A.1).
+-- positions.opened_at is the START of the deciding discovery run and the
+-- paper entry is priced then; the row itself is written 10-27 minutes
+-- later. Recorded by trigger so no trading code changes: the database
+-- stamps its own insert time (UTC).
+CREATE TABLE IF NOT EXISTS position_created_at (
+    position_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS record_position_created_at
+AFTER INSERT ON positions
+BEGIN
+    INSERT OR IGNORE INTO position_created_at (position_id, created_at)
+    VALUES (NEW.position_id, strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now'));
+END;
 """
 
 

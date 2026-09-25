@@ -27,6 +27,7 @@ _INTELLIGENCE_MODULES = [
     _CRYPTO_TRADING / "godfather" / "auditor.py",
     _CRYPTO_TRADING / "godfather" / "book.py",
     _CRYPTO_TRADING / "godfather" / "observation.py",
+    _CRYPTO_TRADING / "godfather" / "reconstruction.py",
     _CRYPTO_TRADING / "godfather" / "risk_units.py",
     _CRYPTO_TRADING / "godfather" / "experience_builder.py",
     _CRYPTO_TRADING / "godfather" / "experience_impact.py",

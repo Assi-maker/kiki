@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Protocol
 
@@ -14,18 +13,25 @@ from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository
 
 _CATCHUP_INTERVAL = "1m"
-# Conservative bound on how many 1m candles a single catch-up pass fetches
-# per instrument. A gap longer than this is only partially recovered - the
-# very next NORMAL monitoring tick still correctly re-evaluates the current
-# SL/TP/time-limit state using real wall-clock time regardless, so this
-# bound trades "perfect backfill of an arbitrarily long outage" for "bounded,
-# predictable exchange API load at startup", never for correctness of the
-# ongoing, ordinary monitoring loop.
-_MAX_CATCHUP_KLINES = 1000
+# 2026-09-25 (Fas 2A.1): catch-up used to fetch only the LATEST 1000 1m
+# candles, so any outage longer than ~16.7 h silently skipped its own
+# beginning - the part where a stop was most likely to have been crossed.
+# It now walks the WHOLE gap forward from its start in pages of the
+# BingX per-call cap (1440 candles, live-verified 2026-09-12, the same cap
+# backtest/historical_fetch.py uses): exact coverage instead of a bigger
+# buffer. Minutes the exchange itself does not return are reported as
+# `kline_history_gap` errors (run status partial_error), never assumed.
+_PAGE_CANDLES = 1440
+# The minute that is still forming at `now`, and the boundary minute at
+# `since`, are legitimately absent - not history gaps.
+_BOUNDARY_TOLERANCE = timedelta(minutes=2)
 
 
 class LivePriceSource(Protocol):
-    def get_klines(self, symbol: str, interval: str, limit: int = 1) -> list[dict]: ...
+    def get_klines(
+        self, symbol: str, interval: str, limit: int = 1,
+        start_time_ms: int | None = None, end_time_ms: int | None = None,
+    ) -> list[dict]: ...
     def get_funding_rate(self, symbol: str, limit: int = 1) -> list[dict]: ...
 
 
@@ -77,11 +83,15 @@ def run_monitoring_catchup(
                 continue
             seen_instruments.add(symbol)
             try:
-                missed = _fetch_missed_candles(connector, symbol, since, now)
+                missed, history_gaps = _fetch_missed_candles(connector, symbol, since, now)
                 funding_rate = _latest_funding_rate(connector, symbol)
             except ConnectorUnavailableError as exc:
                 errors.append(f"{type(exc).__name__}: {exc} ({symbol})")
                 continue
+            for gap_start, gap_end in history_gaps:
+                errors.append(
+                    f"kline_history_gap {gap_start.isoformat()}..{gap_end.isoformat()} ({symbol})"
+                )
             for kline in missed:
                 price_lookup = {symbol: (kline.low, kline.high, kline.close, funding_rate)}
                 closed.extend(
@@ -103,17 +113,47 @@ def run_monitoring_catchup(
         return closed
 
 
+def _ms(moment: datetime) -> int:
+    return int(moment.timestamp() * 1000)
+
+
 def _fetch_missed_candles(
     connector: LivePriceSource, symbol: str, since: datetime, now: datetime
-) -> list[Kline]:
-    minutes_gap = max(1, math.ceil((now - since).total_seconds() / 60))
-    limit = min(minutes_gap + 2, _MAX_CATCHUP_KLINES)  # +2: cover boundary/partial-minute rounding
-    raw_klines = connector.get_klines(symbol, _CATCHUP_INTERVAL, limit=limit)
-    candles = sorted(
-        (Kline.from_raw(raw, symbol, _CATCHUP_INTERVAL) for raw in raw_klines),
-        key=lambda k: k.observed_at,
-    )
-    return [k for k in candles if since < k.observed_at <= now]
+) -> tuple[list[Kline], list[tuple[datetime, datetime]]]:
+    """Every 1m candle in (since, now], paged forward from `since`, plus
+    the windows the exchange did not return. Pages are bounded by
+    startTime/endTime, so nothing after `now` can be requested."""
+    by_time: dict[datetime, Kline] = {}
+    cursor = since
+    while cursor < now:
+        page_end = min(cursor + timedelta(minutes=_PAGE_CANDLES), now)
+        raw_klines = connector.get_klines(
+            symbol, _CATCHUP_INTERVAL, limit=_PAGE_CANDLES,
+            start_time_ms=_ms(cursor), end_time_ms=_ms(page_end),
+        )
+        for raw in raw_klines:
+            kline = Kline.from_raw(raw, symbol, _CATCHUP_INTERVAL)
+            if since < kline.observed_at <= now:
+                by_time[kline.observed_at] = kline
+        cursor = page_end
+    candles = [by_time[moment] for moment in sorted(by_time)]
+    return candles, _history_gaps(candles, since, now)
+
+
+def _history_gaps(
+    candles: list[Kline], since: datetime, now: datetime
+) -> list[tuple[datetime, datetime]]:
+    """Windows longer than one candle with no candle, including a missing
+    start or end of the gap (minus the boundary minutes)."""
+    edges = [since] + [k.observed_at for k in candles] + [now]
+    gaps: list[tuple[datetime, datetime]] = []
+    for index, (a, b) in enumerate(zip(edges, edges[1:], strict=False)):
+        allowed = timedelta(minutes=1)
+        if index == 0 or index == len(edges) - 2:
+            allowed += _BOUNDARY_TOLERANCE
+        if b - a > allowed:
+            gaps.append((a, b))
+    return gaps
 
 
 def _latest_funding_rate(connector: LivePriceSource, symbol: str) -> Decimal:

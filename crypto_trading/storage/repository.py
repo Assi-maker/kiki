@@ -563,6 +563,12 @@ class Repository(Protocol):
     def find_runs_by_type(self, run_type: str) -> list[dict]: ...
     def get_position_opened_run(self, position_id: str) -> dict | None: ...
     def find_guardian_authority_decisions_for_position(self, position_id: str) -> list[dict]: ...
+    def save_exchange_klines(self, instrument: str, rows: list[dict], fetched_at: datetime) -> int: ...
+    def find_exchange_klines(
+        self, instrument: str, start: datetime, end: datetime
+    ) -> list[dict]: ...
+    def get_position_created_at(self, position_id: str) -> datetime | None: ...
+    def find_runs_with_errors(self, run_type: str) -> list[dict]: ...
 
 
 class SQLiteRepository:
@@ -3575,5 +3581,48 @@ class SQLiteRepository:
             "SELECT * FROM guardian_authority_decisions WHERE position_id = ? "
             "ORDER BY decided_at ASC",
             (position_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_exchange_klines(self, instrument: str, rows: list[dict], fetched_at: datetime) -> int:
+        """`rows`: dicts with open_time (datetime), open, high, low, close,
+        volume. INSERT OR IGNORE - archived history is never rewritten."""
+        inserted = 0
+        for row in rows:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO exchange_klines_1m "
+                "(instrument, open_time, open, high, low, close, volume, fetched_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    instrument, row["open_time"].isoformat(), str(row["open"]),
+                    str(row["high"]), str(row["low"]), str(row["close"]), str(row["volume"]),
+                    fetched_at.isoformat(),
+                ),
+            )
+            inserted += cur.rowcount
+        self._conn.commit()
+        return inserted
+
+    def find_exchange_klines(
+        self, instrument: str, start: datetime, end: datetime
+    ) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM exchange_klines_1m WHERE instrument = ? "
+            "AND open_time >= ? AND open_time <= ? ORDER BY open_time ASC",
+            (instrument, start.isoformat(), end.isoformat()),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_position_created_at(self, position_id: str) -> datetime | None:
+        row = self._conn.execute(
+            "SELECT created_at FROM position_created_at WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        return datetime.fromisoformat(row["created_at"]) if row is not None else None
+
+    def find_runs_with_errors(self, run_type: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT run_id, run_type, started_at, completed_at, status, errors FROM runs "
+            "WHERE run_type = ? AND status IN ('partial_error', 'error') ORDER BY started_at ASC",
+            (run_type,),
         ).fetchall()
         return [dict(row) for row in rows]

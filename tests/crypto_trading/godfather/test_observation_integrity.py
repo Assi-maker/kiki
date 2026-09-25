@@ -62,11 +62,17 @@ def test_a_short_gap_with_catch_up_is_fully_recovered():
     assert len(gaps) == 1 and gaps[0].unrecovered is None
 
 
-def test_a_gap_longer_than_the_catch_up_window_leaves_its_start_unrecovered():
-    runs = [_run(0, 1), _run(1 + CATCHUP_MAX_MINUTES + 500, 1 + CATCHUP_MAX_MINUTES + 501)]
+def test_a_legacy_catch_up_left_the_start_of_a_long_gap_unrecovered():
+    base = datetime(2026, 9, 10, tzinfo=UTC)  # before the paged catch-up existed
+
+    def run(a, b):
+        return {"started_at": (base + timedelta(minutes=a)).isoformat(),
+                "completed_at": (base + timedelta(minutes=b)).isoformat()}
+
+    runs = [run(0, 1), run(1 + CATCHUP_MAX_MINUTES + 500, 1 + CATCHUP_MAX_MINUTES + 501)]
     gaps = monitoring_gaps(runs, [{"started_at": runs[1]["started_at"]}])
     start, end = gaps[0].unrecovered
-    assert start == _at(1)
+    assert start == base + timedelta(minutes=1)
     assert (end - start) == timedelta(minutes=500)
 
 
@@ -75,9 +81,22 @@ def test_a_gap_without_any_catch_up_is_wholly_unrecovered():
     assert gaps[0].unrecovered == (_at(1), _at(30))
 
 
-def test_the_catch_up_window_constant_matches_the_paper_engine():
-    from crypto_trading.paper_trading.monitoring_catchup import _MAX_CATCHUP_KLINES
-    assert CATCHUP_MAX_MINUTES == _MAX_CATCHUP_KLINES
+def test_legacy_catch_ups_are_bounded_and_paged_ones_recover_the_whole_gap():
+    """Before Fas 2A.1 a catch-up replayed at most 1000 minutes; a paged
+    catch-up (from PAGED_CATCHUP_SINCE) replays the whole gap."""
+    from crypto_trading.godfather.observation import PAGED_CATCHUP_SINCE
+    from crypto_trading.paper_trading import monitoring_catchup
+
+    assert not hasattr(monitoring_catchup, "_MAX_CATCHUP_KLINES")
+    start = PAGED_CATCHUP_SINCE + timedelta(hours=1)
+    runs = [
+        {"started_at": start.isoformat(), "completed_at": start.isoformat()},
+        {"started_at": (start + timedelta(hours=48)).isoformat(),
+         "completed_at": (start + timedelta(hours=48, minutes=1)).isoformat()},
+    ]
+    gaps = monitoring_gaps(runs, [{"started_at": runs[1]["started_at"]}])
+    assert gaps[0].unrecovered is None
+    assert CATCHUP_MAX_MINUTES == 1000
 
 
 # ---------------------------------------------------------------------
@@ -109,7 +128,8 @@ def test_gap_before_tp_with_exchange_history_uses_the_exchange_outcome():
     assert obs.status == "PARTIAL"
     assert obs.outcome_source == "EXCHANGE"
     assert obs.exit_verification == "EXCHANGE"
-    assert "EXIT_VERIFIED_BY_EXCHANGE" in obs.reasons
+    assert obs.paper_exit_status == "UNVERIFIED"
+    assert "MONITORING_GAP_UNRECOVERED" in obs.reasons
 
 
 def test_gap_through_both_sl_and_tp_is_unobservable_without_exchange_history():
@@ -125,14 +145,14 @@ def test_gap_through_both_sl_and_tp_is_unobservable_without_exchange_history():
     assert obs.path_status == "PARTIAL"
 
 
-def test_a_recovered_gap_is_candle_verified_but_not_complete():
+def test_a_recovered_gap_is_candle_verified():
     position = make_position(exit_price=Decimal("95"), exit_reason="stop_loss",
                              closed_at=_at(60))
     recovered = MonitoringGap(start=_at(10), end=_at(50), recovered_from=_at(10))
     obs = _classify(position, _dense(position, 60), gaps=[recovered])
 
     assert obs.exit_verification == "CANDLES_REPLAYED"
-    assert obs.status == "PARTIAL"
+    assert obs.paper_exit_status == "VERIFIED"
 
 
 def test_unknown_paper_outcome_without_exchange_is_unobservable():

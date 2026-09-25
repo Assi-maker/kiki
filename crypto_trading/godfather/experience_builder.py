@@ -61,9 +61,16 @@ def trade_profile(
     counterfactual_rows: list[dict],
     prediction_errors: list[dict],
 ) -> dict:
-    """Everything that happened after entry, for one trade."""
+    """Everything that happened after entry, for one trade - measured on
+    the ACTUAL position (actual entry, from activation), not on the
+    decision-time paper entry."""
     position = trade.position
-    entry = position.simulated_fill_entry
+    timeline = trade.timeline
+    entry = (
+        timeline.actual_entry
+        if timeline is not None and timeline.actual_entry is not None
+        else position.simulated_fill_entry
+    )
     close = (
         (position.closed_at - position.opened_at).total_seconds() / 60
         if position.closed_at is not None else None
@@ -95,8 +102,28 @@ def trade_profile(
     observation = trade.observation
     if observation is not None:
         profile["observation"] = observation.as_dict()
+    if timeline is not None:
+        profile["timeline"] = timeline.as_dict()
     if trade.r is not None and trade.r.return_pct is not None:
         profile["return_pct"] = str(trade.r.return_pct * _HUNDRED)
+    if trade.candle_path is not None and (observation is None or observation.path_usable):
+        # Real exchange candles over the whole life: the strongest source.
+        stats = trade.candle_path
+        profile["has_path"] = True
+        profile["path_source"] = "EXCHANGE_KLINES"
+        for key in ("minutes_to_first_favorable", "minutes_to_target", "minutes_to_sl",
+                    "entry_success"):
+            profile[key] = stats.get(key)
+        mfe = stats["mfe_pct"]
+        profile["levels_reached"] = [str(level) for level in LEVELS_PCT if mfe >= level]
+        final = (
+            trade.r.return_pct * _HUNDRED
+            if trade.r and trade.r.return_pct is not None else None
+        )
+        if final is not None and mfe > _ZERO:
+            profile["giveback_ratio"] = str((mfe - final) / mfe)
+            profile["management_capture"] = str(final / mfe)
+        return profile
     if not trade.points or entry == _ZERO:
         profile["has_path"] = False
         return profile
@@ -110,6 +137,7 @@ def trade_profile(
 
     # Time is measured from ACTIVATION (the position existing), not from
     # the decision timestamp the paper entry carries.
+    profile["path_source"] = "GUARDIAN_TICKS"
     start = (
         observation.activation_minutes
         if observation is not None and observation.activation_minutes is not None
@@ -172,19 +200,29 @@ def build_samples(
         if exclusion_reason(trade) is not None:
             continue
         path_ok = trade.observation is None or trade.observation.path_usable
+        actual = trade.position
+        if trade.timeline is not None and trade.timeline.actual_entry is not None:
+            actual = trade.position.model_copy(
+                update={"simulated_fill_entry": trade.timeline.actual_entry}
+            )
         metrics = compute_path_metrics(
-            trade.position, trade.points if path_ok else [],
+            actual, trade.points if path_ok else [],
             settings.guardian.watch_decay_threshold, settings.guardian.exit_decay_threshold,
         )
+        mfe, mae, to_mfe = metrics.mfe_pct, metrics.mae_pct, metrics.minutes_to_mfe
+        if path_ok and trade.candle_path is not None:
+            mfe = trade.candle_path["mfe_pct"]
+            mae = trade.candle_path["mae_pct"]
+            to_mfe = trade.candle_path["minutes_to_mfe"]
         samples.append(ExperienceSample(
             position_id=trade.position.position_id,
             closed_at=trade.position.closed_at,
             pnl=trade.pnl,
             r=trade.outcome_r,
             observation=trade.observation.as_dict() if trade.observation else {},
-            mfe_pct=metrics.mfe_pct,
-            mae_pct=metrics.mae_pct,
-            minutes_to_mfe=metrics.minutes_to_mfe,
+            mfe_pct=mfe,
+            mae_pct=mae,
+            minutes_to_mfe=to_mfe,
             regime=trade.regime,
             features=trade.features,
             profile=trade_profile(
@@ -222,7 +260,7 @@ def _group(rows: list[dict]) -> dict[str, list[dict]]:
 def build_samples_from_repo(
     repo: Repository, settings: Settings, book: list[TradeContext] | None = None
 ) -> list[ExperienceSample]:
-    book = book if book is not None else load_book(repo, settings.risk_limits.fee_pct)
+    book = book if book is not None else load_book(repo, risk_limits=settings.risk_limits)
     return build_samples(
         book,
         _group(repo.find_godfather_counterfactuals()),
@@ -237,7 +275,7 @@ def run_experience_backfill(
     """Backfill Experience Memory from the whole history. Restates the
     pattern table (patterns that no longer exist are removed) and removes
     prediction-error rows that belong to zero-size positions."""
-    book = load_book(repo, settings.risk_limits.fee_pct)
+    book = load_book(repo, risk_limits=settings.risk_limits)
     zero_size = [t.position.position_id for t in book if t.position.size == _ZERO]
     removed = repo.delete_godfather_prediction_errors_for_positions(zero_size) if persist else 0
     samples = build_samples_from_repo(repo, settings, book)

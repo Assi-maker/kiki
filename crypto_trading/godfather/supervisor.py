@@ -467,7 +467,7 @@ def _thesis_action_mix(counterfactuals: dict[str, list[CounterfactualResult]]) -
 def run_supervisor_sweep(
     repo: Repository, settings: Settings, now: datetime, run_id: str, persist: bool = True
 ) -> dict:
-    book = load_book(repo, settings.risk_limits.fee_pct)
+    book = load_book(repo, risk_limits=settings.risk_limits)
     scorable = [t for t in book if t.scorable]
     if len(scorable) < 2:
         return {"status": "INSUFFICIENT_DATA", "scorable_trades": len(scorable)}

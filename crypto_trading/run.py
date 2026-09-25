@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import threading
+import time
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import uvicorn
@@ -13,6 +15,7 @@ from crypto_trading import (
     discovery_loop,
     godfather_loop,
     guardian_loop,
+    kline_archive,
     live_execution_loop,
     monitoring_loop,
     notify_loop,
@@ -255,6 +258,24 @@ def _run_godfather_intelligence_forever(settings: Settings) -> None:
     godfather_loop.run_forever(repo, settings)
 
 
+def _run_kline_archive_forever(
+    connector: BingXMarketDataConnector, settings: Settings, interval_seconds: int = 1800
+) -> None:
+    """Fas 2A.1: archive the exchange 1m klines of every closed trade's
+    window, so GODFATHER can verify exits and reconstruct paths after any
+    monitoring/Guardian gap. Read-only market data; writes only
+    exchange_klines_1m. Same fail-safe shape as the other loops: an
+    exception is logged, the loop continues."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    while True:
+        try:
+            kline_archive.archive_positions(connector, repo, datetime.now(UTC), limit=20)
+        except Exception as exc:  # noqa: BLE001 - never kill the thread
+            log_event("kline_archive", event="kline_archive_tick_failed",
+                      error_type=type(exc).__name__, error=str(exc))
+        time.sleep(interval_seconds)
+
+
 def _run_guardian_forever(
     market_data_connector: BingXMarketDataConnector,
     runner: AgentRunner,
@@ -419,6 +440,9 @@ def main() -> None:
     # the same place its behaviour is documented.
     if settings.godfather.intelligence_enabled:
         threads.append(godfather_thread)
+        threads.append(threading.Thread(
+            target=_run_kline_archive_forever, args=(connector, settings), daemon=True,
+        ))
     else:
         log_event(
             "startup",

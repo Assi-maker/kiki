@@ -40,10 +40,13 @@ class _CatchupStubConnector:
         self._funding_rates = funding_rates or {}
         self._raise_for = raise_for or {}
 
-    def get_klines(self, symbol, interval, limit=1):
+    def get_klines(self, symbol, interval, limit=1, start_time_ms=None, end_time_ms=None):
         if symbol in self._raise_for:
             raise self._raise_for[symbol]
-        return self._klines.get(symbol, [])[-limit:]
+        rows = self._klines.get(symbol, [])
+        if start_time_ms is not None:
+            rows = [r for r in rows if start_time_ms <= int(r["time"]) <= end_time_ms]
+        return rows[-limit:]
 
     def get_funding_rate(self, symbol, limit=1):
         return self._funding_rates.get(symbol, [])[-limit:]
@@ -156,3 +159,83 @@ def test_persists_a_monitoring_catchup_runs_row(tmp_path):
     ).fetchone()
     assert row is not None
     assert row["status"] == "ok"
+
+
+# --- Fas 2A.1: the whole gap is replayed, not the latest 1000 minutes ---
+
+
+def _gap_setup(tmp_path, gap_hours, stop_minute=None, missing=()):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo, instrument="BTCUSDT", stop_loss=Decimal("49000"),
+                        target=Decimal("60000"),
+                        opened_at=datetime(2026, 9, 11, 9, 0, tzinfo=UTC))
+    since = datetime(2026, 9, 11, 10, 0, tzinfo=UTC)
+    now = since + timedelta(hours=gap_hours)
+    repo.start_run("run-0", "monitoring", since)
+    repo.complete_run("run-0", since, "ok", [])
+    klines = []
+    for minute in range(1, int(gap_hours * 60) + 1):
+        if minute in missing:
+            continue
+        low = "48000" if minute == stop_minute else "50000"
+        klines.append(_raw_kline("50000", _ms(since + timedelta(minutes=minute)), low=low))
+    connector = _CatchupStubConnector(
+        klines={"BTCUSDT": klines},
+        funding_rates={"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(now))]},
+    )
+    return repo, connector, since, now
+
+
+def test_a_stop_early_in_a_long_gap_is_found_for_2_12_24_and_48_hour_restarts(tmp_path):
+    for hours in (2, 12, 24, 48):
+        path = tmp_path / f"h{hours}"
+        path.mkdir()
+        repo, connector, since, now = _gap_setup(path, hours, stop_minute=30)
+        closed = run_monitoring_catchup(connector, repo, _settings(), now)
+
+        assert len(closed) == 1, hours
+        assert closed[0].exit_reason == "stop_loss"
+        # The candle's own time, 30 minutes into the gap - not the restart.
+        assert closed[0].closed_at == since + timedelta(minutes=30)
+
+
+def test_no_exit_during_a_long_gap_leaves_the_position_open(tmp_path):
+    repo, connector, _since, now = _gap_setup(tmp_path, 12)
+    assert run_monitoring_catchup(connector, repo, _settings(), now) == []
+    assert repo.find_open_positions()[0].status == "OPEN_POSITION"
+
+
+def test_the_hard_time_limit_expiring_inside_a_gap_closes_at_its_own_minute(tmp_path):
+    """Opened 09:00, 24 h limit, bot down from 10:00 for 30 h: the limit
+    expired at 09:00 next day, inside the gap - it closes there, not at
+    the restart."""
+    repo, connector, _since, now = _gap_setup(tmp_path, 30)
+    closed = run_monitoring_catchup(connector, repo, _settings(), now)
+    assert len(closed) == 1
+    assert closed[0].exit_reason == "time_limit"
+    assert closed[0].closed_at == datetime(2026, 9, 12, 9, 0, tzinfo=UTC)
+
+
+def test_missing_exchange_history_is_reported_never_assumed(tmp_path):
+    repo, connector, since, now = _gap_setup(tmp_path, 12, missing=set(range(100, 160)))
+    run_monitoring_catchup(connector, repo, _settings(), now)
+    rows = repo.find_runs_by_type("monitoring_catchup")
+    assert rows[-1]["status"] == "partial_error"
+    errors = repo.find_runs_with_errors("monitoring_catchup")[-1]["errors"]
+    assert "kline_history_gap" in errors and "BTCUSDT" in errors
+
+
+def test_catch_up_pages_forward_and_never_requests_beyond_now(tmp_path):
+    repo, connector, since, now = _gap_setup(tmp_path, 30)
+    calls = []
+    original = connector.get_klines
+
+    def spy(symbol, interval, limit=1, start_time_ms=None, end_time_ms=None):
+        calls.append((start_time_ms, end_time_ms, limit))
+        return original(symbol, interval, limit, start_time_ms, end_time_ms)
+
+    connector.get_klines = spy
+    run_monitoring_catchup(connector, repo, _settings(), now)
+    assert calls[0][0] == _ms(since)
+    assert all(end <= _ms(now) for _start, end, _limit in calls)
+    assert len(calls) == 2 and all(limit == 1440 for *_x, limit in calls)
