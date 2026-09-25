@@ -66,6 +66,18 @@ def counterargument_bucket(count: int) -> str:
     return _bucket(float(count), [1.0, 3.0, 5.0], ["0", "1-2", "3-4", ">=5"])
 
 
+def volatility_bucket(pct_change: float) -> str:
+    """Absolute primary-timeframe price change in %. 2.0 is the
+    screener's own `price_volatility` trigger threshold."""
+    return _bucket(abs(pct_change), [1.0, 2.0, 4.0], ["<1", "1-2", "2-4", ">=4"])
+
+
+def funding_bucket(funding_rate_pct: float) -> str:
+    """Funding rate in %. 0.05 is the screener's own funding trigger;
+    0.01 is the exchange's default neutral funding."""
+    return _bucket(funding_rate_pct, [0.0, 0.01, 0.05], ["<0", "0-0.01", "0.01-0.05", ">=0.05"])
+
+
 def hour_bucket(moment: datetime) -> str:
     """UTC six-hour blocks. Crypto trades continuously, but liquidity and
     volatility do not - and four buckets is the most granularity a
@@ -122,6 +134,10 @@ def build_candidate_features(
     features["volume_zscore_bucket"] = volume_zscore_bucket(
         float(evidence.volume_evidence.value)
     )
+    features["volatility_bucket"] = volatility_bucket(
+        float(evidence.price_volatility_evidence.value)
+    )
+    features["funding_bucket"] = funding_bucket(float(evidence.funding_oi_evidence.value))
 
     secondary = evidence.secondary_timeframe_evidence
     if secondary is None:

@@ -25,6 +25,9 @@ _CRYPTO_TRADING = _REPO_ROOT / "crypto_trading"
 
 _INTELLIGENCE_MODULES = [
     _CRYPTO_TRADING / "godfather" / "auditor.py",
+    _CRYPTO_TRADING / "godfather" / "book.py",
+    _CRYPTO_TRADING / "godfather" / "experience_builder.py",
+    _CRYPTO_TRADING / "godfather" / "experience_impact.py",
     _CRYPTO_TRADING / "godfather" / "costs.py",
     _CRYPTO_TRADING / "godfather" / "entry_selection.py",
     _CRYPTO_TRADING / "godfather" / "mfe_model.py",
@@ -314,3 +317,15 @@ def test_every_new_decision_module_proposes_only_permitted_actions():
     assert "validate_action_is_safe(" in source
     for forbidden in ("BUY", "ADD", "INCREASE", "OPEN"):
         assert f'"{forbidden}"' not in source
+
+
+def test_the_intelligence_layer_can_make_no_ai_call():
+    """Fas 2 requirement: zero new Anthropic calls. No GODFATHER analysis
+    module may import an LLM client or the agent layer, so experience is
+    built and consumed deterministically."""
+    for path in _INTELLIGENCE_MODULES:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for module in _imported_modules(tree):
+            assert not module.startswith(("anthropic", "crypto_trading.agents")), (
+                f"{path.name} imports {module}"
+            )

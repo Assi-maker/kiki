@@ -558,6 +558,8 @@ class Repository(Protocol):
     def find_godfather_policies(self) -> list[dict]: ...
     def save_godfather_policy_transition(self, transition: dict, run_id: str) -> None: ...
     def find_godfather_policy_transitions(self) -> list[dict]: ...
+    def replace_godfather_experience_patterns(self, records: list[ExperiencePattern]) -> None: ...
+    def delete_godfather_prediction_errors_for_positions(self, position_ids: list[str]) -> int: ...
 
 
 class SQLiteRepository:
@@ -3520,3 +3522,26 @@ class SQLiteRepository:
             "SELECT * FROM godfather_policy_transitions ORDER BY transition_id ASC"
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def replace_godfather_experience_patterns(self, records: list[ExperiencePattern]) -> None:
+        """A backfill restates Experience Memory: patterns absent from the
+        new sweep (e.g. a feature bucket that no longer has support) must
+        not linger with an old verdict."""
+        self._conn.execute("DELETE FROM godfather_experience_patterns")
+        if not records:
+            self._conn.commit()
+        for record in records:
+            self.upsert_godfather_experience_pattern(record)
+
+    def delete_godfather_prediction_errors_for_positions(self, position_ids: list[str]) -> int:
+        """Removes prediction-error rows for positions that had no outcome
+        to predict (zero-size). GODFATHER's own table; nothing else reads it
+        as ground truth."""
+        removed = 0
+        for position_id in position_ids:
+            cur = self._conn.execute(
+                "DELETE FROM godfather_prediction_errors WHERE position_id = ?", (position_id,)
+            )
+            removed += cur.rowcount
+        self._conn.commit()
+        return removed

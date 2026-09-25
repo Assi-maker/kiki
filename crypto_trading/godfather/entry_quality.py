@@ -178,6 +178,7 @@ def assess_entry_quality(
     now: datetime,
     run_id: str,
     regime_compatible: bool | None = None,
+    experience_evidence: dict | None = None,
 ) -> EntryQualityAssessment:
     """One advisory verdict, with every reason recorded as a code.
 
@@ -222,8 +223,16 @@ def assess_entry_quality(
         if code in _CONFLICT_PENALTIES:
             reason_codes.append(f"conflict:{code}")
 
+    history = _history_subscore(edge_class)
+    if experience_evidence is not None:
+        # Graded experience (Fas 2): 0.5 + 0.5 x the confidence-weighted
+        # signed evidence. NOISE / INSUFFICIENT_DATA patterns weigh 0 by
+        # construction, so an unproven history stays exactly neutral; a
+        # FAILURE_PATTERN keeps its unconditional REJECT below regardless.
+        history = 0.5 + 0.5 * float(experience_evidence.get("signed_weight", 0.0))
+        reason_codes.append(f"experience:{experience_evidence.get('verdict')}")
     subscores = {
-        "history": _history_subscore(edge_class),
+        "history": history,
         "evidence": float(candidate.evidence_record.candidate_score),
         "confirmation": _confirmation_subscore(features),
         "contradiction": 1.0 - conflict_penalty,
@@ -278,6 +287,18 @@ def assess_entry_quality(
             "subscores": subscores,
             "weights": _WEIGHTS,
             "features": {k: str(v) for k, v in features.items()},
+            "experience": (
+                None if experience_evidence is None else {
+                    "verdict": experience_evidence.get("verdict"),
+                    "signed_weight": experience_evidence.get("signed_weight"),
+                    "matched": [
+                        {k: m[k] for k in ("pattern_id", "sample_size", "edge_class",
+                                           "entry_quality_class", "confidence", "weight")}
+                        for m in experience_evidence.get("matched", [])
+                    ],
+                    "similar_cases": experience_evidence.get("similar_cases"),
+                }
+            ),
         },
         run_id=run_id,
     )

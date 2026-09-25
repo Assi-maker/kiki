@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from datetime import datetime, time
 from decimal import Decimal
 
 from crypto_trading.config.loader import Settings
 from crypto_trading.godfather import stats
 from crypto_trading.godfather.auditor import detect_conflicts
+from crypto_trading.godfather.book import TradeContext, load_book
+from crypto_trading.godfather.book import safe_candidate as _safe_candidate
 from crypto_trading.godfather.counterfactual import ENGINE_VERSION, run_counterfactuals
 from crypto_trading.godfather.entry_quality import assess_entry_quality
 from crypto_trading.godfather.entry_selection import (
@@ -44,11 +45,12 @@ from crypto_trading.godfather.experience import (
     ExperienceConfig,
     ExperienceSample,
     build_experience_memory,
+    experience_evidence,
 )
+from crypto_trading.godfather.experience_builder import build_samples_from_repo
 from crypto_trading.godfather.features import build_candidate_features
 from crypto_trading.godfather.mfe_model import MfeModel, observations_for_trade
-from crypto_trading.godfather.path import PathPoint, compute_path_metrics, reconstruct_price_path
-from crypto_trading.godfather.pipeline import _regime_for, _safe_candidate, _thresholds
+from crypto_trading.godfather.pipeline import _thresholds
 from crypto_trading.godfather.policy_registry import (
     PolicyEvidence,
     evaluate_registry,
@@ -63,10 +65,7 @@ from crypto_trading.godfather.portfolio import (
     exposure_profile,
     theme_of,
 )
-from crypto_trading.paper_trading.execution import compute_pnl_or_none
-from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.godfather import CounterfactualResult
-from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository
 
 _ZERO = Decimal("0")
@@ -91,67 +90,6 @@ POLICY_DESCRIPTIONS = {
     "ENTRY_SELECTION_TOP_HALF": "take only the better half of each confirmed cohort",
     "PORTFOLIO_THEME_CAP": "skip a TAKE when its theme already holds 2 open/selected positions",
 }
-
-
-@dataclass
-class TradeContext:
-    position: Position
-    candidate: Candidate | None
-    opportunity_screen: dict | None
-    gate_decision: dict | None
-    observations: list[dict]
-    points: list[PathPoint]
-    pnl: Decimal | None
-    regime: str
-    features: dict = field(default_factory=dict)
-
-    @property
-    def scorable(self) -> bool:
-        return self.pnl is not None and self.position.size != _ZERO and bool(self.points)
-
-
-def load_book(repo: Repository) -> list[TradeContext]:
-    book: list[TradeContext] = []
-    for position in repo.find_closed_positions():
-        observations = repo.find_guardian_observations_for_position(position.position_id)
-        candidate = _safe_candidate(repo, position.candidate_id)
-        screen = repo.get_assessment_payload(position.candidate_id, "opportunity_screen")
-        regime = _regime_for(observations)
-        book.append(TradeContext(
-            position=position,
-            candidate=candidate,
-            opportunity_screen=screen,
-            gate_decision=repo.get_gate_decision(position.candidate_id),
-            observations=observations,
-            points=reconstruct_price_path(position, observations),
-            pnl=None if position.size == _ZERO else compute_pnl_or_none(position),
-            regime=regime,
-            features=build_candidate_features(candidate, screen, position.opened_at, regime),
-        ))
-    book.sort(key=lambda t: t.position.opened_at)
-    return book
-
-
-def experience_samples(book: list[TradeContext], settings: Settings) -> list[ExperienceSample]:
-    samples: list[ExperienceSample] = []
-    for trade in book:
-        if not trade.scorable or trade.position.closed_at is None:
-            continue
-        metrics = compute_path_metrics(
-            trade.position, trade.points,
-            settings.guardian.watch_decay_threshold, settings.guardian.exit_decay_threshold,
-        )
-        samples.append(ExperienceSample(
-            position_id=trade.position.position_id,
-            closed_at=trade.position.closed_at,
-            pnl=trade.pnl,
-            mfe_pct=metrics.mfe_pct,
-            mae_pct=metrics.mae_pct,
-            minutes_to_mfe=metrics.minutes_to_mfe,
-            regime=trade.regime,
-            features=trade.features,
-        ))
-    return samples
 
 
 class PatternsAsOf:
@@ -241,6 +179,10 @@ def build_entry_signals(
             now=decided_at,
             run_id=run_id,
             regime_compatible=(None if regime == "unknown" else regime in ("btc_strong", "btc_ok")),
+            experience_evidence=experience_evidence(
+                patterns_as_of(decided_at), features,
+                settings.godfather.experience_min_sample_size,
+            ),
         )
         signals.append(EntrySignal(
             candidate_id=candidate.candidate_id,
@@ -527,7 +469,7 @@ def run_supervisor_sweep(
         min_support=settings.godfather.experience_min_support,
         fdr_q=settings.godfather.experience_fdr_q,
     )
-    samples = experience_samples(book, settings)
+    samples = build_samples_from_repo(repo, settings, book)
     patterns_now = build_experience_memory(samples, now, run_id, config)
     signals = build_entry_signals(
         repo, settings, book, PatternsAsOf(samples, config), now, run_id, persist

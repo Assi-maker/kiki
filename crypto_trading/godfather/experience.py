@@ -51,6 +51,7 @@ whether one is real.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -100,6 +101,12 @@ class ExperienceSample:
     minutes_to_mfe: float | None
     regime: str
     features: dict[str, object] = field(default_factory=dict)
+    # What happened AFTER entry (price path, management, prediction
+    # errors, counterfactual deltas) - built by `experience_builder`. It is
+    # aggregated into each pattern's evidence file and NEVER matched on:
+    # patterns are conditioned on `features` (pre-entry) only.
+    profile: dict = field(default_factory=dict)
+    live: bool = False
 
     @property
     def win(self) -> bool:
@@ -381,6 +388,10 @@ def build_experience_memory(
     ordered = sorted(samples, key=lambda s: s.closed_at)
     baseline_win_rate = sum(1 for s in ordered if s.win) / len(ordered)
     baseline_expectancy = _expectancy(ordered) or _ZERO
+    # Global calibration / out-of-sample boundary: the first 70% of the
+    # history (by close time) is calibration, the rest out-of-sample.
+    calibration_cut = ordered[min(len(ordered) - 1, int(len(ordered) * config.train_fraction))]
+    calibration_cut = calibration_cut.closed_at
 
     definitions = enumerate_patterns(ordered, config)
     computed = [
@@ -401,6 +412,7 @@ def build_experience_memory(
         [computed[i].p_value for i in testable_indices], config.fdr_q
     )
     significant: dict[int, bool] = dict(zip(testable_indices, flags, strict=True))
+    entry_quality = _entry_quality_classes(computed, ordered, config)
 
     results: list[ExperiencePattern] = []
     for index, pattern in enumerate(computed):
@@ -454,11 +466,260 @@ def build_experience_memory(
                     "fdr_q": config.fdr_q,
                     "hypotheses_tested_in_sweep": len(testable_indices),
                     "min_sample_size": config.min_sample_size,
+                    "profile": summarise_profiles(pattern.matched, config),
+                    "evidence": _evidence_split(
+                        pattern.matched, calibration_cut, baseline_expectancy
+                    ),
+                    "entry_quality": entry_quality[index],
                 },
                 run_id=run_id,
             )
         )
     return results
+
+
+def _quantiles(values: list[float]) -> dict | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+
+    def q(fraction: float) -> float:
+        return ordered[min(len(ordered) - 1, int(fraction * (len(ordered) - 1) + 0.5))]
+
+    return {"n": len(ordered), "p25": q(0.25), "p50": q(0.5), "p75": q(0.75)}
+
+
+def _median(values: list[float]) -> float | None:
+    return _quantiles(values)["p50"] if values else None
+
+
+def summarise_profiles(samples: list[ExperienceSample], config: ExperienceConfig) -> dict:
+    """What trades matching a pattern did AFTER entry - the answer to
+    "how far do trades like this usually go, and how much adverse
+    movement do they take". Descriptive: it never changes the edge class;
+    every statistic carries its own n, and a counterfactual summary with
+    fewer than `min_support` observed trades is INSUFFICIENT_DATA."""
+    with_path = [s for s in samples if s.profile.get("has_path")]
+    levels: dict[str, int] = {}
+    for sample in with_path:
+        for level in sample.profile.get("levels_reached", []):
+            levels[level] = levels.get(level, 0) + 1
+    exits: dict[str, int] = {}
+    for sample in samples:
+        reason = str(sample.profile.get("exit_reason") or "unknown")
+        exits[reason] = exits.get(reason, 0) + 1
+    entry_outcomes = [
+        s.profile["entry_success"] for s in with_path if s.profile.get("entry_success") is not None
+    ]
+    counterfactuals: dict[str, list[float]] = {}
+    for sample in samples:
+        for policy, delta in sample.profile.get("counterfactual_delta", {}).items():
+            counterfactuals.setdefault(policy, []).append(float(delta))
+
+    def _errors(key: str) -> dict:
+        values = [float(s.profile[key]) for s in samples if s.profile.get(key) is not None]
+        return {"n": len(values), "mean": stats.mean(values)}
+
+    return {
+        "with_price_path": len(with_path),
+        "mfe_pct": _quantiles([float(s.mfe_pct) for s in with_path if s.mfe_pct is not None]),
+        "mae_pct": _quantiles([float(s.mae_pct) for s in with_path if s.mae_pct is not None]),
+        "minutes_to_mfe": _median([s.minutes_to_mfe for s in with_path
+                                   if s.minutes_to_mfe is not None]),
+        "minutes_to_first_favorable": _median([
+            s.profile["minutes_to_first_favorable"] for s in with_path
+            if s.profile.get("minutes_to_first_favorable") is not None
+        ]),
+        "minutes_to_target": _median([
+            s.profile["minutes_to_target"] for s in with_path
+            if s.profile.get("minutes_to_target") is not None
+        ]),
+        "minutes_to_sl": _median([
+            s.profile["minutes_to_sl"] for s in with_path
+            if s.profile.get("minutes_to_sl") is not None
+        ]),
+        "level_reach_rate": {
+            level: count / len(with_path) for level, count in sorted(levels.items())
+        } if with_path else {},
+        "giveback_ratio": _quantiles([
+            float(s.profile["giveback_ratio"]) for s in with_path
+            if s.profile.get("giveback_ratio") is not None
+        ]),
+        "management_capture": _quantiles([
+            float(s.profile["management_capture"]) for s in with_path
+            if s.profile.get("management_capture") is not None
+        ]),
+        "entry_success_rate": (
+            sum(1 for ok in entry_outcomes if ok) / len(entry_outcomes)
+            if entry_outcomes else None
+        ),
+        "entry_success_n": len(entry_outcomes),
+        "exit_mix": exits,
+        "forecast_calibration_error": _errors("forecast_error"),
+        "thesis_error": _errors("thesis_error"),
+        "counterfactual_mean_delta_usdt": {
+            policy: (
+                {"n": len(values), "mean": stats.mean(values)}
+                if len(values) >= config.min_support
+                else {"n": len(values), "mean": None, "status": "INSUFFICIENT_DATA"}
+            )
+            for policy, values in sorted(counterfactuals.items())
+        },
+    }
+
+
+def _evidence_split(
+    matched: list[ExperienceSample], calibration_cut: datetime, baseline: Decimal
+) -> dict:
+    """Which of this pattern's evidence is calibration history, which is
+    out-of-sample, and which came from LIVE-executed trades. A pattern
+    whose support is all calibration has not been tested yet."""
+    calibration = [s for s in matched if s.closed_at < calibration_cut]
+    oos = [s for s in matched if s.closed_at >= calibration_cut]
+
+    def _lift(group: list[ExperienceSample]) -> str | None:
+        expectancy = _expectancy(group)
+        return None if expectancy is None else str(expectancy - baseline)
+
+    return {
+        "calibration_n": len(calibration),
+        "oos_n": len(oos),
+        "live_n": sum(1 for s in matched if s.live),
+        "calibration_lift_usdt": _lift(calibration),
+        "oos_lift_usdt": _lift(oos),
+        "calibration_cut": calibration_cut.isoformat(),
+    }
+
+
+def _entry_quality_classes(
+    computed: list[_PatternStats], ordered: list[ExperienceSample], config: ExperienceConfig
+) -> list[dict]:
+    """ENTRY quality, kept apart from the P/L outcome on purpose.
+
+    "Entry success" = the trade reached +1% before it reached -1%. That is
+    decided before any exit rule, target or Guardian intervention acts,
+    so a bad entry that a lucky exit turned into a win cannot be learned
+    as a good entry. Same anti-noise contract as the P/L classes: n >= 30,
+    exact binomial vs the baseline entry-success rate, BH across every
+    pattern, and the same sign in both chronological halves.
+    """
+    baseline_outcomes = [
+        s.profile["entry_success"] for s in ordered if s.profile.get("entry_success") is not None
+    ]
+    if not baseline_outcomes:
+        return [{"class": "INSUFFICIENT_DATA", "n": 0} for _ in computed]
+    baseline = sum(1 for ok in baseline_outcomes if ok) / len(baseline_outcomes)
+
+    rows: list[dict] = []
+    for pattern in computed:
+        outcomes = [
+            s.profile["entry_success"] for s in pattern.matched
+            if s.profile.get("entry_success") is not None
+        ]
+        n = len(outcomes)
+        successes = sum(1 for ok in outcomes if ok)
+        first, second = stats.split_halves(outcomes)
+        rows.append({
+            "n": n,
+            "success_rate": successes / n if n else None,
+            "baseline_success_rate": baseline,
+            "p_value": stats.binomial_test_two_sided(successes, n, baseline) if n else 1.0,
+            "first_half_rate": (sum(first) / len(first)) if first else None,
+            "second_half_rate": (sum(second) / len(second)) if second else None,
+        })
+    testable = [i for i, row in enumerate(rows) if row["n"] >= config.min_sample_size]
+    flags = stats.benjamini_hochberg([rows[i]["p_value"] for i in testable], config.fdr_q)
+    significant = dict(zip(testable, flags, strict=True))
+    for index, row in enumerate(rows):
+        row["fdr_significant"] = significant.get(index, False)
+        if row["n"] < config.min_sample_size:
+            row["class"] = "INSUFFICIENT_DATA"
+            continue
+        above = [r is not None and r > baseline for r in (
+            row["success_rate"], row["first_half_rate"], row["second_half_rate"]
+        )]
+        below = [r is not None and r < baseline for r in (
+            row["success_rate"], row["first_half_rate"], row["second_half_rate"]
+        )]
+        if row["fdr_significant"] and all(above):
+            row["class"] = "ENTRY_EDGE"
+        elif row["fdr_significant"] and all(below):
+            row["class"] = "ENTRY_FAILURE"
+        else:
+            row["class"] = "NOISE"
+    return rows
+
+
+_SUPPORTING = {"EDGE": 1.0, "WEAK_EDGE": 0.5, "REGIME_DEPENDENT": 0.25}
+_OPPOSING = {"FAILURE_PATTERN": 1.0, "DECAYING_EDGE": 0.25}
+
+
+def experience_evidence(
+    patterns: list[dict],
+    features: dict[str, object],
+    min_sample_size: int = DEFAULT_MIN_SAMPLE_SIZE,
+) -> dict:
+    """What Experience Memory says about a situation, as EVIDENCE.
+
+    Every matching pattern is listed with its sample size, class and
+    confidence, so a reader sees what GODFATHER recognises and how well.
+    Only classified patterns carry weight: NOISE and INSUFFICIENT_DATA
+    have confidence 0 by construction and move nothing - "I have seen 12
+    of these" is recognition, not evidence. The signed weight is
+    confidence x class strength, summed and clipped to [-1, 1].
+
+    `similar_cases` is the price-path profile of the most SPECIFIC
+    matching pattern that still has at least `min_sample_size` trades:
+    how far such trades went and how much adverse movement they took.
+    """
+    matched: list[dict] = []
+    signed = 0.0
+    for row in patterns:
+        condition = row.get("condition") or {}
+        if not condition or not all(features.get(k) == v for k, v in condition.items()):
+            continue
+        detail = row.get("detail") or {}
+        if isinstance(detail, str):
+            detail = json.loads(detail or "{}")
+        edge_class = str(row.get("edge_class"))
+        confidence = float(row.get("confidence") or 0.0)
+        entry = detail.get("entry_quality") or {}
+        weight = confidence * (_SUPPORTING.get(edge_class, 0.0) - _OPPOSING.get(edge_class, 0.0))
+        if entry.get("class") == "ENTRY_FAILURE":
+            weight -= 0.5
+        elif entry.get("class") == "ENTRY_EDGE":
+            weight += 0.5
+        signed += weight
+        matched.append({
+            "pattern_id": row.get("pattern_id"),
+            "sample_size": int(row.get("sample_size") or 0),
+            "edge_class": edge_class,
+            "entry_quality_class": entry.get("class"),
+            "confidence": confidence,
+            "expectancy_usdt": None if row.get("expectancy_usdt") is None
+            else str(row.get("expectancy_usdt")),
+            "weight": weight,
+            "profile": detail.get("profile"),
+        })
+    signed = max(-1.0, min(1.0, signed))
+    if not matched:
+        verdict = "UNKNOWN_SITUATION"
+    elif all(m["weight"] == 0 for m in matched):
+        verdict = "NO_EVIDENCE"
+    else:
+        verdict = "SUPPORTS" if signed > 0 else "OPPOSES" if signed < 0 else "MIXED"
+    reliable = [m for m in matched if m["sample_size"] >= min_sample_size and m["profile"]]
+    specific = min(reliable, key=lambda m: m["sample_size"]) if reliable else None
+    return {
+        "verdict": verdict,
+        "signed_weight": signed,
+        "matched": sorted(matched, key=lambda m: -abs(m["weight"])),
+        "similar_cases": (
+            {"pattern_id": specific["pattern_id"], "sample_size": specific["sample_size"],
+             "profile": specific["profile"]}
+            if specific else {"status": "INSUFFICIENT_DATA"}
+        ),
+    }
 
 
 def lookup_edge_class(

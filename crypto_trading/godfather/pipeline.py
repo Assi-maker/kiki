@@ -40,6 +40,8 @@ from decimal import Decimal
 from crypto_trading.config.loader import Settings
 from crypto_trading.godfather import experience as experience_module
 from crypto_trading.godfather.auditor import audit_decision
+from crypto_trading.godfather.book import regime_for as _regime_for
+from crypto_trading.godfather.book import safe_candidate as _safe_candidate
 from crypto_trading.godfather.counterfactual import (
     aggregate_policy_performance,
     common_scorable_positions,
@@ -47,11 +49,14 @@ from crypto_trading.godfather.counterfactual import (
 )
 from crypto_trading.godfather.entry_quality import assess_entry_quality
 from crypto_trading.godfather.experience import (
-    ExperienceConfig,
-    ExperienceSample,
     build_experience_memory,
+    experience_evidence,
 )
-from crypto_trading.godfather.features import btc_regime_bucket, build_candidate_features
+from crypto_trading.godfather.experience_builder import (
+    build_samples_from_repo,
+    experience_config,
+)
+from crypto_trading.godfather.features import build_candidate_features
 from crypto_trading.godfather.investigator import (
     investigate_position,
     judge_entry,
@@ -69,14 +74,12 @@ from crypto_trading.godfather.thesis import (
 )
 from crypto_trading.logging import log_event
 from crypto_trading.paper_trading.execution import compute_pnl_or_none
-from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.godfather import (
     CounterfactualResult,
     PredictionErrorSource,
     ThesisObservation,
 )
 from crypto_trading.schemas.trade import Position
-from crypto_trading.storage.exceptions import CorruptCandidateStateError
 from crypto_trading.storage.repository import Repository
 
 _ZERO = Decimal("0")
@@ -91,41 +94,6 @@ def _thresholds(settings: Settings) -> ThesisThresholds:
         exit=settings.guardian.exit_decay_threshold,
         max_hold_hours=settings.risk_limits.max_position_hold_hours,
     )
-
-
-def _safe_candidate(repo: Repository, candidate_id: str) -> Candidate | None:
-    """A corrupt candidate row is context, not control flow - the same
-    non-fatal treatment `guardian/self_improvement.py` already gives it.
-    An investigation with no candidate is still worth having; one that
-    crashed the whole batch is not."""
-    try:
-        return repo.get_candidate(candidate_id)
-    except CorruptCandidateStateError:
-        return None
-
-
-def _regime_for(observations: list[dict]) -> str:
-    """BTC regime as Guardian measured it on this position's FIRST tick.
-
-    The first observed tick rather than an average: regime compatibility
-    is an entry-time question, and averaging over the trade's life would
-    mix in conditions that only existed after the decision was made.
-    """
-    if not observations:
-        return "unknown"
-    first = min(observations, key=lambda row: str(row.get("observed_at") or ""))
-    factors = first.get("factors")
-    if isinstance(factors, str):
-        try:
-            factors = json.loads(factors)
-        except (ValueError, TypeError):
-            factors = {}
-    if not isinstance(factors, dict):
-        return "unknown"
-    value = factors.get("market_regime")
-    if not isinstance(value, (int, float)):
-        return "unknown"
-    return btc_regime_bucket(float(value))
 
 
 def _thesis_id(position_id: str, observed_at: datetime) -> str:
@@ -281,6 +249,11 @@ def run_investigation_batch(
             position.opened_at,
             _regime_for(observations),
         )
+        if position.size == _ZERO:
+            # Exposure-blocked: there is no outcome to have predicted. The
+            # first backfill wrote 97 such rows ("exit via target at 0
+            # USDT", classification UNKNOWN) - noise, not experience.
+            continue
         for record in build_prediction_errors(
             investigation, audit, _actionable_sources(patterns, features)
         ):
@@ -314,75 +287,17 @@ def _observation_quality(position: Position, points: list) -> dict:
     }
 
 
-def build_experience_samples(repo: Repository, settings: Settings) -> list[ExperienceSample]:
-    """One sample per stored investigation that has a scorable outcome.
-
-    Built from the investigations table rather than recomputed from
-    positions, so Experience Memory and the post-mortems can never be
-    looking at two different versions of the same trade.
-    """
-    samples: list[ExperienceSample] = []
-    for row in repo.find_godfather_trade_investigations():
-        pnl_raw = row.get("realized_pnl_usdt")
-        if pnl_raw is None:
-            continue
-        position = repo.get_position(str(row["position_id"]))
-        if position is None or position.closed_at is None:
-            continue
-        if position.size == _ZERO:
-            # Exposure-blocked: P/L 0 under every outcome. Counting it would
-            # teach Experience Memory that these setups are "flat".
-            continue
-        candidate = _safe_candidate(repo, str(row["candidate_id"]))
-        opportunity_screen = repo.get_assessment_payload(
-            str(row["candidate_id"]), "opportunity_screen"
-        )
-        observations = repo.find_guardian_observations_for_position(position.position_id)
-        regime = _regime_for(observations)
-        features = build_candidate_features(
-            candidate, opportunity_screen, position.opened_at, regime
-        )
-        # The outcome classification is a legitimate GROUPING key for
-        # reporting but must never be a pattern FEATURE: it is derived
-        # from the outcome, so a pattern conditioned on it would predict
-        # the answer with the answer.
-        samples.append(
-            ExperienceSample(
-                position_id=position.position_id,
-                closed_at=position.closed_at,
-                pnl=Decimal(str(pnl_raw)),
-                mfe_pct=_optional_decimal(row.get("mfe_pct")),
-                mae_pct=_optional_decimal(row.get("mae_pct")),
-                minutes_to_mfe=row.get("minutes_to_mfe"),
-                regime=regime,
-                features=features,
-            )
-        )
-    return samples
-
-
-def _optional_decimal(value: object) -> Decimal | None:
-    if value is None:
-        return None
-    try:
-        return Decimal(str(value))
-    except (ValueError, ArithmeticError):
-        return None
-
-
 def run_experience_sweep(
     repo: Repository, settings: Settings, now: datetime, run_id: str
 ) -> dict:
-    """Recompute every pattern verdict from the full investigation history."""
-    samples = build_experience_samples(repo, settings)
-    config = ExperienceConfig(
-        min_sample_size=settings.godfather.experience_min_sample_size,
-        min_support=settings.godfather.experience_min_support,
-        fdr_q=settings.godfather.experience_fdr_q,
-    )
-    patterns = build_experience_memory(samples, now, run_id, config)
-    for pattern in patterns:
-        repo.upsert_godfather_experience_pattern(pattern)
+    """Recompute every pattern verdict from the full history, with the
+    Experience Builder's enriched samples (price path, entry vs management,
+    prediction errors, counterfactuals). The same samples the offline
+    backfill uses, so the 15-minute tick never overwrites the backfill
+    with a poorer version of the same memory."""
+    samples = build_samples_from_repo(repo, settings)
+    patterns = build_experience_memory(samples, now, run_id, experience_config(settings))
+    repo.replace_godfather_experience_patterns(patterns)
     by_class: dict[str, int] = {}
     for pattern in patterns:
         by_class[pattern.edge_class] = by_class.get(pattern.edge_class, 0) + 1
@@ -521,6 +436,7 @@ def run_entry_quality_backfill(
             now=now,
             run_id=run_id,
             regime_compatible=(None if regime == "unknown" else regime in ("btc_strong", "btc_ok")),
+            experience_evidence=experience_evidence(patterns, features),
         )
         if repo.save_godfather_entry_quality(assessment):
             written += 1
