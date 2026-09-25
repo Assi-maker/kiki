@@ -57,12 +57,14 @@ from crypto_trading.godfather.investigator import (
     judge_entry,
     judge_management,
 )
+from crypto_trading.godfather.mfe_model import MfeModel, observations_for_trade
 from crypto_trading.godfather.path import compute_path_metrics, reconstruct_price_path
+from crypto_trading.godfather.position_decision import decide_position
 from crypto_trading.godfather.prediction_error import build_prediction_errors
+from crypto_trading.godfather.stop_simulation import MAX_UNOBSERVED_MINUTES
 from crypto_trading.godfather.thesis import (
     ThesisThresholds,
     build_thesis_features,
-    evaluate_thesis,
     validate_action_is_safe,
 )
 from crypto_trading.logging import log_event
@@ -250,6 +252,10 @@ def run_investigation_batch(
             now=now,
             run_id=run_id,
         )
+        investigation.during["observation_quality"] = _observation_quality(position, points)
+        investigation.before["exposure"] = (
+            "ZERO_SIZE_UNAVAILABLE" if position.size == _ZERO else "EXPOSED"
+        )
         if repo.save_godfather_trade_investigation(investigation):
             investigated += 1
 
@@ -288,6 +294,26 @@ def run_investigation_batch(
     }
 
 
+def _observation_quality(position: Position, points: list) -> dict:
+    """How well Guardian actually watched this trade. A trade with holes
+    is not a worse trade - but conclusions drawn from its path are weaker,
+    and Experience Memory must be able to tell the two apart."""
+    minutes = [p.minutes_in_trade for p in points]
+    if position.closed_at is not None and minutes:
+        minutes.append((position.closed_at - position.opened_at).total_seconds() / 60)
+    gaps = [b - a for a, b in zip(minutes, minutes[1:], strict=False)]
+    return {
+        "points": len(points),
+        "max_gap_minutes": max(gaps) if gaps else None,
+        "gaps_over_limit": sum(1 for g in gaps if g > MAX_UNOBSERVED_MINUTES),
+        "status": (
+            "UNAVAILABLE" if not points
+            else "PARTIAL" if any(g > MAX_UNOBSERVED_MINUTES for g in gaps)
+            else "OBSERVED"
+        ),
+    }
+
+
 def build_experience_samples(repo: Repository, settings: Settings) -> list[ExperienceSample]:
     """One sample per stored investigation that has a scorable outcome.
 
@@ -302,6 +328,10 @@ def build_experience_samples(repo: Repository, settings: Settings) -> list[Exper
             continue
         position = repo.get_position(str(row["position_id"]))
         if position is None or position.closed_at is None:
+            continue
+        if position.size == _ZERO:
+            # Exposure-blocked: P/L 0 under every outcome. Counting it would
+            # teach Experience Memory that these setups are "flat".
             continue
         candidate = _safe_candidate(repo, str(row["candidate_id"]))
         opportunity_screen = repo.get_assessment_payload(
@@ -371,13 +401,19 @@ def run_thesis_tracking(
     """
     thresholds = _thresholds(settings)
     written = 0
-    for position in repo.find_open_positions():
+    open_positions = repo.find_open_positions()
+    mfe_model = _mfe_model_as_of(repo, now) if open_positions else None
+    for position in open_positions:
         observations = repo.find_guardian_observations_for_position(position.position_id)
         points = reconstruct_price_path(position, observations)
         features = build_thesis_features(position, points, thresholds.max_hold_hours)
         if features is None:
             continue
-        decision = evaluate_thesis(position, features, thresholds)
+        estimate = (
+            mfe_model.estimate(features.mfe_pct_so_far) if mfe_model is not None else None
+        )
+        position_decision = decide_position(position, features, thresholds, estimate)
+        decision = position_decision.as_thesis_decision()
         violations = validate_action_is_safe(position, decision)
         if violations:
             log_event(
@@ -417,12 +453,29 @@ def run_thesis_tracking(
                     else None
                 ),
                 "guardian_factors": features.factors,
+                "thesis_action": position_decision.thesis_action,
+                "profit_protection": position_decision.profit_protection,
+                "mfe_context": position_decision.mfe_context,
+                "observation_age_minutes": (now - observed_at).total_seconds() / 60,
             },
             run_id=run_id,
         )
         if repo.save_godfather_position_thesis(record):
             written += 1
     return written
+
+
+def _mfe_model_as_of(repo: Repository, now: datetime) -> MfeModel:
+    """MFE history from every trade closed before `now`."""
+    observations = []
+    for position in repo.find_closed_positions():
+        if position.size == _ZERO or position.closed_at is None or position.closed_at >= now:
+            continue
+        points = reconstruct_price_path(
+            position, repo.find_guardian_observations_for_position(position.position_id)
+        )
+        observations.extend(observations_for_trade(position, points))
+    return MfeModel(observations)
 
 
 def run_entry_quality_backfill(

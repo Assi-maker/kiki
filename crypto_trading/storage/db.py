@@ -915,6 +915,49 @@ CREATE TABLE IF NOT EXISTS godfather_policy_evaluations (
 
 CREATE INDEX IF NOT EXISTS idx_gf_policy_evaluations_policy
     ON godfather_policy_evaluations(policy);
+
+-- Policy registry (GODFATHER supervisor, 2026-09-25): the CURRENT
+-- lifecycle status of every entry/position/portfolio policy GODFATHER
+-- evaluates, with the gates and the evidence that produced it. Read by
+-- nothing in the trading path (AST-pinned) - a PROMOTED row records
+-- eligibility, it does not wire a policy into execution.
+CREATE TABLE IF NOT EXISTS godfather_policies (
+    policy_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL,
+    computed_status TEXT NOT NULL,
+    fdr_significant INTEGER NOT NULL,
+    gates_json TEXT NOT NULL,
+    flags_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+-- Every status change, append-only: the audit trail that makes a
+-- promotion or a rollback reconstructible after the fact.
+CREATE TABLE IF NOT EXISTS godfather_policy_transitions (
+    transition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_id TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT NOT NULL,
+    changed_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS godfather_policy_transitions_no_update
+BEFORE UPDATE ON godfather_policy_transitions
+BEGIN
+    SELECT RAISE(ABORT, 'godfather_policy_transitions is append-only: UPDATE is not permitted');
+END;
+
+CREATE TRIGGER IF NOT EXISTS godfather_policy_transitions_no_delete
+BEFORE DELETE ON godfather_policy_transitions
+BEGIN
+    SELECT RAISE(ABORT, 'godfather_policy_transitions is append-only: DELETE is not permitted');
+END;
 """
 
 

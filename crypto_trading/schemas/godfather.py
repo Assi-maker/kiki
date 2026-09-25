@@ -125,6 +125,7 @@ class DecisionAudit(BaseModel):
 
 CounterfactualPolicy = Literal[
     "BASELINE",
+    "NO_INTERVENTION",
     "REJECT_ENTRY",
     "DELAY_ENTRY_30M",
     "DELAY_ENTRY_60M",
@@ -133,6 +134,9 @@ CounterfactualPolicy = Literal[
     "TIGHTEN_SL_AFTER_FAVORABLE",
     "REDUCE_ON_WEAKENING",
     "SAFE_TP_AT_HALF_TARGET",
+    "PROFIT_LOCK_HALF_MFE",
+    "THESIS_TIGHTEN",
+    "THESIS_POLICY",
 ]
 
 

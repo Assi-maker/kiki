@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 
 from crypto_trading.config.loader import Settings
 from crypto_trading.godfather.pipeline import run_godfather_intelligence_tick
+from crypto_trading.godfather.supervisor import run_supervisor_sweep, sweep_is_due
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.storage.repository import Repository
 
@@ -39,6 +40,14 @@ def run_godfather_tick(repo: Repository, settings: Settings) -> dict:
             run_id,
             batch_limit=settings.godfather.intelligence_batch_limit,
         )
+        if settings.godfather.intelligence_enabled and sweep_is_due(repo, settings, now):
+            sweep = run_supervisor_sweep(repo, settings, now, run_id)
+            summary["supervisor"] = {
+                "policies": len(sweep.get("registry", [])),
+                "transitions": len(sweep.get("transitions", [])),
+                "status": sweep.get("status", "ok"),
+            }
+            log_event(run_id, event="godfather_supervisor_sweep", **summary["supervisor"])
         repo.complete_run(run_id, datetime.now(UTC), "ok", [])
         return summary
     except Exception as exc:

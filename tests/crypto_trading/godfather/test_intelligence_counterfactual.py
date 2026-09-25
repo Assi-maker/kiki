@@ -144,11 +144,13 @@ def test_an_exit_policy_that_never_fires_is_recorded_as_identical_to_baseline():
 
 def test_delaying_the_entry_uses_the_price_actually_observed_at_the_delay():
     position = make_position(exit_price=Decimal("97"))
+    # Guardian's real cadence (~1-2 min): the delayed trade must be
+    # WATCHED while it is open, or its outcome is UNOBSERVABLE (next test).
     points = _path(
         position,
         (0, Decimal("100")),
         (30, Decimal("96")),
-        (60, Decimal("98")),
+        *[(30 + step * 5, Decimal("97.5")) for step in range(1, 18)],
         (120, Decimal("97")),
     )
 
@@ -359,3 +361,15 @@ def test_the_baseline_policy_is_excluded_from_significance_testing():
     ]
 
     assert assess_policy_significance(rows) == {}
+
+
+def test_a_delayed_trade_that_was_not_watched_is_unobservable_not_scored():
+    position = make_position(exit_price=Decimal("97"))
+    points = _path(
+        position, (0, Decimal("100")), (30, Decimal("96")), (120, Decimal("97"))
+    )
+
+    delayed = _by_policy(_run(position, points))["DELAY_ENTRY_30M"]
+
+    assert delayed.delta_pnl_usdt is None
+    assert delayed.detail["observation_status"] == "UNOBSERVABLE"

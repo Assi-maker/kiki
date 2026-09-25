@@ -194,3 +194,64 @@ def sign_flip_p_value(
         if abs(total) >= observed - tolerance:
             extreme += 1
     return (extreme + 1) / (iterations + 1)
+
+
+def bootstrap_diff_ci(
+    a: list[float], b: list[float], iterations: int = 2000, alpha: float = 0.05,
+    seed: int = 20260925,
+) -> Interval | None:
+    """Percentile bootstrap CI for mean(a) - mean(b), resampling each
+    group independently. Used where the two groups are different trades
+    (TAKE vs WAIT), so no pairing exists."""
+    if len(a) < 2 or len(b) < 2:
+        return None
+    rng = random.Random(seed)
+    diffs: list[float] = []
+    for _ in range(iterations):
+        mean_a = sum(a[rng.randrange(len(a))] for _ in a) / len(a)
+        mean_b = sum(b[rng.randrange(len(b))] for _ in b) / len(b)
+        diffs.append(mean_a - mean_b)
+    diffs.sort()
+    lo_idx = int((alpha / 2) * iterations)
+    hi_idx = min(iterations - 1, int((1 - alpha / 2) * iterations))
+    return Interval(lower=diffs[lo_idx], upper=diffs[hi_idx])
+
+
+def permutation_diff_p_value(
+    a: list[float], b: list[float], iterations: int = 20000, seed: int = 20260925
+) -> float:
+    """Two-sided label-permutation test of mean(a) == mean(b). Exact in
+    spirit, Monte Carlo in practice, seeded and +1-corrected like
+    `sign_flip_p_value`."""
+    if not a or not b:
+        return 1.0
+    observed = abs(sum(a) / len(a) - sum(b) / len(b))
+    pooled = list(a) + list(b)
+    n_a = len(a)
+    rng = random.Random(seed)
+    tolerance = observed * 1e-12
+    extreme = 0
+    for _ in range(iterations):
+        rng.shuffle(pooled)
+        diff = abs(sum(pooled[:n_a]) / n_a - sum(pooled[n_a:]) / (len(pooled) - n_a))
+        if diff >= observed - tolerance:
+            extreme += 1
+    return (extreme + 1) / (iterations + 1)
+
+
+def sequential_blocks(values: list, blocks: int = 4) -> list[list]:
+    """Chronological, contiguous, near-equal blocks for walk-forward
+    stability checks: an effect that is real should keep its sign block
+    after block, each block judged only on what happened in it."""
+    n = len(values)
+    if n == 0 or blocks <= 0:
+        return []
+    size, extra = divmod(n, blocks)
+    out: list[list] = []
+    start = 0
+    for index in range(blocks):
+        end = start + size + (1 if index < extra else 0)
+        if end > start:
+            out.append(values[start:end])
+        start = end
+    return out

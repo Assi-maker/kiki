@@ -45,3 +45,13 @@ experience_fdr_q: 0.10
 # read by nothing.
 entry_quality_enforcement_enabled: false
 thesis_enforcement_enabled: false
+
+# --- GODFATHER supervisor (2026-09-25) ---------------------------------
+# docs/superpowers/plans/2026-09-25-godfather-supervisor.md. The sweep
+# gates every entry/position/portfolio policy (sample size, effect CI,
+# Benjamini-Hochberg, train/test, walk-forward, costs, baseline, regime)
+# and records the status in godfather_policies. policy_promotion_enabled
+# decides only whether a VALIDATED policy may be marked CANARY in that
+# table; nothing in the trading path reads it either way.
+supervisor_sweep_interval_hours: 6
+policy_promotion_enabled: false

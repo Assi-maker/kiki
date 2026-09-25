@@ -25,6 +25,14 @@ _CRYPTO_TRADING = _REPO_ROOT / "crypto_trading"
 
 _INTELLIGENCE_MODULES = [
     _CRYPTO_TRADING / "godfather" / "auditor.py",
+    _CRYPTO_TRADING / "godfather" / "costs.py",
+    _CRYPTO_TRADING / "godfather" / "entry_selection.py",
+    _CRYPTO_TRADING / "godfather" / "mfe_model.py",
+    _CRYPTO_TRADING / "godfather" / "policy_registry.py",
+    _CRYPTO_TRADING / "godfather" / "portfolio.py",
+    _CRYPTO_TRADING / "godfather" / "position_decision.py",
+    _CRYPTO_TRADING / "godfather" / "stop_simulation.py",
+    _CRYPTO_TRADING / "godfather" / "supervisor.py",
     _CRYPTO_TRADING / "godfather" / "counterfactual.py",
     _CRYPTO_TRADING / "godfather" / "entry_quality.py",
     _CRYPTO_TRADING / "godfather" / "experience.py",
@@ -52,6 +60,8 @@ _INTELLIGENCE_TABLES = [
     "godfather_position_thesis",
     "godfather_entry_quality",
     "godfather_policy_evaluations",
+    "godfather_policies",
+    "godfather_policy_transitions",
 ]
 
 # Everything that can move real money, or that decides whether money
@@ -204,6 +214,8 @@ def test_the_live_trading_path_never_calls_an_intelligence_repository_method():
         "get_godfather_entry_quality",
         "find_godfather_entry_quality_assessments",
         "find_godfather_policy_evaluations",
+        "find_godfather_policies",
+        "find_godfather_policy_transitions",
     }
     for path in _LIVE_TRADING_PATH:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -272,3 +284,33 @@ def test_a_policy_evaluation_can_never_authorise_a_rule_change():
     assert '"change_live_rules": False' in evaluation
     for config in (_CRYPTO_TRADING / "config").glob("*.yaml"):
         assert "godfather_policy_evaluations" not in config.read_text(encoding="utf-8")
+
+
+def test_policy_promotion_is_read_only_by_the_config_and_the_supervisor():
+    """The one flag that lets the registry mark a policy CANARY. It is
+    named in exactly three places, none of which can execute anything:
+    the loader declares it, the supervisor passes it to the registry, and
+    the registry documents it (it receives a plain bool)."""
+    readers = sorted(
+        path.name
+        for path in _CRYPTO_TRADING.rglob("*.py")
+        if "policy_promotion_enabled" in path.read_text(encoding="utf-8")
+    )
+    assert readers == ["loader.py", "policy_registry.py", "supervisor.py"]
+
+
+def test_the_supervisor_ships_with_promotion_disabled():
+    yaml_text = (_CRYPTO_TRADING / "config" / "godfather.yaml").read_text(encoding="utf-8")
+    assert "policy_promotion_enabled: false" in yaml_text
+
+
+def test_every_new_decision_module_proposes_only_permitted_actions():
+    """position_decision may only emit the five permitted actions, and it
+    validates each decision with thesis.validate_action_is_safe (never
+    widen, never remove the last stop, never add exposure)."""
+    source = (_CRYPTO_TRADING / "godfather" / "position_decision.py").read_text(
+        encoding="utf-8"
+    )
+    assert "validate_action_is_safe(" in source
+    for forbidden in ("BUY", "ADD", "INCREASE", "OPEN"):
+        assert f'"{forbidden}"' not in source

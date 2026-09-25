@@ -26,6 +26,23 @@ spread/slippage/fee - so a policy cannot look good merely by trading more
 often for free. That is requirement 9's "realistic costs and slippage"
 and requirement 10's "transaction costs / unnecessary turnover", made
 structural.
+
+**Observed, unobservable, unavailable - never silently neutral.** Every
+row carries `detail["observation_status"]`:
+
+* OBSERVED - the simulated outcome rests on prices Guardian actually saw.
+* UNOBSERVABLE - a stop, target or limit the policy would have had
+  resting on the exchange spans a hole in Guardian's record longer than
+  `stop_simulation.MAX_UNOBSERVED_MINUTES`. What it would have done in
+  the hole is unknown, so `simulated_pnl_usdt` and `delta_pnl_usdt` are
+  None and every aggregation skips the row.
+* UNAVAILABLE - the counterfactual needs a price that cannot exist (e.g.
+  NO_INTERVENTION for a trade Guardian closed early: the path ends at the
+  intervention).
+
+Zero-size (exposure-blocked) positions produce no rows at all: they carry
+P/L 0 under every policy and would otherwise enter every sample as
+dozens of perfectly "neutral" trades.
 """
 
 from __future__ import annotations
@@ -37,11 +54,23 @@ from decimal import Decimal
 
 from crypto_trading.config.loader import RiskLimitsConfig
 from crypto_trading.godfather import stats
+from crypto_trading.godfather.costs import implied_funding_rate, simulate_exit_pnl
+from crypto_trading.godfather.mfe_model import MfeModel
 from crypto_trading.godfather.path import PathPoint
+from crypto_trading.godfather.position_decision import decide_position
+from crypto_trading.godfather.stop_simulation import (
+    MAX_UNOBSERVED_MINUTES,
+    StopPolicy,
+    StopSimulation,
+    ThresholdRule,
+    excursion,
+    simulate_stop_rule,
+)
 from crypto_trading.godfather.thesis import (
     ThesisThresholds,
     build_thesis_features,
     classify_thesis_state,
+    evaluate_thesis,
 )
 from crypto_trading.paper_trading.execution import (
     compute_fees,
@@ -55,13 +84,21 @@ from crypto_trading.schemas.trade import Position
 _ZERO = Decimal("0")
 _HALF = Decimal("0.5")
 
-# Favourable excursion after which TIGHTEN_SL_AFTER_FAVORABLE moves the
-# stop to breakeven. Deliberately the SAME 1% the live Profit Protection
-# mechanism already uses (`config/loader.py::
-# LiveExecutionConfig.profit_protection_threshold_pct`), so this
-# counterfactual measures the policy the system actually has rather than
-# a hypothetical one nobody could ship.
-_FAVORABLE_THRESHOLD = Decimal("0.01")
+# TIGHTEN_SL_AFTER_FAVORABLE: break-even at +1%, deliberately the SAME
+# threshold the live Profit Protection mechanism uses
+# (`LiveExecutionConfig.profit_protection_threshold_pct`), so this measures
+# the policy the system actually has. PROFIT_LOCK_HALF_MFE is the single
+# profit-lock variant, pre-declared in the 2026-09-25 TIGHTEN_SL
+# evaluation before its results were computed - no threshold search.
+BREAK_EVEN_POLICY = StopPolicy(
+    "TIGHTEN_SL_AFTER_FAVORABLE", Decimal("0.01"), _ZERO, "live", "live PP config"
+)
+PROFIT_LOCK_POLICY = StopPolicy(
+    "PROFIT_LOCK_HALF_MFE", Decimal("0.01"), Decimal("0.5"), "hypothesis",
+    "pre-declared 2026-09-25",
+)
+
+ENGINE_VERSION = 2
 
 _DELAY_POLICIES: dict[str, float] = {
     "DELAY_ENTRY_30M": 30.0,
@@ -78,61 +115,6 @@ class _Trigger:
 
 def _sign(position: Position) -> Decimal:
     return Decimal("-1") if position.direction == "SHORT" else Decimal("1")
-
-
-def _hold_hours(position: Position, minutes: float) -> Decimal:
-    return Decimal(str(max(0.0, minutes))) / Decimal("60")
-
-
-def _simulate_exit_pnl(
-    position: Position,
-    exit_reference_price: Decimal,
-    minutes_in_trade: float,
-    risk_limits: RiskLimitsConfig,
-    funding_rate: Decimal,
-    size: Decimal | None = None,
-) -> Decimal:
-    """P/L of closing `size` (default: the whole position) at
-    `exit_reference_price`, through the live fill/fee/funding model.
-
-    Not a new formula: `compute_fill_price`, `compute_fees` and
-    `compute_funding` are imported unmodified from the paper engine, and
-    the gross term is the same `size * price_return` used by
-    `execution.py::compute_pnl`.
-    """
-    notional = position.size if size is None else size
-    fill = compute_fill_price(
-        exit_reference_price,
-        position.direction,
-        risk_limits.spread_pct,
-        risk_limits.slippage_pct,
-        "exit",
-    )
-    entry = position.simulated_fill_entry
-    if entry == _ZERO:
-        return _ZERO
-    price_return = (fill - entry) / entry
-    gross = notional * price_return * _sign(position)
-    fees = compute_fees(notional, risk_limits.fee_pct)
-    funding = compute_funding(notional, funding_rate, _hold_hours(position, minutes_in_trade))
-    return gross - fees - funding
-
-
-def _implied_funding_rate(position: Position) -> Decimal:
-    """Back out the per-period funding rate the real close actually
-    charged, so a simulated exit is charged on the same basis rather than
-    on an assumed zero. Falls back to 0 when the real position carries no
-    funding data (a LIVE-mirrored close), which is the only honest choice
-    available there."""
-    if position.funding is None or position.size == _ZERO or position.closed_at is None:
-        return _ZERO
-    hold_hours = Decimal(
-        str((position.closed_at - position.opened_at).total_seconds() / 3600)
-    )
-    periods = int(hold_hours // Decimal("8"))
-    if periods <= 0:
-        return _ZERO
-    return position.funding / (position.size * periods)
 
 
 # ---------------------------------------------------------------------
@@ -162,30 +144,6 @@ def _fires_on_thesis(
 
 def _fires_on_safe_tp(prefix: list[PathPoint]) -> bool:
     return prefix[-1].progress_ratio >= _HALF
-
-
-def _effective_tightened_stop(
-    position: Position, prefix: list[PathPoint]
-) -> Decimal | None:
-    """Breakeven, but only once the favourable excursion SO FAR has
-    reached the threshold. Returns None before that - the original stop
-    still governs, and it is never widened."""
-    sign = _sign(position)
-    entry = position.simulated_fill_entry
-    if entry == _ZERO:
-        return None
-    best = max(prefix, key=lambda p: sign * (p.price - entry))
-    excursion = sign * (best.price - entry) / entry
-    if excursion < _FAVORABLE_THRESHOLD:
-        return None
-    return entry
-
-
-def _fires_on_tightened_stop(position: Position, prefix: list[PathPoint]) -> bool:
-    stop = _effective_tightened_stop(position, prefix)
-    if stop is None:
-        return False
-    return _sign(position) * (prefix[-1].price - stop) <= _ZERO
 
 
 def _first_trigger(
@@ -260,6 +218,17 @@ def _simulate_delayed_entry(
             return (False, None, None, {"reason": "no path observed after the delayed entry"})
         exit_point = remaining[-1]
 
+    # The delayed trade's own stop and target rest on the exchange; a hole
+    # in the record between its entry and its exit hides whether they hit.
+    watched = [entry_point.minutes_in_trade] + [
+        p.minutes_in_trade for p in remaining if p.minutes_in_trade <= exit_point.minutes_in_trade
+    ]
+    if _largest_gap(watched) > MAX_UNOBSERVED_MINUTES:
+        return (False, None, None, {
+            "observation_status": "UNOBSERVABLE",
+            "reason": "hole in the record while the delayed trade was open",
+        })
+
     fill = compute_fill_price(
         exit_point.price,
         position.direction,
@@ -271,7 +240,8 @@ def _simulate_delayed_entry(
     gross = position.size * price_return * sign
     fees = compute_fees(position.size, risk_limits.fee_pct)
     held = exit_point.minutes_in_trade - entry_point.minutes_in_trade
-    funding = compute_funding(position.size, funding_rate, _hold_hours(position, held))
+    held_hours = Decimal(str(max(0.0, held))) / Decimal("60")
+    funding = compute_funding(position.size, funding_rate, held_hours)
     pnl = gross - fees - funding
     detail = {
         "delayed_entry_minutes": entry_point.minutes_in_trade,
@@ -295,7 +265,7 @@ def _simulate_reduce(
     """Half the exposure is realised at the trigger, half rides to the
     real exit. The surviving half's P/L is taken as half the REAL
     outcome, which is exact: `compute_pnl` is linear in `size`."""
-    realised_half = _simulate_exit_pnl(
+    realised_half = simulate_exit_pnl(
         position,
         trigger.price,
         trigger.minutes,
@@ -318,6 +288,151 @@ def _counterfactual_id(position_id: str, policy: str) -> str:
     return hashlib.sha256(f"{position_id}:{policy}".encode()).hexdigest()
 
 
+def _largest_gap(minutes: list[float]) -> float:
+    return max((b - a for a, b in zip(minutes, minutes[1:], strict=False)), default=0.0)
+
+
+def _close_minutes(position: Position) -> float | None:
+    if position.closed_at is None:
+        return None
+    return (position.closed_at - position.opened_at).total_seconds() / 60
+
+
+def _stop_row(sim: StopSimulation) -> tuple[bool, float | None, Decimal | None, dict]:
+    """(triggered, trigger_minutes, simulated_pnl, detail) for a stop-type
+    policy, with the unobservable case turned into a None outcome.
+
+    `triggered` means the policy INTERVENED - it moved the stop - whether
+    or not the moved stop was then hit. A moved stop that is never hit is
+    still an intervention with a real (zero) effect, and leaving those
+    trades out would score the policy only on the trades it hurt or
+    helped, not on every trade it touched."""
+    detail = {
+        "activated": sim.activated,
+        "activation_minutes": sim.activation_minutes,
+        "stopped": sim.stopped,
+        "stop_level": None if sim.stop_level is None else str(sim.stop_level),
+        "pessimistic_pnl_usdt": str(sim.pnl_pessimistic_usdt),
+        "max_unobserved_minutes_armed": sim.max_unobserved_minutes_armed,
+        "observation_status": "OBSERVED" if sim.observable else "UNOBSERVABLE",
+    }
+    if not sim.observable:
+        return sim.activated, sim.activation_minutes, None, detail
+    return sim.activated, sim.activation_minutes, sim.pnl_usdt, detail
+
+
+class _ThesisTightenRule:
+    """THESIS_TIGHTEN: move the stop only when the THESIS says so (B
+    alone), never on P/L. The direct counterpart of the unconditional
+    break-even, to separate "protecting profit" from "responding to a
+    weakening thesis"."""
+
+    def __init__(self, position: Position, thresholds: ThesisThresholds) -> None:
+        self._position = position
+        self._thresholds = thresholds
+
+    def __call__(self, prefix: list[PathPoint]) -> Decimal | None:
+        features = build_thesis_features(
+            self._position, prefix, self._thresholds.max_hold_hours
+        )
+        if features is None:
+            return None
+        decision = evaluate_thesis(self._position, features, self._thresholds)
+        return decision.proposed_stop_loss if decision.action == "TIGHTEN_SL" else None
+
+
+def simulate_position_policy(
+    position: Position,
+    points: list[PathPoint],
+    thresholds: ThesisThresholds,
+    mfe_model: MfeModel | None,
+    actual_pnl: Decimal,
+    risk_limits: RiskLimitsConfig,
+    funding_rate: Decimal,
+) -> tuple[Decimal | None, dict]:
+    """THESIS_POLICY: the full `position_decision.decide_position` replayed
+    tick by tick. EXIT closes at the observed price; REDUCE realises half
+    once; TIGHTEN_SL arms/ratchets a stop that works from the NEXT tick;
+    HOLD/PROTECT change nothing. Whatever exposure is left at the real
+    close takes the real outcome pro rata (exact: P/L is linear in size).
+
+    `mfe_model` must already be restricted to trades that closed before
+    this position OPENED (`MfeModel.as_of`) - the caller's job, checked by
+    the tests - so the profit-protection component never sees the future.
+    """
+    entry = position.simulated_fill_entry
+    remaining = Decimal("1")
+    realised = _ZERO
+    stop: Decimal | None = None
+    armed_since: int | None = None
+    armed_gap = 0.0
+    actions: dict[str, int] = {}
+    reduced = False
+    for i, point in enumerate(points):
+        if stop is not None and i > 0:
+            armed_gap = max(armed_gap, point.minutes_in_trade - points[i - 1].minutes_in_trade)
+            if point.price <= stop:
+                realised += simulate_exit_pnl(
+                    position, stop, point.minutes_in_trade, risk_limits, funding_rate,
+                    size=position.size * remaining,
+                )
+                remaining = _ZERO
+                actions["STOPPED"] = actions.get("STOPPED", 0) + 1
+                break
+        features = build_thesis_features(position, points[: i + 1], thresholds.max_hold_hours)
+        if features is None:
+            continue
+        mfe_so_far = max(_ZERO, excursion(max(p.price for p in points[: i + 1]), entry) * 100)
+        estimate = mfe_model.estimate(mfe_so_far) if mfe_model is not None else None
+        decision = decide_position(position, features, thresholds, estimate)
+        actions[decision.action] = actions.get(decision.action, 0) + 1
+        if decision.action == "EXIT":
+            realised += simulate_exit_pnl(
+                position, point.price, point.minutes_in_trade, risk_limits, funding_rate,
+                size=position.size * remaining,
+            )
+            remaining = _ZERO
+            break
+        if decision.action == "REDUCE" and not reduced:
+            realised += simulate_exit_pnl(
+                position, point.price, point.minutes_in_trade, risk_limits, funding_rate,
+                size=position.size * remaining * _HALF,
+            )
+            remaining *= _HALF
+            reduced = True
+        if decision.action == "TIGHTEN_SL" and decision.proposed_stop_loss is not None:
+            if stop is None:
+                armed_since = i
+            stop = decision.proposed_stop_loss if stop is None else max(
+                stop, decision.proposed_stop_loss
+            )
+
+    if remaining > _ZERO:
+        close = _close_minutes(position)
+        if stop is not None and close is not None:
+            armed_gap = max(armed_gap, close - points[-1].minutes_in_trade)
+        exit_price = position.theoretical_exit
+        if stop is not None and exit_price is not None and exit_price <= stop and close:
+            realised += simulate_exit_pnl(
+                position, stop, close, risk_limits, funding_rate,
+                size=position.size * remaining,
+            )
+        else:
+            realised += actual_pnl * remaining
+    detail = {
+        "actions": actions,
+        "reduced": reduced,
+        "stop_armed_at_index": armed_since,
+        "stop_level": None if stop is None else str(stop),
+        "max_unobserved_minutes_armed": armed_gap if stop is not None else None,
+    }
+    if stop is not None and armed_gap > MAX_UNOBSERVED_MINUTES:
+        detail["observation_status"] = "UNOBSERVABLE"
+        return None, detail
+    detail["observation_status"] = "OBSERVED"
+    return realised, detail
+
+
 def run_counterfactuals(
     position: Position,
     points: list[PathPoint],
@@ -325,18 +440,25 @@ def run_counterfactuals(
     thresholds: ThesisThresholds,
     now: datetime,
     run_id: str,
+    mfe_model: MfeModel | None = None,
 ) -> list[CounterfactualResult]:
     """Every policy, against one real position's real path.
 
-    Returns an EMPTY list when the position's real P/L is unknown or the
-    path is empty - a counterfactual with nothing to be counter to is not
-    produced at all rather than produced and flagged.
+    Returns an EMPTY list when the position's real P/L is unknown, the
+    path is empty, or the position had no exposure - a counterfactual
+    with nothing to be counter to is not produced at all rather than
+    produced and flagged.
+
+    `mfe_model`, when given, must be restricted to trades closed before
+    this position opened; only THESIS_POLICY uses it.
     """
     actual_pnl = compute_pnl_or_none(position)
-    if actual_pnl is None or not points:
+    if actual_pnl is None or not points or position.size == _ZERO:
+        return []
+    if position.simulated_fill_entry == _ZERO:
         return []
 
-    funding_rate = _implied_funding_rate(position)
+    funding_rate = implied_funding_rate(position)
     results: list[CounterfactualResult] = []
 
     def _emit(
@@ -348,6 +470,7 @@ def run_counterfactuals(
         detail: dict,
     ) -> None:
         delta = None if simulated_pnl is None else simulated_pnl - actual_pnl
+        status = detail.get("observation_status", "OBSERVED")
         results.append(
             CounterfactualResult(
                 counterfactual_id=_counterfactual_id(position.position_id, policy),
@@ -361,17 +484,34 @@ def run_counterfactuals(
                 actual_pnl_usdt=actual_pnl,
                 delta_pnl_usdt=delta,
                 no_lookahead_verified=True,
-                detail={**detail, "path_point_count": len(points)},
+                detail={
+                    **detail,
+                    "observation_status": status,
+                    "path_point_count": len(points),
+                    "engine_version": ENGINE_VERSION,
+                },
                 run_id=run_id,
             )
         )
 
-    # The reference row. Its delta is zero by construction - it exists so
-    # every aggregation can be written against a uniform table instead of
-    # special-casing "the real one".
+    # The reference row: the real outcome. Delta zero by construction.
     _emit("BASELINE", True, None, position.simulated_fill_exit, actual_pnl, {
         "exit_reason": position.exit_reason,
     })
+
+    # No intervention at all. For the PAPER book this IS the real outcome,
+    # except when Guardian closed the trade early: the path ends at the
+    # intervention, so what the untouched trade would have done is not
+    # observable - UNAVAILABLE, never assumed equal to the real outcome.
+    if (position.exit_reason or "").lower() == "guardian_exit":
+        _emit("NO_INTERVENTION", False, None, None, None, {
+            "observation_status": "UNAVAILABLE",
+            "reason": "real trade was closed by an intervention; its path ends there",
+        })
+    else:
+        _emit("NO_INTERVENTION", False, None, position.simulated_fill_exit, actual_pnl, {
+            "note": "no intervention changed this trade; identical to BASELINE",
+        })
 
     # Not taking the trade at all: no exposure, no costs, no P/L.
     _emit("REJECT_ENTRY", True, 0.0, None, _ZERO, {
@@ -384,6 +524,19 @@ def run_counterfactuals(
         )
         _emit(policy, ok, delay if ok else None, exit_price, pnl if ok else None, detail)
 
+    # Stop-type policies: shared simulator, shared observability rule.
+    stop_policies: list[tuple[CounterfactualPolicy, object]] = [
+        ("TIGHTEN_SL_AFTER_FAVORABLE", ThresholdRule(position, BREAK_EVEN_POLICY)),
+        ("PROFIT_LOCK_HALF_MFE", ThresholdRule(position, PROFIT_LOCK_POLICY)),
+        ("THESIS_TIGHTEN", _ThesisTightenRule(position, thresholds)),
+    ]
+    for policy, rule in stop_policies:
+        sim = simulate_stop_rule(position, points, rule, actual_pnl, risk_limits, funding_rate)
+        triggered, minutes, pnl, detail = _stop_row(sim)
+        _emit(policy, triggered, minutes, sim.stop_level if sim.stopped else None, pnl, detail)
+
+    # Decision-at-a-tick policies: they act only when Guardian observes,
+    # exactly as the live system can only act when it runs.
     exit_policies: list[tuple[CounterfactualPolicy, object]] = [
         (
             "EXIT_ON_THESIS_INVALID",
@@ -395,27 +548,40 @@ def run_counterfactuals(
                 position, prefix, thresholds, ("WEAKENING", "INVALID", "EXIT")
             ),
         ),
-        (
-            "TIGHTEN_SL_AFTER_FAVORABLE",
-            lambda prefix: _fires_on_tightened_stop(position, prefix),
-        ),
-        ("SAFE_TP_AT_HALF_TARGET", lambda prefix: _fires_on_safe_tp(prefix)),
     ]
     for policy, predicate in exit_policies:
         trigger = _first_trigger(position, points, predicate)
         if trigger is None:
-            # Never fired => this policy would have produced exactly the
-            # real outcome. Recorded explicitly (delta 0) rather than
-            # omitted, so "how often does this policy even apply?" is
-            # answerable from the table.
             _emit(policy, False, None, position.simulated_fill_exit, actual_pnl, {
                 "note": "policy never triggered; outcome identical to baseline",
             })
             continue
-        pnl = _simulate_exit_pnl(
+        pnl = simulate_exit_pnl(
             position, trigger.price, trigger.minutes, risk_limits, funding_rate
         )
         _emit(policy, True, trigger.minutes, trigger.price, pnl, {
+            "trigger_index": trigger.index,
+        })
+
+    # Half-target take-profit is a resting limit order: like a stop it
+    # would have worked through a hole, so a hole before it fires (or
+    # before the real close, if it never fires) makes it unobservable.
+    trigger = _first_trigger(position, points, _fires_on_safe_tp)
+    until = trigger.minutes if trigger is not None else _close_minutes(position)
+    watched = [p.minutes_in_trade for p in points if until is None or p.minutes_in_trade <= until]
+    if until is not None:
+        watched.append(until)
+    if _largest_gap(watched) > MAX_UNOBSERVED_MINUTES:
+        _emit("SAFE_TP_AT_HALF_TARGET", trigger is not None, None, None, None, {
+            "observation_status": "UNOBSERVABLE",
+        })
+    elif trigger is None:
+        _emit("SAFE_TP_AT_HALF_TARGET", False, None, position.simulated_fill_exit, actual_pnl, {
+            "note": "policy never triggered; outcome identical to baseline",
+        })
+    else:
+        pnl = simulate_exit_pnl(position, trigger.price, trigger.minutes, risk_limits, funding_rate)
+        _emit("SAFE_TP_AT_HALF_TARGET", True, trigger.minutes, trigger.price, pnl, {
             "trigger_index": trigger.index,
         })
 
@@ -442,6 +608,12 @@ def run_counterfactuals(
             pnl,
             detail,
         )
+
+    pnl, detail = simulate_position_policy(
+        position, points, thresholds, mfe_model, actual_pnl, risk_limits, funding_rate
+    )
+    acted = any(action != "HOLD" for action in detail["actions"])
+    _emit("THESIS_POLICY", acted, None, None, pnl, detail)
 
     return results
 

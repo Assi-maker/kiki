@@ -551,6 +551,13 @@ class Repository(Protocol):
         run_id: str,
     ) -> bool: ...
     def find_godfather_policy_evaluations(self, policy: str) -> list[dict]: ...
+    def upsert_godfather_entry_quality(self, record: EntryQualityAssessment) -> None: ...
+    def replace_godfather_counterfactual(self, record: CounterfactualResult) -> None: ...
+    def find_confirmed_gate_decisions(self) -> list[dict]: ...
+    def upsert_godfather_policy(self, row: dict, updated_at: datetime, run_id: str) -> None: ...
+    def find_godfather_policies(self) -> list[dict]: ...
+    def save_godfather_policy_transition(self, transition: dict, run_id: str) -> None: ...
+    def find_godfather_policy_transitions(self) -> list[dict]: ...
 
 
 class SQLiteRepository:
@@ -3188,8 +3195,16 @@ class SQLiteRepository:
         return [dict(row) for row in rows]
 
     def save_godfather_counterfactual(self, record: CounterfactualResult) -> bool:
+        return self._write_godfather_counterfactual(record, "INSERT OR IGNORE")
+
+    def replace_godfather_counterfactual(self, record: CounterfactualResult) -> None:
+        """Restates a (position, policy) simulation - used when the engine
+        version changes, so old rows never linger with old semantics."""
+        self._write_godfather_counterfactual(record, "INSERT OR REPLACE")
+
+    def _write_godfather_counterfactual(self, record: CounterfactualResult, verb: str) -> bool:
         cur = self._conn.execute(
-            "INSERT OR IGNORE INTO godfather_counterfactuals "
+            f"{verb} INTO godfather_counterfactuals "
             "(counterfactual_id, position_id, policy, created_at, triggered, "
             "trigger_minutes, simulated_exit_price, simulated_pnl_usdt, "
             "actual_pnl_usdt, delta_pnl_usdt, no_lookahead_verified, detail_json, "
@@ -3352,8 +3367,16 @@ class SQLiteRepository:
         return dict(row) if row is not None else None
 
     def save_godfather_entry_quality(self, record: EntryQualityAssessment) -> bool:
+        return self._write_godfather_entry_quality(record, "INSERT OR IGNORE")
+
+    def upsert_godfather_entry_quality(self, record: EntryQualityAssessment) -> None:
+        """The supervisor's as-of-time rescoring restates a candidate's
+        verdict; the advisory `enforced=False` is carried by the record."""
+        self._write_godfather_entry_quality(record, "INSERT OR REPLACE")
+
+    def _write_godfather_entry_quality(self, record: EntryQualityAssessment, verb: str) -> bool:
         cur = self._conn.execute(
-            "INSERT OR IGNORE INTO godfather_entry_quality "
+            f"{verb} INTO godfather_entry_quality "
             "(candidate_id, instrument, assessed_at, verdict, quality_score, "
             "expected_edge_class, expected_expectancy_usdt, risk_reward, "
             "regime_compatible, conflict_score, expected_cost_usdt, enforced, "
@@ -3438,5 +3461,62 @@ class SQLiteRepository:
             "SELECT * FROM godfather_policy_evaluations WHERE policy = ? "
             "ORDER BY evaluated_at ASC",
             (policy,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_confirmed_gate_decisions(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT candidate_id, evaluated_at FROM gate_decisions "
+            "WHERE decision = 'CONFIRMED' ORDER BY evaluated_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_godfather_policy(self, row: dict, updated_at: datetime, run_id: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO godfather_policies "
+            "(policy_id, kind, description, status, computed_status, fdr_significant, "
+            "gates_json, flags_json, evidence_json, updated_at, run_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row["policy_id"],
+                row["kind"],
+                row["description"],
+                row["status"],
+                row["computed_status"],
+                int(row["fdr_significant"]),
+                json.dumps(row["gates"]),
+                json.dumps(row["flags"]),
+                json.dumps(row["evidence"], default=str),
+                updated_at.isoformat(),
+                run_id,
+            ),
+        )
+        self._conn.commit()
+
+    def find_godfather_policies(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_policies ORDER BY policy_id ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_godfather_policy_transition(self, transition: dict, run_id: str) -> None:
+        self._conn.execute(
+            "INSERT INTO godfather_policy_transitions "
+            "(policy_id, from_status, to_status, changed_at, reason, run_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                transition["policy_id"],
+                transition["from_status"],
+                transition["to_status"],
+                transition["changed_at"],
+                transition["reason"],
+                run_id,
+            ),
+        )
+        self._conn.commit()
+
+    def find_godfather_policy_transitions(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_policy_transitions ORDER BY transition_id ASC"
         ).fetchall()
         return [dict(row) for row in rows]

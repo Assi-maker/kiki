@@ -376,6 +376,18 @@ class GodfatherConfig(BaseModel):
     entry_quality_enforcement_enabled: bool = False
     thesis_enforcement_enabled: bool = False
 
+    # --- GODFATHER supervisor (2026-09-25) --------------------------
+    # How often the full supervisor sweep (policy registry, as-of entry
+    # selection, portfolio, MFE model) runs inside the intelligence tick.
+    # It rescans the whole history, so it runs far less often than the
+    # 15-minute tick.
+    supervisor_sweep_interval_hours: int = Field(gt=0, default=6)
+    # Whether a VALIDATED policy may move to CANARY in the registry. Ships
+    # False. Even when True, nothing in the trading path reads the
+    # registry (AST-pinned): wiring a promoted policy into Guardian
+    # Authority remains a separate, reviewed change.
+    policy_promotion_enabled: bool = False
+
 
 class Settings(BaseModel):
     db_path: Path

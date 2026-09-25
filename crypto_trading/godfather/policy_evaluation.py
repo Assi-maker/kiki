@@ -59,11 +59,23 @@ from decimal import Decimal
 
 from crypto_trading.config.loader import RiskLimitsConfig, Settings
 from crypto_trading.godfather import stats
-from crypto_trading.godfather.counterfactual import _implied_funding_rate, _simulate_exit_pnl
+from crypto_trading.godfather.costs import implied_funding_rate
 from crypto_trading.godfather.entry_quality import assess_entry_quality
 from crypto_trading.godfather.features import build_candidate_features
 from crypto_trading.godfather.path import PathPoint, reconstruct_price_path
-from crypto_trading.godfather.pipeline import _regime_for, _safe_candidate
+from crypto_trading.godfather.pipeline import _regime_for, _safe_candidate, _thresholds
+from crypto_trading.godfather.stop_simulation import (
+    MAX_UNOBSERVED_MINUTES,
+    StopPolicy,
+    StopSimulation,
+    simulate_stop_policy,
+)
+from crypto_trading.godfather.stop_simulation import excursion as _excursion
+from crypto_trading.godfather.thesis import (
+    ThesisThresholds,
+    build_thesis_features,
+    classify_thesis_state,
+)
 from crypto_trading.paper_trading.execution import compute_pnl_or_none
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository
@@ -84,25 +96,6 @@ MIN_HALF_CELL = 5
 
 FDR_Q = 0.10
 
-# Guardian ticks every ~97 s (p90 158 s), but the path also has holes of
-# up to 90 hours where nothing was running. A stop "hit" inside such a hole
-# is not an observation: on the first real run, five break-even exits were
-# credited inside 15-74 h holes, one of them worth +287 USDT on its own,
-# and together they flipped the sign of the whole result. A trade whose
-# armed stop spans a hole longer than this is UNOBSERVABLE for that policy
-# and is excluded from it rather than guessed at. The candle-based shadow
-# replication is the check on what that exclusion leaves out.
-MAX_UNOBSERVED_MINUTES = 10.0
-
-
-@dataclass(frozen=True)
-class StopPolicy:
-    name: str
-    activation_pct: Decimal
-    # 0 = break-even. 0.5 = lock half of the best excursion seen so far.
-    lock_fraction: Decimal
-    role: str
-    provenance: str
 
 
 PRE_REGISTERED_POLICIES: tuple[StopPolicy, ...] = (
@@ -128,179 +121,6 @@ PRE_REGISTERED_POLICIES: tuple[StopPolicy, ...] = (
         "declared 2026-09-25 before its results were computed; the only variant",
     ),
 )
-
-
-# ---------------------------------------------------------------------
-# Per-trade simulation
-# ---------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class StopSimulation:
-    """One stop policy applied to one trade's real path."""
-
-    activated: bool
-    activation_index: int | None
-    activation_minutes: float | None
-    activation_at: datetime | None
-    mfe_before_pct: Decimal | None
-    mae_before_pct: Decimal | None
-    stopped: bool
-    stop_minutes: float | None
-    stop_level: Decimal | None
-    # Stop-order fill at the stop level (what an exchange stop does).
-    pnl_usdt: Decimal
-    # Pessimistic: filled at the first OBSERVED price at/below the stop,
-    # the analogue of the paper engine booking stop exits at candle low.
-    pnl_pessimistic_usdt: Decimal
-    mae_until_exit_pct: Decimal
-    # Longest stretch without an observation while the moved stop was in
-    # force (activation -> policy exit, or -> real close). None when the
-    # policy never activated.
-    max_unobserved_minutes_armed: float | None = None
-
-    @property
-    def observable(self) -> bool:
-        return (
-            self.max_unobserved_minutes_armed is None
-            or self.max_unobserved_minutes_armed <= MAX_UNOBSERVED_MINUTES
-        )
-
-
-def _excursion(price: Decimal, entry: Decimal) -> Decimal:
-    return (price - entry) / entry
-
-
-def simulate_stop_policy(
-    position: Position,
-    points: list[PathPoint],
-    policy: StopPolicy,
-    actual_pnl: Decimal,
-    risk_limits: RiskLimitsConfig,
-    funding_rate: Decimal,
-) -> StopSimulation:
-    """Walk the real path; the stop in force at tick `i` is derived from
-    `points[:i]` only. Before activation the ORIGINAL stop governs and is
-    exactly what the real trade had, so the no-policy outcome is the real
-    outcome and needs no simulation at all - only the policy's own exit
-    is simulated, through the live fill/fee/funding model.
-
-    LONG-only, like every execution path in this codebase.
-    """
-    entry = position.simulated_fill_entry
-    best = _ZERO
-    worst = _ZERO
-    stop: Decimal | None = None
-    activation: tuple[int, PathPoint, Decimal, Decimal] | None = None
-    armed_gap: float | None = None
-
-    for i, point in enumerate(points):
-        if stop is not None:
-            gap = point.minutes_in_trade - points[i - 1].minutes_in_trade
-            armed_gap = gap if armed_gap is None else max(armed_gap, gap)
-        if stop is not None and point.price <= stop:
-            return _stopped(
-                position, policy, activation, point, stop, point.price, worst,
-                risk_limits, funding_rate, armed_gap,
-            )
-        excursion = _excursion(point.price, entry)
-        best = max(best, excursion)
-        worst = min(worst, excursion)
-        if best >= policy.activation_pct:
-            if activation is None:
-                activation = (i, point, best, worst)
-            candidate = entry * (Decimal("1") + policy.lock_fraction * best)
-            stop = candidate if stop is None else max(stop, candidate)
-
-    # The real exit is below the stop but no tick caught the crossing:
-    # the price passed through the stop in the last interval before the
-    # close. A stop order fills there; the pessimistic reading keeps the
-    # real exit price (i.e. grants the policy no benefit at all).
-    if stop is not None and position.closed_at is not None:
-        tail = (position.closed_at - position.opened_at).total_seconds() / 60 - (
-            points[-1].minutes_in_trade
-        )
-        armed_gap = tail if armed_gap is None else max(armed_gap, tail)
-    exit_price = position.theoretical_exit
-    if (
-        stop is not None
-        and exit_price is not None
-        and exit_price <= stop
-        and position.closed_at is not None
-    ):
-        minutes = (position.closed_at - position.opened_at).total_seconds() / 60
-        close_point = PathPoint(
-            observed_at=position.closed_at,
-            minutes_in_trade=minutes,
-            price=exit_price,
-            unrealized_pnl=_ZERO,
-            progress_ratio=_ZERO,
-            decay_score=_ZERO,
-            state="CLOSE",
-            factors={},
-            price_cross_check_ok=True,
-        )
-        worst = min(worst, _excursion(exit_price, entry))
-        return _stopped(
-            position, policy, activation, close_point, stop, exit_price, worst,
-            risk_limits, funding_rate, armed_gap, pessimistic_is_actual=actual_pnl,
-        )
-
-    return StopSimulation(
-        activated=activation is not None,
-        activation_index=activation[0] if activation else None,
-        activation_minutes=activation[1].minutes_in_trade if activation else None,
-        activation_at=activation[1].observed_at if activation else None,
-        mfe_before_pct=activation[2] * _HUNDRED if activation else None,
-        mae_before_pct=activation[3] * _HUNDRED if activation else None,
-        stopped=False,
-        stop_minutes=None,
-        stop_level=stop,
-        pnl_usdt=actual_pnl,
-        pnl_pessimistic_usdt=actual_pnl,
-        mae_until_exit_pct=worst * _HUNDRED,
-        max_unobserved_minutes_armed=armed_gap,
-    )
-
-
-def _stopped(
-    position: Position,
-    policy: StopPolicy,
-    activation: tuple[int, PathPoint, Decimal, Decimal] | None,
-    point: PathPoint,
-    stop: Decimal,
-    observed_price: Decimal,
-    worst: Decimal,
-    risk_limits: RiskLimitsConfig,
-    funding_rate: Decimal,
-    armed_gap: float | None,
-    pessimistic_is_actual: Decimal | None = None,
-) -> StopSimulation:
-    assert activation is not None  # a stop only exists after activation
-    pnl = _simulate_exit_pnl(position, stop, point.minutes_in_trade, risk_limits, funding_rate)
-    if pessimistic_is_actual is not None:
-        pessimistic = pessimistic_is_actual
-    else:
-        pessimistic = _simulate_exit_pnl(
-            position, min(observed_price, stop), point.minutes_in_trade, risk_limits,
-            funding_rate,
-        )
-    entry = position.simulated_fill_entry
-    return StopSimulation(
-        activated=True,
-        activation_index=activation[0],
-        activation_minutes=activation[1].minutes_in_trade,
-        activation_at=activation[1].observed_at,
-        mfe_before_pct=activation[2] * _HUNDRED,
-        mae_before_pct=activation[3] * _HUNDRED,
-        stopped=True,
-        stop_minutes=point.minutes_in_trade,
-        stop_level=stop,
-        pnl_usdt=pnl,
-        pnl_pessimistic_usdt=pessimistic,
-        mae_until_exit_pct=min(worst, _excursion(stop, entry)) * _HUNDRED,
-        max_unobserved_minutes_armed=armed_gap,
-    )
 
 
 def classify_effect(sim: StopSimulation, baseline_pnl: Decimal) -> str:
@@ -424,6 +244,7 @@ def evaluate_trade(
     risk_limits: RiskLimitsConfig,
     strata: dict[str, str] | None = None,
     policies: tuple[StopPolicy, ...] = PRE_REGISTERED_POLICIES,
+    thresholds: ThesisThresholds | None = None,
 ) -> TradeEvaluation | None:
     """None when the real P/L is unknown (a LIVE-mirrored close with no
     PAPER exit data), there is no path, or the position had no exposure.
@@ -438,7 +259,7 @@ def evaluate_trade(
     if actual is None or not points or position.simulated_fill_entry == _ZERO:
         return None
     entry = position.simulated_fill_entry
-    funding_rate = _implied_funding_rate(position)
+    funding_rate = implied_funding_rate(position)
     sims = {
         policy.name: simulate_stop_policy(
             position, points, policy, actual, risk_limits, funding_rate
@@ -477,6 +298,18 @@ def evaluate_trade(
         record_strata["minutes_to_activation"] = minutes_to_activation_bucket(
             float(primary.activation_minutes or 0.0)
         )
+        if thresholds is not None and primary.activation_index is not None:
+            # The thesis as it stood AT the intervention, from the prefix only:
+            # does break-even hurt STRONG trades and help WEAKENING ones?
+            features = build_thesis_features(
+                position, points[: primary.activation_index + 1], thresholds.max_hold_hours
+            )
+            if features is not None:
+                state, _reasons = classify_thesis_state(features, thresholds)
+                record_strata["thesis_state_at_activation"] = state
+                record_strata["momentum_decay_at_activation"] = _bucket(
+                    features.factor("momentum_decay"), [0.3, 0.6], ["<0.3", "0.3-0.6", ">=0.6"]
+                )
 
     return TradeEvaluation(
         position_id=position.position_id,
@@ -725,6 +558,8 @@ STRATA_DIMENSIONS = (
     "mfe_at_activation",
     "minutes_to_activation",
     "activation_progress_to_target",
+    "thesis_state_at_activation",
+    "momentum_decay_at_activation",
 )
 
 
@@ -1506,6 +1341,7 @@ def run_policy_evaluation(
         record = evaluate_trade(
             position, points, settings.risk_limits,
             strata=_strata_for(repo, settings, position, observations),
+            thresholds=_thresholds(settings),
         )
         if record is not None:
             trades.append(record)
