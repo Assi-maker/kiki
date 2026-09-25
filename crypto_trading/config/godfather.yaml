@@ -9,3 +9,39 @@
 # inert (False) - not yet activated. Activation is a separate, later,
 # explicit decision, same discipline as every guardian.yaml flag before it.
 priority_boost_enabled: false
+
+# --- GODFATHER Intelligence Layer (2026-09-25) -------------------------
+# docs/superpowers/plans/2026-09-25-godfather-intelligence-layer.md.
+#
+# intelligence_enabled turns on the analysis tick: Trade Investigator,
+# Decision Auditor, Counterfactual Engine, Experience Memory, Prediction
+# Error Loop and Position Thesis tracking. It is ON because this layer
+# is read-only with respect to trading: it writes exclusively to its own
+# seven godfather_* tables, and no code in gate/, screening/,
+# paper_trading/, guardian/ or connectors/ reads any of them (pinned by
+# tests/crypto_trading/godfather/test_intelligence_isolation.py). The
+# worst outcome of a bug in it is a wrong report.
+intelligence_enabled: true
+intelligence_check_interval_seconds: 900
+intelligence_batch_limit: 50
+entry_quality_backfill_limit: 50
+
+# Experience Memory's anti-noise gates. Read the direction of danger
+# before touching these: LOWERING experience_min_sample_size or RAISING
+# experience_fdr_q makes GODFATHER more willing to believe a pattern is
+# real. 30 is the same sample floor guardian/authority.py already
+# enforces for live heuristics; 0.10 is the false-discovery rate allowed
+# across the WHOLE pattern sweep, not per pattern.
+experience_min_sample_size: 30
+experience_min_support: 8
+experience_fdr_q: 0.10
+
+# The two surfaces through which this layer could ever change a trade.
+# Both ship inert and stay inert until a separate, explicitly approved
+# activation backed by validated out-of-sample evidence - the user's
+# requirement 12/14: build and verify the research infrastructure first,
+# change trading decisions only afterwards. Today the entry-quality
+# verdicts and thesis recommendations are recorded with enforced=0 and
+# read by nothing.
+entry_quality_enforcement_enabled: false
+thesis_enforcement_enabled: false

@@ -11,6 +11,7 @@ from crypto_trading import (
     demo_execution_loop,
     detective_loop,
     discovery_loop,
+    godfather_loop,
     guardian_loop,
     live_execution_loop,
     monitoring_loop,
@@ -239,6 +240,20 @@ def _run_detective_forever(runner: AgentRunner, settings: Settings) -> None:
     detective_loop.run_forever(repo, runner, settings)
 
 
+def _run_godfather_intelligence_forever(settings: Settings) -> None:
+    """GODFATHER Intelligence Layer (2026-09-25) - its own thread, with
+    its own SQLite connection, same thread-bound-connection discipline as
+    every loop above.
+
+    Takes no AgentRunner: this tick is entirely deterministic and makes
+    no AI call at all, which is also why it is separate from the
+    Detective thread it superficially resembles - an AI-budget stall must
+    never be able to block the analysis the rest of the layer depends on.
+    """
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    godfather_loop.run_forever(repo, settings)
+
+
 def _run_guardian_forever(
     market_data_connector: BingXMarketDataConnector,
     runner: AgentRunner,
@@ -382,7 +397,24 @@ def main() -> None:
         args=(detective_runner, settings),
         daemon=True,
     )
+    godfather_thread = threading.Thread(
+        target=_run_godfather_intelligence_forever,
+        args=(settings,),
+        daemon=True,
+    )
     threads = [discovery_thread, monitoring_thread, detective_thread]
+    # Gated on its own config flag rather than an env var: unlike Guardian
+    # or LIVE execution, this thread cannot touch a position or an order,
+    # so it needs no arming ritual - but it must still be switchable from
+    # the same place its behaviour is documented.
+    if settings.godfather.intelligence_enabled:
+        threads.append(godfather_thread)
+    else:
+        log_event(
+            "startup",
+            event="godfather_intelligence_disabled",
+            reason="godfather.intelligence_enabled is false",
+        )
 
     notifier = build_notifier_from_env()
     if notifier is not None:

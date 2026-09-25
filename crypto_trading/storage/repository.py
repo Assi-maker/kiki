@@ -24,6 +24,15 @@ from crypto_trading.schemas.detective import DetectiveAnalysisRecord
 from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.evidence import CandidateEvidenceRecord
 from crypto_trading.schemas.forecast import ForecastRecord
+from crypto_trading.schemas.godfather import (
+    CounterfactualResult,
+    DecisionAudit,
+    EntryQualityAssessment,
+    ExperiencePattern,
+    PredictionErrorRecord,
+    ThesisObservation,
+    TradeInvestigation,
+)
 from crypto_trading.schemas.guardian import GuardianObservation
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.db import get_connection
@@ -497,6 +506,37 @@ class Repository(Protocol):
     def set_godfather_priority_strategist_last_proposed_date(
         self, date_iso: str, updated_at: datetime
     ) -> None: ...
+
+    # GODFATHER Intelligence Layer (2026-09-25). Read-and-own-tables-only:
+    # every method below reads already-persisted trading data and writes
+    # exclusively to the seven godfather_* analysis tables - none of them
+    # can reach `positions`, an order primitive, or any live heuristics
+    # table the decision core reads. See storage/db.py's own header above
+    # those tables for why that separation is the safety argument.
+    def save_godfather_trade_investigation(self, record: TradeInvestigation) -> bool: ...
+    def get_assessment_payload(self, candidate_id: str, field_name: str) -> dict | None: ...
+    def get_godfather_trade_investigation(self, position_id: str) -> dict | None: ...
+    def find_godfather_trade_investigations(self) -> list[dict]: ...
+    def find_closed_positions_pending_godfather_investigation(
+        self, limit: int
+    ) -> list[Position]: ...
+    def count_closed_positions_pending_godfather_investigation(self) -> int: ...
+    def save_godfather_decision_audit(self, record: DecisionAudit) -> bool: ...
+    def get_godfather_decision_audit(self, position_id: str) -> dict | None: ...
+    def find_godfather_decision_audits(self) -> list[dict]: ...
+    def save_godfather_counterfactual(self, record: CounterfactualResult) -> bool: ...
+    def find_godfather_counterfactuals_for_position(self, position_id: str) -> list[dict]: ...
+    def find_godfather_counterfactuals(self) -> list[dict]: ...
+    def upsert_godfather_experience_pattern(self, record: ExperiencePattern) -> None: ...
+    def find_godfather_experience_patterns(self) -> list[dict]: ...
+    def save_godfather_prediction_error(self, record: PredictionErrorRecord) -> bool: ...
+    def find_godfather_prediction_errors(self) -> list[dict]: ...
+    def save_godfather_position_thesis(self, record: ThesisObservation) -> bool: ...
+    def find_godfather_position_thesis_for_position(self, position_id: str) -> list[dict]: ...
+    def find_latest_godfather_position_thesis(self, position_id: str) -> dict | None: ...
+    def save_godfather_entry_quality(self, record: EntryQualityAssessment) -> bool: ...
+    def get_godfather_entry_quality(self, candidate_id: str) -> dict | None: ...
+    def find_godfather_entry_quality_assessments(self) -> list[dict]: ...
 
 
 class SQLiteRepository:
@@ -2977,3 +3017,364 @@ class SQLiteRepository:
             (updated_at.isoformat(),),
         )
         self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # GODFATHER Intelligence Layer (2026-09-25)
+    # ------------------------------------------------------------------
+    # Persistence-only: not one method below is read on behalf of a
+    # trading decision, and not one writes anything outside the seven
+    # godfather_* analysis tables. `_decimal_text` keeps the project-wide
+    # Decimal discipline - a money value is stored as its exact string or
+    # as NULL, never coerced through a float.
+
+    @staticmethod
+    def _decimal_text(value: Decimal | None) -> str | None:
+        return str(value) if value is not None else None
+
+    def save_godfather_trade_investigation(self, record: TradeInvestigation) -> bool:
+        """INSERT OR IGNORE on position_id: re-investigating an already
+        investigated trade is an idempotent no-op, so a crashed or
+        repeated pipeline pass can never produce a second, divergent
+        post-mortem of the same position."""
+        during = record.during
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO godfather_trade_investigations "
+            "(position_id, candidate_id, instrument, created_at, classification, "
+            "entry_verdict, management_verdict, exit_reason, hold_minutes, "
+            "realized_pnl_usdt, mfe_pct, mae_pct, giveback_ratio, minutes_to_mfe, "
+            "minutes_to_target_touch, minutes_to_sl_touch, first_questionable_minutes, "
+            "first_invalid_minutes, path_point_count, avoidable_loss_usdt, "
+            "best_alternative_policy, detail_json, run_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.position_id,
+                record.candidate_id,
+                record.instrument,
+                record.created_at.isoformat(),
+                record.classification,
+                record.entry_verdict,
+                record.management_verdict,
+                record.after.get("exit_reason"),
+                record.after.get("hold_minutes"),
+                record.after.get("realized_pnl_usdt"),
+                during.get("mfe_pct"),
+                during.get("mae_pct"),
+                during.get("giveback_ratio"),
+                during.get("minutes_to_mfe"),
+                during.get("minutes_to_target_touch"),
+                during.get("minutes_to_sl_touch"),
+                during.get("first_questionable_minutes"),
+                during.get("first_invalid_minutes"),
+                int(during.get("path_point_count") or 0),
+                self._decimal_text(record.avoidable_loss.estimated_pnl_improvement_usdt),
+                record.avoidable_loss.policy,
+                record.model_dump_json(),
+                record.run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_assessment_payload(self, candidate_id: str, field_name: str) -> dict | None:
+        """The raw stored payload for one assessment role.
+
+        Exists because `Candidate` deliberately has no `opportunity_screen`
+        field (the cheap pre-screen is not part of the seven-role chain),
+        yet the Decision Auditor must be able to answer "what did the
+        Opportunity Screener say?" - requirement 3 names it explicitly.
+        Read-only, returns None rather than raising for a missing or
+        unparseable row: a missing opinion is evidence of absence, not an
+        error to abort an audit on."""
+        row = self._conn.execute(
+            "SELECT payload FROM assessments WHERE candidate_id = ? AND field_name = ?",
+            (candidate_id, field_name),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            parsed = json.loads(row["payload"])
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def get_godfather_trade_investigation(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM godfather_trade_investigations WHERE position_id = ?",
+            (position_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_godfather_trade_investigations(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_trade_investigations ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_closed_positions_pending_godfather_investigation(
+        self, limit: int
+    ) -> list[Position]:
+        """Same anti-join shape as find_closed_positions_pending_detective_
+        analysis - the investigations table IS the restart-safe cursor, so
+        there is no separate pointer that can drift out of sync."""
+        rows = self._conn.execute(
+            "SELECT * FROM positions WHERE status = 'CLOSED' "
+            "AND position_id NOT IN "
+            "(SELECT position_id FROM godfather_trade_investigations) "
+            "ORDER BY closed_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [self._row_to_position(row) for row in rows]
+
+    def count_closed_positions_pending_godfather_investigation(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM positions WHERE status = 'CLOSED' "
+            "AND position_id NOT IN "
+            "(SELECT position_id FROM godfather_trade_investigations)"
+        ).fetchone()
+        return int(row["n"])
+
+    def save_godfather_decision_audit(self, record: DecisionAudit) -> bool:
+        components = [c.model_dump(mode="json") for c in record.components]
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO godfather_decision_audits "
+            "(position_id, candidate_id, created_at, fault_domain, right_count, "
+            "wrong_count, unknown_count, conflict_count, components_json, "
+            "conflicts_json, misleading_components_json, missing_information_json, "
+            "run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.position_id,
+                record.candidate_id,
+                record.created_at.isoformat(),
+                record.fault_domain,
+                sum(1 for c in record.components if c.verdict == "RIGHT"),
+                sum(1 for c in record.components if c.verdict == "WRONG"),
+                sum(1 for c in record.components if c.verdict == "UNSCORABLE"),
+                len(record.conflicts),
+                json.dumps(components),
+                json.dumps(record.conflicts),
+                json.dumps(record.misleading_components),
+                json.dumps(record.missing_information),
+                record.run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_godfather_decision_audit(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM godfather_decision_audits WHERE position_id = ?",
+            (position_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_godfather_decision_audits(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_decision_audits ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_godfather_counterfactual(self, record: CounterfactualResult) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO godfather_counterfactuals "
+            "(counterfactual_id, position_id, policy, created_at, triggered, "
+            "trigger_minutes, simulated_exit_price, simulated_pnl_usdt, "
+            "actual_pnl_usdt, delta_pnl_usdt, no_lookahead_verified, detail_json, "
+            "run_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.counterfactual_id,
+                record.position_id,
+                record.policy,
+                record.created_at.isoformat(),
+                int(record.triggered),
+                record.trigger_minutes,
+                self._decimal_text(record.simulated_exit_price),
+                self._decimal_text(record.simulated_pnl_usdt),
+                self._decimal_text(record.actual_pnl_usdt),
+                self._decimal_text(record.delta_pnl_usdt),
+                int(record.no_lookahead_verified),
+                json.dumps(record.detail),
+                record.run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def find_godfather_counterfactuals_for_position(self, position_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_counterfactuals WHERE position_id = ? "
+            "ORDER BY policy ASC",
+            (position_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_godfather_counterfactuals(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_counterfactuals ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_godfather_experience_pattern(self, record: ExperiencePattern) -> None:
+        """INSERT OR REPLACE: a sweep restates the CURRENT verdict for a
+        pattern. Deliberately not append-per-day - Experience Memory is a
+        living evidence file per pattern (same discipline as
+        guardian_authority_heuristics), and what changed between sweeps is
+        already visible in the sample_size/computed_at pair."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO godfather_experience_patterns "
+            "(pattern_id, pattern_family, pattern_key, condition_json, computed_at, "
+            "sample_size, win_count, win_rate, wilson_low, wilson_high, "
+            "expectancy_usdt, expectancy_ci_low, expectancy_ci_high, avg_mfe_pct, "
+            "avg_mae_pct, avg_minutes_to_mfe, baseline_win_rate, "
+            "baseline_expectancy_usdt, lift_expectancy_usdt, p_value, "
+            "fdr_significant, first_half_lift, second_half_lift, "
+            "regime_breakdown_json, edge_class, confidence, survived_walk_forward, "
+            "detail_json, run_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.pattern_id,
+                record.pattern_family,
+                record.pattern_key,
+                json.dumps(record.condition),
+                record.computed_at.isoformat(),
+                record.sample_size,
+                record.win_count,
+                record.win_rate,
+                record.wilson_low,
+                record.wilson_high,
+                self._decimal_text(record.expectancy_usdt),
+                self._decimal_text(record.expectancy_ci_low),
+                self._decimal_text(record.expectancy_ci_high),
+                self._decimal_text(record.avg_mfe_pct),
+                self._decimal_text(record.avg_mae_pct),
+                record.avg_minutes_to_mfe,
+                record.baseline_win_rate,
+                self._decimal_text(record.baseline_expectancy_usdt),
+                self._decimal_text(record.lift_expectancy_usdt),
+                record.p_value,
+                int(record.fdr_significant),
+                self._decimal_text(record.first_half_lift),
+                self._decimal_text(record.second_half_lift),
+                json.dumps(record.regime_breakdown),
+                record.edge_class,
+                record.confidence,
+                int(record.survived_walk_forward),
+                json.dumps(record.detail),
+                record.run_id,
+            ),
+        )
+        self._conn.commit()
+
+    def find_godfather_experience_patterns(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_experience_patterns ORDER BY pattern_id ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_godfather_prediction_error(self, record: PredictionErrorRecord) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO godfather_prediction_errors "
+            "(prediction_error_id, position_id, source, created_at, expected, "
+            "actual, error, cause, lesson, magnitude, detail_json, run_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.prediction_error_id,
+                record.position_id,
+                record.source,
+                record.created_at.isoformat(),
+                record.expected,
+                record.actual,
+                record.error,
+                record.cause,
+                record.lesson,
+                record.magnitude,
+                json.dumps(record.detail),
+                record.run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def find_godfather_prediction_errors(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_prediction_errors ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_godfather_position_thesis(self, record: ThesisObservation) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO godfather_position_thesis "
+            "(thesis_id, position_id, observed_at, thesis_state, recommended_action, "
+            "enforced, reason_codes_json, features_json, run_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                record.thesis_id,
+                record.position_id,
+                record.observed_at.isoformat(),
+                record.thesis_state,
+                record.recommended_action,
+                int(record.enforced),
+                json.dumps(record.reason_codes),
+                json.dumps(record.features),
+                record.run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def find_godfather_position_thesis_for_position(self, position_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_position_thesis WHERE position_id = ? "
+            "ORDER BY observed_at ASC",
+            (position_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_latest_godfather_position_thesis(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM godfather_position_thesis WHERE position_id = ? "
+            "ORDER BY observed_at DESC LIMIT 1",
+            (position_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def save_godfather_entry_quality(self, record: EntryQualityAssessment) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO godfather_entry_quality "
+            "(candidate_id, instrument, assessed_at, verdict, quality_score, "
+            "expected_edge_class, expected_expectancy_usdt, risk_reward, "
+            "regime_compatible, conflict_score, expected_cost_usdt, enforced, "
+            "reason_codes_json, detail_json, run_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.candidate_id,
+                record.instrument,
+                record.assessed_at.isoformat(),
+                record.verdict,
+                record.quality_score,
+                record.expected_edge_class,
+                self._decimal_text(record.expected_expectancy_usdt),
+                self._decimal_text(record.risk_reward),
+                None if record.regime_compatible is None else int(record.regime_compatible),
+                record.conflict_score,
+                self._decimal_text(record.expected_cost_usdt),
+                int(record.enforced),
+                json.dumps(record.reason_codes),
+                json.dumps(record.detail),
+                record.run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def get_godfather_entry_quality(self, candidate_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM godfather_entry_quality WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_godfather_entry_quality_assessments(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_entry_quality ORDER BY assessed_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]

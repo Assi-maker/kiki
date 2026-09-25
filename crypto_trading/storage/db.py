@@ -667,6 +667,233 @@ CREATE TABLE IF NOT EXISTS godfather_priority_heuristic_candidates (
     demotion_reason TEXT,
     run_id TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------------
+-- GODFATHER Intelligence Layer (2026-09-25), see
+-- docs/superpowers/plans/2026-09-25-godfather-intelligence-layer.md.
+--
+-- Seven tables, one per subsystem. They share one structural property
+-- that is the whole safety argument for this layer, and it is the same
+-- argument godfather_priority_heuristics above already rests on, only
+-- stronger: NOTHING in the live trading path reads any of them. The real
+-- decision core (guardian/authority.py), the Gate (gate/), screening
+-- (screening/), sizing (paper_trading/position_sizing.py) and every
+-- exchange primitive have zero references to these table names. They are
+-- append-mostly analysis output: written by crypto_trading/godfather/*,
+-- read by crypto_trading/godfather/report.py and by the strategist
+-- prompts. A bug in any of them can therefore produce a wrong REPORT,
+-- never a wrong trade - which is exactly the staging the user asked for
+-- ("first build and verify research/experience/decision infrastructure,
+-- THEN let objectively validated improvements deploy autonomously").
+-- tests/crypto_trading/godfather/test_intelligence_isolation.py greps
+-- the live tree to keep that true.
+-- ---------------------------------------------------------------------
+
+-- Trade Investigator: exactly one structured post-mortem per already-
+-- CLOSED position (position_id IS the primary key - a second
+-- investigation of the same trade is an idempotent no-op, same
+-- INSERT OR IGNORE claim shape as live_profit_protection). The columns
+-- are the queryable spine; `detail_json` carries the full BEFORE/DURING/
+-- AFTER record (schemas/godfather.py::TradeInvestigation) so a later
+-- question never needs a schema migration to be answerable.
+CREATE TABLE IF NOT EXISTS godfather_trade_investigations (
+    position_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    entry_verdict TEXT NOT NULL,
+    management_verdict TEXT NOT NULL,
+    exit_reason TEXT,
+    hold_minutes REAL,
+    realized_pnl_usdt TEXT,
+    mfe_pct TEXT,
+    mae_pct TEXT,
+    giveback_ratio TEXT,
+    minutes_to_mfe REAL,
+    minutes_to_target_touch REAL,
+    minutes_to_sl_touch REAL,
+    first_questionable_minutes REAL,
+    first_invalid_minutes REAL,
+    path_point_count INTEGER NOT NULL,
+    avoidable_loss_usdt TEXT,
+    best_alternative_policy TEXT,
+    detail_json TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gf_investigations_classification
+    ON godfather_trade_investigations(classification);
+
+-- Decision Auditor: one row per investigated position, reconstructing
+-- what each pipeline component said BEFORE entry and scoring it against
+-- what actually happened. components_json is the structured per-component
+-- verdict list (never free LLM text - explicit user requirement 3).
+CREATE TABLE IF NOT EXISTS godfather_decision_audits (
+    position_id TEXT PRIMARY KEY,
+    candidate_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    fault_domain TEXT NOT NULL,
+    right_count INTEGER NOT NULL,
+    wrong_count INTEGER NOT NULL,
+    unknown_count INTEGER NOT NULL,
+    conflict_count INTEGER NOT NULL,
+    components_json TEXT NOT NULL,
+    conflicts_json TEXT NOT NULL,
+    misleading_components_json TEXT NOT NULL,
+    missing_information_json TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+-- Counterfactual Engine: one row per (position, policy). Every row is a
+-- SIMULATED outcome and is never mixed into any table holding a real
+-- one - the separation the user asked for ("results must be clearly
+-- separated from actual outcome") is physical, not a flag. no_lookahead_
+-- verified records that the policy's own decision function was evaluated
+-- with a strictly truncated prefix of the path (see
+-- godfather/counterfactual.py); a False here disqualifies the row from
+-- every downstream aggregation rather than merely annotating it.
+CREATE TABLE IF NOT EXISTS godfather_counterfactuals (
+    counterfactual_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    policy TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    triggered INTEGER NOT NULL,
+    trigger_minutes REAL,
+    simulated_exit_price TEXT,
+    simulated_pnl_usdt TEXT,
+    actual_pnl_usdt TEXT,
+    delta_pnl_usdt TEXT,
+    no_lookahead_verified INTEGER NOT NULL,
+    detail_json TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gf_counterfactuals_position
+    ON godfather_counterfactuals(position_id);
+CREATE INDEX IF NOT EXISTS idx_gf_counterfactuals_policy
+    ON godfather_counterfactuals(policy);
+
+-- Experience Memory: one row per evaluated pattern per sweep. This is
+-- structured data, deliberately NOT LLM prose (explicit user requirement
+-- 11). edge_class is the answer to "how much is good and how much is
+-- bad": INSUFFICIENT_DATA / NOISE / WEAK_EDGE / REGIME_DEPENDENT /
+-- DECAYING_EDGE / EDGE / FAILURE_PATTERN, and a row may only claim EDGE
+-- after clearing every gate in godfather/experience.py's own
+-- classification contract (sample size, Wilson bound, bootstrap CI,
+-- FDR-corrected p-value, both-halves sign agreement). INSERT OR REPLACE
+-- on pattern_id: a sweep restates the current verdict for a pattern, it
+-- does not accumulate one row per day forever.
+CREATE TABLE IF NOT EXISTS godfather_experience_patterns (
+    pattern_id TEXT PRIMARY KEY,
+    pattern_family TEXT NOT NULL,
+    pattern_key TEXT NOT NULL,
+    condition_json TEXT NOT NULL,
+    computed_at TEXT NOT NULL,
+    sample_size INTEGER NOT NULL,
+    win_count INTEGER NOT NULL,
+    win_rate REAL,
+    wilson_low REAL,
+    wilson_high REAL,
+    expectancy_usdt TEXT,
+    expectancy_ci_low TEXT,
+    expectancy_ci_high TEXT,
+    avg_mfe_pct TEXT,
+    avg_mae_pct TEXT,
+    avg_minutes_to_mfe REAL,
+    baseline_win_rate REAL,
+    baseline_expectancy_usdt TEXT,
+    lift_expectancy_usdt TEXT,
+    p_value REAL,
+    fdr_significant INTEGER NOT NULL,
+    first_half_lift TEXT,
+    second_half_lift TEXT,
+    regime_breakdown_json TEXT NOT NULL,
+    edge_class TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    survived_walk_forward INTEGER NOT NULL,
+    detail_json TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gf_experience_edge_class
+    ON godfather_experience_patterns(edge_class);
+
+-- Prediction Error Loop: EXPECTED / ACTUAL / ERROR / CAUSE / LESSON, one
+-- row per pre-registered expectation that has now resolved. `source`
+-- names which subsystem's expectation this scores (trade_thesis,
+-- forecast_agent, risk_agent, guardian_authority, entry_quality), so the
+-- same loop covers every component that commits to an expectation up
+-- front instead of only Guardian Authority's own decisions.
+CREATE TABLE IF NOT EXISTS godfather_prediction_errors (
+    prediction_error_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expected TEXT NOT NULL,
+    actual TEXT NOT NULL,
+    error TEXT NOT NULL,
+    cause TEXT NOT NULL,
+    lesson TEXT NOT NULL,
+    magnitude REAL,
+    detail_json TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gf_prediction_errors_source
+    ON godfather_prediction_errors(source);
+
+-- Position Thesis tracking: append-only, one row per evaluated tick per
+-- open position. `enforced` is 0 for every row this phase writes - the
+-- thesis layer RECORDS what it would do; Guardian Authority remains the
+-- only path that may act (explicit user requirement 4/12). The column
+-- exists so that a later, separately-approved activation is a visible
+-- data difference rather than an invisible code change.
+CREATE TABLE IF NOT EXISTS godfather_position_thesis (
+    thesis_id TEXT PRIMARY KEY,
+    position_id TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    thesis_state TEXT NOT NULL,
+    recommended_action TEXT NOT NULL,
+    enforced INTEGER NOT NULL DEFAULT 0,
+    reason_codes_json TEXT NOT NULL,
+    features_json TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gf_thesis_position
+    ON godfather_position_thesis(position_id, observed_at);
+
+CREATE TRIGGER IF NOT EXISTS godfather_position_thesis_no_update
+BEFORE UPDATE ON godfather_position_thesis
+BEGIN
+    SELECT RAISE(ABORT, 'godfather_position_thesis is append-only: UPDATE is not permitted');
+END;
+
+-- Entry Quality Layer: one advisory verdict per CONFIRMED candidate,
+-- recorded ALONGSIDE the real Gate decision, never in place of it.
+-- `enforced` is 0 for every row this phase writes, same discipline and
+-- same reason as godfather_position_thesis above.
+CREATE TABLE IF NOT EXISTS godfather_entry_quality (
+    candidate_id TEXT PRIMARY KEY,
+    instrument TEXT NOT NULL,
+    assessed_at TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    quality_score REAL NOT NULL,
+    expected_edge_class TEXT NOT NULL,
+    expected_expectancy_usdt TEXT,
+    risk_reward TEXT,
+    regime_compatible INTEGER,
+    conflict_score REAL NOT NULL,
+    expected_cost_usdt TEXT,
+    enforced INTEGER NOT NULL DEFAULT 0,
+    reason_codes_json TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gf_entry_quality_verdict
+    ON godfather_entry_quality(verdict);
 """
 
 
@@ -713,6 +940,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_guardian_authority_decisions_add_intervention_applied(conn)
     _migrate_guardian_authority_decisions_add_matched_heuristic_ids_json(conn)
     _migrate_guardian_authority_heuristic_candidates_add_target_decision_type(conn)
+    _migrate_godfather_decision_audits_add_conflicts_json(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -873,3 +1101,28 @@ def _add_column_idempotent(conn: sqlite3.Connection, alter_sql: str) -> None:
     except sqlite3.OperationalError as exc:
         if "duplicate column name" not in str(exc):
             raise
+
+
+def _migrate_godfather_decision_audits_add_conflicts_json(conn: sqlite3.Connection) -> None:
+    """godfather_decision_audits.conflicts_json - the CODES of the
+    pre-entry conflicts the Decision Auditor counted, not just their
+    number.
+
+    Needed because the conflict codes are what the Entry Quality layer
+    penalises and what a later Experience Memory sweep can group trades
+    by; the `conflict_count` column alone answers "how many" but never
+    "which", and re-deriving them at read time would let the two records
+    drift apart. Same idempotent ALTER pattern and the same reason as
+    every migration above: a real database already had the table by the
+    time this column was added, and `CREATE TABLE IF NOT EXISTS` alone
+    does nothing to an already-existing table."""
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(godfather_decision_audits)").fetchall()
+    }
+    if columns and "conflicts_json" not in columns:
+        _add_column_idempotent(
+            conn,
+            "ALTER TABLE godfather_decision_audits ADD COLUMN "
+            "conflicts_json TEXT NOT NULL DEFAULT '[]'",
+        )

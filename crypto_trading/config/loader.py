@@ -339,6 +339,43 @@ class GodfatherConfig(BaseModel):
 
     priority_boost_enabled: bool = False
 
+    # --- GODFATHER Intelligence Layer (2026-09-25) ------------------
+    # intelligence_enabled gates the whole analysis tick
+    # (crypto_trading/godfather/pipeline.py + godfather_loop.py).
+    # Unlike every other flag in this class it defaults to True, and the
+    # reason is a real asymmetry rather than an exception to the house
+    # rule: this subsystem writes exclusively to its own seven
+    # godfather_* tables and is read by nothing in the trading path, so
+    # the worst a bug here can produce is a wrong REPORT. The flags that
+    # would let its conclusions reach a trade
+    # (entry_quality_enforcement_enabled / thesis_enforcement_enabled)
+    # are separate, and THEY ship inert in the usual way.
+    intelligence_enabled: bool = True
+    intelligence_check_interval_seconds: int = Field(gt=0, default=900)
+    intelligence_batch_limit: int = Field(gt=0, default=50)
+    entry_quality_backfill_limit: int = Field(ge=0, default=50)
+
+    # Experience Memory's anti-noise gates. Config rather than constants
+    # so they can be re-tuned as the trade history grows - but note the
+    # direction of safety: LOWERING min_sample_size or RAISING fdr_q
+    # makes the system more willing to believe a pattern is real, which
+    # is exactly the failure the user asked to be protected from. The
+    # default 30 is the same floor guardian/authority.py::
+    # _MIN_SAMPLE_SIZE already enforces for live heuristics.
+    experience_min_sample_size: int = Field(gt=0, default=30)
+    experience_min_support: int = Field(gt=0, default=8)
+    experience_fdr_q: float = Field(gt=0, lt=1, default=0.10)
+
+    # Enforcement surfaces. Both ship False and stay False until a
+    # separate, explicitly approved activation - requirement 12/14: build
+    # and verify the research infrastructure FIRST, change trading
+    # decisions only afterwards, on validated evidence. Nothing in
+    # crypto_trading/godfather/ reads these yet; they exist so the
+    # activation is a config change in a reviewed place rather than a
+    # scattered code edit.
+    entry_quality_enforcement_enabled: bool = False
+    thesis_enforcement_enabled: bool = False
+
 
 class Settings(BaseModel):
     db_path: Path
