@@ -33,6 +33,7 @@ _INTELLIGENCE_MODULES = [
     _CRYPTO_TRADING / "godfather" / "objective.py",
     _CRYPTO_TRADING / "godfather" / "path.py",
     _CRYPTO_TRADING / "godfather" / "pipeline.py",
+    _CRYPTO_TRADING / "godfather" / "policy_evaluation.py",
     _CRYPTO_TRADING / "godfather" / "prediction_error.py",
     _CRYPTO_TRADING / "godfather" / "report.py",
     _CRYPTO_TRADING / "godfather" / "stats.py",
@@ -50,6 +51,7 @@ _INTELLIGENCE_TABLES = [
     "godfather_prediction_errors",
     "godfather_position_thesis",
     "godfather_entry_quality",
+    "godfather_policy_evaluations",
 ]
 
 # Everything that can move real money, or that decides whether money
@@ -201,6 +203,7 @@ def test_the_live_trading_path_never_calls_an_intelligence_repository_method():
         "find_latest_godfather_position_thesis",
         "get_godfather_entry_quality",
         "find_godfather_entry_quality_assessments",
+        "find_godfather_policy_evaluations",
     }
     for path in _LIVE_TRADING_PATH:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -250,3 +253,22 @@ def test_every_thesis_and_entry_quality_row_is_written_as_advisory():
     assert "enforced=True" not in pipeline
     assert "enforced=False" in entry_quality
     assert "enforced=True" not in entry_quality
+
+
+def test_a_policy_evaluation_can_never_authorise_a_rule_change():
+    """The policy report is experience data, never a switch. Pinned at
+    both ends: the writer hard-codes promotion_allowed = 0 and the schema
+    refuses any other value, and no config file names the table."""
+    repository = (_CRYPTO_TRADING / "storage" / "repository.py").read_text(encoding="utf-8")
+    schema = (_CRYPTO_TRADING / "storage" / "db.py").read_text(encoding="utf-8")
+    evaluation = (_CRYPTO_TRADING / "godfather" / "policy_evaluation.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CHECK (promotion_allowed = 0)" in schema
+    assert "mean_uplift_usdt, promotion_allowed, report_json, run_id) " in repository
+    assert "VALUES (?,?,?,?,?,?,?,0,?,?)" in repository
+    assert '"promotion_allowed": False' in evaluation
+    assert '"change_live_rules": False' in evaluation
+    for config in (_CRYPTO_TRADING / "config").glob("*.yaml"):
+        assert "godfather_policy_evaluations" not in config.read_text(encoding="utf-8")

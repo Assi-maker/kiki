@@ -164,3 +164,33 @@ def split_halves(values: list) -> tuple[list, list]:
         return (values[:], [])
     cut = n // 2
     return (values[:cut], values[cut:])
+
+
+def sign_flip_p_value(
+    values: list[float], iterations: int = 20000, seed: int = 20260925
+) -> float:
+    """Two-sided paired randomisation test of "mean effect = 0".
+
+    Under the null that a policy is irrelevant to a trade, the sign of
+    each per-trade delta is as likely to be + as -, so flipping signs at
+    random generates the null distribution of the sum. Unlike the sign
+    test this uses magnitudes - which is the point for P/L, where one
+    destroyed winner can outweigh several small savings. Seeded, so a
+    stored p-value re-derives byte for byte; the +1 correction keeps a
+    Monte Carlo p-value from ever being exactly 0.
+    """
+    if not values:
+        return 1.0
+    observed = abs(sum(values))
+    if observed == 0.0:
+        return 1.0
+    rng = random.Random(seed)
+    tolerance = observed * 1e-12
+    extreme = 0
+    for _ in range(iterations):
+        total = 0.0
+        for value in values:
+            total += value if rng.random() < 0.5 else -value
+        if abs(total) >= observed - tolerance:
+            extreme += 1
+    return (extreme + 1) / (iterations + 1)

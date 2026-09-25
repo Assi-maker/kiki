@@ -894,6 +894,27 @@ CREATE TABLE IF NOT EXISTS godfather_entry_quality (
 
 CREATE INDEX IF NOT EXISTS idx_gf_entry_quality_verdict
     ON godfather_entry_quality(verdict);
+
+-- Policy evaluations: one diagnostic report per (policy, run), written by
+-- godfather/policy_evaluation.py as experience data GODFATHER can read
+-- later. It is evidence, never a switch: promotion_allowed is pinned to 0
+-- by a CHECK, so no row in this table can ever claim to authorise a rule
+-- change - that remains a separate, explicit human decision.
+CREATE TABLE IF NOT EXISTS godfather_policy_evaluations (
+    evaluation_id TEXT PRIMARY KEY,
+    policy TEXT NOT NULL,
+    evaluated_at TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    activated_trades INTEGER NOT NULL,
+    mean_uplift_usdt TEXT,
+    promotion_allowed INTEGER NOT NULL DEFAULT 0 CHECK (promotion_allowed = 0),
+    report_json TEXT NOT NULL,
+    run_id TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_gf_policy_evaluations_policy
+    ON godfather_policy_evaluations(policy);
 """
 
 

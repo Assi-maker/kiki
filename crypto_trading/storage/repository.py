@@ -537,6 +537,20 @@ class Repository(Protocol):
     def save_godfather_entry_quality(self, record: EntryQualityAssessment) -> bool: ...
     def get_godfather_entry_quality(self, candidate_id: str) -> dict | None: ...
     def find_godfather_entry_quality_assessments(self) -> list[dict]: ...
+    def find_all_live_profit_protection(self) -> list[dict]: ...
+    def save_godfather_policy_evaluation(
+        self,
+        evaluation_id: str,
+        policy: str,
+        evaluated_at: datetime,
+        verdict: str,
+        confidence: str,
+        activated_trades: int,
+        mean_uplift_usdt: str | None,
+        report: dict,
+        run_id: str,
+    ) -> bool: ...
+    def find_godfather_policy_evaluations(self, policy: str) -> list[dict]: ...
 
 
 class SQLiteRepository:
@@ -3376,5 +3390,53 @@ class SQLiteRepository:
     def find_godfather_entry_quality_assessments(self) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM godfather_entry_quality ORDER BY assessed_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def find_all_live_profit_protection(self) -> list[dict]:
+        """Every real LIVE Profit Protection row, whatever its status -
+        read-only history for godfather/policy_evaluation.py."""
+        rows = self._conn.execute(
+            "SELECT * FROM live_profit_protection ORDER BY claimed_at ASC"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_godfather_policy_evaluation(
+        self,
+        evaluation_id: str,
+        policy: str,
+        evaluated_at: datetime,
+        verdict: str,
+        confidence: str,
+        activated_trades: int,
+        mean_uplift_usdt: str | None,
+        report: dict,
+        run_id: str,
+    ) -> bool:
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO godfather_policy_evaluations "
+            "(evaluation_id, policy, evaluated_at, verdict, confidence, activated_trades, "
+            "mean_uplift_usdt, promotion_allowed, report_json, run_id) "
+            "VALUES (?,?,?,?,?,?,?,0,?,?)",
+            (
+                evaluation_id,
+                policy,
+                evaluated_at.isoformat(),
+                verdict,
+                confidence,
+                activated_trades,
+                mean_uplift_usdt,
+                json.dumps(report, default=str),
+                run_id,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def find_godfather_policy_evaluations(self, policy: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM godfather_policy_evaluations WHERE policy = ? "
+            "ORDER BY evaluated_at ASC",
+            (policy,),
         ).fetchall()
         return [dict(row) for row in rows]
