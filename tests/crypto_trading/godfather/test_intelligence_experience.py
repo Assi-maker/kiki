@@ -173,8 +173,8 @@ def test_a_pattern_that_worked_and_then_stopped_is_a_decaying_edge():
 
 def test_a_pattern_that_only_works_in_one_regime_is_regime_dependent():
     breakdown = {
-        "btc_strong": {"n": 20, "lift_usdt": "9"},
-        "btc_bad": {"n": 20, "lift_usdt": "-7"},
+        "btc_strong": {"n": 20, "lift": "9"},
+        "btc_bad": {"n": 20, "lift": "-7"},
     }
     pattern = _edge_candidate(
         ci=(-2.0, 9.0), regime_breakdown=breakdown, first_half_lift="4", second_half_lift="6"
@@ -187,8 +187,8 @@ def test_a_pattern_that_only_works_in_one_regime_is_regime_dependent():
 
 def test_regime_splits_are_ignored_when_a_regime_has_too_few_samples():
     breakdown = {
-        "btc_strong": {"n": 38, "lift_usdt": "9"},
-        "btc_bad": {"n": 2, "lift_usdt": "-7"},
+        "btc_strong": {"n": 38, "lift": "9"},
+        "btc_bad": {"n": 2, "lift": "-7"},
     }
     pattern = _edge_candidate(ci=(-2.0, 9.0), regime_breakdown=breakdown)
 

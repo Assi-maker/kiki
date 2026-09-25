@@ -60,6 +60,10 @@ class EntrySignal:
     opened_at: datetime | None = None
     closed_at: datetime | None = None
     realized_pnl: Decimal | None = None
+    # Net R (Fas 2A): the unit every comparison below is made in, so a
+    # 2 500-USDT trade does not outweigh a 500-USDT one. USDT stays for
+    # capital totals.
+    realized_r: Decimal | None = None
     regime: str = "unknown"
     reason_codes: list[str] = field(default_factory=list)
     cohort_size: int = 1
@@ -71,8 +75,12 @@ class EntrySignal:
     assessment: Any = None
 
     @property
+    def outcome(self) -> Decimal | None:
+        return self.realized_r if self.realized_r is not None else self.realized_pnl
+
+    @property
     def scored(self) -> bool:
-        return self.realized_pnl is not None
+        return self.outcome is not None
 
 
 def assign_selection(signals: list[EntrySignal]) -> None:
@@ -101,13 +109,14 @@ def _floats(values: list[Decimal]) -> list[float]:
 
 
 def _group(signals: list[EntrySignal]) -> dict:
-    pnls = [s.realized_pnl for s in signals if s.realized_pnl is not None]
-    n = len(pnls)
+    outcomes = [s.outcome for s in signals if s.outcome is not None]
+    usdt = [s.realized_pnl for s in signals if s.realized_pnl is not None]
+    n = len(outcomes)
     return {
         "n": n,
-        "total_pnl_usdt": str(sum(pnls, _ZERO)),
-        "mean_pnl_usdt": float(sum(pnls, _ZERO) / n) if n else None,
-        "win_rate": (sum(1 for p in pnls if p > _ZERO) / n) if n else None,
+        "total_pnl_usdt": str(sum(usdt, _ZERO)),
+        "mean_outcome": float(sum(outcomes, _ZERO) / n) if n else None,
+        "win_rate": (sum(1 for p in outcomes if p > _ZERO) / n) if n else None,
     }
 
 
@@ -135,8 +144,8 @@ def within_cohort_effects(signals: list[EntrySignal]) -> list[tuple[datetime, fl
             cohorts.setdefault(signal.discovery_run_id, []).append(signal)
     effects: list[tuple[datetime, float]] = []
     for members in cohorts.values():
-        top = [float(s.realized_pnl) for s in members if s.selection_verdict == "TRADE"]
-        rest = [float(s.realized_pnl) for s in members if s.selection_verdict != "TRADE"]
+        top = [float(s.outcome) for s in members if s.selection_verdict == "TRADE"]
+        rest = [float(s.outcome) for s in members if s.selection_verdict != "TRADE"]
         if top and rest:
             effects.append((
                 min(s.decided_at for s in members),
@@ -171,7 +180,7 @@ def evaluate_selection(signals: list[EntrySignal], cut: datetime) -> dict:
             for verdict in ("TRADE", "WAIT", "REJECT")
         },
         "take_vs_rest": two_group_test(
-            [s.realized_pnl for s in take], [s.realized_pnl for s in rest]
+            [s.outcome for s in take], [s.outcome for s in rest]
         ),
         "within_cohort": {
             "cohorts": len(effect_values),
@@ -187,7 +196,11 @@ def evaluate_selection(signals: list[EntrySignal], cut: datetime) -> dict:
             "values": effect_values,
             "moments": [moment.isoformat() for moment, _v in effects],
         },
-        "book_if_only_take_usdt": str(sum((s.realized_pnl for s in take), _ZERO)),
-        "book_actual_usdt": str(sum((s.realized_pnl for s in scored), _ZERO)),
+        "book_if_only_take_usdt": str(sum(
+            (s.realized_pnl for s in take if s.realized_pnl is not None), _ZERO
+        )),
+        "book_actual_usdt": str(sum(
+            (s.realized_pnl for s in scored if s.realized_pnl is not None), _ZERO
+        )),
         "trades_avoided": len(rest),
     }

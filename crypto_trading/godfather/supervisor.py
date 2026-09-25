@@ -196,7 +196,10 @@ def build_entry_signals(
             position_id=trade.position.position_id if trade is not None else None,
             opened_at=trade.position.opened_at if trade is not None else None,
             closed_at=trade.position.closed_at if trade is not None else None,
-            realized_pnl=trade.pnl if trade is not None and trade.scorable else None,
+            realized_pnl=(
+                trade.pnl if trade is not None and trade.outcome_r is not None else None
+            ),
+            realized_r=trade.outcome_r if trade is not None else None,
             regime=regime,
             reason_codes=assessment.reason_codes,
             assessment=assessment,
@@ -287,8 +290,21 @@ def position_policy_evidence(
 ) -> list[PolicyEvidence]:
     """One `PolicyEvidence` per counterfactual policy, over the trades
     where it ACTED and was OBSERVED. Trades it never touched are not
-    padded in as zeros - that would inflate n and shrink every CI."""
+    padded in as zeros - that would inflate n and shrink every CI.
+
+    Effects are in R (Fas 2A): a USDT delta divided by the trade's own
+    initial risk in USDT, so the gates compare like with like across the
+    84-2 545 USDT size range. A trade without a reconstructible initial
+    risk contributes nothing."""
     by_id = {t.position.position_id: t for t in book}
+
+    def _risk(position_id: str) -> Decimal | None:
+        trade = by_id[position_id]
+        return trade.r.risk_usdt if trade.r is not None else None
+
+    def _in_r(position_id: str, usdt: Decimal) -> float:
+        return float(usdt / _risk(position_id))
+
     rows_by_policy: dict[str, list[CounterfactualResult]] = {}
     for results in counterfactuals.values():
         for row in results:
@@ -302,16 +318,17 @@ def position_policy_evidence(
         observed = [
             r for r in acted
             if r.detail.get("observation_status") == "OBSERVED" and r.delta_pnl_usdt is not None
+            and _risk(r.position_id)
         ]
         observed.sort(key=lambda r: by_id[r.position_id].position.opened_at)
-        deltas = [float(r.delta_pnl_usdt) for r in observed]
+        deltas = [_in_r(r.position_id, r.delta_pnl_usdt) for r in observed]
         ci = stats.bootstrap_mean_ci(deltas)
-        train = [float(r.delta_pnl_usdt) for r in observed
+        train = [_in_r(r.position_id, r.delta_pnl_usdt) for r in observed
                  if by_id[r.position_id].position.opened_at < cut]
-        test = [float(r.delta_pnl_usdt) for r in observed
+        test = [_in_r(r.position_id, r.delta_pnl_usdt) for r in observed
                 if by_id[r.position_id].position.opened_at >= cut]
         pessimistic = [
-            float(Decimal(r.detail["pessimistic_pnl_usdt"]) - r.actual_pnl_usdt)
+            _in_r(r.position_id, Decimal(r.detail["pessimistic_pnl_usdt"]) - r.actual_pnl_usdt)
             for r in observed if r.detail.get("pessimistic_pnl_usdt") is not None
         ]
         actual_wins = sum(1 for r in observed if r.actual_pnl_usdt > _ZERO)
@@ -334,7 +351,8 @@ def position_policy_evidence(
             expectancy_change=stats.mean(deltas),
             win_rate_change=((sim_wins - actual_wins) / len(observed)) if observed else None,
             regime_cells=_regime_cells([
-                (by_id[r.position_id].regime, float(r.delta_pnl_usdt)) for r in observed
+                (by_id[r.position_id].regime, _in_r(r.position_id, r.delta_pnl_usdt))
+                for r in observed
             ]),
             unobservable=sum(1 for r in acted
                              if r.detail.get("observation_status") == "UNOBSERVABLE"),
@@ -384,8 +402,8 @@ def entry_policy_evidence(selection: dict, diversification: dict, signals: list[
     kept_minus_skipped = None if diff["mean_diff_usdt"] is None else -diff["mean_diff_usdt"]
 
     def _half_diff(before: bool) -> float | None:
-        k = [float(s.realized_pnl) for s in kept if (s.decided_at < cut) == before]
-        sk = [float(s.realized_pnl) for s in skipped if (s.decided_at < cut) == before]
+        k = [float(s.outcome) for s in kept if (s.decided_at < cut) == before]
+        sk = [float(s.outcome) for s in skipped if (s.decided_at < cut) == before]
         return (sum(k) / len(k) - sum(sk) / len(sk)) if k and sk else None
 
     portfolio_evidence = PolicyEvidence(
@@ -449,7 +467,7 @@ def _thesis_action_mix(counterfactuals: dict[str, list[CounterfactualResult]]) -
 def run_supervisor_sweep(
     repo: Repository, settings: Settings, now: datetime, run_id: str, persist: bool = True
 ) -> dict:
-    book = load_book(repo)
+    book = load_book(repo, settings.risk_limits.fee_pct)
     scorable = [t for t in book if t.scorable]
     if len(scorable) < 2:
         return {"status": "INSUFFICIENT_DATA", "scorable_trades": len(scorable)}
@@ -592,7 +610,7 @@ def render_markdown(report: dict) -> str:
     w("")
     w("## Policy registry")
     w("")
-    w("| policy | kind | status | n | mean effect / trade [95% CI] | p | BH | train / test "
+    w("| policy | kind | status | n | mean effect R / trade [95% CI] | p | BH | train / test "
       "| walk-forward blocks | unobservable | flags |")
     w("|---|---|---|---|---|---|---|---|---|---|---|")
     for row in report["registry"]:
@@ -642,7 +660,7 @@ def render_markdown(report: dict) -> str:
     w("|---|---|---|---|---|")
     for verdict, g in es["by_verdict"].items():
         label = "TAKE" if verdict == "TRADE" else verdict
-        w(f"| {label} | {g['n']} | {_m(g['total_pnl_usdt'])} | {_m(g['mean_pnl_usdt'])} | "
+        w(f"| {label} | {g['n']} | {_m(g['total_pnl_usdt'])} | {_m(g['mean_outcome'])} R | "
           f"{_p(g['win_rate'])} |")
     wc = es["within_cohort"]
     tv = es["take_vs_rest"]

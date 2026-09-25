@@ -30,6 +30,7 @@ data/crypto_trading.db
 data/crypto_trading.db-journal
 data/crypto_trading.db-wal
 data/crypto_trading.db-shm
+data/*.instance.lock
 
 # OS
 Thumbs.db

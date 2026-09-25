@@ -95,7 +95,7 @@ class ExperienceSample:
 
     position_id: str
     closed_at: datetime
-    pnl: Decimal
+    pnl: Decimal | None
     mfe_pct: Decimal | None
     mae_pct: Decimal | None
     minutes_to_mfe: float | None
@@ -107,10 +107,24 @@ class ExperienceSample:
     # patterns are conditioned on `features` (pre-entry) only.
     profile: dict = field(default_factory=dict)
     live: bool = False
+    # Net R (Fas 2A). When present it is THE outcome every statistic and
+    # every edge class is computed on - size-independent, so a pattern
+    # measures the signal rather than the sizing regime it happened to
+    # trade under. USDT (`pnl`) is kept as the separate capital measure.
+    r: Decimal | None = None
+    observation: dict = field(default_factory=dict)
+
+    @property
+    def outcome(self) -> Decimal:
+        if self.r is not None:
+            return self.r
+        if self.pnl is None:
+            raise ValueError(f"sample {self.position_id} has neither R nor P/L")
+        return self.pnl
 
     @property
     def win(self) -> bool:
-        return self.pnl > _ZERO
+        return self.outcome > _ZERO
 
 
 @dataclass(frozen=True)
@@ -165,7 +179,30 @@ def enumerate_patterns(
 def _expectancy(samples: list[ExperienceSample]) -> Decimal | None:
     if not samples:
         return None
-    return sum((s.pnl for s in samples), _ZERO) / Decimal(len(samples))
+    return sum((s.outcome for s in samples), _ZERO) / Decimal(len(samples))
+
+
+def _usdt_expectancy(samples: list[ExperienceSample]) -> Decimal | None:
+    values = [s.pnl for s in samples if s.pnl is not None]
+    if not values:
+        return None
+    return sum(values, _ZERO) / Decimal(len(values))
+
+
+def outcome_metric(samples: list[ExperienceSample]) -> str:
+    return "R" if samples and all(s.r is not None for s in samples) else "USDT"
+
+
+def _s(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _usdt_ci(samples: list[ExperienceSample], side: int) -> Decimal | None:
+    values = [float(s.pnl) for s in samples if s.pnl is not None]
+    ci = stats.bootstrap_mean_ci(values) if len(values) >= 2 else None
+    if ci is None:
+        return None
+    return Decimal(str(ci.lower if side == 0 else ci.upper))
 
 
 def _avg_decimal(values: list[Decimal]) -> Decimal | None:
@@ -241,8 +278,8 @@ def _compute_pattern_stats(
         regime: {
             "n": len(group),
             "win_rate": (sum(1 for s in group if s.win) / len(group)) if group else None,
-            "expectancy_usdt": str(_expectancy(group)) if group else None,
-            "lift_usdt": (
+            "expectancy": str(_expectancy(group)) if group else None,
+            "lift": (
                 str(_expectancy(group) - baseline_expectancy) if group else None
             ),
         }
@@ -257,7 +294,7 @@ def _compute_pattern_stats(
         wilson=stats.wilson_interval(wins, n),
         expectancy=expectancy,
         expectancy_ci=(
-            stats.bootstrap_mean_ci([float(s.pnl) for s in matched]) if n >= 2 else None
+            stats.bootstrap_mean_ci([float(s.outcome) for s in matched]) if n >= 2 else None
         ),
         p_value=stats.binomial_test_two_sided(wins, n, baseline_win_rate),
         lift=lift,
@@ -278,9 +315,9 @@ def _same_sign(*values: Decimal | None) -> bool:
 
 def _regime_signs_disagree(breakdown: dict, config: ExperienceConfig) -> bool:
     lifts = [
-        Decimal(str(entry["lift_usdt"]))
+        Decimal(str(entry["lift"]))
         for entry in breakdown.values()
-        if entry.get("lift_usdt") is not None and entry["n"] >= config.min_regime_samples
+        if entry.get("lift") is not None and entry["n"] >= config.min_regime_samples
     ]
     if len(lifts) < 2:
         return False
@@ -388,6 +425,8 @@ def build_experience_memory(
     ordered = sorted(samples, key=lambda s: s.closed_at)
     baseline_win_rate = sum(1 for s in ordered if s.win) / len(ordered)
     baseline_expectancy = _expectancy(ordered) or _ZERO
+    baseline_usdt = _usdt_expectancy(ordered)
+    metric = outcome_metric(ordered)
     # Global calibration / out-of-sample boundary: the first 70% of the
     # history (by close time) is calibration, the rest out-of-sample.
     calibration_cut = ordered[min(len(ordered) - 1, int(len(ordered) * config.train_fraction))]
@@ -435,19 +474,18 @@ def build_experience_memory(
                 win_rate=pattern.win_rate,
                 wilson_low=pattern.wilson.lower if pattern.wilson else None,
                 wilson_high=pattern.wilson.upper if pattern.wilson else None,
-                expectancy_usdt=pattern.expectancy,
-                expectancy_ci_low=(
-                    Decimal(str(pattern.expectancy_ci.lower)) if pattern.expectancy_ci else None
-                ),
-                expectancy_ci_high=(
-                    Decimal(str(pattern.expectancy_ci.upper)) if pattern.expectancy_ci else None
-                ),
+                expectancy_usdt=_usdt_expectancy(pattern.matched),
+                expectancy_ci_low=_usdt_ci(pattern.matched, 0),
+                expectancy_ci_high=_usdt_ci(pattern.matched, 1),
                 avg_mfe_pct=_avg_decimal(mfes),
                 avg_mae_pct=_avg_decimal(maes),
                 avg_minutes_to_mfe=_avg_float(times),
                 baseline_win_rate=baseline_win_rate,
-                baseline_expectancy_usdt=baseline_expectancy,
-                lift_expectancy_usdt=pattern.lift,
+                baseline_expectancy_usdt=baseline_usdt,
+                lift_expectancy_usdt=(
+                    None if baseline_usdt is None or _usdt_expectancy(pattern.matched) is None
+                    else _usdt_expectancy(pattern.matched) - baseline_usdt
+                ),
                 p_value=pattern.p_value,
                 fdr_significant=fdr_significant,
                 first_half_lift=pattern.first_half_lift,
@@ -457,8 +495,18 @@ def build_experience_memory(
                 confidence=_confidence(pattern, edge_class, config),
                 survived_walk_forward=survived,
                 detail={
+                    # The unit every class-deciding statistic (expectancy,
+                    # its CI, lift, halves, walk-forward) is computed in.
+                    "outcome_metric": metric,
+                    "outcome": {
+                        "expectancy": _s(pattern.expectancy),
+                        "ci_low": pattern.expectancy_ci.lower if pattern.expectancy_ci else None,
+                        "ci_high": pattern.expectancy_ci.upper if pattern.expectancy_ci else None,
+                        "lift": _s(pattern.lift),
+                        "baseline": _s(baseline_expectancy),
+                    },
                     "walk_forward_holdout_n": pattern.walk_forward_n,
-                    "walk_forward_lift_usdt": (
+                    "walk_forward_lift": (
                         str(pattern.walk_forward_lift)
                         if pattern.walk_forward_lift is not None
                         else None
@@ -585,8 +633,8 @@ def _evidence_split(
         "calibration_n": len(calibration),
         "oos_n": len(oos),
         "live_n": sum(1 for s in matched if s.live),
-        "calibration_lift_usdt": _lift(calibration),
-        "oos_lift_usdt": _lift(oos),
+        "calibration_lift": _lift(calibration),
+        "oos_lift": _lift(oos),
         "calibration_cut": calibration_cut.isoformat(),
     }
 

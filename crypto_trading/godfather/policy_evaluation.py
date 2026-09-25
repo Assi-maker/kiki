@@ -190,6 +190,15 @@ class TradeEvaluation:
     final_return_pct: Decimal | None
     strata: dict[str, str] = field(default_factory=dict)
 
+    @property
+    def risk_usdt(self) -> Decimal | None:
+        """Initial planned risk in USDT (size x distance to the ORIGINAL
+        stop) - the denominator that turns a USDT delta into R."""
+        if self.entry_price <= _ZERO:
+            return None
+        risk = self.size * (self.entry_price - self.original_stop_loss) / self.entry_price
+        return risk if risk > _ZERO else None
+
     def delta(self, policy: str, pessimistic: bool = False) -> Decimal:
         sim = self.sims[policy]
         pnl = sim.pnl_pessimistic_usdt if pessimistic else sim.pnl_usdt
@@ -464,6 +473,10 @@ def policy_block(trades: list[TradeEvaluation], policy: StopPolicy, cut: datetim
             1 for t in stopped if (t.real_exit_reason or "").lower() == "target"
         ),
         "paired": paired_test(deltas),
+        # The same paired effect in R (Fas 2A): size-independent.
+        "paired_r": paired_test([
+            t.delta(policy.name) / t.risk_usdt for t in active if t.risk_usdt
+        ]),
         "pessimistic_fill": paired_test([t.delta(policy.name, pessimistic=True) for t in active]),
         "train": {"n": len(train), "mean_delta_usdt": _mean_or_none(
             [t.delta(policy.name) for t in train])},
@@ -1147,6 +1160,8 @@ def render_markdown(report: dict) -> str:
     row("mean uplift [95% bootstrap CI]", lambda b: f"{_money(b['paired']['mean_delta_usdt'])} "
         f"[{_money(b['paired']['ci_low_usdt'])}, {_money(b['paired']['ci_high_usdt'])}]")
     row("pessimistic-fill mean uplift", lambda b: _money(b["pessimistic_fill"]["mean_delta_usdt"]))
+    row("mean uplift in R [95% CI]", lambda b: f"{_num(b['paired_r']['mean_delta_usdt'], 3)} R "
+        f"[{_num(b['paired_r']['ci_low_usdt'], 3)}, {_num(b['paired_r']['ci_high_usdt'], 3)}]")
     row("p (sign-flip) / sign test", lambda b: f"{b['paired']['p_value']:.4f} / "
         f"{b['paired']['sign_test_p_value']:.4f}")
     row("train mean uplift (n)", lambda b: f"{_money(b['train']['mean_delta_usdt'])} "

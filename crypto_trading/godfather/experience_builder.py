@@ -92,17 +92,38 @@ def trade_profile(
         elif error["source"] == "trade_thesis":
             profile["thesis_error"] = float(error["magnitude"])
 
+    observation = trade.observation
+    if observation is not None:
+        profile["observation"] = observation.as_dict()
+    if trade.r is not None and trade.r.return_pct is not None:
+        profile["return_pct"] = str(trade.r.return_pct * _HUNDRED)
     if not trade.points or entry == _ZERO:
+        profile["has_path"] = False
+        return profile
+    if observation is not None and not observation.path_usable:
+        # A path with holes yields a lower-bound MFE, an upper-bound MAE and
+        # time-to-events that may be wrong. None of them is recorded - the
+        # trade still counts for its (verified) outcome.
+        profile["has_path"] = False
+        profile["path_excluded"] = observation.path_status
         return profile
 
-    minutes = [p.minutes_in_trade for p in trade.points]
+    # Time is measured from ACTIVATION (the position existing), not from
+    # the decision timestamp the paper entry carries.
+    start = (
+        observation.activation_minutes
+        if observation is not None and observation.activation_minutes is not None
+        else 0.0
+    )
+    start = min(start, trade.points[0].minutes_in_trade)
+    minutes = [p.minutes_in_trade - start for p in trade.points]
     moves = [excursion(p.price, entry) * _HUNDRED for p in trade.points]
     final = (
         excursion(position.theoretical_exit, entry) * _HUNDRED
         if position.theoretical_exit is not None else moves[-1]
     )
     all_moves = [*moves, final]
-    all_minutes = [*minutes, close if close is not None else minutes[-1]]
+    all_minutes = [*minutes, (close - start) if close is not None else minutes[-1]]
     mfe = max(all_moves)
 
     def _first(predicate) -> float | None:
@@ -111,7 +132,12 @@ def trade_profile(
     profile["minutes_to_first_favorable"] = _first(lambda x: x >= Decimal("0.5"))
     profile["levels_reached"] = [str(level) for level in LEVELS_PCT if mfe >= level]
     target_pct = excursion(position.target, entry) * _HUNDRED
-    sl_pct = excursion(position.stop_loss, entry) * _HUNDRED
+    initial_sl = (
+        trade.r.initial_stop_loss
+        if trade.r is not None and trade.r.initial_stop_loss is not None
+        else position.stop_loss
+    )
+    sl_pct = excursion(initial_sl, entry) * _HUNDRED
     profile["minutes_to_target"] = _first(lambda x: x >= target_pct)
     profile["minutes_to_sl"] = _first(lambda x: x <= sl_pct)
     if mfe > _ZERO:
@@ -143,16 +169,19 @@ def build_samples(
 ) -> list[ExperienceSample]:
     samples: list[ExperienceSample] = []
     for trade in book:
-        if trade.pnl is None or trade.position.size == _ZERO or trade.position.closed_at is None:
+        if exclusion_reason(trade) is not None:
             continue
+        path_ok = trade.observation is None or trade.observation.path_usable
         metrics = compute_path_metrics(
-            trade.position, trade.points,
+            trade.position, trade.points if path_ok else [],
             settings.guardian.watch_decay_threshold, settings.guardian.exit_decay_threshold,
         )
         samples.append(ExperienceSample(
             position_id=trade.position.position_id,
             closed_at=trade.position.closed_at,
             pnl=trade.pnl,
+            r=trade.outcome_r,
+            observation=trade.observation.as_dict() if trade.observation else {},
             mfe_pct=metrics.mfe_pct,
             mae_pct=metrics.mae_pct,
             minutes_to_mfe=metrics.minutes_to_mfe,
@@ -168,6 +197,21 @@ def build_samples(
     return samples
 
 
+def exclusion_reason(trade: TradeContext) -> str | None:
+    """Why a closed trade is NOT experience - or None when it is. An
+    outcome that was not seen, or that cannot be expressed in R, is never
+    turned into evidence."""
+    if trade.position.size == _ZERO:
+        return "ZERO_SIZE"
+    if trade.position.closed_at is None:
+        return "NOT_CLOSED"
+    if trade.observation is not None and not trade.observation.outcome_usable:
+        return "UNOBSERVABLE_OUTCOME"
+    if trade.outcome_r is None:
+        return "R_UNAVAILABLE"
+    return None
+
+
 def _group(rows: list[dict]) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
     for row in rows:
@@ -178,7 +222,7 @@ def _group(rows: list[dict]) -> dict[str, list[dict]]:
 def build_samples_from_repo(
     repo: Repository, settings: Settings, book: list[TradeContext] | None = None
 ) -> list[ExperienceSample]:
-    book = book if book is not None else load_book(repo)
+    book = book if book is not None else load_book(repo, settings.risk_limits.fee_pct)
     return build_samples(
         book,
         _group(repo.find_godfather_counterfactuals()),
@@ -193,7 +237,7 @@ def run_experience_backfill(
     """Backfill Experience Memory from the whole history. Restates the
     pattern table (patterns that no longer exist are removed) and removes
     prediction-error rows that belong to zero-size positions."""
-    book = load_book(repo)
+    book = load_book(repo, settings.risk_limits.fee_pct)
     zero_size = [t.position.position_id for t in book if t.position.size == _ZERO]
     removed = repo.delete_godfather_prediction_errors_for_positions(zero_size) if persist else 0
     samples = build_samples_from_repo(repo, settings, book)

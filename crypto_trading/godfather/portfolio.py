@@ -123,8 +123,8 @@ def cohort_outcome_dependence(signals: list[EntrySignal]) -> dict:
     number of independent bets per cohort is m / (1 + (m - 1) ICC)."""
     groups: dict[str, list[float]] = {}
     for s in signals:
-        if s.realized_pnl is not None:
-            groups.setdefault(s.discovery_run_id, []).append(float(s.realized_pnl))
+        if s.outcome is not None:
+            groups.setdefault(s.discovery_run_id, []).append(float(s.outcome))
     groups = {k: v for k, v in groups.items() if len(v) >= 2}
     values = [v for members in groups.values() for v in members]
     k = len(groups)
@@ -184,12 +184,14 @@ def evaluate_diversification(signals: list[EntrySignal], cut: datetime) -> dict:
     kept = [s for s in signals if s.scored and s.portfolio_verdict == "KEEP"]
     skipped = [s for s in signals if s.scored and s.portfolio_verdict == "SKIP_CONCENTRATION"]
     test = two_group_test(
-        [s.realized_pnl for s in skipped], [s.realized_pnl for s in kept]
+        [s.outcome for s in skipped], [s.outcome for s in kept]
     )
     return {
         "kept": len(kept),
         "skipped_concentration": len(skipped),
-        "skipped_total_pnl_usdt": str(sum((s.realized_pnl for s in skipped), _ZERO)),
+        "skipped_total_pnl_usdt": str(sum(
+            (s.realized_pnl for s in skipped if s.realized_pnl is not None), _ZERO
+        )),
         "skipped_minus_kept": test,
         "skipped_train_n": sum(1 for s in skipped if s.decided_at < cut),
         "skipped_test_n": sum(1 for s in skipped if s.decided_at >= cut),

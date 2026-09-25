@@ -171,6 +171,44 @@ def coverage(book: list[TradeContext], samples: list[ExperienceSample], repo: Re
     }
 
 
+def observation_integrity(book: list[TradeContext], samples: list[ExperienceSample]) -> dict:
+    """Fas 2A: how well each trade was observed, and why trades were left
+    out of Experience Memory."""
+    from crypto_trading.godfather.experience_builder import exclusion_reason
+
+    status: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    exclusions: dict[str, int] = {}
+    outcome_sources: dict[str, int] = {}
+    for trade in book:
+        obs = trade.observation
+        if obs is not None:
+            status[obs.status] = status.get(obs.status, 0) + 1
+            outcome_sources[obs.outcome_source] = outcome_sources.get(obs.outcome_source, 0) + 1
+            for reason in obs.reasons:
+                reasons[reason] = reasons.get(reason, 0) + 1
+        why = exclusion_reason(trade)
+        if why is not None:
+            exclusions[why] = exclusions.get(why, 0) + 1
+    r_values = sorted(float(s.r) for s in samples if s.r is not None)
+    return {
+        "status": status,
+        "reasons": dict(sorted(reasons.items(), key=lambda kv: -kv[1])),
+        "outcome_sources": outcome_sources,
+        "excluded_from_experience": exclusions,
+        "path_usable": sum(1 for t in book if t.observation and t.observation.path_usable),
+        "r": {
+            "n": len(r_values),
+            "expectancy": stats.mean(r_values),
+            "median": r_values[len(r_values) // 2] if r_values else None,
+            "win_rate": (sum(1 for v in r_values if v > 0) / len(r_values)) if r_values else None,
+            "worst": r_values[:3],
+            "best": r_values[-3:],
+            "expectancy_without_worst3": stats.mean(r_values[3:]) if len(r_values) > 6 else None,
+        },
+    }
+
+
 def learned(patterns: list[ExperiencePattern]) -> dict:
     classified = [p for p in patterns if p.edge_class not in ("NOISE", "INSUFFICIENT_DATA")]
     entry_classes: dict[str, int] = {}
@@ -186,6 +224,8 @@ def learned(patterns: list[ExperiencePattern]) -> dict:
             "pattern": p.pattern_key,
             "n": p.sample_size,
             "expectancy_usdt": None if p.expectancy_usdt is None else float(p.expectancy_usdt),
+            "expectancy_r": (_detail(p).get("outcome") or {}).get("expectancy")
+            if _detail(p).get("outcome_metric") == "R" else None,
             "win_rate": p.win_rate,
             "mfe_p50": (profile.get("mfe_pct") or {}).get("p50"),
             "mae_p50": (profile.get("mae_pct") or {}).get("p50"),
@@ -243,7 +283,8 @@ def management_experience(samples: list[ExperienceSample]) -> dict:
         maes = [float(s.mae_pct) for s in group if s.mae_pct is not None]
         exits[reason] = {
             "n": len(group),
-            "mean_pnl_usdt": stats.mean([float(s.pnl) for s in group]),
+            "mean_pnl_usdt": stats.mean([float(s.pnl) for s in group if s.pnl is not None]),
+            "mean_r": stats.mean([float(s.r) for s in group if s.r is not None]),
             "median_mfe_pct": sorted(mfes)[len(mfes) // 2] if mfes else None,
             "median_mae_pct": sorted(maes)[len(maes) // 2] if maes else None,
         }
@@ -286,6 +327,7 @@ def run_fas2(
         "ai_calls": 0,
         "cleanup": cleanup,
         "coverage": coverage(book, samples, repo),
+        "observation_integrity": observation_integrity(book, samples),
         "learned": learned(patterns),
         "evidence_quality": evidence_quality(patterns),
         "management": management_experience(samples),
@@ -320,6 +362,20 @@ def render_markdown(report: dict) -> str:
     for key, value in c.items():
         w(f"- {key.replace('_', ' ')}: {value}")
     w("")
+    oi = report.get("observation_integrity")
+    if oi:
+        w("## Observation integrity")
+        w("")
+        w(f"- Status: {oi['status']}; outcome source: {oi['outcome_sources']}; "
+          f"path fully observed: {oi['path_usable']}")
+        w(f"- Excluded from Experience Memory: {oi['excluded_from_experience']}")
+        w(f"- Reasons: {oi['reasons']}")
+        r = oi["r"]
+        w(f"- R over {r['n']} trades: expectancy {_f(r['expectancy'], 3)} R, median "
+          f"{_f(r['median'], 3)} R, win rate {_pct(r['win_rate'])}, worst "
+          f"{[round(v, 2) for v in r['worst']]}, expectancy without the 3 worst "
+          f"{_f(r['expectancy_without_worst3'], 3)} R")
+        w("")
     le = report["learned"]
     w("## Learned experience")
     w("")
@@ -334,11 +390,12 @@ def render_markdown(report: dict) -> str:
     else:
         w("**No pattern is EDGE, WEAK_EDGE, REGIME_DEPENDENT, DECAYING_EDGE or FAILURE_PATTERN.**")
     w("")
-    w("| pattern | n | expectancy | win rate | MFE p50 % | MAE p50 % | entry success | P/L class "
-      "| entry class | OOS n |")
-    w("|---|---|---|---|---|---|---|---|---|---|")
+    w("| pattern | n | expectancy R | expectancy USDT | win rate | MFE p50 % | MAE p50 % "
+      "| entry success | P/L class | entry class | OOS n |")
+    w("|---|---|---|---|---|---|---|---|---|---|---|")
     for r in le["regime_and_feature_profiles"]:
-        w(f"| {r['pattern']} | {r['n']} | {_f(r['expectancy_usdt'])} | {_pct(r['win_rate'])} | "
+        w(f"| {r['pattern']} | {r['n']} | {_f(r['expectancy_r'], 3)} | "
+          f"{_f(r['expectancy_usdt'])} | {_pct(r['win_rate'])} | "
           f"{_f(r['mfe_p50'])} | {_f(r['mae_p50'])} | {_pct(r['entry_success_rate'])} | "
           f"{r['edge_class']} | {r['entry_class']} | {r['oos_n']} |")
     w("")
@@ -351,11 +408,11 @@ def render_markdown(report: dict) -> str:
     m = report["management"]
     w("## Exit / management experience")
     w("")
-    w("| exit | n | mean P/L | median MFE % | median MAE % |")
-    w("|---|---|---|---|---|")
+    w("| exit | n | mean R | mean P/L USDT | median MFE % | median MAE % |")
+    w("|---|---|---|---|---|---|")
     for reason, row in m["by_exit_reason"].items():
-        w(f"| {reason} | {row['n']} | {_f(row['mean_pnl_usdt'])} | {_f(row['median_mfe_pct'])} "
-          f"| {_f(row['median_mae_pct'])} |")
+        w(f"| {reason} | {row['n']} | {_f(row.get('mean_r'), 3)} | {_f(row['mean_pnl_usdt'])} "
+          f"| {_f(row['median_mfe_pct'])} | {_f(row['median_mae_pct'])} |")
     w("")
     w(f"Entry vs management: {m['entry_vs_management']}.")
     w("")

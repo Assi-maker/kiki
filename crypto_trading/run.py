@@ -34,6 +34,7 @@ from crypto_trading.connectors.news_rss import NewsRSSConnector
 from crypto_trading.dashboard.api import RepositoryFactory, create_app
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.notify.telegram import TelegramNotifier
+from crypto_trading.single_instance import AlreadyRunningError, InstanceLock, lock_path_for
 from crypto_trading.storage.repository import SQLiteRepository
 
 
@@ -347,6 +348,15 @@ def _run_dashboard_forever(app: FastAPI, settings: Settings) -> None:
 
 def main() -> None:
     settings = get_settings()
+    # One process per database (2026-09-25): two concurrent bots doubled
+    # every loop on 2026-09-12. Held for the whole process lifetime and
+    # released by the OS on exit, so a crash never leaves a stale lock.
+    instance_lock = InstanceLock(lock_path_for(settings.db_path))
+    try:
+        instance_lock.acquire()
+    except AlreadyRunningError as exc:
+        print(f"crypto_trading is already running: {exc}")
+        raise SystemExit(1) from exc
     runner = build_runner_from_env()
     screener_runner = build_screener_runner_from_env()
     detective_runner = build_detective_runner_from_env()

@@ -560,6 +560,9 @@ class Repository(Protocol):
     def find_godfather_policy_transitions(self) -> list[dict]: ...
     def replace_godfather_experience_patterns(self, records: list[ExperiencePattern]) -> None: ...
     def delete_godfather_prediction_errors_for_positions(self, position_ids: list[str]) -> int: ...
+    def find_runs_by_type(self, run_type: str) -> list[dict]: ...
+    def get_position_opened_run(self, position_id: str) -> dict | None: ...
+    def find_guardian_authority_decisions_for_position(self, position_id: str) -> list[dict]: ...
 
 
 class SQLiteRepository:
@@ -3545,3 +3548,32 @@ class SQLiteRepository:
             removed += cur.rowcount
         self._conn.commit()
         return removed
+
+    def find_runs_by_type(self, run_type: str) -> list[dict]:
+        """Read-only: every run of one type (observation-integrity analysis
+        reconstructs monitoring coverage from these)."""
+        rows = self._conn.execute(
+            "SELECT run_id, run_type, started_at, completed_at, status FROM runs "
+            "WHERE run_type = ? ORDER BY started_at ASC",
+            (run_type,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_position_opened_run(self, position_id: str) -> dict | None:
+        """Read-only: the run whose POSITION_OPENED event created this
+        position - its completion bounds when the position came to exist."""
+        row = self._conn.execute(
+            "SELECT r.run_id, r.run_type, r.started_at, r.completed_at FROM events e "
+            "JOIN runs r ON r.run_id = e.run_id "
+            "WHERE e.aggregate_id = ? AND e.event_type = 'POSITION_OPENED' LIMIT 1",
+            (position_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_guardian_authority_decisions_for_position(self, position_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT * FROM guardian_authority_decisions WHERE position_id = ? "
+            "ORDER BY decided_at ASC",
+            (position_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
