@@ -141,7 +141,7 @@ from decimal import Decimal
 
 from crypto_trading.config.loader import RiskLimitsConfig, Settings
 from crypto_trading.logging import log_event
-from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.paper_trading.execution import compute_pnl, realized_pnl_for
 from crypto_trading.paper_trading.position_opening import open_position_for_candidate
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.trade import Position
@@ -821,7 +821,16 @@ def resolve_pending_decisions(repo: Repository, now: datetime) -> int:
             continue
 
         actual_exit_reason = position.exit_reason
-        actual_pnl = compute_pnl(position)
+        # 2026-09-26: a position closed only by the LIVE exit mirror has no
+        # PAPER exit, and compute_pnl raised on it - aborting every Guardian
+        # tick at this call. The outcome is now PAPER (exactly compute_pnl)
+        # or the LIVE execution's verified exchange exit, in the same
+        # paper-size units as every other row (same sign as the real
+        # result). An UNVERIFIABLE outcome stays PENDING: never resolved on,
+        # never learned from.
+        actual_pnl = realized_pnl_for(repo, position).paper_size_equivalent(position)
+        if actual_pnl is None:
+            continue
         actual_pnl_usdt = str(actual_pnl)
 
         if decision["decision_type"] in ("CLOSE_EARLY", "TAKE_PROFIT"):

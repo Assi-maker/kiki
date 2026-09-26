@@ -350,3 +350,48 @@ def test_strategist_context_builds_and_marks_the_pnl_source(tmp_path):
     assert len(rows) == 3
     assert sorted(row["pnl_source"] for row in rows) == ["LIVE", "PAPER", "PAPER"]
     assert all(row["pnl_usdt"] != "None" for row in rows)
+
+
+# --- Guardian Authority outcome resolution (explicitly approved 2026-09-26) --
+
+
+def _tighten_sl_decision(repo, decision_id, position_id, expected="favorable"):
+    repo.save_guardian_authority_decision(
+        decision_id, position_id, position_id, "TIGHTEN_SL", _T0 - timedelta(hours=1),
+        "reasoning", "expect a favorable move", expected, 0.7, "run-1",
+        old_sl="90", new_sl="95",
+    )
+
+
+def test_resolve_pending_decisions_uses_a_verified_live_outcome(tmp_path):
+    from crypto_trading.guardian.authority import resolve_pending_decisions
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _live_only_close(repo, "lv", _T0, "97", "TIME_LIMIT", None)
+    _tighten_sl_decision(repo, "ga-lv", "lv")
+
+    assert resolve_pending_decisions(repo, _T0 + timedelta(hours=1)) == 1
+    row = repo.get_guardian_authority_decision("ga-lv")
+    assert row["outcome_status"] == "RESOLVED"
+    # paper-size units (same as every other row): -3.04% net x 1000 paper size
+    assert Decimal(row["actual_pnl_usdt"]) == Decimal("-30.4")
+    assert row["expectation_correct"] == 0  # predicted favorable, really lost
+
+
+def test_resolve_pending_decisions_leaves_an_unverifiable_outcome_pending(tmp_path):
+    """Before the fix this raised NoneType - Decimal and, being called from
+    the Guardian tick, would have stopped Guardian for every open position."""
+    from crypto_trading.guardian.authority import resolve_pending_decisions
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _live_only_close(repo, "lv", _T0, "99", "stop_loss", None)
+    _seed_closed_position(repo, "paper", _T0, Decimal("101"))
+    _tighten_sl_decision(repo, "ga-lv", "lv")
+    _tighten_sl_decision(repo, "ga-paper", "paper")
+
+    assert resolve_pending_decisions(repo, _T0 + timedelta(hours=1)) == 1
+    assert repo.get_guardian_authority_decision("ga-lv")["outcome_status"] == "PENDING"
+    paper = repo.get_guardian_authority_decision("ga-paper")
+    assert paper["outcome_status"] == "RESOLVED"
+    assert paper["actual_pnl_usdt"] == str(compute_pnl(repo.get_position("paper")))
+    assert paper["expectation_correct"] == 1
