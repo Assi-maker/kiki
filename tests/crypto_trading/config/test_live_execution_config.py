@@ -8,7 +8,7 @@ def test_settings_load_live_execution_defaults():
     assert live.claim_stale_after_seconds > 0
     assert live.max_retries > 0
     assert live.max_concurrent_positions == 4
-    assert live.margin_per_trade_usdt == 10
+    assert live.margin_per_trade_usdt == 100
     assert live.leverage == 10
     assert live.max_position_hold_hours == 6
     assert live.margin_safety_buffer_usdt == 1

@@ -43,7 +43,12 @@ from crypto_trading.godfather.reconstruction import (
     replay_exit,
     verify_exit,
 )
-from crypto_trading.godfather.risk_units import RMultiple, compute_r, initial_stop_loss
+from crypto_trading.godfather.risk_units import (
+    RMultiple,
+    compute_r,
+    initial_stop_loss,
+    live_usdt_outcome,
+)
 from crypto_trading.paper_trading.execution import compute_fill_price, compute_pnl_or_none
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.trade import Position
@@ -115,6 +120,9 @@ class TradeContext:
     candle_path: dict | None = None
     kline_replay: KlineReplay | None = None
     kline_verdict: str | None = None
+    # LIVE trades only: USDT at the execution's own exchange size (see
+    # risk_units.live_usdt_outcome) - never used to compare edges.
+    live_usdt: dict | None = None
 
     @property
     def scorable(self) -> bool:
@@ -394,6 +402,7 @@ def load_book(
             candle_path=candle_stats,
             kline_replay=replay,
             kline_verdict=verdict,
+            live_usdt=live_usdt_outcome(live_execution, r, position.direction, fee_pct),
         ))
     book.sort(key=lambda t: t.position.opened_at)
     return book

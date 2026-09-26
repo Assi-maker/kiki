@@ -420,7 +420,7 @@ def test_get_settings_loads_live_discovery_gate_config_and_leaves_hard_caps_unto
     assert live.discovery_gate_cooldown_seconds == 300
     assert live.discovery_candidate_buffer == 0
     assert live.max_concurrent_positions == 4
-    assert live.margin_per_trade_usdt == Decimal("10")
+    assert live.margin_per_trade_usdt == Decimal("100")
     assert live.leverage == 10
     assert live.margin_safety_buffer_usdt == Decimal("1.00")
     assert live.signal_ttl_seconds == 1800

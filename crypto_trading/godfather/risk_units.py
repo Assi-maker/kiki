@@ -135,3 +135,68 @@ def compute_r(
         return_pct=return_pct,
         risk_usdt=risk_usdt if risk_usdt > _ZERO else None,
     )
+
+
+def live_usdt_outcome(
+    live_execution: dict | None, r: RMultiple | None, direction: str, fee_pct: Decimal | None
+) -> dict | None:
+    """USDT for a LIVE trade at its OWN exchange size, never the paper size.
+
+    `RMultiple.risk_usdt` is `position.size x risk %` - the PAPER size,
+    which is what the paper counterfactual deltas it divides are measured
+    in, so it must stay that way. A LIVE execution has its own, fixed size
+    (margin x leverage, `live_execution.yaml`; 100 USDT notional before
+    2026-09-26, 1 000 USDT after), recorded per row - so a book that
+    spans the change mixes both, and only the row's own quantity is
+    right. Edge comparisons stay in R / %; this is reporting only.
+
+    Real fees/funding are taken when the row has them; LIVE closes do not
+    record them today, so fees fall back to the same `fee_pct` model R's
+    net already uses (flagged MODELLED) and unknown funding counts as 0
+    (flagged UNKNOWN)."""
+    if live_execution is None:
+        return None
+    qty = _decimal(live_execution.get("entry_quantity"))
+    entry = _decimal(live_execution.get("exchange_fill_entry"))
+    exit_ = _decimal(live_execution.get("exchange_fill_exit"))
+    notional = (
+        qty * entry if qty is not None and entry is not None and qty > _ZERO and entry > _ZERO
+        else _decimal(live_execution.get("notional_usdt"))
+    )
+    out: dict = {
+        "margin_usdt": _decimal(live_execution.get("margin_usdt")),
+        "leverage": _decimal(live_execution.get("leverage")),
+        "entry_quantity": qty,
+        "notional_usdt": notional,
+        "planned_risk_usdt": (
+            notional * r.initial_risk_pct
+            if notional is not None and r is not None and r.initial_risk_pct is not None
+            else None
+        ),
+        "gross_pnl_usdt": None,
+        "fees_usdt": None,
+        "fees_source": None,
+        "funding_usdt": None,
+        "funding_source": None,
+        "net_pnl_usdt": None,
+    }
+    if qty is None or qty <= _ZERO or entry is None or exit_ is None or notional is None:
+        return out
+    gross = _sign(direction) * (exit_ - entry) * qty
+    fees = _decimal(live_execution.get("realized_fees_usdt"))
+    if fees is not None:
+        out["fees_source"] = "EXCHANGE"
+    elif fee_pct is not None:
+        fees, out["fees_source"] = notional * fee_pct, "MODELLED"
+    funding = _decimal(live_execution.get("realized_funding_usdt"))
+    out["funding_source"] = "EXCHANGE" if funding is not None else "UNKNOWN"
+    out.update(
+        gross_pnl_usdt=gross,
+        fees_usdt=fees,
+        funding_usdt=funding,
+        net_pnl_usdt=(
+            gross - fees + (funding if funding is not None else _ZERO)
+            if fees is not None else None
+        ),
+    )
+    return out

@@ -226,3 +226,70 @@ def exposure_profile(
         "peak_concurrent_notional_usdt": str(peak),
         "peak_single_theme_share": peak_theme_share,
     }
+
+
+def live_capital_profile(
+    trades: list[tuple[datetime, datetime | None, dict, Decimal | None]],
+) -> dict:
+    """LIVE book at each execution's own exchange size: (claimed, closed,
+    `risk_units.live_usdt_outcome` dict, net R).
+
+    Grouped by notional tier because the configured size changed on
+    2026-09-26 (100 -> 1 000 USDT notional): USDT is only summed WITHIN a
+    tier, while R is the one number compared ACROSS tiers - a 10x larger
+    position must never read as a 10x better or worse edge. Executions
+    that never filled are left out entirely."""
+    tiers: dict[str, dict] = {}
+    notional_events: list[tuple[datetime, Decimal]] = []
+    margin_events: list[tuple[datetime, Decimal]] = []
+    for claimed, closed, usdt, r_net in trades:
+        qty = usdt.get("entry_quantity")
+        if qty is None or qty <= _ZERO:
+            continue  # never filled (e.g. FAILED): no capital was ever at risk
+        notional = usdt.get("notional_usdt")
+        margin = usdt.get("margin_usdt")
+        tier_key = str(usdt.get("margin_usdt")) if margin is not None else "unknown"
+        tier = tiers.setdefault(tier_key, {
+            "trades": 0, "net_pnl_usdt": _ZERO, "pnl_trades": 0,
+            "planned_risk_usdt": _ZERO, "r_values": [],
+        })
+        tier["trades"] += 1
+        if usdt.get("net_pnl_usdt") is not None:
+            tier["net_pnl_usdt"] += usdt["net_pnl_usdt"]
+            tier["pnl_trades"] += 1
+        if usdt.get("planned_risk_usdt") is not None:
+            tier["planned_risk_usdt"] += usdt["planned_risk_usdt"]
+        if r_net is not None:
+            tier["r_values"].append(r_net)
+        for events, amount in ((notional_events, notional), (margin_events, margin)):
+            if amount is None:
+                continue
+            events.append((claimed, amount))
+            if closed is not None:
+                events.append((closed, -amount))
+
+    def _peak(events: list[tuple[datetime, Decimal]]) -> Decimal:
+        current = peak = _ZERO
+        for _moment, change in sorted(events, key=lambda e: (e[0], e[1])):
+            current += change
+            peak = max(peak, current)
+        return peak
+
+    return {
+        "by_margin_tier_usdt": {
+            key: {
+                "trades": t["trades"],
+                "net_pnl_usdt": str(t["net_pnl_usdt"]),
+                "pnl_trades": t["pnl_trades"],
+                "planned_risk_usdt": str(t["planned_risk_usdt"]),
+                "expectancy_r": (
+                    str(sum(t["r_values"], _ZERO) / Decimal(len(t["r_values"])))
+                    if t["r_values"] else None
+                ),
+                "r_trades": len(t["r_values"]),
+            }
+            for key, t in sorted(tiers.items())
+        },
+        "peak_concurrent_notional_usdt": str(_peak(notional_events)),
+        "peak_concurrent_margin_usdt": str(_peak(margin_events)),
+    }

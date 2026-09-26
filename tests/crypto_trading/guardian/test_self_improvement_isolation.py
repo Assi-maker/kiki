@@ -190,12 +190,14 @@ _LIVE_EXECUTION_YAML_PATH = "crypto_trading/config/live_execution.yaml"
 _LIVE_EXECUTION_HARD_LIMIT_FIELDS = ("leverage", "margin_per_trade_usdt", "max_concurrent_positions")
 
 # Recorded once (2026-09-17, authoring/fix time), from the live checked-out
-# files - never from git history.
+# files - never from git history. The LIVE hard-limit hash was re-recorded
+# 2026-09-26 for an explicit user decision (margin_per_trade_usdt 10 -> 100;
+# leverage 10 and max_concurrent_positions 4 unchanged).
 _EXPECTED_RISK_LIMITS_YAML_SHA256 = (
     "88806ef2f5d74b2f5a494eb3a70a0d98d4b1ce8b66c91387a427b65652a2112b"
 )
 _EXPECTED_LIVE_EXECUTION_HARD_LIMITS_SHA256 = (
-    "2efa5bacb4c509333ed71267dfd4091456b9e8d27eb68a4c842ef3fec12adb05"
+    "9c0f3227ed40a402aaa535be230e05d4186a23d9d2846fb40232d91a2584b0a3"
 )
 
 

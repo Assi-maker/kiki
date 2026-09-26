@@ -28,6 +28,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from crypto_trading.godfather.path import PathMetrics
+from crypto_trading.godfather.risk_units import live_usdt_outcome
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.godfather import (
     AvoidableLossFinding,
@@ -252,7 +253,14 @@ def build_after_section(
             "realized_funding_usdt": live_execution.get("realized_funding_usdt"),
             "notional_usdt": live_execution.get("notional_usdt"),
             "leverage": live_execution.get("leverage"),
+            "margin_usdt": live_execution.get("margin_usdt"),
+            "entry_quantity": live_execution.get("entry_quantity"),
         }
+        # Real gross P/L at the LIVE execution's own size - realized_pnl_usdt
+        # above is the paper position's, a different (paper) size.
+        own_size = live_usdt_outcome(live_execution, None, position.direction, None)
+        gross = own_size.get("gross_pnl_usdt") if own_size else None
+        after["live"]["gross_pnl_usdt"] = str(gross) if gross is not None else None
     return after
 
 

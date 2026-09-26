@@ -225,3 +225,14 @@ def test_a_permissive_decision_is_never_served_from_cache(tmp_path):
     _evaluate(repo, live, gate=gate, now=_NOW + timedelta(seconds=10))
 
     assert live.balance_calls == 2
+
+
+def test_affordable_slots_at_the_2026_09_26_capital_level():
+    """100 USDT margin + 1.00 buffer per position (real live_execution.yaml)."""
+    from crypto_trading.config.loader import get_settings
+
+    cfg = get_settings().live_execution
+    assert affordable_live_slots(Decimal("100.99"), cfg) == 0
+    assert affordable_live_slots(Decimal("101.00"), cfg) == 1
+    assert affordable_live_slots(Decimal("401.00"), cfg) == 4
+    assert affordable_live_slots(Decimal("400.00"), cfg) == 3

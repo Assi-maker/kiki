@@ -174,7 +174,7 @@ def test_has_sufficient_live_capacity_false_when_reconciled_count_at_cap(tmp_pat
             pid, f"cid-{i}", f"ex-{i}", "0.002", "50000", None, None, _NOW
         )
     connector = _SpyConnector(
-        balance="100.00",
+        balance="1000.00",
         all_positions=[{"symbol": "BTC-USDT", "positionAmt": "0.002"}] * 4,
     )
 
@@ -203,7 +203,7 @@ def test_reconcile_active_executions_closes_out_positions_gone_flat_on_exchange(
 def test_process_pending_positions_claims_and_submits_when_capacity_available(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = get_settings()
 
     process_pending_positions(
@@ -214,8 +214,8 @@ def test_process_pending_positions_claims_and_submits_when_capacity_available(tm
     assert connector.leverage_calls == [("BTC-USDT", 10)]
     row = repo.get_live_execution("pos-1")
     assert row["phase"] == "ACTIVE"
-    assert row["margin_usdt"] == "10"
-    assert row["notional_usdt"] == "100"
+    assert row["margin_usdt"] == "100"
+    assert row["notional_usdt"] == "1000"
 
 
 def test_process_pending_positions_blocks_a_second_symbol_when_one_is_already_active(tmp_path):
@@ -230,7 +230,7 @@ def test_process_pending_positions_blocks_a_second_symbol_when_one_is_already_ac
     )
     _open_position(repo, position_id="pos-2")
     connector = _SpyConnector(
-        balance="100.00",
+        balance="1000.00",
         # pos-1 must still look genuinely open on the exchange, or
         # has_sufficient_live_capacity's own reconciliation pass would
         # auto-close it as gone-flat before the symbol gate is even reached.
@@ -252,7 +252,7 @@ def test_process_pending_positions_allows_the_only_pending_symbol(tmp_path):
     never block a legitimate first entry."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, position_id="pos-1")
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = get_settings()
 
     process_pending_positions(
@@ -294,7 +294,7 @@ def test_process_pending_positions_allows_a_new_symbol_position_once_the_old_one
     )
     repo.close_live_execution("pos-1", "TIME_LIMIT", "50100", _NOW)
     _open_position(repo, position_id="pos-2")
-    connector = _SpyConnector(balance="100.00", all_positions=[])  # exchange also flat
+    connector = _SpyConnector(balance="1000.00", all_positions=[])  # exchange also flat
     settings = get_settings()
 
     process_pending_positions(
@@ -313,7 +313,7 @@ def test_process_pending_positions_blocks_when_only_the_exchange_knows_about_the
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, position_id="pos-1")
     connector = _SpyConnector(
-        balance="100.00", all_positions=[{"symbol": "BTC-USDT", "positionAmt": "0.002"}],
+        balance="1000.00", all_positions=[{"symbol": "BTC-USDT", "positionAmt": "0.002"}],
     )
     settings = get_settings()
 
@@ -339,7 +339,7 @@ def test_process_pending_positions_claims_a_fresh_signal_within_ttl(tmp_path):
     exactly as before the TTL check existed - no regression to §7/§8."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, confirmed_at=_NOW - timedelta(minutes=5))
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = _with_ttl(get_settings(), ttl_seconds=1800)
 
     process_pending_positions(
@@ -356,7 +356,7 @@ def test_process_pending_positions_treats_signal_exactly_at_ttl_boundary_as_elig
     (inclusive boundary) - not stale."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, confirmed_at=_NOW - timedelta(seconds=1800))
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = _with_ttl(get_settings(), ttl_seconds=1800)
 
     process_pending_positions(
@@ -376,7 +376,7 @@ def test_process_pending_positions_never_claims_a_signal_older_than_ttl(tmp_path
     ever at risk)."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, confirmed_at=_NOW - timedelta(seconds=1801))
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = _with_ttl(get_settings(), ttl_seconds=1800)
 
     process_pending_positions(
@@ -406,7 +406,7 @@ def test_process_pending_positions_old_stale_backlog_never_blocks_a_fresh_signal
         repo, position_id="pos-fresh",
         opened_at=_NOW, confirmed_at=_NOW - timedelta(minutes=5),  # well within TTL
     )
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = _with_ttl(get_settings(), ttl_seconds=1800)
 
     process_pending_positions(
@@ -428,7 +428,7 @@ def test_process_pending_positions_never_claims_a_very_old_signal_across_repeate
     confirmed_at, ttl), so it can never "eventually" succeed."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, confirmed_at=_NOW - timedelta(days=2))
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = _with_ttl(get_settings(), ttl_seconds=1800)
 
     for tick_offset in (0, 60, 3600, 7200):
@@ -457,7 +457,7 @@ def test_process_pending_positions_treats_a_missing_confirmed_event_as_stale(tmp
         run_id="seed", schema_version=1, payload={},
     )
     repo.create_position_with_event(position, event)  # deliberately no CONFIRMED event
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = _with_ttl(get_settings(), ttl_seconds=1800)
 
     process_pending_positions(
@@ -481,7 +481,7 @@ def test_process_pending_positions_restart_never_reclaims_an_already_stale_signa
     (simulating a further restart) still does."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, confirmed_at=_NOW - timedelta(hours=10))
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = _with_ttl(get_settings(), ttl_seconds=1800)
 
     # "first tick after restart"
@@ -509,7 +509,7 @@ def test_process_pending_positions_skips_when_capacity_full(tmp_path):
     )
     _open_position(repo, "pos-new")
     connector = _SpyConnector(
-        balance="100.00",
+        balance="1000.00",
         all_positions=[{"symbol": "BTC-USDT", "positionAmt": "0.002"}],
     )
     settings = get_settings()
@@ -532,12 +532,12 @@ def test_process_pending_positions_skips_when_capacity_full(tmp_path):
 def test_process_pending_positions_skips_safely_below_exchange_minimum(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = get_settings()
 
     process_pending_positions(
         repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
-        {"BTC-USDT": Decimal("1000")},  # exchange minimum notional far above 100 USDT
+        {"BTC-USDT": Decimal("5000")},  # exchange minimum notional far above the 1000 USDT order
         settings, "r1", _NOW,
     )
 
@@ -553,7 +553,7 @@ def test_process_pending_positions_marks_failed_on_confirmed_rejection(tmp_path)
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(
-        balance="100.00", all_positions=[], order_status="REJECTED", executed_qty="0",
+        balance="1000.00", all_positions=[], order_status="REJECTED", executed_qty="0",
     )
     settings = get_settings()
 
@@ -574,7 +574,7 @@ def test_process_pending_positions_leaves_row_uncertain_on_unrecognized_status(t
     guessed either way - stays ENTRY_SUBMITTED, retried later."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
-    connector = _SpyConnector(balance="100.00", all_positions=[], order_status="NEW", executed_qty="0")
+    connector = _SpyConnector(balance="1000.00", all_positions=[], order_status="NEW", executed_qty="0")
     settings = get_settings()
 
     process_pending_positions(
@@ -594,7 +594,7 @@ def test_process_pending_positions_leaves_row_uncertain_on_partial_fill(tmp_path
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(
-        balance="100.00", all_positions=[], order_status="PARTIALLY_FILLED", executed_qty="0.001",
+        balance="1000.00", all_positions=[], order_status="PARTIALLY_FILLED", executed_qty="0.001",
     )
     settings = get_settings()
 
@@ -624,7 +624,7 @@ def test_process_pending_positions_leaves_claimed_on_placement_timeout_with_unre
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(
-        balance="100.00", all_positions=[],
+        balance="1000.00", all_positions=[],
         place_raises=httpx.TransportError("timed out"),
         lookup_raises=httpx.TransportError("timed out"),
     )
@@ -648,7 +648,7 @@ def test_process_pending_positions_promotes_to_active_when_timeout_but_lookup_co
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(
-        balance="100.00", all_positions=[],
+        balance="1000.00", all_positions=[],
         place_raises=httpx.TransportError("timed out"),
         order_status="FILLED", executed_qty="0.002",
     )
@@ -675,7 +675,7 @@ def test_process_pending_positions_leaves_claimed_on_application_level_placement
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(
-        balance="100.00", all_positions=[],
+        balance="1000.00", all_positions=[],
         place_raises=ConnectorUnavailableError("boom"),
         lookup_returns_none=True,
     )
@@ -702,7 +702,7 @@ def test_process_pending_positions_marks_failed_immediately_on_order_rejected_er
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(
-        balance="100.00", all_positions=[],
+        balance="1000.00", all_positions=[],
         place_raises=OrderRejectedError(
             "BingX Live API error 101400: TP Price must be greater than Last Price "
             "(/openApi/swap/v2/trade/order)"
@@ -731,7 +731,7 @@ def test_a_rejected_entry_frees_the_live_capacity_slot_for_the_next_candidate(tm
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, position_id="pos-1")
     _open_position(repo, position_id="pos-2")
-    connector = _SpyConnector(balance="100.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
     settings = get_settings()
     settings = settings.model_copy(
         update={"live_execution": settings.live_execution.model_copy(
@@ -775,7 +775,7 @@ def test_resolve_pending_entries_never_resubmits_across_repeated_uncertain_ticks
     order for the same position."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
-    connector = _SpyConnector(balance="100.00", all_positions=[], order_status="NEW", executed_qty="0")
+    connector = _SpyConnector(balance="1000.00", all_positions=[], order_status="NEW", executed_qty="0")
     settings = get_settings()
 
     process_pending_positions(
@@ -896,7 +896,7 @@ def test_recover_stale_claims_promotes_to_active_when_lookup_confirms_filled(tmp
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     repo.claim_live_execution("pos-1", _NOW - timedelta(seconds=60), "10", "100", "10")
-    connector = _SpyConnector(balance="100.00")
+    connector = _SpyConnector(balance="1000.00")
 
     recover_stale_claims(repo, connector, "r1", _NOW, stale_after_seconds=30)
 
@@ -913,7 +913,7 @@ def test_recover_stale_claims_never_resubmits_when_status_is_unresolvable(tmp_pa
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     repo.claim_live_execution("pos-1", _NOW - timedelta(seconds=60), "10", "100", "10")
-    connector = _SpyConnector(balance="100.00", lookup_returns_none=True)
+    connector = _SpyConnector(balance="1000.00", lookup_returns_none=True)
 
     recover_stale_claims(repo, connector, "r1", _NOW, stale_after_seconds=30)
     recover_stale_claims(repo, connector, "r1", _NOW + timedelta(seconds=30), stale_after_seconds=30)
@@ -927,7 +927,7 @@ def test_recover_stale_claims_marks_failed_only_on_confirmed_rejection(tmp_path)
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     repo.claim_live_execution("pos-1", _NOW - timedelta(seconds=60), "10", "100", "10")
-    connector = _SpyConnector(balance="100.00", order_status="CANCELED", executed_qty="0")
+    connector = _SpyConnector(balance="1000.00", order_status="CANCELED", executed_qty="0")
 
     recover_stale_claims(repo, connector, "r1", _NOW, stale_after_seconds=30)
 
@@ -1139,3 +1139,92 @@ def test_close_guardian_exit_positions_is_idempotent_and_preserves_paper_close(t
     assert closed.simulated_fill_exit == Decimal("49500")
     assert closed.closed_at == _NOW
     assert position.position_id == "pos-1"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-26 LIVE capital level (explicit user decision): 100 USDT margin x
+# 10 leverage = ~1000 USDT notional, max 4 concurrent, max 1 per symbol -
+# from the real live_execution.yaml, through the unchanged sizing path.
+# ---------------------------------------------------------------------------
+
+
+def test_real_live_config_is_100_margin_10x_leverage_max_4():
+    cfg = get_settings().live_execution
+    assert cfg.margin_per_trade_usdt == Decimal("100")
+    assert cfg.leverage == 10
+    assert cfg.max_concurrent_positions == 4
+    assert cfg.margin_per_trade_usdt * cfg.leverage == Decimal("1000")
+
+
+def test_process_pending_positions_sizes_a_live_order_at_1000_usdt_notional(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, entry=Decimal("50000"))
+    connector = _SpyConnector(balance="1000.00", all_positions=[], executed_qty="0.020")
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, get_settings(), "r1", _NOW,
+    )
+
+    assert connector.leverage_calls == [("BTC-USDT", 10)]
+    assert len(connector.calls) == 1
+    assert Decimal(connector.calls[0]["quantity"]) * Decimal("50000") == Decimal("1000")
+    # the planned SL/TP go to the exchange unchanged - the size never moves them
+    assert connector.calls[0]["stop_loss_price"] == "49000"
+    assert connector.calls[0]["target_price"] == "52000"
+    row = repo.get_live_execution("pos-1")
+    assert (row["margin_usdt"], row["notional_usdt"], row["leverage"]) == ("100", "1000", "10")
+
+
+def test_live_notional_rounds_down_never_above_1000_usdt(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, entry=Decimal("0.3337"))
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 0},
+        {"BTC-USDT": Decimal("0")}, get_settings(), "r1", _NOW,
+    )
+
+    notional = Decimal(connector.calls[0]["quantity"]) * Decimal("0.3337")
+    assert Decimal("999.5") < notional <= Decimal("1000")
+
+
+def test_live_margin_below_100_plus_buffer_blocks_the_order(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector(balance="100.99", all_positions=[])  # < 100 + 1.00 buffer
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, get_settings(), "r1", _NOW,
+    )
+
+    assert connector.calls == []
+    assert repo.get_live_execution("pos-1") is None
+
+
+def test_a_fifth_live_position_is_blocked_at_the_new_size(tmp_path):
+    """4 x 1000 USDT already open: the account-wide cap still holds no matter
+    how much margin is free."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i in range(4):
+        pid = f"open-{i}"
+        _open_position(repo, pid)
+        repo.claim_live_execution(pid, _NOW, "100", "1000", "10")
+        repo.update_live_execution_submitted(
+            pid, f"cid-{i}", f"ex-{i}", "0.020", "50000", None, None, _NOW
+        )
+    _open_position(repo, "pos-5")
+    connector = _SpyConnector(
+        balance="100000.00",
+        all_positions=[{"symbol": "BTC-USDT", "positionAmt": "0.020"}],
+    )
+
+    process_pending_positions(
+        repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+        {"BTC-USDT": Decimal("0")}, get_settings(), "r1", _NOW,
+    )
+
+    assert connector.calls == []
+    assert repo.get_live_execution("pos-5") is None

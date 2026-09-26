@@ -63,6 +63,7 @@ from crypto_trading.godfather.portfolio import (
     concurrent_return_correlation,
     evaluate_diversification,
     exposure_profile,
+    live_capital_profile,
     theme_of,
 )
 from crypto_trading.schemas.godfather import CounterfactualResult
@@ -555,6 +556,15 @@ def run_supervisor_sweep(
                  theme_of(t.position.instrument))
                 for t in scorable
             ]),
+            "live_capital": live_capital_profile([
+                (datetime.fromisoformat(t.live_execution["claimed_at"]),
+                 datetime.fromisoformat(t.live_execution["closed_at"])
+                 if t.live_execution.get("closed_at") else None,
+                 t.live_usdt, t.outcome_r)
+                for t in book
+                if t.live_usdt is not None and t.live_execution
+                and t.live_execution.get("claimed_at")
+            ]),
         },
         "experience_memory": {"samples": len(samples), "by_edge_class": edge_counts},
         "registry": registry,
@@ -697,6 +707,15 @@ def render_markdown(report: dict) -> str:
     w(f"- Exposure: {pf['exposure']['direction']}, peak concurrent notional "
       f"{_m(pf['exposure']['peak_concurrent_notional_usdt'], 0)} USDT, peak single-theme "
       f"share {_p(pf['exposure']['peak_single_theme_share'])}.")
+    live = pf.get("live_capital") or {}
+    for tier, row in (live.get("by_margin_tier_usdt") or {}).items():
+        w(f"- LIVE at {tier} USDT margin: {row['trades']} trades, net "
+          f"{_m(row['net_pnl_usdt'])} USDT over {row['pnl_trades']} (own exchange size, "
+          f"fees modelled when unrecorded), planned risk {_m(row['planned_risk_usdt'])} USDT, "
+          f"expectancy {_m(row['expectancy_r'], 3)} R over {row['r_trades']}.")
+    if live:
+        w(f"- LIVE peak concurrent: {_m(live['peak_concurrent_notional_usdt'], 0)} USDT "
+          f"notional, {_m(live['peak_concurrent_margin_usdt'], 0)} USDT margin.")
     w(f"- Theme cap (advisory): kept {div['kept']}, skipped {div['skipped_concentration']} "
       f"(skipped trades made {_m(div['skipped_total_pnl_usdt'])} USDT).")
     w("")

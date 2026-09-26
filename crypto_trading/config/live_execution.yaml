@@ -9,7 +9,11 @@ check_interval_seconds: 30
 claim_stale_after_seconds: 30
 max_retries: 3
 max_concurrent_positions: 4
-margin_per_trade_usdt: "10"
+# 2026-09-26, explicit user decision: 10 -> 100 USDT margin per position
+# (x10 leverage = ~1000 USDT notional; 4 positions = 400 USDT margin /
+# ~4000 USDT notional at most). leverage and max_concurrent_positions
+# unchanged. Sizing, SL/TP, Gate, Guardian and GODFATHER policy untouched.
+margin_per_trade_usdt: "100"
 leverage: 10
 max_position_hold_hours: 6
 margin_safety_buffer_usdt: "1.00"
