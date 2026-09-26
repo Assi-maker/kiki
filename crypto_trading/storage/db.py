@@ -1039,6 +1039,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_guardian_authority_decisions_add_matched_heuristic_ids_json(conn)
     _migrate_guardian_authority_heuristic_candidates_add_target_decision_type(conn)
     _migrate_godfather_decision_audits_add_conflicts_json(conn)
+    _migrate_live_executions_add_exit_fill_source(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -1186,6 +1187,18 @@ def _migrate_guardian_authority_heuristic_candidates_add_target_decision_type(
             "ALTER TABLE guardian_authority_heuristic_candidates "
             "ADD COLUMN target_decision_type TEXT",
         )
+
+
+def _migrate_live_executions_add_exit_fill_source(conn: sqlite3.Connection) -> None:
+    """2026-09-26: HOW a LIVE exit price was obtained - 'EXCHANGE_ORDER'
+    (the exchange's own filled SL/TP order), 'MARKET_CLOSE' (the exchange's
+    response to our own market close) or 'TICKER' (last price at
+    reconciliation time - not a fill). Only the first two are a verified
+    exit. Existing rows stay NULL, never guessed; see
+    paper_trading/execution.py::resolve_realized_pnl for how NULL is read."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(live_executions)").fetchall()}
+    if "exit_fill_source" not in columns:
+        _add_column_idempotent(conn, "ALTER TABLE live_executions ADD COLUMN exit_fill_source TEXT")
 
 
 def _add_column_idempotent(conn: sqlite3.Connection, alter_sql: str) -> None:

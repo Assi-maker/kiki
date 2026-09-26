@@ -134,6 +134,7 @@ class Repository(Protocol):
         closed_at: datetime,
         realized_fees_usdt: str | None = None,
         realized_funding_usdt: str | None = None,
+        exit_fill_source: str | None = None,
     ) -> None: ...
     def mark_live_execution_failed(
         self, position_id: str, last_error: str, updated_at: datetime
@@ -1145,14 +1146,15 @@ class SQLiteRepository:
         closed_at: datetime,
         realized_fees_usdt: str | None = None,
         realized_funding_usdt: str | None = None,
+        exit_fill_source: str | None = None,
     ) -> None:
         self._conn.execute(
             "UPDATE live_executions SET phase = 'CLOSED', exit_reason = ?, "
             "exchange_fill_exit = ?, realized_fees_usdt = ?, realized_funding_usdt = ?, "
-            "closed_at = ?, updated_at = ? WHERE position_id = ?",
+            "exit_fill_source = ?, closed_at = ?, updated_at = ? WHERE position_id = ?",
             (
                 exit_reason, exchange_fill_exit, realized_fees_usdt, realized_funding_usdt,
-                closed_at.isoformat(), closed_at.isoformat(), position_id,
+                exit_fill_source, closed_at.isoformat(), closed_at.isoformat(), position_id,
             ),
         )
         self._conn.commit()

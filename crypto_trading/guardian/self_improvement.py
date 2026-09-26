@@ -88,7 +88,11 @@ from crypto_trading.guardian.authority import (
 )
 from crypto_trading.guardian.tick import _budget_allows_one_more_call, _utc_day_start
 from crypto_trading.logging import log_event
-from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.paper_trading.execution import (
+    RealizedPnl,
+    realized_pnl_for,
+    resolve_realized_pnl,
+)
 from crypto_trading.schemas.assessments import GodfatherStrategistAssessment
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
@@ -245,8 +249,22 @@ def _most_recent_rows(rows: list[dict], timestamp_key: str) -> list[dict]:
     return ordered[:_MAX_EVIDENCE_ROWS]
 
 
+def _realized_outcome(
+    position: Position, outcomes: dict[str, RealizedPnl] | None
+) -> RealizedPnl:
+    """The position's verified outcome (PAPER, or the LIVE execution's own
+    verified exchange exit) - or UNVERIFIABLE, which every learning consumer
+    below skips: nothing is learned from an outcome that is not known.
+    Without a precomputed map only the paper exit is considered."""
+    if outcomes is not None and position.position_id in outcomes:
+        return outcomes[position.position_id]
+    return resolve_realized_pnl(position, None, Decimal("0"))
+
+
 def _closed_position_entry_outcomes(
-    positions: list[Position], candidates_by_id: dict[str, Candidate]
+    positions: list[Position],
+    candidates_by_id: dict[str, Candidate],
+    outcomes: dict[str, RealizedPnl] | None = None,
 ) -> list[dict]:
     """Task 4B: real pre-entry evidence paired with the real outcome it led
     to, for the already-windowed closed positions.
@@ -275,24 +293,30 @@ def _closed_position_entry_outcomes(
     which already excludes those rows on the explicit 2026-09-03 user ruling
     - and it would show the model a `pnl_usdt` of roughly zero for a trade
     that never had any market exposure at all."""
-    outcomes: list[dict] = []
+    rows: list[dict] = []
     for position in positions:
         if _is_blocked_by_exposure(position):
             continue
         candidate = candidates_by_id.get(position.candidate_id)
         if candidate is None:
             continue
-        outcomes.append(
+        realized = _realized_outcome(position, outcomes)
+        if not realized.verified:
+            continue  # 2026-09-26: unknown outcome - never shown, never learned from
+        rows.append(
             {
                 "closed_at": position.closed_at.isoformat() if position.closed_at else None,
                 "factors": _pre_entry_factors(candidate),
                 # str(), not float(): the same Decimal-preserving discipline
                 # detective/stats.py already applies to money in a prompt.
-                "pnl_usdt": str(compute_pnl(position)),
+                # In the paper position's own units, so PAPER and LIVE rows
+                # compare; pnl_source says which one it really came from.
+                "pnl_usdt": str(realized.paper_size_equivalent(position)),
+                "pnl_source": realized.source,
                 "exit_reason": position.exit_reason,
             }
         )
-    return outcomes
+    return rows
 
 
 def _most_recent_closed_positions(positions: list[Position]) -> list[Position]:
@@ -331,7 +355,11 @@ def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
         if candidate is not None:
             candidates_by_id[position.candidate_id] = candidate
 
-    entry_outcomes = _closed_position_entry_outcomes(closed_positions, candidates_by_id)
+    realized = {
+        position.position_id: realized_pnl_for(repo, position, settings.risk_limits.fee_pct)
+        for position in closed_positions
+    }
+    entry_outcomes = _closed_position_entry_outcomes(closed_positions, candidates_by_id, realized)
 
     return {
         "run_id": run_id,
@@ -381,7 +409,9 @@ def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
         # FACTOR_NAMES's own comment): TAKE_PROFIT candidates may use ONLY
         # these two names, never mixed with either vocabulary above.
         "take_profit_factor_names": _TAKE_PROFIT_FACTOR_NAMES,
-        "take_profit_observations": _take_profit_observation_context(repo, closed_positions),
+        "take_profit_observations": _take_profit_observation_context(
+            repo, closed_positions, realized
+        ),
     }
 
 
@@ -860,11 +890,14 @@ def _pre_entry_veto_evidence_pool(repo: Repository) -> list[tuple[str, dict, boo
         candidate = _safe_get_candidate(repo, position.candidate_id)
         if candidate is None:
             continue  # missing/corrupt entry evidence - skip, never guess
+        realized = realized_pnl_for(repo, position)
+        if not realized.verified:
+            continue  # 2026-09-26: unknown outcome - never learned from
         pool.append(
             (
                 position.closed_at.isoformat(),
                 _pre_entry_factors(candidate),
-                compute_pnl(position) <= Decimal("0"),
+                realized.paper_size_equivalent(position) <= Decimal("0"),
             )
         )
 
@@ -915,7 +948,11 @@ def _take_profit_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]
             continue
         if _is_blocked_by_exposure(position):
             continue
-        eventual_pnl = compute_pnl(position)
+        # Paper-size units: compared below with the observation's own
+        # paper-size unrealized_pnl (LIVE outcomes via their net return).
+        eventual_pnl = realized_pnl_for(repo, position).paper_size_equivalent(position)
+        if eventual_pnl is None:
+            continue  # 2026-09-26: unknown outcome - never learned from
         for observation in repo.find_guardian_observations_for_position(position.position_id):
             try:
                 observed_pnl = Decimal(observation["unrealized_pnl"])
@@ -937,7 +974,9 @@ def _take_profit_evidence_pool(repo: Repository) -> list[tuple[str, dict, bool]]
 
 
 def _take_profit_observation_context(
-    repo: Repository, positions: list[Position]
+    repo: Repository,
+    positions: list[Position],
+    outcomes: dict[str, RealizedPnl] | None = None,
 ) -> list[dict]:
     """Real per-observation evidence for the LLM to reason about TAKE_PROFIT
     patterns from, for the SAME already-windowed `positions` list
@@ -955,7 +994,9 @@ def _take_profit_observation_context(
     for position in positions:
         if _is_blocked_by_exposure(position):
             continue
-        eventual_pnl = compute_pnl(position)
+        eventual_pnl = _realized_outcome(position, outcomes).paper_size_equivalent(position)
+        if eventual_pnl is None:
+            continue  # 2026-09-26: unknown outcome - never shown, never learned from
         for observation in repo.find_guardian_observations_for_position(position.position_id):
             observations.append(
                 {

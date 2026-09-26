@@ -84,7 +84,7 @@ from crypto_trading.guardian.self_improvement import (
 )
 from crypto_trading.guardian.tick import _budget_allows_one_more_call, _utc_day_start
 from crypto_trading.logging import log_event
-from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.paper_trading.execution import realized_pnl_for
 from crypto_trading.schemas.assessments import GodfatherPriorityStrategistAssessment
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
@@ -135,11 +135,14 @@ def _priority_boost_evidence_pool(repo: Repository) -> list[tuple[str, dict, boo
         candidate = _safe_get_candidate(repo, position.candidate_id)
         if candidate is None:
             continue
+        realized = realized_pnl_for(repo, position)
+        if not realized.verified:
+            continue  # 2026-09-26: unknown outcome - never learned from
         pool.append(
             (
                 position.closed_at.isoformat(),
                 _pre_entry_factors(candidate),
-                compute_pnl(position) > Decimal("0"),
+                realized.paper_size_equivalent(position) > Decimal("0"),
             )
         )
 
@@ -160,7 +163,10 @@ def _build_priority_context(repo: Repository, run_id: str) -> dict:
         if candidate is not None:
             candidates_by_id[position.candidate_id] = candidate
 
-    entry_outcomes = _closed_position_entry_outcomes(closed_positions, candidates_by_id)
+    realized = {
+        position.position_id: realized_pnl_for(repo, position) for position in closed_positions
+    }
+    entry_outcomes = _closed_position_entry_outcomes(closed_positions, candidates_by_id, realized)
 
     return {
         "run_id": run_id,

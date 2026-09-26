@@ -57,6 +57,7 @@ def _finalize_live_close(
     exit_reason: str,
     exchange_fill_exit: str,
     now: datetime,
+    exit_fill_source: str | None = None,
 ) -> None:
     """The ONE place every verified LIVE exit path (exchange SL/TP found flat,
     Guardian EXIT, TIME_LIMIT) records its close: the live_executions row AND
@@ -71,7 +72,9 @@ def _finalize_live_close(
     close_position_for_live_exit is idempotent and only touches a row that is
     still OPEN_POSITION - a position PAPER already closed keeps PAPER's own
     exit data - and never writes PAPER's simulated-fill fields."""
-    repo.close_live_execution(position_id, exit_reason, exchange_fill_exit, now)
+    repo.close_live_execution(
+        position_id, exit_reason, exchange_fill_exit, now, exit_fill_source=exit_fill_source,
+    )
     repo.close_position_for_live_exit(position_id, exit_reason, now)
 
 
@@ -159,6 +162,7 @@ def reconcile_active_executions(
         if exchange_exit is not None:
             exit_reason, exit_price = exchange_exit
             classified_by = "exchange_order"
+            fill_source = "EXCHANGE_ORDER"
         else:
             exit_price = Decimal(
                 str(market_data_connector.get_ticker(position.instrument)["lastPrice"])
@@ -167,7 +171,10 @@ def reconcile_active_executions(
             distance_to_target = abs(exit_price - position.target)
             exit_reason = "stop_loss" if distance_to_stop <= distance_to_target else "target"
             classified_by = "ticker_heuristic"
-        _finalize_live_close(repo, position.position_id, exit_reason, str(exit_price), now)
+            fill_source = "TICKER"  # last price, not a fill - never a verified exit
+        _finalize_live_close(
+            repo, position.position_id, exit_reason, str(exit_price), now, fill_source,
+        )
         log_event(
             run_id, event="live_position_closed", position_id=position.position_id,
             exit_reason=exit_reason, classified_by=classified_by,
@@ -588,7 +595,8 @@ def close_guardian_exit_positions(
                 client_order_id=client_order_id,
             )
             _finalize_live_close(
-                repo, position.position_id, "GUARDIAN_EXIT", str(result.get("avgPrice", "")), now
+                repo, position.position_id, "GUARDIAN_EXIT", str(result.get("avgPrice", "")), now,
+                "MARKET_CLOSE",
             )
             log_event(run_id, event="live_guardian_exit_closed", position_id=position.position_id)
         except _GUARDED_ERRORS as exc:
@@ -631,7 +639,8 @@ def close_time_limit_positions(
             # row and mirror onto the shared `positions` row in one place, same as
             # every other LIVE exit path.
             _finalize_live_close(
-                repo, position.position_id, "TIME_LIMIT", str(result.get("avgPrice", "")), now
+                repo, position.position_id, "TIME_LIMIT", str(result.get("avgPrice", "")), now,
+                "MARKET_CLOSE",
             )
             log_event(run_id, event="live_time_limit_closed", position_id=position.position_id)
         except _GUARDED_ERRORS as exc:

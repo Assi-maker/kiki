@@ -17,7 +17,7 @@ from crypto_trading.calibration.calibration_curve import (
     compute_calibration_status,
 )
 from crypto_trading.config.loader import Settings
-from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.paper_trading.execution import compute_pnl_or_none
 from crypto_trading.performance.metrics import (
     compute_breakdown_by_direction,
     compute_breakdown_by_instrument,
@@ -210,7 +210,10 @@ def _trade_history_position_summary(position: Position) -> dict:
     stängda positioner. PnL beräknas via paper_trading.execution.compute_pnl
     - samma, enda centrala funktion som notify/telegram.py::
     format_closed_message() (Fas 6) redan använder, ingen ny formel."""
-    pnl = str(compute_pnl(position)) if position.status == "CLOSED" else None
+    # PAPER-historik: en position som bara stängts av LIVE saknar PAPER-exit
+    # och får pnl None (okänd), aldrig en krasch eller ett påhittat värde.
+    paper_pnl = compute_pnl_or_none(position) if position.status == "CLOSED" else None
+    pnl = str(paper_pnl) if paper_pnl is not None else None
     return {
         "position_id": position.position_id,
         "candidate_id": position.candidate_id,

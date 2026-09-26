@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.paper_trading.execution import compute_pnl, has_paper_exit_data
 from crypto_trading.schemas.trade import Position
 
 
@@ -11,8 +11,13 @@ def trade_pnls(positions: list[Position]) -> list[Decimal]:
     - den enda PnL-källan i hela systemet (PLAN_CRYPTO_PHASE8.md, Global
     Constraints). Filtrerar bort allt som inte är status == 'CLOSED'
     internt, defensivt oavsett vad anroparen skickar in - compute_pnl()
-    kräver simulated_fill_exit, som bara är satt på stängda positioner."""
-    return [compute_pnl(p) for p in positions if p.status == "CLOSED"]
+    kräver simulated_fill_exit, som bara är satt på stängda positioner.
+
+    2026-09-26: en position som bara stängts av LIVE-exitspegeln saknar
+    PAPER-exitdata - dess PAPER-P/L är okänd och lämnas utanför (samma regel
+    som detective/stats.py), aldrig påhittad och aldrig ersatt med LIVE-P/L
+    i en annan storlek. Förut kraschade hela notify-dagsrapporten på den."""
+    return [compute_pnl(p) for p in _closed_positions_with_paper_exit(positions)]
 
 
 def compute_cumulative_pnl(pnls: list[Decimal]) -> Decimal:
@@ -56,8 +61,12 @@ def compute_profit_factor(pnls: list[Decimal]) -> Decimal | None:
 def _closed_positions_sorted_by_closed_at(positions: list[Position]) -> list[Position]:
     """Filtrerar till status == 'CLOSED' och sorterar kronologiskt på
     closed_at - beräknat internt, litar aldrig på anroparens ordning."""
-    closed = [p for p in positions if p.status == "CLOSED"]
+    closed = _closed_positions_with_paper_exit(positions)
     return sorted(closed, key=lambda p: p.closed_at)
+
+
+def _closed_positions_with_paper_exit(positions: list[Position]) -> list[Position]:
+    return [p for p in positions if p.status == "CLOSED" and has_paper_exit_data(p)]
 
 
 def compute_drawdown(positions: list[Position]) -> Decimal | None:

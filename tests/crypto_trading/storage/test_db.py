@@ -487,7 +487,7 @@ def test_live_executions_table_exists(tmp_path):
         "entry_quantity", "sl_exchange_order_id", "tp_exchange_order_id", "exit_reason",
         "exchange_fill_entry", "exchange_fill_exit", "last_error", "margin_usdt",
         "notional_usdt", "leverage", "realized_fees_usdt", "realized_funding_usdt",
-        "claimed_at", "updated_at", "closed_at",
+        "claimed_at", "updated_at", "closed_at", "exit_fill_source",
     }
 
 
