@@ -114,6 +114,7 @@ from crypto_trading.connectors.bingx_live_trading import (
 )
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.logging import log_event
+from crypto_trading.safety_kernel import live_stop_move_violations
 from crypto_trading.storage.repository import Repository
 
 # Copied verbatim from live_profit_protection.py: any of these during a
@@ -416,6 +417,24 @@ def _place_and_verify_new_sl(
         repo, position_id, instrument, old_sl_order_id, current_sl_price, new_sl, run_id, now,
     ):
         return  # nothing placed, nothing cancelled, existing protection untouched
+
+    # P0 Safety Kernel (2026-09-28): the deterministic layer above this
+    # authority - never a stop inside the liquidation buffer, never a
+    # loosening - re-checked independently before anything is placed.
+    violations = live_stop_move_violations(
+        repo.get_live_execution(position_id), current_sl_price, new_sl,
+    )
+    if violations:
+        repo.set_guardian_authority_live_sl_action_status(
+            position_id, "ABORTED_SAFETY_KERNEL", now,
+            last_error="safety_kernel:" + ",".join(violations),
+        )
+        log_event(
+            run_id, event="ga_live_sl_aborted_safety_kernel", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id, new_sl=str(new_sl),
+            violations=violations, status="ABORTED_SAFETY_KERNEL",
+        )
+        return
 
     # Quantity is sourced fresh from the repository (never a cached/stale
     # value) - the same entry_quantity recorded when this position's live

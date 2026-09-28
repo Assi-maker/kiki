@@ -1041,6 +1041,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_godfather_decision_audits_add_conflicts_json(conn)
     _migrate_live_executions_add_exit_fill_source(conn)
     _migrate_live_executions_add_exit_verification(conn)
+    _migrate_add_safety_kernel_decisions(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -1217,6 +1218,16 @@ def _migrate_live_executions_add_exit_verification(conn: sqlite3.Connection) -> 
     for column in _EXIT_VERIFICATION_COLUMNS:
         if column not in columns:
             _add_column_idempotent(conn, f"ALTER TABLE live_executions ADD COLUMN {column} TEXT")
+
+
+def _migrate_add_safety_kernel_decisions(conn: sqlite3.Connection) -> None:
+    """2026-09-28 P0: the latest Safety Kernel decision per LIVE candidate
+    (APPROVE / REDUCE / REJECT + every input and limit), for audit."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS safety_kernel_decisions ("
+        "position_id TEXT PRIMARY KEY, decided_at TEXT NOT NULL, action TEXT NOT NULL, "
+        "detail_json TEXT NOT NULL)"
+    )
 
 
 def _add_column_idempotent(conn: sqlite3.Connection, alter_sql: str) -> None:

@@ -121,7 +121,7 @@ def _fixtures_where_the_paper_position_stays_open() -> dict:
     LIVE afterwards."""
     fixtures = _happy_fixtures()
     fixtures["crypto-risk-agent"] = fixtures["crypto-risk-agent"].model_copy(
-        update={"suggested_stop_loss": "50000", "suggested_target": "60000"}
+        update={"suggested_stop_loss": "53000", "suggested_target": "60000"}
     )
     return fixtures
 
@@ -367,7 +367,7 @@ def test_balance_dropping_between_discovery_and_execution_stops_the_order(tmp_pa
     process_pending_positions(
         repo,
         exchange,
-        _SpyMarketDataConnector(),
+        _SpyMarketDataConnector(last_price="55000"),  # the paper entry price
         {"BTCUSDT": 3},
         {},
         _settings(),
@@ -380,7 +380,7 @@ def test_balance_dropping_between_discovery_and_execution_stops_the_order(tmp_pa
     process_pending_positions(
         repo,
         exchange_with_capital,
-        _SpyMarketDataConnector(),
+        _SpyMarketDataConnector(last_price="55000"),
         {"BTCUSDT": 3},
         {},
         _settings(),

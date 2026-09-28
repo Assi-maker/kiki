@@ -109,6 +109,10 @@ class Repository(Protocol):
     def get_live_execution(self, position_id: str) -> dict | None: ...
     def find_live_executions_needing_exit_verification(self, limit: int) -> list[dict]: ...
     def has_overlapping_live_execution(self, position_id: str) -> bool: ...
+    def record_safety_kernel_decision(
+        self, position_id: str, decided_at: datetime, action: str, detail: dict
+    ) -> None: ...
+    def get_safety_kernel_decision(self, position_id: str) -> dict | None: ...
     def record_live_exit_verification(self, position_id: str, result, verified_at: datetime) -> None: ...
     def find_active_live_execution_for_instrument(self, instrument: str) -> dict | None: ...
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]: ...
@@ -1172,6 +1176,25 @@ class SQLiteRepository:
             (limit,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def record_safety_kernel_decision(
+        self, position_id: str, decided_at: datetime, action: str, detail: dict
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO safety_kernel_decisions (position_id, decided_at, action, "
+            "detail_json) VALUES (?, ?, ?, ?)",
+            (position_id, decided_at.isoformat(), action, json.dumps(detail, default=str)),
+        )
+        self._conn.commit()
+
+    def get_safety_kernel_decision(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM safety_kernel_decisions WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {"action": row["action"], "decided_at": row["decided_at"],
+                "detail": json.loads(row["detail_json"])}
 
     def has_overlapping_live_execution(self, position_id: str) -> bool:
         """Read-only. True when another LIVE execution on the same instrument

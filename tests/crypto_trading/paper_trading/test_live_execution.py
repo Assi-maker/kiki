@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import httpx
 
-from crypto_trading.config.loader import get_settings
+from crypto_trading.config.loader import SafetyKernelConfig, get_settings
 from crypto_trading.connectors.bingx_live_trading import OrderRejectedError
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.paper_trading.live_execution import (
@@ -24,6 +24,7 @@ _NOW = datetime(2026, 9, 6, 12, 0, tzinfo=UTC)
 
 def _open_position(
     repo, position_id="pos-1", opened_at=_NOW, entry=Decimal("50000"), confirmed_at=None,
+    stop_loss=Decimal("49000"),
 ) -> Position:
     """confirmed_at defaults to opened_at - i.e. the signal is fresh at
     `_NOW` unless a test explicitly backdates it - so every pre-existing
@@ -32,7 +33,7 @@ def _open_position(
     position = Position(
         position_id=position_id, candidate_id=position_id, instrument="BTC-USDT",
         direction="LONG", status="OPEN_POSITION", theoretical_entry=entry,
-        simulated_fill_entry=entry, stop_loss=Decimal("49000"), target=Decimal("52000"),
+        simulated_fill_entry=entry, stop_loss=stop_loss, target=Decimal("52000"),
         size=Decimal("1000"), fill_model_version="v1", opened_at=opened_at,
     )
     event = Event(
@@ -43,6 +44,17 @@ def _open_position(
     repo.create_position_with_event(position, event)
     _confirm_signal(repo, position_id, confirmed_at if confirmed_at is not None else opened_at)
     return position
+
+
+def _without_safety_caps(settings):
+    """Only for tests of the BASE sizing (the 100 USDT x 10 ceiling): the
+    Safety Kernel's budgets are lifted so they cannot bind. Every other test
+    runs with the real production limits."""
+    huge = Decimal(10) ** 12
+    return settings.model_copy(update={"safety": SafetyKernelConfig(
+        max_risk_per_trade_pct=huge, max_risk_per_trade_usdt=huge, max_portfolio_risk_pct=huge,
+        max_group_risk_pct=huge, max_total_notional_multiple=huge,
+    )})
 
 
 def _confirm_signal(repo, candidate_id, confirmed_at) -> None:
@@ -69,8 +81,9 @@ class _SpyConnector:
     def __init__(
         self, balance="123.45", all_positions=None, order_status="FILLED",
         executed_qty="0.002", place_raises=None, lookup_raises=None, lookup_returns_none=False,
-        history=None, history_raises=None,
+        history=None, history_raises=None, equity=None,
     ):
+        self._equity = equity
         self.calls = []
         self.lookup_calls = 0
         self._balance = balance
@@ -124,7 +137,8 @@ class _SpyConnector:
         return None
 
     def get_balance(self):
-        return {"availableMargin": self._balance}
+        # 2026-09-28 Safety Kernel: equity is what the risk budget is sized on.
+        return {"availableMargin": self._balance, "equity": self._equity or self._balance}
 
     def cancel_all_open_orders(self, symbol):
         return {}
@@ -204,7 +218,7 @@ def test_process_pending_positions_claims_and_submits_when_capacity_available(tm
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(balance="1000.00", all_positions=[])
-    settings = get_settings()
+    settings = _without_safety_caps(get_settings())  # base-size bookkeeping only
 
     process_pending_positions(
         repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
@@ -1157,13 +1171,14 @@ def test_real_live_config_is_100_margin_10x_leverage_max_4():
 
 
 def test_process_pending_positions_sizes_a_live_order_at_1000_usdt_notional(tmp_path):
+    """The BASE size (margin x leverage) is still the ceiling - kernel lifted."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo, entry=Decimal("50000"))
     connector = _SpyConnector(balance="1000.00", all_positions=[], executed_qty="0.020")
 
     process_pending_positions(
         repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
-        {"BTC-USDT": Decimal("0")}, get_settings(), "r1", _NOW,
+        {"BTC-USDT": Decimal("0")}, _without_safety_caps(get_settings()), "r1", _NOW,
     )
 
     assert connector.leverage_calls == [("BTC-USDT", 10)]
@@ -1183,7 +1198,7 @@ def test_live_notional_rounds_down_never_above_1000_usdt(tmp_path):
 
     process_pending_positions(
         repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 0},
-        {"BTC-USDT": Decimal("0")}, get_settings(), "r1", _NOW,
+        {"BTC-USDT": Decimal("0")}, _without_safety_caps(get_settings()), "r1", _NOW,
     )
 
     notional = Decimal(connector.calls[0]["quantity"]) * Decimal("0.3337")
@@ -1254,3 +1269,160 @@ def test_a_stale_signal_is_logged_once_not_on_every_tick(tmp_path, caplog):
     assert repo.get_live_execution("pos-spam-1") is None  # still never claimed
     assert repo.get_live_execution("pos-spam-2") is None
     assert connector.calls == []
+
+
+# ---------------------------------------------------------------------------
+# P0 Safety Kernel in front of every LIVE entry (2026-09-28)
+# ---------------------------------------------------------------------------
+
+def _run(repo, connector, market=None, settings=None, now=_NOW):
+    process_pending_positions(
+        repo, connector, market or _SpyMarketDataConnector(), {"BTC-USDT": 4},
+        {"BTC-USDT": Decimal("5")}, settings or get_settings(), "r1", now,
+    )
+
+
+_OPEN_ON_EXCHANGE = [{"symbol": s, "positionAmt": "0.0084"} for s in ("AAA-USDT", "BBB-USDT", "CCC-USDT")]
+
+
+def _seed_open_live(repo, pid, symbol, quantity="0.0084", with_break_even=False):
+    _open_position(repo, position_id=pid)
+    repo._conn.execute("UPDATE positions SET instrument = ? WHERE position_id = ?", (symbol, pid))
+    repo._conn.commit()
+    repo.claim_live_execution_if_symbol_free(pid, _NOW, "20", "200", "10")
+    repo.update_live_execution_submitted(
+        pid, entry_client_order_id="c", entry_exchange_order_id="c", entry_quantity=quantity,
+        exchange_fill_entry="50000", sl_exchange_order_id=None, tp_exchange_order_id=None,
+        updated_at=_NOW,
+    )
+    if with_break_even:
+        repo._conn.execute(
+            "INSERT INTO live_profit_protection (position_id, status, threshold_pct, "
+            "breakeven_price, new_sl_client_order_id, claimed_at, updated_at) "
+            "VALUES (?, 'SL_REPLACED', '0.01', '50000', 'x', ?, ?)",
+            (pid, _NOW.isoformat(), _NOW.isoformat()),
+        )
+        repo._conn.commit()
+
+
+def test_the_kernel_reduces_a_live_entry_to_one_percent_of_equity(tmp_path):
+    """Default production limits: equity 1000 -> worst-case loss <= 10 USDT.
+    The base size (1000 notional, 0.02 BTC with a 2 % stop) would risk ~27."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
+    _run(repo, connector)
+
+    assert len(connector.calls) == 1
+    quantity = Decimal(connector.calls[0]["quantity"])
+    assert Decimal("0") < quantity < Decimal("0.02")
+    worst = (quantity * (Decimal("50150") - Decimal("49000") * Decimal("0.997"))
+             + quantity * Decimal("50150") * Decimal("0.001"))
+    assert worst <= Decimal("10")
+    assert connector.calls[0]["stop_loss_price"] == "49000"  # SL/TP never moved
+    assert connector.calls[0]["target_price"] == "52000"
+    assert connector.leverage_calls == [("BTC-USDT", 10)]  # leverage untouched
+    row = repo.get_live_execution("pos-1")
+    assert Decimal(row["notional_usdt"]) == quantity * Decimal("50000")
+    assert Decimal(row["margin_usdt"]) == quantity * Decimal("50000") / 10
+    decision = repo.get_safety_kernel_decision("pos-1")
+    assert decision["action"] == "REDUCE"
+    assert "PER_TRADE_RISK_CAP" in decision["detail"]["binding_limits"]
+
+
+def test_the_kernel_uses_current_equity_not_the_balance(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector(balance="1000.00", equity="500.00", all_positions=[])
+    _run(repo, connector)
+    decision = repo.get_safety_kernel_decision("pos-1")
+    assert Decimal(decision["detail"]["risk_usdt"]) <= Decimal("5")
+
+
+def test_a_stop_too_close_to_liquidation_is_never_sent(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, stop_loss=Decimal("45500"))  # -9 % at 10x
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
+    _run(repo, connector)
+    assert connector.calls == []
+    row = repo.get_live_execution("pos-1")
+    assert row["phase"] == "SKIPPED"
+    assert "LIQUIDATION_TOO_CLOSE" in row["last_error"]
+
+
+def test_missing_equity_fails_closed(tmp_path):
+    class _NoEquity(_SpyConnector):
+        def get_balance(self):
+            return {"availableMargin": "1000.00"}
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _NoEquity(all_positions=[])
+    _run(repo, connector)
+    assert connector.calls == []
+    assert repo.get_live_execution("pos-1") is None  # not consumed: retried next tick
+
+
+def test_a_ticker_failure_fails_closed(tmp_path):
+    class _NoTicker(_SpyMarketDataConnector):
+        def get_ticker(self, symbol):
+            raise ConnectorUnavailableError("down")
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
+    _run(repo, connector, market=_NoTicker())
+    assert connector.calls == []
+    assert repo.get_live_execution("pos-1") is None
+
+
+def test_the_portfolio_ceiling_blocks_a_new_entry_when_open_risk_is_used_up(tmp_path):
+    """Three open full-risk positions (~10 USDT worst case each at equity 1000)
+    fill the 3 % portfolio budget: a fourth signal is not sent - even though
+    max_concurrent_positions is 4."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i, symbol in enumerate(("AAA-USDT", "BBB-USDT", "CCC-USDT")):
+        _seed_open_live(repo, f"open-{i}", symbol)
+    _open_position(repo, position_id="pos-new")
+    connector = _SpyConnector(balance="1000.00", all_positions=_OPEN_ON_EXCHANGE)
+    _run(repo, connector)
+    assert connector.calls == []
+    assert repo.get_live_execution("pos-new") is None  # budget-type reject: retry while fresh
+    decision = repo.get_safety_kernel_decision("pos-new")
+    assert decision["action"] == "REJECT"
+    assert set(decision["detail"]["reasons"]) & {"PORTFOLIO_RISK_CAP", "GROUP_RISK_CAP"}
+
+
+def test_a_break_even_protected_position_frees_portfolio_headroom(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i, symbol in enumerate(("AAA-USDT", "BBB-USDT", "CCC-USDT")):
+        _seed_open_live(repo, f"open-{i}", symbol, with_break_even=True)
+    _open_position(repo, position_id="pos-new")
+    connector = _SpyConnector(balance="1000.00", all_positions=_OPEN_ON_EXCHANGE)
+    _run(repo, connector)
+    assert len(connector.calls) == 1
+
+
+def test_only_process_pending_positions_can_reach_the_entry_order_and_only_after_the_kernel():
+    """Structural: the single path to place_entry_order_with_sl_tp is
+    _submit_entry_order, called only from process_pending_positions, after
+    _safety_size_entry. No GODFATHER/Guardian module references either."""
+    import ast
+    import pathlib
+
+    import crypto_trading
+    root = pathlib.Path(crypto_trading.__file__).parent
+    tree = ast.parse((root / "paper_trading" / "live_execution.py").read_text(encoding="utf-8"))
+    callers = {}
+    for fn in [n for n in tree.body if isinstance(n, ast.FunctionDef)]:
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_submit_entry_order":
+                callers.setdefault(fn.name, []).append(node.lineno)
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_safety_size_entry":
+                callers.setdefault(fn.name + ":kernel", []).append(node.lineno)
+    assert {k for k in callers if not k.endswith(":kernel")} == {"process_pending_positions"}
+    assert min(callers["process_pending_positions:kernel"]) < min(callers["process_pending_positions"])
+    for path in list((root / "godfather").rglob("*.py")) + list((root / "guardian").rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        assert "_submit_entry_order" not in text, path
+        assert "place_entry_order_with_sl_tp" not in text, path

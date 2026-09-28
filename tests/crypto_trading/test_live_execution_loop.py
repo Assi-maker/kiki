@@ -46,7 +46,7 @@ class _SpyConnector:
         return None
 
     def get_balance(self):
-        return {"availableMargin": "1000.00"}
+        return {"availableMargin": "1000.00", "equity": "1000.00"}
 
     def cancel_all_open_orders(self, symbol):
         return {}

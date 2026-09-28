@@ -389,6 +389,33 @@ class GodfatherConfig(BaseModel):
     policy_promotion_enabled: bool = False
 
 
+class SafetyKernelConfig(BaseModel):
+    """Deterministic Safety Kernel limits (P0, 2026-09-28) - see
+    crypto_trading/safety_kernel.py and config/safety_kernel.yaml for the
+    reasoning behind each value. The defaults ARE the production values, so a
+    Settings built without the yaml (tests) is never less safe than LIVE."""
+
+    max_risk_per_trade_pct: Decimal = Decimal("0.01")
+    max_risk_per_trade_usdt: Decimal = Decimal("10")
+    max_portfolio_risk_pct: Decimal = Decimal("0.03")
+    max_group_risk_pct: Decimal = Decimal("0.025")
+    max_total_notional_multiple: Decimal = Decimal("3")
+    entry_price_buffer_pct: Decimal = Decimal("0.003")
+    stop_slippage_buffer_pct: Decimal = Decimal("0.003")
+    round_trip_fee_pct: Decimal = Decimal("0.001")
+    maintenance_margin_rate: Decimal = Decimal("0.01")
+    min_liquidation_buffer_pct: Decimal = Decimal("0.02")
+    symbol_groups: dict[str, str] = Field(
+        default_factory=lambda: {"BTC-USDT": "crypto_major", "ETH-USDT": "crypto_major"}
+    )
+    group_prefixes: dict[str, str] = Field(
+        default_factory=lambda: {
+            "NCSK": "tokenized_equity", "NCCO": "commodity_fx", "NCFX": "commodity_fx",
+        }
+    )
+    default_group: str = "crypto_alt"
+
+
 class Settings(BaseModel):
     db_path: Path
     pipeline: PipelineConfig
@@ -404,6 +431,7 @@ class Settings(BaseModel):
         default_factory=ProfitProtectionExperimentConfig
     )
     godfather: GodfatherConfig = Field(default_factory=GodfatherConfig)
+    safety: SafetyKernelConfig = Field(default_factory=SafetyKernelConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -438,6 +466,7 @@ def get_settings() -> Settings:
             _CONFIG_DIR / "profit_protection_experiment.yaml", ProfitProtectionExperimentConfig
         ),
         godfather=_load_yaml_model(_CONFIG_DIR / "godfather.yaml", GodfatherConfig),
+        safety=_load_yaml_model(_CONFIG_DIR / "safety_kernel.yaml", SafetyKernelConfig),
     )
 
 

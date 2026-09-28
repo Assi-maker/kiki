@@ -14,6 +14,12 @@ from crypto_trading.connectors.bingx_live_trading import (
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.logging import log_event
 from crypto_trading.paper_trading.monitoring import compute_hold_hours
+from crypto_trading.safety_kernel import (
+    EntryDecision,
+    Exposure,
+    exposure_for_open_position,
+    size_entry,
+)
 from crypto_trading.schemas.trade import Position
 from crypto_trading.storage.repository import Repository
 
@@ -459,6 +465,89 @@ def _has_active_live_position_for_symbol(
     return False
 
 
+# Safety Kernel rejections that no later tick can change for THIS signal (its
+# stop/target are fixed): the position is consumed (SKIPPED) with the reason.
+# Budget-type rejections (risk/portfolio/group/notional caps, equity unknown)
+# are retried on later ticks while the signal is still within its TTL.
+_STRUCTURAL_KERNEL_REJECTIONS = frozenset({
+    "LIQUIDATION_TOO_CLOSE", "STOP_NOT_BELOW_ENTRY", "TARGET_NOT_ABOVE_ENTRY",
+})
+_kernel_reject_logged: set[tuple[str, tuple[str, ...]]] = set()
+
+
+def _open_live_exposures(repo: Repository, settings: Settings) -> list[Exposure]:
+    """Worst-case risk of every LIVE position that is open or in flight,
+    from local state that reconcile_active_executions has just refreshed
+    against the exchange. The CURRENT stop is used: after Profit Protection
+    moved it to break-even, only the residual cost risk counts. A Guardian
+    Authority tightening is ignored here - that can only overstate risk,
+    never understate it."""
+    exposures = []
+    for row in repo.find_active_live_executions():
+        position = repo.get_position(row["position_id"])
+        if position is None:
+            continue
+        entry = Decimal(str(row.get("exchange_fill_entry") or position.simulated_fill_entry))
+        if row.get("entry_quantity"):
+            quantity = Decimal(str(row["entry_quantity"]))
+        else:
+            quantity = Decimal(str(row.get("notional_usdt") or "0")) / entry
+        stop = position.stop_loss
+        pp = repo.get_live_profit_protection(row["position_id"])
+        if pp is not None and pp.get("status") == "SL_REPLACED" and pp.get("breakeven_price"):
+            stop = max(stop, Decimal(str(pp["breakeven_price"])))
+        exposures.append(
+            exposure_for_open_position(position.instrument, quantity, entry, stop, settings.safety)
+        )
+    return exposures
+
+
+def _safety_size_entry(
+    repo: Repository,
+    connector: BingXLiveTradingConnector,
+    market_data_connector: object,
+    position: Position,
+    base_quantity: Decimal,
+    precision: int,
+    min_notional: Decimal,
+    settings: Settings,
+    run_id: str,
+    now: datetime,
+) -> EntryDecision | None:
+    """P0 Safety Kernel (2026-09-28) in front of the ONE path to a LIVE entry.
+    Reads current equity and the live price (both fail-closed: None = no
+    entry this tick), sizes the entry with safety_kernel.size_entry and
+    records the decision. Can only keep or shrink base_quantity."""
+    try:
+        equity_raw = connector.get_balance().get("equity")
+        equity = Decimal(str(equity_raw)) if equity_raw not in (None, "") else None
+        last_price = Decimal(str(market_data_connector.get_ticker(position.instrument)["lastPrice"]))
+    except (*_ORDER_STATE_UNKNOWN_ERRORS, KeyError, ArithmeticError, ValueError) as exc:
+        log_event(
+            run_id, event="safety_kernel_inputs_unavailable", position_id=position.position_id,
+            instrument=position.instrument, error_type=type(exc).__name__, error=str(exc),
+        )
+        return None
+    decision = size_entry(
+        symbol=position.instrument, equity=equity, last_price=last_price,
+        stop_loss=position.stop_loss, target=position.target,
+        leverage=settings.live_execution.leverage, base_quantity=base_quantity,
+        quantity_precision=precision, min_notional=min_notional,
+        open_exposures=_open_live_exposures(repo, settings), limits=settings.safety,
+    )
+    detail = {**decision.as_log(), "last_price": str(last_price),
+              "base_quantity": str(base_quantity), "stop_loss": str(position.stop_loss),
+              "target": str(position.target)}
+    repo.record_safety_kernel_decision(position.position_id, now, decision.action, detail)
+    key = (position.position_id, tuple(decision.reasons))
+    if decision.action != "REJECT" or key not in _kernel_reject_logged:
+        if decision.action == "REJECT":
+            _kernel_reject_logged.add(key)
+        log_event(run_id, event="safety_kernel_entry_decision", position_id=position.position_id,
+                  instrument=position.instrument, **detail)
+    return decision
+
+
 def process_pending_positions(
     repo: Repository,
     connector: BingXLiveTradingConnector,
@@ -495,6 +584,27 @@ def process_pending_positions(
         )
         min_notional = min_notional_by_symbol.get(position.instrument, Decimal("0"))
         notional = quantity * position.simulated_fill_entry
+        base_quantity = quantity
+        if quantity > 0 and notional >= min_notional:
+            # P0 Safety Kernel: the base size above is only a CEILING.
+            decision = _safety_size_entry(
+                repo, connector, market_data_connector, position, quantity, precision,
+                min_notional, settings, run_id, now,
+            )
+            if decision is None:
+                continue  # inputs unavailable: fail closed, retried next tick
+            if decision.action == "REJECT":
+                if set(decision.reasons) & _STRUCTURAL_KERNEL_REJECTIONS:
+                    if repo.claim_live_execution_if_symbol_free(
+                        position.position_id, now, "0", "0", str(cfg.leverage),
+                    ):
+                        repo.mark_live_execution_skipped(
+                            position.position_id,
+                            "safety_kernel:" + ",".join(decision.reasons), now,
+                        )
+                continue
+            quantity = decision.quantity
+            notional = quantity * position.simulated_fill_entry
         if quantity <= 0 or notional < min_notional:
             if not repo.claim_live_execution_if_symbol_free(
                 position.position_id, now, str(cfg.margin_per_trade_usdt),
@@ -507,14 +617,19 @@ def process_pending_positions(
                 instrument=position.instrument,
             )
             continue
+        if quantity < base_quantity:  # reduced by the Safety Kernel: record the real size
+            notional_text = str(notional.quantize(Decimal("0.01")))
+            margin_text = str((notional / cfg.leverage).quantize(Decimal("0.01")))
+        else:
+            notional_text = str(cfg.margin_per_trade_usdt * cfg.leverage)
+            margin_text = str(cfg.margin_per_trade_usdt)
+        margin, notional = Decimal(margin_text), Decimal(notional_text)
         if not repo.claim_live_execution_if_symbol_free(
-            position.position_id, now, str(cfg.margin_per_trade_usdt),
-            str(cfg.margin_per_trade_usdt * cfg.leverage), str(cfg.leverage),
+            position.position_id, now, margin_text, notional_text, str(cfg.leverage),
         ):
             continue  # another run/duplicate observation already claimed it
         _submit_entry_order(
-            repo, connector, position, quantity, cfg.margin_per_trade_usdt,
-            cfg.margin_per_trade_usdt * cfg.leverage, cfg.leverage, run_id, now,
+            repo, connector, position, quantity, margin, notional, cfg.leverage, run_id, now,
         )
 
 

@@ -14,6 +14,7 @@ from crypto_trading.connectors.bingx_live_trading import (
 )
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
 from crypto_trading.logging import log_event
+from crypto_trading.safety_kernel import live_stop_move_violations
 from crypto_trading.storage.repository import Repository
 
 # This module is intentionally standalone (design spec "Integration point"):
@@ -482,6 +483,26 @@ def _place_and_verify_new_sl(
     live_execution = repo.get_live_execution(position_id)
     raw_entry_quantity = (live_execution or {}).get("entry_quantity")
     entry_quantity = _parse_positive_decimal(raw_entry_quantity)
+
+    # P0 Safety Kernel (2026-09-28): the break-even stop must never LOWER a
+    # stop already above it (e.g. one Guardian Authority tightened) and never
+    # sit inside the liquidation buffer. Checked before anything is placed.
+    violations = live_stop_move_violations(
+        live_execution, (repo.get_live_profit_protection(position_id) or {}).get("old_sl_price"),
+        breakeven_price,
+    )
+    if violations:
+        repo.set_live_profit_protection_status(
+            position_id, "ABORTED_SAFETY_KERNEL", now,
+            last_error="safety_kernel:" + ",".join(violations),
+        )
+        log_event(
+            run_id, event="live_pp_aborted_safety_kernel", position_id=position_id,
+            instrument=instrument, old_sl_order_id=old_sl_order_id,
+            breakeven_price=str(breakeven_price), violations=violations,
+            status="ABORTED_SAFETY_KERNEL",
+        )
+        return
 
     # Deep-review fix 1: a missing/zero/unparseable entry_quantity (a real,
     # reachable state - see live_execution.py's _resolve_uncertain_entry)

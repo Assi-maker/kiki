@@ -280,13 +280,15 @@ def _seed_always_on_heuristic(repo, heuristic_id="h-1", adjustment=0.2):
     )
 
 
-def _make_active_live_execution(repo, position_id, entry_quantity="10", avg_entry="100"):
+def _make_active_live_execution(
+    repo, position_id, entry_quantity="10", avg_entry="100", leverage="10",
+):
     """Seeds a live_executions row already in phase ACTIVE for an
     already-seeded position - same claim/update_submitted sequence
     test_authority_live.py's own _open_active_live_position helper uses,
     so `repo.get_live_execution(position_id)["phase"] == "ACTIVE"` (the
     exact check process_one_position uses to route LIVE vs PAPER)."""
-    repo.claim_live_execution(position_id, _NOW, "10", "100", "10")
+    repo.claim_live_execution(position_id, _NOW, "10", "100", leverage)
     repo.update_live_execution_submitted(
         position_id, "cid-1", "ex-1", entry_quantity, avg_entry, None, None, _NOW,
     )
@@ -865,7 +867,11 @@ def test_authority_tighten_sl_live_intervention_applied_true_only_for_the_claimi
     exact bug this test guards against."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_candidate_and_position(repo)  # pos-1: stop_loss=90, simulated_fill_entry=100, BTCUSDT
-    _make_active_live_execution(repo, "pos-1", entry_quantity="10", avg_entry="100")
+    # leverage 5: this fixture's stops (90 -> ~90.25 on a 100 entry) sit inside
+    # the P0 Safety Kernel's liquidation buffer at 10x (est. liquidation 91),
+    # which the kernel now correctly refuses - this test is about claim
+    # idempotency, not about liquidation distance.
+    _make_active_live_execution(repo, "pos-1", entry_quantity="10", avg_entry="100", leverage="5")
     _seed_always_on_heuristic(repo, adjustment=0.2)
     connector = _StubConnector(price="100")
     # Real fixture (not a mock): matches _open_active_live_position's shape
