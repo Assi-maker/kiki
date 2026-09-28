@@ -443,7 +443,7 @@ def validate_cost_model(paper_fee_pct: Decimal, costs: CostModelConfig) -> None:
 class ShadowConfig(BaseModel):
     """P3-P6 shadow evaluation (2026-09-28) - see config/shadow.yaml."""
 
-    oos_start: str = "2026-09-28T16:00:00+00:00"
+    oos_start: str = "2026-09-28T21:30:00+00:00"
     evaluation_interval_seconds: int = 1800
 
 

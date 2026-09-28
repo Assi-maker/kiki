@@ -3,6 +3,6 @@
 # were formed on (IN_SAMPLE_HISTORICAL); only decisions from oos_start on are
 # out-of-sample evidence. Set to the deployment time of the shadow evaluator
 # and never moved later to "improve" a result.
-oos_start: "2026-09-28T16:00:00+00:00"
+oos_start: "2026-09-28T21:30:00+00:00"
 # How often ready candidates (6 h window passed) are evaluated.
 evaluation_interval_seconds: 1800
