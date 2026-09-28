@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, model_validator
 
 from crypto_trading.schemas.common import AssessmentStatus
 
@@ -37,13 +37,20 @@ class ForecastAssessment(AssessmentBase):
     horizon: str
     forecast_version: str
 
-    @field_validator("scenario_probabilities")
-    @classmethod
-    def probabilities_sum_to_one(cls, v: dict[str, float]) -> dict[str, float]:
-        total = sum(v.values())
+    @model_validator(mode="after")
+    def probabilities_sum_to_one(self) -> ForecastAssessment:
+        """Business rule for REAL model answers only (status="ok"). A failed/
+        timeout role is persisted by the runner as a placeholder with empty
+        probabilities; enforcing the sum on it made every failed forecast
+        unreadable on load (2026-09-29: 310 NO_TRADE candidates raised
+        CorruptCandidateStateError). The Gate treats any status != "ok" as
+        missing_or_failed_assessment regardless of the fields."""
+        if self.status != "ok":
+            return self
+        total = sum(self.scenario_probabilities.values())
         if not (0.999 <= total <= 1.001):
             raise ValueError(f"scenario_probabilities must sum to 1.0, got {total}")
-        return v
+        return self
 
 
 class RiskAssessment(AssessmentBase):

@@ -55,6 +55,30 @@ def test_forecast_scenario_probabilities_valid_sum():
     assert abs(sum(a.scenario_probabilities.values()) - 1.0) < 0.001
 
 
+def test_an_ok_forecast_with_empty_probabilities_is_still_invalid():
+    with pytest.raises(ValidationError):
+        ForecastAssessment(
+            **_BASE_KWARGS, status="ok", scenario_probabilities={}, horizon="4h",
+            forecast_version="v1",
+        )
+
+
+@pytest.mark.parametrize("status", ["failed", "timeout"])
+def test_a_failed_forecast_placeholder_reads_back(status):
+    """2026-09-29: the runner persists a failed role as a placeholder with
+    scenario_probabilities={} (model_construct). The sum-to-one business rule
+    is for REAL model answers (status="ok") - applying it on read made every
+    failed forecast unreadable (310 NO_TRADE candidates ->
+    CorruptCandidateStateError)."""
+    raw = (
+        '{"agent_name":"crypto-forecast-agent","run_id":"r","created_at":"2026-09-02T09:07:06Z",'
+        f'"status":"{status}","scenario_probabilities":{{}},"horizon":"","forecast_version":""}}'
+    )
+    a = ForecastAssessment.model_validate_json(raw)
+    assert a.status == status
+    assert a.scenario_probabilities == {}
+
+
 def test_risk_assessment_is_advisory_fields_only():
     a = RiskAssessment(
         **_BASE_KWARGS,
