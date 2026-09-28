@@ -488,6 +488,10 @@ def test_live_executions_table_exists(tmp_path):
         "exchange_fill_entry", "exchange_fill_exit", "last_error", "margin_usdt",
         "notional_usdt", "leverage", "realized_fees_usdt", "realized_funding_usdt",
         "claimed_at", "updated_at", "closed_at", "exit_fill_source",
+        # 2026-09-28 exchange-verified exit record (live_exit_reconciliation.py)
+        "exit_verification", "exit_verification_reason", "exit_classification",
+        "exit_exchange_order_ids", "entry_filled_at", "exit_filled_at",
+        "exchange_realized_pnl_usdt", "exit_verified_at",
     }
 
 
@@ -536,3 +540,29 @@ def test_decimal_json_roundtrip_is_exact_never_via_float(value):
 
     assert reconstructed == value
     assert isinstance(deserialized["amount"], str)  # aldrig ett JSON-tal/float
+
+
+def test_exit_verification_columns_are_added_to_an_existing_database(tmp_path):
+    """2026-09-28: the production DB already has live_executions - the new
+    exit-verification columns must be added in place, idempotently, with
+    existing rows left NULL (= not yet checked), never guessed."""
+    import sqlite3 as _sqlite3
+
+    path = tmp_path / "old.db"
+    old = _sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE live_executions (position_id TEXT PRIMARY KEY, phase TEXT NOT NULL, "
+        "claimed_at TEXT NOT NULL, updated_at TEXT NOT NULL, exit_fill_source TEXT)"
+    )
+    old.execute("INSERT INTO live_executions VALUES ('p1', 'CLOSED', 'c', 'u', 'TICKER')")
+    old.commit()
+    old.close()
+
+    conn = get_connection(path)
+    conn.close()
+    conn = get_connection(path)  # second run: idempotent
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(live_executions)").fetchall()}
+    assert {"exit_verification", "exit_classification", "exit_verified_at"} <= columns
+    row = conn.execute("SELECT exit_verification, exit_fill_source FROM live_executions").fetchone()
+    assert row["exit_verification"] is None
+    assert row["exit_fill_source"] == "TICKER"

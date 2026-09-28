@@ -1228,3 +1228,29 @@ def test_a_fifth_live_position_is_blocked_at_the_new_size(tmp_path):
 
     assert connector.calls == []
     assert repo.get_live_execution("pos-5") is None
+
+
+def test_a_stale_signal_is_logged_once_not_on_every_tick(tmp_path, caplog):
+    """2026-09-28 log-spam fix: 1 226 identical live_signal_stale_skipped lines
+    in 20 h buried real errors. The skip DECISION is unchanged (still made on
+    every tick, still a pure function of now/confirmed_at/ttl); only the log
+    line is emitted once per position per process."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo, position_id="pos-spam-1", confirmed_at=_NOW - timedelta(hours=3))
+    _open_position(repo, position_id="pos-spam-2", confirmed_at=_NOW - timedelta(hours=3))
+    connector = _SpyConnector(balance="1000.00", all_positions=[])
+    settings = _with_ttl(get_settings(), ttl_seconds=1800)
+
+    with caplog.at_level("INFO", logger="crypto_trading"):
+        for tick_offset in (0, 30, 60, 90):
+            process_pending_positions(
+                repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+                {"BTC-USDT": Decimal("0")}, settings, "r1", _NOW + timedelta(seconds=tick_offset),
+            )
+
+    stale_lines = [r.getMessage() for r in caplog.records if "live_signal_stale_skipped" in r.getMessage()]
+    assert sum("pos-spam-1" in line for line in stale_lines) == 1
+    assert sum("pos-spam-2" in line for line in stale_lines) == 1
+    assert repo.get_live_execution("pos-spam-1") is None  # still never claimed
+    assert repo.get_live_execution("pos-spam-2") is None
+    assert connector.calls == []

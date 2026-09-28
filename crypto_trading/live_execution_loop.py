@@ -15,6 +15,7 @@ from crypto_trading.paper_trading.live_execution import (
     recover_stale_claims,
     resolve_pending_entries,
 )
+from crypto_trading.paper_trading.live_exit_reconciliation import verify_closed_live_exits
 from crypto_trading.paper_trading.live_profit_protection import run_live_profit_protection_tick
 from crypto_trading.storage.repository import Repository
 
@@ -72,6 +73,16 @@ def run_live_execution_tick(
             repo, connector, market_data_connector, quantity_precision_by_symbol,
             min_notional_by_symbol, settings, run_id, now,
         )
+        # 2026-09-28: read-only verification of already-CLOSED exits against
+        # the exchange's order history, LAST so it can never delay a trading
+        # step, and isolated so its failure never fails the trading tick.
+        try:
+            verify_closed_live_exits(repo, connector, run_id, now)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                run_id, event="live_exit_verification_failed",
+                error_type=type(exc).__name__, error=str(exc),
+            )
         repo.complete_run(run_id, datetime.now(UTC), "ok", [])
     except Exception as exc:
         log_event(

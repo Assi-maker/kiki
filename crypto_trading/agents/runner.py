@@ -10,6 +10,7 @@ from typing import TypeVar
 from anthropic import Anthropic, APIError
 
 from crypto_trading.agents.loader import AgentDefinition
+from crypto_trading.ai_health import AI_HEALTH, NON_RETRYABLE_KINDS, classify_api_error
 from crypto_trading.logging import log_event
 from crypto_trading.schemas.assessments import AssessmentBase
 
@@ -173,8 +174,30 @@ class RealClaudeRunner(AgentRunner):
                 data.setdefault("created_at", datetime.now(UTC).isoformat())
                 self.last_call_billed = billed_this_call
                 self.last_call_cost_usd = cost_this_call
+                AI_HEALTH.record_success(datetime.now(UTC))
                 return output_schema.model_validate(data)
-            except (json.JSONDecodeError, ValueError, TypeError, APIError) as exc:
+            except APIError as exc:
+                # 2026-09-28: every Anthropic failure is classified, logged as
+                # its own ai_api_error event and folded into AI_HEALTH (the
+                # watchdog alerts on it). Credit exhaustion / a rejected key
+                # cannot be fixed by retrying - stop at once and fail closed.
+                kind = classify_api_error(exc)
+                AI_HEALTH.record_failure(kind, agent_def.name, datetime.now(UTC))
+                log_event(
+                    run_id,
+                    event="ai_api_error",
+                    agent_name=agent_def.name,
+                    kind=kind,
+                    status_code=getattr(exc, "status_code", None),
+                    attempt=attempt + 1,
+                    max_retries=self._max_retries,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                if kind in NON_RETRYABLE_KINDS:
+                    break
+                continue
+            except (json.JSONDecodeError, ValueError, TypeError) as exc:
                 # SPEC §10: every retry failure must leave a diagnostic trace —
                 # never a silent `continue`. Never interpolate the raw exception
                 # or any raw request/response object here, only type name +

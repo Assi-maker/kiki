@@ -233,3 +233,44 @@ def test_run_live_execution_tick_calls_profit_protection_in_correct_order_when_e
     # Same run_id this tick used for reconcile_active_executions - proves
     # the call isn't accidentally minting/forwarding a different run.
     assert pp_args[3] == mock_reconcile.call_args.args[3]
+
+
+def test_run_live_execution_tick_verifies_closed_exits_after_trading_work(tmp_path):
+    """2026-09-28: exit verification runs LAST in the tick, after every
+    trading step, with the tick's own repo/connector/run_id/now."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo)
+    connector = _SpyConnector()
+    calls = []
+
+    def _fake_verify(repo_, connector_, run_id, now):
+        calls.append((repo_, connector_, now, repo.get_live_execution("pos-1")["phase"]))
+        return 0
+
+    with patch("crypto_trading.live_execution_loop.verify_closed_live_exits", _fake_verify):
+        run_live_execution_tick(
+            repo, connector, _SpyMarketDataConnector(), {"BTC-USDT": 3},
+            {"BTC-USDT": Decimal("0")}, get_settings(), _NOW,
+        )
+
+    assert calls == [(repo, connector, _NOW, "ACTIVE")]  # the new entry was already placed
+
+
+def test_an_exit_verification_failure_never_fails_the_trading_tick(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_open_position(repo)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("verification exploded")
+
+    with patch("crypto_trading.live_execution_loop.verify_closed_live_exits", _boom):
+        run_live_execution_tick(
+            repo, _SpyConnector(), _SpyMarketDataConnector(), {"BTC-USDT": 3},
+            {"BTC-USDT": Decimal("0")}, get_settings(), _NOW,
+        )
+
+    assert repo.get_live_execution("pos-1")["phase"] == "ACTIVE"
+    status = repo._conn.execute(
+        "SELECT status FROM runs WHERE run_type = 'live_execution'"
+    ).fetchone()["status"]
+    assert status == "ok"

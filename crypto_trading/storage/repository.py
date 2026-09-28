@@ -107,6 +107,9 @@ class Repository(Protocol):
         notional_usdt: str, leverage: str,
     ) -> bool: ...
     def get_live_execution(self, position_id: str) -> dict | None: ...
+    def find_live_executions_needing_exit_verification(self, limit: int) -> list[dict]: ...
+    def has_overlapping_live_execution(self, position_id: str) -> bool: ...
+    def record_live_exit_verification(self, position_id: str, result, verified_at: datetime) -> None: ...
     def find_active_live_execution_for_instrument(self, instrument: str) -> dict | None: ...
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]: ...
     def get_candidate_confirmed_at(self, candidate_id: str) -> datetime | None: ...
@@ -223,6 +226,7 @@ class Repository(Protocol):
     ) -> None: ...
     def abandon_profit_protection_shadow(self, shadow_id: str, abandoned_at: datetime) -> None: ...
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None: ...
+    def latest_run_started_at_by_type(self) -> dict[str, datetime]: ...
     def complete_run(
         self,
         run_id: str,
@@ -1159,6 +1163,61 @@ class SQLiteRepository:
         )
         self._conn.commit()
 
+    def find_live_executions_needing_exit_verification(self, limit: int) -> list[dict]:
+        """CLOSED LIVE rows whose exit has not been checked against the
+        exchange yet (2026-09-28), newest close first."""
+        rows = self._conn.execute(
+            "SELECT * FROM live_executions WHERE phase = 'CLOSED' AND exit_verification IS NULL "
+            "ORDER BY closed_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_overlapping_live_execution(self, position_id: str) -> bool:
+        """Read-only. True when another LIVE execution on the same instrument
+        was open at any moment this one was (claimed..closed) - the exchange
+        merges same-symbol LONGs, so neither exit can be attributed."""
+        row = self._conn.execute(
+            "SELECT 1 FROM live_executions me JOIN positions mp ON mp.position_id = me.position_id "
+            "JOIN live_executions other ON other.position_id != me.position_id "
+            "JOIN positions op ON op.position_id = other.position_id "
+            "WHERE me.position_id = ? AND op.instrument = mp.instrument "
+            "AND other.phase IN ('ACTIVE', 'CLOSED') AND other.entry_quantity IS NOT NULL "
+            "AND other.claimed_at < COALESCE(me.closed_at, '9999') "
+            "AND COALESCE(other.closed_at, '9999') > me.claimed_at LIMIT 1",
+            (position_id,),
+        ).fetchone()
+        return row is not None
+
+    def record_live_exit_verification(self, position_id: str, result, verified_at: datetime) -> None:
+        """Stores a live_exit_reconciliation.ExitReconciliation. Only a
+        VERIFIED result replaces the exit price (and a TICKER/unknown fill
+        source) and stores the exchange's real fees and funding; exit_reason
+        is never rewritten. Only ever touches a CLOSED row."""
+        iso = lambda moment: moment.isoformat() if moment is not None else None  # noqa: E731
+        text = lambda value: str(value) if value is not None else None  # noqa: E731
+        self._conn.execute(
+            "UPDATE live_executions SET exit_verification = ?, exit_verification_reason = ?, "
+            "exit_classification = ?, exit_exchange_order_ids = ?, entry_filled_at = ?, "
+            "exit_filled_at = ?, exchange_realized_pnl_usdt = ?, exit_verified_at = ? "
+            "WHERE position_id = ? AND phase = 'CLOSED'",
+            (
+                result.verification, result.reason, result.classification, result.exit_order_ids,
+                iso(result.entry_filled_at), iso(result.exit_filled_at),
+                text(result.exchange_realized_pnl_usdt), verified_at.isoformat(), position_id,
+            ),
+        )
+        if result.verification == "VERIFIED":
+            self._conn.execute(
+                "UPDATE live_executions SET exchange_fill_exit = ?, realized_fees_usdt = ?, "
+                "realized_funding_usdt = ?, exit_fill_source = CASE WHEN exit_fill_source = "
+                "'MARKET_CLOSE' THEN 'MARKET_CLOSE' ELSE 'EXCHANGE_ORDER' END "
+                "WHERE position_id = ? AND phase = 'CLOSED'",
+                (text(result.exit_price), text(result.fees_usdt), text(result.funding_usdt),
+                 position_id),
+            )
+        self._conn.commit()
+
     def mark_live_execution_failed(
         self, position_id: str, last_error: str, updated_at: datetime
     ) -> None:
@@ -1653,6 +1712,15 @@ class SQLiteRepository:
             (Decimal(json.loads(row["payload"]).get("cost_usd", "0")) for row in rows),
             Decimal("0"),
         )
+
+    def latest_run_started_at_by_type(self) -> dict[str, datetime]:
+        """Read-only. The newest `runs.started_at` per loop - the watchdog's
+        heartbeat source (2026-09-28); every loop already records a run per
+        tick."""
+        rows = self._conn.execute(
+            "SELECT run_type, MAX(started_at) AS latest FROM runs GROUP BY run_type"
+        ).fetchall()
+        return {row["run_type"]: datetime.fromisoformat(row["latest"]) for row in rows}
 
     def start_run(self, run_id: str, run_type: str, started_at: datetime) -> None:
         self._conn.execute(

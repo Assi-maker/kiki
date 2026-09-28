@@ -172,6 +172,12 @@ def resolve_realized_pnl(
         return _unverifiable("NO_PAPER_EXIT_AND_NO_LIVE_EXECUTION")
     if live_execution.get("phase") != "CLOSED":
         return _unverifiable("LIVE_EXECUTION_NOT_CLOSED")
+    if live_execution.get("exit_verification") == "UNVERIFIABLE":
+        # 2026-09-28: the exchange's own records could not confirm this exit
+        # (live_exit_reconciliation.py) - never trust the locally recorded fill.
+        return _unverifiable(
+            f"EXCHANGE_EVIDENCE:{live_execution.get('exit_verification_reason') or 'UNKNOWN'}"
+        )
     fill_source = live_execution.get("exit_fill_source")
     if fill_source is None and live_execution.get("exit_reason") in _MARKET_CLOSE_EXIT_REASONS:
         fill_source = "MARKET_CLOSE"

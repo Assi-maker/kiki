@@ -20,6 +20,7 @@ _POSITIONS_PATH = "/openApi/swap/v2/user/positions"
 _OPEN_ORDERS_PATH = "/openApi/swap/v2/trade/openOrders"
 _ALL_ORDERS_PATH = "/openApi/swap/v2/trade/allOrders"
 _BALANCE_PATH = "/openApi/swap/v2/user/balance"
+_INCOME_PATH = "/openApi/swap/v2/user/income"
 
 
 def _unwrap_order(data: dict | None) -> dict:
@@ -226,20 +227,37 @@ class BingXLiveTradingConnector:
             return data
         return data.get("orders", [])
 
-    def get_order_history(self, symbol: str, start_time_ms: int, limit: int = 50) -> list[dict]:
+    def get_order_history(
+        self, symbol: str, start_time_ms: int, limit: int = 50, end_time_ms: int | None = None
+    ) -> list[dict]:
         """Read-only. The exchange's own order history for `symbol` since
         `start_time_ms` (GET allOrders) - the ground truth for HOW a position
         actually closed (which order type filled, and at what price). Unlike
         get_order_by_client_order_id/get_order_status, an API error is NOT
         collapsed into an empty result: it raises ConnectorUnavailableError so a
         caller can tell 'no such orders' from 'the exchange did not answer'."""
-        data = self._request(
-            "GET", _ALL_ORDERS_PATH,
-            {"symbol": symbol, "startTime": start_time_ms, "limit": limit},
-        ) or {}
+        params = {"symbol": symbol, "startTime": start_time_ms, "limit": limit}
+        if end_time_ms is not None:
+            params["endTime"] = end_time_ms  # BingX rejects ranges over 7 days
+        data = self._request("GET", _ALL_ORDERS_PATH, params) or {}
         if isinstance(data, list):
             return data
         return data.get("orders", [])
+
+    def get_income(
+        self, symbol: str, income_type: str, start_time_ms: int, end_time_ms: int, limit: int = 1000
+    ) -> list[dict]:
+        """Read-only. The exchange's own income ledger (REALIZED_PNL,
+        TRADING_FEE, FUNDING_FEE, ...) for `symbol` in [start, end] - the
+        source of REAL funding for a LIVE trade (2026-09-28 exit
+        reconciliation). Like get_order_history, an API error raises
+        ConnectorUnavailableError rather than looking like "no income"."""
+        data = self._request(
+            "GET", _INCOME_PATH,
+            {"symbol": symbol, "incomeType": income_type, "startTime": start_time_ms,
+             "endTime": end_time_ms, "limit": limit},
+        ) or []
+        return data if isinstance(data, list) else []
 
     def cancel_all_open_orders(self, symbol: str) -> dict:
         return self._request("DELETE", _ALL_OPEN_ORDERS_PATH, {"symbol": symbol}) or {}

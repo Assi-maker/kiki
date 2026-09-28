@@ -38,3 +38,6 @@ Thumbs.db
 
 # Git worktrees (subagent-driven-development isolated workspaces)
 .worktrees/
+
+# Bot runtime logs (persistent, rotated by the bot itself - 2026-09-28)
+logs/

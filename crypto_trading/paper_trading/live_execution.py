@@ -376,6 +376,9 @@ def _submit_entry_order(
     _resolve_uncertain_entry(repo, connector, position, client_order_id, run_id, now, origin="post_submit")
 
 
+_stale_skip_logged: set[str] = set()
+
+
 def _signal_is_fresh(
     repo: Repository, position: Position, ttl_seconds: int, run_id: str, now: datetime
 ) -> bool:
@@ -396,6 +399,12 @@ def _signal_is_fresh(
     age_seconds = (now - confirmed_at).total_seconds() if confirmed_at is not None else None
     if confirmed_at is not None and age_seconds <= ttl_seconds:
         return True
+    # 2026-09-28: log once per position per process, not on every 30 s tick
+    # (1 226 identical lines in 20 h buried real errors). The decision above
+    # is still re-made on every tick; only the repeated log line is dropped.
+    if position.position_id in _stale_skip_logged:
+        return False
+    _stale_skip_logged.add(position.position_id)
     log_event(
         run_id, event="live_signal_stale_skipped", position_id=position.position_id,
         candidate_id=position.candidate_id,

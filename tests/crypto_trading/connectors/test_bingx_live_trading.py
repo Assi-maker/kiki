@@ -334,3 +334,52 @@ def test_get_order_history_raises_connector_unavailable_on_api_error_code():
 
     with pytest.raises(ConnectorUnavailableError):
         _connector().get_order_history("ENA-USDT", 1789800000000)
+
+
+@respx.mock
+def test_get_income_is_a_read_only_get_of_the_income_history():
+    """2026-09-28 exit reconciliation: real funding (and fees) come from the
+    exchange's own income ledger - a GET, never anything that can trade."""
+    route = respx.get(f"{_LIVE_BASE}/openApi/swap/v2/user/income").mock(
+        return_value=Response(200, json={"code": 0, "msg": "", "data": [
+            {"symbol": "2Z-USDT", "incomeType": "FUNDING_FEE", "income": "0.0123", "time": 1790400000000},
+        ]})
+    )
+
+    rows = _connector().get_income("2Z-USDT", "FUNDING_FEE", 1790390000000, 1790410000000)
+
+    assert rows == [
+        {"symbol": "2Z-USDT", "incomeType": "FUNDING_FEE", "income": "0.0123", "time": 1790400000000}
+    ]
+    request = route.calls[0].request
+    assert request.method == "GET"
+    params = parse_qs(urlparse(str(request.url)).query)
+    assert params["symbol"] == ["2Z-USDT"]
+    assert params["incomeType"] == ["FUNDING_FEE"]
+    assert params["startTime"] == ["1790390000000"]
+    assert params["endTime"] == ["1790410000000"]
+    assert "signature" in params
+
+
+@respx.mock
+def test_get_income_raises_connector_unavailable_on_api_error_code():
+    respx.get(f"{_LIVE_BASE}/openApi/swap/v2/user/income").mock(
+        return_value=Response(200, json={"code": 100500, "msg": "internal", "data": {}})
+    )
+
+    with pytest.raises(ConnectorUnavailableError):
+        _connector().get_income("2Z-USDT", "FUNDING_FEE", 1, 2)
+
+
+@respx.mock
+def test_get_order_history_passes_an_optional_end_time():
+    """BingX rejects allOrders ranges over 7 days (109400 'the query range is
+    more than seven days') - the caller bounds the window with endTime."""
+    route = respx.get(f"{_LIVE_BASE}/openApi/swap/v2/trade/allOrders").mock(
+        return_value=Response(200, json={"code": 0, "msg": "", "data": {"orders": []}})
+    )
+
+    _connector().get_order_history("ENA-USDT", 1789800000000, limit=100, end_time_ms=1789900000000)
+
+    params = parse_qs(urlparse(str(route.calls[0].request.url)).query)
+    assert params["endTime"] == ["1789900000000"]

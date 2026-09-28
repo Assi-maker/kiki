@@ -1040,6 +1040,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_guardian_authority_heuristic_candidates_add_target_decision_type(conn)
     _migrate_godfather_decision_audits_add_conflicts_json(conn)
     _migrate_live_executions_add_exit_fill_source(conn)
+    _migrate_live_executions_add_exit_verification(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -1199,6 +1200,23 @@ def _migrate_live_executions_add_exit_fill_source(conn: sqlite3.Connection) -> N
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(live_executions)").fetchall()}
     if "exit_fill_source" not in columns:
         _add_column_idempotent(conn, "ALTER TABLE live_executions ADD COLUMN exit_fill_source TEXT")
+
+
+_EXIT_VERIFICATION_COLUMNS = (
+    "exit_verification", "exit_verification_reason", "exit_classification",
+    "exit_exchange_order_ids", "entry_filled_at", "exit_filled_at",
+    "exchange_realized_pnl_usdt", "exit_verified_at",
+)
+
+
+def _migrate_live_executions_add_exit_verification(conn: sqlite3.Connection) -> None:
+    """2026-09-28: the exchange-verified record of each LIVE exit, written by
+    paper_trading/live_exit_reconciliation.py next to the bot's own
+    close-time record (which is never rewritten). NULL = not yet checked."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(live_executions)").fetchall()}
+    for column in _EXIT_VERIFICATION_COLUMNS:
+        if column not in columns:
+            _add_column_idempotent(conn, f"ALTER TABLE live_executions ADD COLUMN {column} TEXT")
 
 
 def _add_column_idempotent(conn: sqlite3.Connection, alter_sql: str) -> None:

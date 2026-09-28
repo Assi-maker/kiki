@@ -5,6 +5,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
@@ -19,8 +20,10 @@ from crypto_trading import (
     live_execution_loop,
     monitoring_loop,
     notify_loop,
+    watchdog,
 )
 from crypto_trading.agents.runner import AgentRunner, RealClaudeRunner
+from crypto_trading.ai_health import AI_HEALTH
 from crypto_trading.config.exceptions import ConfigError
 from crypto_trading.config.loader import (
     Settings,
@@ -35,10 +38,18 @@ from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.connectors.external_data import ExternalDataConnector
 from crypto_trading.connectors.news_rss import NewsRSSConnector
 from crypto_trading.dashboard.api import RepositoryFactory, create_app
-from crypto_trading.logging import log_event, new_run_id
+from crypto_trading.logging import configure_persistent_logging, log_event, new_run_id
 from crypto_trading.notify.telegram import TelegramNotifier
 from crypto_trading.single_instance import AlreadyRunningError, InstanceLock, lock_path_for
 from crypto_trading.storage.repository import SQLiteRepository
+
+_DEFAULT_LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+
+
+def log_dir_from_env() -> Path:
+    """Where the persistent, rotated bot log lives (2026-09-28). Defaults to
+    the repository's own logs/ folder; CRYPTO_TRADING_LOG_DIR overrides."""
+    return Path(os.environ.get("CRYPTO_TRADING_LOG_DIR") or _DEFAULT_LOG_DIR)
 
 
 def build_runner_from_env() -> AgentRunner:
@@ -323,6 +334,23 @@ def _run_notify_forever(notifier: TelegramNotifier, settings: Settings) -> None:
     notify_loop.run_forever(notifier, repo, settings)
 
 
+def _run_watchdog_forever(
+    settings: Settings,
+    notifier: TelegramNotifier | None,
+    loop_threads: dict[str, threading.Thread],
+    process_started_at: datetime,
+    heartbeat_path: Path,
+) -> None:
+    """2026-09-28 watchdog thread: own SQLite connection (same discipline as
+    every loop above), the process-wide AI_HEALTH the runners write to, and
+    no trading connector at all - it can only log, write the heartbeat file
+    and send Telegram alerts."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    watchdog.run_watchdog_forever(
+        repo, notifier, AI_HEALTH, loop_threads, process_started_at, heartbeat_path
+    )
+
+
 def _run_dashboard_forever(app: FastAPI, settings: Settings) -> None:
     """Fas 7:s fjärde, oberoende tråd. Till skillnad från de tre ovan
     konstruerar denna INTE en delad Repository här - `app` byggdes redan i
@@ -368,6 +396,9 @@ def _run_dashboard_forever(app: FastAPI, settings: Settings) -> None:
 
 
 def main() -> None:
+    # First, before anything that can fail: a startup error must be on disk too.
+    configure_persistent_logging(log_dir_from_env())
+    process_started_at = datetime.now(UTC)
     settings = get_settings()
     # One process per database (2026-09-25): two concurrent bots doubled
     # every loop on 2026-09-12. Held for the whole process lifetime and
@@ -412,6 +443,7 @@ def main() -> None:
 
     discovery_thread = threading.Thread(
         target=_run_discovery_forever,
+        name="discovery",
         args=(
             connector, runner, settings, news_connector, external_data_connector,
             screener_runner, live_connector,
@@ -420,16 +452,19 @@ def main() -> None:
     )
     monitoring_thread = threading.Thread(
         target=_run_monitoring_forever,
+        name="monitoring",
         args=(connector, settings),
         daemon=True,
     )
     detective_thread = threading.Thread(
         target=_run_detective_forever,
+        name="detective",
         args=(detective_runner, settings),
         daemon=True,
     )
     godfather_thread = threading.Thread(
         target=_run_godfather_intelligence_forever,
+        name="godfather_intelligence",
         args=(settings,),
         daemon=True,
     )
@@ -453,7 +488,9 @@ def main() -> None:
     notifier = build_notifier_from_env()
     if notifier is not None:
         threads.append(
-            threading.Thread(target=_run_notify_forever, args=(notifier, settings), daemon=True)
+            threading.Thread(
+                target=_run_notify_forever, args=(notifier, settings), daemon=True, name="notify",
+            )
         )
     else:
         log_event(
@@ -507,6 +544,7 @@ def main() -> None:
         threads.append(
             threading.Thread(
                 target=_run_guardian_forever,
+                name="guardian",
                 args=(connector, guardian_runner, settings, live_connector),
                 daemon=True,
             )
@@ -521,6 +559,7 @@ def main() -> None:
             threads.append(
                 threading.Thread(
                     target=_run_live_execution_forever,
+                    name="live_execution",
                     args=(connector, live_connector, settings),
                     daemon=True,
                 )
@@ -535,6 +574,21 @@ def main() -> None:
             "startup", event="live_execution_disabled",
             reason="CRYPTO_TRADING_LIVE_EXECUTION_ENABLED not set",
         )
+
+    # Watchdog (2026-09-28): every loop above records one `runs` row per tick
+    # under these run_type names; the watchdog alerts when one stops ticking
+    # or its thread dies, and writes logs/heartbeat.json for the external
+    # scheduled check (python -m crypto_trading.watchdog).
+    loop_threads = {
+        thread.name: thread for thread in threads if thread.name in watchdog.LOOP_STALE_AFTER_SECONDS
+    }
+    threads.append(threading.Thread(
+        target=_run_watchdog_forever,
+        args=(settings, notifier, loop_threads, process_started_at,
+              log_dir_from_env() / "heartbeat.json"),
+        daemon=True,
+        name="watchdog",
+    ))
 
     for thread in threads:
         thread.start()

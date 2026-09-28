@@ -215,3 +215,39 @@ def test_run_detective_forever_constructs_its_own_repository_inside_the_worker_t
     conn = sqlite3.connect(settings.db_path)
     row = conn.execute("SELECT status FROM runs WHERE run_id = 'run-4'").fetchone()
     assert row is not None, "the tick's write never reached the database"
+
+
+def test_run_watchdog_forever_uses_its_own_repository_and_the_global_ai_health(
+    tmp_path, monkeypatch
+):
+    """2026-09-28 watchdog thread: same thread-bound-connection discipline as
+    every other loop, and it watches the process-wide AI_HEALTH the runners
+    write to - never a private copy."""
+    from crypto_trading.ai_health import AI_HEALTH
+
+    settings = _settings_with_db(tmp_path)
+    seen: dict = {}
+    errors: list[BaseException] = []
+
+    def fake_forever(repo, notifier, health, threads, started_at, heartbeat_path):
+        try:
+            repo.latest_run_started_at_by_type()
+            seen.update(thread=threading.get_ident(), health=health, threads=threads,
+                        heartbeat_path=heartbeat_path)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(run_module.watchdog, "run_watchdog_forever", fake_forever)
+    loop_threads = {"live_execution": threading.current_thread()}
+    worker = threading.Thread(
+        target=run_module._run_watchdog_forever,
+        args=(settings, None, loop_threads, datetime.now(UTC), tmp_path / "hb.json"),
+    )
+    worker.start()
+    worker.join(timeout=5)
+
+    assert errors == []
+    assert seen["thread"] == worker.ident
+    assert seen["health"] is AI_HEALTH
+    assert seen["threads"] is loop_threads
+    assert seen["heartbeat_path"] == tmp_path / "hb.json"

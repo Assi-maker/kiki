@@ -111,3 +111,26 @@ def test_build_detective_runner_from_env_returns_a_distinct_instance_from_screen
     detective_runner = build_detective_runner_from_env()
     screener_runner = build_screener_runner_from_env()
     assert detective_runner is not screener_runner
+
+
+def test_main_configures_persistent_logging_before_anything_else(monkeypatch, tmp_path):
+    """2026-09-28: the log file must exist even when startup itself fails
+    (settings, instance lock, missing API key) - so it is the first step."""
+    import crypto_trading.run as run_module
+
+    calls = []
+    monkeypatch.setenv("CRYPTO_TRADING_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(run_module, "configure_persistent_logging",
+                        lambda log_dir: calls.append(log_dir))
+
+    class _Stop(Exception):
+        pass
+
+    def _settings_fail():
+        raise _Stop
+
+    monkeypatch.setattr(run_module, "get_settings", _settings_fail)
+    import pytest as _pytest
+    with _pytest.raises(_Stop):
+        run_module.main()
+    assert [str(p) for p in calls] == [str(tmp_path / "logs")]
