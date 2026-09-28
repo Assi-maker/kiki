@@ -45,6 +45,8 @@ LOOP_STALE_AFTER_SECONDS: dict[str, int] = {
     "detective": 20 * 60,
     "godfather_intelligence": 60 * 60,
     "discovery": 90 * 60,
+    # P3-P6 shadow evaluator: every 30 min, a tick can take several minutes
+    "shadow_evaluation": 90 * 60,
 }
 DEFAULT_STALE_AFTER_SECONDS = 30 * 60
 REPEAT_ALERT_AFTER = timedelta(minutes=60)

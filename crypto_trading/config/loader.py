@@ -440,6 +440,13 @@ def validate_cost_model(paper_fee_pct: Decimal, costs: CostModelConfig) -> None:
         )
 
 
+class ShadowConfig(BaseModel):
+    """P3-P6 shadow evaluation (2026-09-28) - see config/shadow.yaml."""
+
+    oos_start: str = "2026-09-28T16:00:00+00:00"
+    evaluation_interval_seconds: int = 1800
+
+
 class GatePolicyConfig(BaseModel):
     """P1 Gate content requirements (2026-09-28) - see config/gate.yaml.
     Defaults ARE the production values."""
@@ -467,6 +474,7 @@ class Settings(BaseModel):
     safety: SafetyKernelConfig = Field(default_factory=SafetyKernelConfig)
     gate: GatePolicyConfig = Field(default_factory=GatePolicyConfig)
     costs: CostModelConfig = Field(default_factory=CostModelConfig)
+    shadow: ShadowConfig = Field(default_factory=ShadowConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -507,6 +515,7 @@ def get_settings() -> Settings:
         safety=_load_yaml_model(_CONFIG_DIR / "safety_kernel.yaml", SafetyKernelConfig),
         gate=_load_yaml_model(_CONFIG_DIR / "gate.yaml", GatePolicyConfig),
         costs=costs,
+        shadow=_load_yaml_model(_CONFIG_DIR / "shadow.yaml", ShadowConfig),
     )
 
 

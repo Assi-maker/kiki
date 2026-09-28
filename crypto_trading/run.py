@@ -24,6 +24,7 @@ from crypto_trading import (
 )
 from crypto_trading.agents.runner import AgentRunner, RealClaudeRunner
 from crypto_trading.ai_health import AI_HEALTH
+from crypto_trading.shadow import evaluation as shadow_evaluation
 from crypto_trading.config.exceptions import ConfigError
 from crypto_trading.config.loader import (
     Settings,
@@ -334,6 +335,16 @@ def _run_notify_forever(notifier: TelegramNotifier, settings: Settings) -> None:
     notify_loop.run_forever(notifier, repo, settings)
 
 
+def _run_shadow_forever(connector: BingXMarketDataConnector, settings: Settings) -> None:
+    """P3-P6 shadow evaluator (2026-09-28): own SQLite connection, only the
+    read-only public market-data connector, writes only shadow_evaluations.
+    It never blocks, opens, changes or closes anything."""
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    shadow_evaluation.run_forever(
+        repo, connector, settings, interval_seconds=settings.shadow.evaluation_interval_seconds
+    )
+
+
 def _run_watchdog_forever(
     settings: Settings,
     notifier: TelegramNotifier | None,
@@ -579,6 +590,10 @@ def main() -> None:
     # under these run_type names; the watchdog alerts when one stops ticking
     # or its thread dies, and writes logs/heartbeat.json for the external
     # scheduled check (python -m crypto_trading.watchdog).
+    threads.append(threading.Thread(
+        target=_run_shadow_forever, args=(connector, settings), daemon=True,
+        name="shadow_evaluation",
+    ))
     loop_threads = {
         thread.name: thread for thread in threads if thread.name in watchdog.LOOP_STALE_AFTER_SECONDS
     }

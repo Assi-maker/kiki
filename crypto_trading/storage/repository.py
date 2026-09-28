@@ -117,6 +117,16 @@ class Repository(Protocol):
         self, candidate_id: str, evaluated_at: datetime, outcome: str, detail: dict
     ) -> None: ...
     def get_gate_evaluation(self, candidate_id: str) -> dict | None: ...
+    def find_gate_decisions_without_evaluation(self) -> list[tuple]: ...
+    def find_gate_evaluations_without_shadow(self, limit: int) -> list[dict]: ...
+    def save_shadow_evaluation(self, record: dict, evaluated_at: datetime) -> None: ...
+    def get_shadow_evaluation(self, candidate_id: str) -> dict | None: ...
+    def list_shadow_evaluations(self) -> list[dict]: ...
+    def had_position_on_symbol_within(
+        self, instrument: str, start: datetime, end: datetime, exclude: str
+    ) -> bool: ...
+    def get_godfather_entry_quality_verdict(self, candidate_id: str) -> str | None: ...
+    def verified_live_result(self, position_id: str) -> dict | None: ...
     def record_live_exit_verification(self, position_id: str, result, verified_at: datetime) -> None: ...
     def find_active_live_execution_for_instrument(self, instrument: str) -> dict | None: ...
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]: ...
@@ -1200,6 +1210,74 @@ class SQLiteRepository:
             (candidate_id, evaluated_at.isoformat(), outcome, json.dumps(detail, default=str)),
         )
         self._conn.commit()
+
+    # --- shadow evaluation (P3-P6, 2026-09-28): read/write only its own table ---
+
+    def find_gate_decisions_without_evaluation(self) -> list[tuple]:
+        return [tuple(r) for r in self._conn.execute(
+            "SELECT g.candidate_id, g.decision, g.reasons, g.evaluated_at FROM gate_decisions g "
+            "LEFT JOIN gate_evaluations e ON e.candidate_id = g.candidate_id "
+            "WHERE e.candidate_id IS NULL ORDER BY g.evaluated_at"
+        ).fetchall()]
+
+    def find_gate_evaluations_without_shadow(self, limit: int) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT e.* FROM gate_evaluations e LEFT JOIN shadow_evaluations s "
+            "ON s.candidate_id = e.candidate_id WHERE s.candidate_id IS NULL "
+            "ORDER BY e.evaluated_at LIMIT ?", (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def save_shadow_evaluation(self, record: dict, evaluated_at: datetime) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO shadow_evaluations (candidate_id, decided_at, cohort, "
+            "evaluated_at, record_json) VALUES (?, ?, ?, ?, ?)",
+            (record["candidate_id"], record["decided_at"], record["cohort"],
+             evaluated_at.isoformat(), json.dumps(record, default=str)),
+        )
+        self._conn.commit()
+
+    def get_shadow_evaluation(self, candidate_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT record_json FROM shadow_evaluations WHERE candidate_id = ?", (candidate_id,)
+        ).fetchone()
+        return json.loads(row["record_json"]) if row else None
+
+    def list_shadow_evaluations(self) -> list[dict]:
+        return [json.loads(r["record_json"]) for r in self._conn.execute(
+            "SELECT record_json FROM shadow_evaluations ORDER BY decided_at"
+        ).fetchall()]
+
+    def had_position_on_symbol_within(
+        self, instrument: str, start: datetime, end: datetime, exclude: str
+    ) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM positions WHERE instrument = ? AND position_id != ? "
+            "AND opened_at >= ? AND opened_at < ? LIMIT 1",
+            (instrument, exclude, start.isoformat(), end.isoformat()),
+        ).fetchone()
+        return row is not None
+
+    def get_godfather_entry_quality_verdict(self, candidate_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT verdict FROM godfather_entry_quality WHERE candidate_id = ?", (candidate_id,)
+        ).fetchone()
+        return row["verdict"] if row else None
+
+    def verified_live_result(self, position_id: str) -> dict | None:
+        """The exchange-verified LIVE net result, or None (not traded / not
+        verified). net = exchange realized P/L - actual fees - funding cost."""
+        row = self._conn.execute(
+            "SELECT * FROM live_executions WHERE position_id = ? AND phase = 'CLOSED' "
+            "AND exit_verification = 'VERIFIED'", (position_id,),
+        ).fetchone()
+        if row is None or row["exchange_realized_pnl_usdt"] is None:
+            return None
+        net = (Decimal(row["exchange_realized_pnl_usdt"])
+               - Decimal(row["realized_fees_usdt"] or "0")
+               - Decimal(row["realized_funding_usdt"] or "0"))
+        return {"net_usdt": str(net), "classification": row["exit_classification"],
+                "notional_usdt": row["notional_usdt"]}
 
     def get_gate_evaluation(self, candidate_id: str) -> dict | None:
         row = self._conn.execute(

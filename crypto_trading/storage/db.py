@@ -1043,6 +1043,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_live_executions_add_exit_verification(conn)
     _migrate_add_safety_kernel_decisions(conn)
     _migrate_add_gate_evaluations(conn)
+    _migrate_add_shadow_evaluations(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -1241,6 +1242,18 @@ def _migrate_add_gate_evaluations(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS gate_evaluations ("
         "candidate_id TEXT PRIMARY KEY, evaluated_at TEXT NOT NULL, outcome TEXT NOT NULL, "
         "detail_json TEXT NOT NULL)"
+    )
+
+
+def _migrate_add_shadow_evaluations(conn: sqlite3.Connection) -> None:
+    """2026-09-28 P3-P6: one shadow record per gate-evaluated candidate
+    (decision-time features, hypothetical veto actions, bracket outcome,
+    break-even/trailing variants, actual LIVE result). Never read by any
+    trading decision."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS shadow_evaluations ("
+        "candidate_id TEXT PRIMARY KEY, decided_at TEXT NOT NULL, cohort TEXT NOT NULL, "
+        "evaluated_at TEXT NOT NULL, record_json TEXT NOT NULL)"
     )
 
 

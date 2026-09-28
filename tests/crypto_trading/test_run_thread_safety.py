@@ -251,3 +251,30 @@ def test_run_watchdog_forever_uses_its_own_repository_and_the_global_ai_health(
     assert seen["health"] is AI_HEALTH
     assert seen["threads"] is loop_threads
     assert seen["heartbeat_path"] == tmp_path / "hb.json"
+
+
+def test_run_shadow_forever_constructs_its_own_repository_inside_the_worker_thread(
+    tmp_path, monkeypatch
+):
+    """P3-P6 shadow evaluator thread (2026-09-28): same thread-bound
+    connection discipline; it gets only the read-only market-data connector."""
+    settings = _settings_with_db(tmp_path)
+    seen = {}
+
+    def fake_forever(repo, connector, settings_, interval_seconds=0):
+        repo.latest_run_started_at_by_type()
+        seen.update(thread=threading.get_ident(), connector=connector, interval=interval_seconds)
+
+    monkeypatch.setattr(run_module.shadow_evaluation, "run_forever", fake_forever)
+    market = object()
+    worker = threading.Thread(target=run_module._run_shadow_forever, args=(market, settings))
+    worker.start()
+    worker.join(timeout=5)
+    assert seen["thread"] == worker.ident
+    assert seen["connector"] is market
+    assert seen["interval"] == settings.shadow.evaluation_interval_seconds
+
+
+def test_the_watchdog_knows_the_shadow_loop():
+    from crypto_trading.watchdog import LOOP_STALE_AFTER_SECONDS
+    assert LOOP_STALE_AFTER_SECONDS["shadow_evaluation"] >= 2 * 1800
