@@ -345,6 +345,17 @@ def _run_shadow_forever(connector: BingXMarketDataConnector, settings: Settings)
     )
 
 
+def _run_entry_quality_forever(connector: BingXMarketDataConnector, settings: Settings) -> None:
+    """Entry Quality Layer (2026-09-28), SHADOW ONLY: own SQLite connection,
+    only the read-only public market-data connector; writes only
+    entry_quality_shadow and godfather_entry_patterns. It never blocks,
+    sizes, opens, changes or closes anything."""
+    from crypto_trading.entry_research import quality
+
+    repo = SQLiteRepository(settings.db_path, settings.pipeline.sqlite_busy_timeout_ms)
+    quality.run_forever(repo, connector, str(settings.db_path))
+
+
 def _run_watchdog_forever(
     settings: Settings,
     notifier: TelegramNotifier | None,
@@ -593,6 +604,10 @@ def main() -> None:
     threads.append(threading.Thread(
         target=_run_shadow_forever, args=(connector, settings), daemon=True,
         name="shadow_evaluation",
+    ))
+    threads.append(threading.Thread(
+        target=_run_entry_quality_forever, args=(connector, settings), daemon=True,
+        name="entry_quality_shadow",
     ))
     loop_threads = {
         thread.name: thread for thread in threads if thread.name in watchdog.LOOP_STALE_AFTER_SECONDS

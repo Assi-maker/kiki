@@ -41,3 +41,7 @@ Thumbs.db
 
 # Bot runtime logs (persistent, rotated by the bot itself - 2026-09-28)
 logs/
+
+# Entry research: DB snapshot, kline cache, generated datasets (reproducible via
+# python -m crypto_trading.entry_research.run --snapshot)
+data/entry_research/

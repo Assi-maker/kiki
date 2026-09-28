@@ -1044,6 +1044,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_add_safety_kernel_decisions(conn)
     _migrate_add_gate_evaluations(conn)
     _migrate_add_shadow_evaluations(conn)
+    _migrate_add_entry_quality_shadow(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -1254,6 +1255,27 @@ def _migrate_add_shadow_evaluations(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS shadow_evaluations ("
         "candidate_id TEXT PRIMARY KEY, decided_at TEXT NOT NULL, cohort TEXT NOT NULL, "
         "evaluated_at TEXT NOT NULL, record_json TEXT NOT NULL)"
+    )
+
+
+def _migrate_add_entry_quality_shadow(conn: sqlite3.Connection) -> None:
+    """2026-09-28 Entry Quality Layer (shadow-only): one row per candidate with
+    its STRONG/ACCEPTABLE/WEAK/REJECT class from the FROZEN registry, the
+    features and evidence behind it, the standardized outcome and the
+    GODFATHER experience chain. godfather_entry_patterns: GODFATHER's periodic
+    re-derivation of entry pattern categories. Neither is read by any trading
+    decision."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS entry_quality_shadow ("
+        "candidate_id TEXT PRIMARY KEY, t0 TEXT NOT NULL, cohort TEXT NOT NULL, "
+        "registry_version TEXT NOT NULL, eq_class TEXT NOT NULL, independent INTEGER NOT NULL, "
+        "classified_at TEXT NOT NULL, record_json TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS godfather_entry_patterns ("
+        "snapshot_id TEXT NOT NULL, computed_at TEXT NOT NULL, pattern TEXT NOT NULL, "
+        "side TEXT NOT NULL, category TEXT NOT NULL, previous_category TEXT, "
+        "n_total INTEGER NOT NULL, stats_json TEXT NOT NULL, PRIMARY KEY (snapshot_id, pattern, side))"
     )
 
 

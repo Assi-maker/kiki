@@ -122,6 +122,14 @@ class Repository(Protocol):
     def save_shadow_evaluation(self, record: dict, evaluated_at: datetime) -> None: ...
     def get_shadow_evaluation(self, candidate_id: str) -> dict | None: ...
     def list_shadow_evaluations(self) -> list[dict]: ...
+    def find_candidates_without_entry_quality(self, created_before: datetime, limit: int) -> list[str]: ...
+    def had_candidate_on_symbol_within(self, symbol: str, start: datetime, end: datetime,
+                                       exclude: str) -> bool: ...
+    def save_entry_quality(self, record: dict, classified_at: datetime) -> None: ...
+    def list_entry_quality(self) -> list[dict]: ...
+    def latest_godfather_entry_patterns(self) -> dict[tuple[str, str], str]: ...
+    def save_godfather_entry_patterns(self, snapshot_id: str, computed_at: datetime,
+                                      rows: list[dict]) -> None: ...
     def had_position_on_symbol_within(
         self, instrument: str, start: datetime, end: datetime, exclude: str
     ) -> bool: ...
@@ -1247,6 +1255,58 @@ class SQLiteRepository:
         return [json.loads(r["record_json"]) for r in self._conn.execute(
             "SELECT record_json FROM shadow_evaluations ORDER BY decided_at"
         ).fetchall()]
+
+    # ---- Entry Quality Layer (shadow-only, 2026-09-28) -------------------------
+
+    def find_candidates_without_entry_quality(self, created_before: datetime, limit: int) -> list[str]:
+        return [r[0] for r in self._conn.execute(
+            "SELECT c.candidate_id FROM candidates c LEFT JOIN entry_quality_shadow e "
+            "ON e.candidate_id = c.candidate_id WHERE e.candidate_id IS NULL AND c.created_at < ? "
+            "ORDER BY c.created_at LIMIT ?", (created_before.isoformat(), limit),
+        ).fetchall()]
+
+    def had_candidate_on_symbol_within(self, symbol: str, start: datetime, end: datetime,
+                                       exclude: str) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM candidates WHERE instrument = ? AND created_at >= ? AND created_at < ? "
+            "AND candidate_id != ? LIMIT 1", (symbol, start.isoformat(), end.isoformat(), exclude),
+        ).fetchone() is not None
+
+    def save_entry_quality(self, record: dict, classified_at: datetime) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO entry_quality_shadow (candidate_id, t0, cohort, registry_version, "
+            "eq_class, independent, classified_at, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (record["candidate_id"], record["t0"], record["cohort"], record["registry_version"],
+             record["eq_class"], int(bool(record["independent"])), classified_at.isoformat(),
+             json.dumps(record, default=str)),
+        )
+        self._conn.commit()
+
+    def list_entry_quality(self) -> list[dict]:
+        return [json.loads(r["record_json"]) for r in self._conn.execute(
+            "SELECT record_json FROM entry_quality_shadow ORDER BY t0"
+        ).fetchall()]
+
+    def latest_godfather_entry_patterns(self) -> dict[tuple[str, str], str]:
+        row = self._conn.execute(
+            "SELECT snapshot_id FROM godfather_entry_patterns ORDER BY computed_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return {}
+        return {(r["pattern"], r["side"]): r["category"] for r in self._conn.execute(
+            "SELECT pattern, side, category FROM godfather_entry_patterns WHERE snapshot_id = ?",
+            (row["snapshot_id"],),
+        ).fetchall()}
+
+    def save_godfather_entry_patterns(self, snapshot_id: str, computed_at: datetime,
+                                      rows: list[dict]) -> None:
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO godfather_entry_patterns (snapshot_id, computed_at, pattern, side, "
+            "category, previous_category, n_total, stats_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [(snapshot_id, computed_at.isoformat(), r["pattern"], r["side"], r["category"],
+              r.get("previous_category"), r["n_total"], json.dumps(r["stats"], default=str)) for r in rows],
+        )
+        self._conn.commit()
 
     def had_position_on_symbol_within(
         self, instrument: str, start: datetime, end: datetime, exclude: str

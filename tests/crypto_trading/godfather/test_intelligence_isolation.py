@@ -52,6 +52,7 @@ _INTELLIGENCE_MODULES = [
     _CRYPTO_TRADING / "godfather" / "report.py",
     _CRYPTO_TRADING / "godfather" / "stats.py",
     _CRYPTO_TRADING / "godfather" / "thesis.py",
+    _CRYPTO_TRADING / "godfather" / "entry_patterns.py",
     _CRYPTO_TRADING / "godfather_loop.py",
 ]
 
@@ -68,6 +69,8 @@ _INTELLIGENCE_TABLES = [
     "godfather_policy_evaluations",
     "godfather_policies",
     "godfather_policy_transitions",
+    "godfather_entry_patterns",
+    "entry_quality_shadow",
 ]
 
 # Everything that can move real money, or that decides whether money
