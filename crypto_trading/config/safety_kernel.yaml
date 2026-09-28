@@ -1,29 +1,26 @@
 # Deterministic Safety Kernel (P0, 2026-09-28) - crypto_trading/safety_kernel.py.
 # HARD limits in front of every LIVE entry and every stop move. Nothing -
 # GODFATHER, Guardian, leverage, max_concurrent_positions, "high confidence" -
-# can raise or bypass them; the kernel only ever REDUCES or REJECTS.
+# can raise or bypass them.
 # Evidence: docs/superpowers/reports/2026-09-28-fas2-forensic-capital-loss.md
 # (risk/trade was 2.8-20 % of equity, 45 % at once, 91 % of the loss in one
 # correlated night, one stop ~0.2-0.7 % from liquidation).
+#
+# FIXED SIZING (user decision 2026-09-29): the LIVE size is always the fixed
+# live_execution.yaml size - 100 USDT margin x 10 = ~1000 USDT notional - and
+# is NEVER reduced. The kernel APPROVES that full size or REJECTS the entry.
+# The former per-trade cap (1 % of equity / 10 USDT) and the 3x-equity
+# notional ceiling were removed: they could only shrink the fixed size.
 
-# Worst-case loss of ONE trade: at most 1 % of CURRENT equity (user decision
-# 2026-09-28) and never more than this absolute ceiling.
-max_risk_per_trade_pct: "0.01"
-max_risk_per_trade_usdt: "10"
+# REJECT if the worst-case loss of ALL open LIVE positions plus the new one
+# would exceed 10 % of CURRENT equity. A position whose stop Profit
+# Protection has moved to break-even only counts its residual cost risk.
+max_portfolio_risk_pct: "0.10"
 
-# Sum of worst-case loss of ALL open LIVE positions (including the new one).
-# 3 % = three full-risk positions; a position whose stop has been moved to
-# break-even by Profit Protection only counts its residual cost risk, so it
-# frees headroom. Replaces the 45 % observed on 2026-09-26.
-max_portfolio_risk_pct: "0.03"
-
-# Same, per correlated group (see below). Every alt long moved with BTC on
-# 27-28/9 (median pairwise 1m correlation 0.27; 91 % of the loss in one
-# window), so all alts share one group and cannot fill the whole portfolio.
-max_group_risk_pct: "0.025"
-
-# Sum of open notional at most 3x equity (was up to ~9.5x).
-max_total_notional_multiple: "3"
+# REJECT if the same sum within one correlated group would exceed 5 % of
+# current equity. Every alt long moved with BTC on 27-28/9 (91 % of the loss
+# in one window), so all alts share one group.
+max_group_risk_pct: "0.05"
 
 # Cost assumptions inside "worst-case risk", from the verified LIVE fills:
 # entry: market order may fill above the last price (buffer 0.3 %);

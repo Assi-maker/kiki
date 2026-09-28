@@ -1,12 +1,14 @@
-"""Deterministic Safety Kernel (P0, 2026-09-28).
+"""Deterministic Safety Kernel (P0 2026-09-28; fixed sizing 2026-09-29).
 
-The 2026-09-26..28 forensic: risk per LIVE trade ranged 2.8-20 % of equity
-(fixed ~1000 USDT notional x an AI-chosen stop distance), up to 45 % of
-equity was at risk at once, and one stop sat ~0.2-0.7 % from the 10x
-liquidation price. The kernel sizes every LIVE entry so that its real
-worst-case loss (stop distance + stop slippage + round-trip fees) fits a
-per-trade, per-group, portfolio and notional budget, and refuses stops too
-close to liquidation. It can only REDUCE or REJECT - never enlarge."""
+The 2026-09-26..28 forensic: risk per LIVE trade ranged 2.8-20 % of equity,
+up to 45 % of equity was at risk at once, and one stop sat ~0.2-0.7 % from
+the 10x liquidation price.
+
+User decision 2026-09-29: LIVE size is FIXED again - 100 USDT margin x 10 =
+~1000 USDT notional - and is never reduced. The kernel APPROVES that full
+size or REJECTS it: total worst-case risk of all open LIVE positions <= 10 %
+of current equity, per correlated group <= 5 %, plus the liquidation guard.
+It never enlarges, never shrinks."""
 from decimal import Decimal as D
 
 import pytest
@@ -23,9 +25,8 @@ from crypto_trading.safety_kernel import (
 )
 
 LIMITS = SafetyKernelConfig(
-    max_risk_per_trade_pct=D("0.01"), max_risk_per_trade_usdt=D("10"),
-    max_portfolio_risk_pct=D("0.03"), max_group_risk_pct=D("0.025"),
-    max_total_notional_multiple=D("3"), entry_price_buffer_pct=D("0.003"),
+    max_portfolio_risk_pct=D("0.10"), max_group_risk_pct=D("0.05"),
+    entry_price_buffer_pct=D("0.003"),
     stop_slippage_buffer_pct=D("0.003"), round_trip_fee_pct=D("0.001"),
     maintenance_margin_rate=D("0.01"), min_liquidation_buffer_pct=D("0.02"),
     symbol_groups={"BTC-USDT": "crypto_major", "ETH-USDT": "crypto_major"},
@@ -44,11 +45,14 @@ def _size(**overrides):
     return size_entry(**args)
 
 
-def test_production_config_loads_with_the_documented_p0_values():
+def test_production_config_loads_the_fixed_sizing_caps():
     safety = get_settings().safety
-    assert safety.max_risk_per_trade_pct == D("0.01")
-    assert safety.max_portfolio_risk_pct <= D("0.05")
+    assert safety.max_portfolio_risk_pct == D("0.10")
+    assert safety.max_group_risk_pct == D("0.05")
     assert safety.min_liquidation_buffer_pct >= D("0.01")
+    # the per-trade % cap and the notional multiple are gone - they could only REDUCE
+    for removed in ("max_risk_per_trade_pct", "max_risk_per_trade_usdt", "max_total_notional_multiple"):
+        assert not hasattr(safety, removed)
 
 
 def test_worst_case_risk_includes_stop_slippage_and_round_trip_fees():
@@ -57,27 +61,44 @@ def test_worst_case_risk_includes_stop_slippage_and_round_trip_fees():
     assert risk == D("53.8500")
 
 
-def test_the_real_ondo_trade_is_reduced_to_one_percent_of_equity():
-    """ONDO 58f1a3 lost 53.26 USDT at ~1000 notional. At 420 equity the
-    kernel allows at most 4.20 USDT worst-case risk."""
+def _full(last=D("1.0"), stop=D("0.99"), **overrides):
+    """A fixed-size entry: 1000 notional at `last`."""
+    return _size(symbol="X-USDT", last_price=last, stop_loss=stop, target=last * D("1.05"),
+                 base_quantity=(D(1000) / last).quantize(D("1")), **overrides)
+
+
+def test_example_approved_full_size_position():
+    """420 equity, stop 1 % below: worst-case risk ~17 USDT <= 21 (group 5 %)
+    and <= 42 (portfolio 10 %) -> APPROVE at the full 1000 quantity."""
+    decision = _full()
+    assert decision.action == "APPROVE"
+    assert decision.quantity == D("1000")
+    assert D("16") < decision.risk_usdt < D("18")
+    assert decision.binding_limits == []
+
+
+def test_example_rejected_full_size_position_is_never_reduced():
+    """The real ONDO trade (lost 53.26 at ~1000 notional): stop 5.2 % below,
+    worst-case risk ~59 USDT > 21 group / 42 portfolio -> REJECT, quantity 0.
+    Before 2026-09-29 this was REDUCED to ~4 USDT risk."""
     decision = _size()
-    assert decision.action == "REDUCE"
-    assert decision.risk_usdt <= D("4.20")
-    assert decision.quantity < D("1698")
-    assert decision.quantity > 0
-    assert "PER_TRADE_RISK_CAP" in decision.binding_limits
+    assert decision.action == "REJECT"
+    assert decision.quantity == 0
+    assert "PORTFOLIO_RISK_CAP" in decision.reasons and "GROUP_RISK_CAP" in decision.reasons
+
+
+def test_the_kernel_never_returns_reduce():
+    for last, stop in ((D("1"), D("0.999")), (D("1"), D("0.99")), (D("1"), D("0.97")), (D("1"), D("0.95"))):
+        for equity in (D("50"), D("420"), D("5000")):
+            decision = _full(last=last, stop=stop, equity=equity)
+            assert decision.action in ("APPROVE", "REJECT")
+            assert decision.quantity in (D("0"), D("1000"))
 
 
 def test_a_trade_already_within_every_budget_is_approved_unchanged():
-    decision = _size(base_quantity=D("100"))  # ~59 USDT notional, ~3.3 USDT risk
+    decision = _size(base_quantity=D("100"))  # ~59 USDT notional, ~3.5 USDT risk
     assert decision.action == "APPROVE"
     assert decision.quantity == D("100")
-
-
-def test_the_absolute_usdt_cap_binds_on_a_large_account():
-    decision = _size(equity=D("100000"), base_quantity=D("100000"))
-    assert decision.risk_usdt <= D("10")
-    assert "PER_TRADE_RISK_CAP" in decision.binding_limits
 
 
 def test_missing_or_non_positive_equity_rejects():
@@ -114,45 +135,43 @@ def test_a_stop_too_close_to_liquidation_rejects_the_real_soon_case():
     assert decision.liquidation_price is not None
 
 
-def test_portfolio_ceiling_limits_the_sum_of_open_risk():
-    open_ = [Exposure("A-USDT", "crypto_alt", D("4.2"), D("100")),
-             Exposure("B-USDT", "crypto_alt", D("4.2"), D("100")),
-             Exposure("BTC-USDT", "crypto_major", D("4.0"), D("100"))]
-    decision = _size(open_exposures=open_)
-    # 3 % of 420 = 12.6; 12.4 already open -> only 0.2 USDT headroom
-    assert decision.action in ("REJECT", "REDUCE")
-    assert decision.portfolio_risk_after <= D("12.6")
-    if decision.action == "REDUCE":
-        assert "PORTFOLIO_RISK_CAP" in decision.binding_limits
-
-
-def test_a_full_portfolio_rejects_a_new_entry():
-    open_ = [Exposure(f"S{i}-USDT", "crypto_alt", D("4.2"), D("100")) for i in range(3)]
-    decision = _size(open_exposures=open_)
+def test_portfolio_cap_rejects_when_the_sum_would_exceed_ten_percent():
+    open_ = [Exposure("BTC-USDT", "crypto_major", D("15"), D("1000")),
+             Exposure("NCSKX-USDT", "tokenized_equity", D("15"), D("1000"))]
+    decision = _full(open_exposures=open_)  # 30 + ~17 > 42
     assert decision.action == "REJECT"
-    assert "PORTFOLIO_RISK_CAP" in decision.reasons
+    assert decision.reasons == ["PORTFOLIO_RISK_CAP"]
+    assert decision.quantity == 0
 
 
-def test_group_ceiling_binds_before_the_portfolio_ceiling():
-    open_ = [Exposure("A-USDT", "crypto_alt", D("4.2"), D("100")),
-             Exposure("B-USDT", "crypto_alt", D("4.2"), D("100"))]
-    decision = _size(open_exposures=open_)
-    # group cap 2.5 % of 420 = 10.5 -> 2.1 headroom < portfolio headroom 4.2
-    assert decision.risk_usdt <= D("2.1") + D("0.0001")
-    assert "GROUP_RISK_CAP" in decision.binding_limits
-
-
-def test_total_notional_ceiling():
-    open_ = [Exposure("A-USDT", "crypto_major", D("0.1"), D("1250"))]
-    decision = _size(open_exposures=open_)
-    # 3 x 420 = 1260 notional allowed; 1250 open -> ~10 USDT notional left
-    assert decision.quantity * D("0.5888") * D("1.003") <= D("10") + D("0.01")
-
-
-def test_below_exchange_minimum_after_reduction_rejects():
-    decision = _size(min_notional=D("500"))
+def test_group_cap_rejects_a_second_correlated_alt():
+    open_ = [Exposure("A-USDT", "crypto_alt", D("10"), D("1000"))]
+    decision = _full(open_exposures=open_)  # alt group 10 + ~17 > 21, portfolio 27 <= 42
     assert decision.action == "REJECT"
-    assert "BELOW_EXCHANGE_MINIMUM_AFTER_RISK_SIZING" in decision.reasons
+    assert decision.reasons == ["GROUP_RISK_CAP"]
+
+
+def test_four_concurrent_full_size_positions_are_possible_when_risk_allows():
+    """Four ~1000-notional positions with tight stops across groups fit: the
+    count limit (max 4) is enforced by live_execution, not by the kernel."""
+    open_ = [Exposure("BTC-USDT", "crypto_major", D("8"), D("1000")),
+             Exposure("NCSKX-USDT", "tokenized_equity", D("8"), D("1000")),
+             Exposure("NCCOX-USDT", "commodity_fx", D("8"), D("1000"))]
+    decision = _full(stop=D("0.995"), open_exposures=open_)  # alt ~12 -> total ~36 <= 42
+    assert decision.action == "APPROVE"
+    assert decision.quantity == D("1000")
+    assert decision.portfolio_risk_after <= D("42")
+
+
+def test_there_is_no_notional_multiple_ceiling_any_more():
+    open_ = [Exposure("BTC-USDT", "crypto_major", D("1"), D("3000"))]
+    assert _full(open_exposures=open_).action == "APPROVE"
+
+
+def test_below_exchange_minimum_rejects():
+    decision = _size(min_notional=D("5000"))
+    assert decision.action == "REJECT"
+    assert "BELOW_EXCHANGE_MINIMUM" in decision.reasons
 
 
 def test_the_kernel_never_enlarges_a_position():

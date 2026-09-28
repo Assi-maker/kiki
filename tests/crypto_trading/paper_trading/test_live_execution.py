@@ -52,8 +52,7 @@ def _without_safety_caps(settings):
     runs with the real production limits."""
     huge = Decimal(10) ** 12
     return settings.model_copy(update={"safety": SafetyKernelConfig(
-        max_risk_per_trade_pct=huge, max_risk_per_trade_usdt=huge, max_portfolio_risk_pct=huge,
-        max_group_risk_pct=huge, max_total_notional_multiple=huge,
+        max_portfolio_risk_pct=huge, max_group_risk_pct=huge,
     )})
 
 
@@ -1305,38 +1304,52 @@ def _seed_open_live(repo, pid, symbol, quantity="0.0084", with_break_even=False)
         repo._conn.commit()
 
 
-def test_the_kernel_reduces_a_live_entry_to_one_percent_of_equity(tmp_path):
-    """Default production limits: equity 1000 -> worst-case loss <= 10 USDT.
-    The base size (1000 notional, 0.02 BTC with a 2 % stop) would risk ~27."""
+def test_fixed_sizing_sends_the_full_100_margin_x_10_order(tmp_path):
+    """User decision 2026-09-29, production limits: 100 USDT margin x 10 =
+    1000 notional = 0.02 BTC at 50000. Worst-case risk ~26.9 USDT fits the
+    10 % portfolio (100) and 5 % group (50) caps at equity 1000 -> the order
+    goes out at the FULL size, never reduced."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(balance="1000.00", all_positions=[])
     _run(repo, connector)
 
     assert len(connector.calls) == 1
-    quantity = Decimal(connector.calls[0]["quantity"])
-    assert Decimal("0") < quantity < Decimal("0.02")
-    worst = (quantity * (Decimal("50150") - Decimal("49000") * Decimal("0.997"))
-             + quantity * Decimal("50150") * Decimal("0.001"))
-    assert worst <= Decimal("10")
+    assert Decimal(connector.calls[0]["quantity"]) == Decimal("0.02")
     assert connector.calls[0]["stop_loss_price"] == "49000"  # SL/TP never moved
     assert connector.calls[0]["target_price"] == "52000"
     assert connector.leverage_calls == [("BTC-USDT", 10)]  # leverage untouched
     row = repo.get_live_execution("pos-1")
-    assert Decimal(row["notional_usdt"]) == quantity * Decimal("50000")
-    assert Decimal(row["margin_usdt"]) == quantity * Decimal("50000") / 10
+    assert row["margin_usdt"] == "100"
+    assert row["notional_usdt"] == "1000"
     decision = repo.get_safety_kernel_decision("pos-1")
-    assert decision["action"] == "REDUCE"
-    assert "PER_TRADE_RISK_CAP" in decision["detail"]["binding_limits"]
+    assert decision["action"] == "APPROVE"
+
+
+def test_fixed_sizing_rejects_instead_of_reducing_when_the_group_cap_is_breached(tmp_path):
+    """Equity 400: group cap 5 % = 20 USDT < the ~26.9 USDT worst case of the
+    fixed-size order -> REJECT, no order at all (never a smaller one)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector(balance="400.00", all_positions=[])
+    _run(repo, connector)
+    assert connector.calls == []
+    assert repo.get_live_execution("pos-1") is None  # budget-type reject: retried while fresh
+    decision = repo.get_safety_kernel_decision("pos-1")
+    assert decision["action"] == "REJECT"
+    assert "GROUP_RISK_CAP" in decision["detail"]["reasons"]
 
 
 def test_the_kernel_uses_current_equity_not_the_balance(tmp_path):
+    """Balance 1000 would allow the fixed order (group cap 50); equity 500
+    gives a group cap of 25 < ~26.9 -> REJECT. Equity, not balance, decides."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(balance="1000.00", equity="500.00", all_positions=[])
     _run(repo, connector)
     decision = repo.get_safety_kernel_decision("pos-1")
-    assert Decimal(decision["detail"]["risk_usdt"]) <= Decimal("5")
+    assert decision["action"] == "REJECT"
+    assert Decimal(decision["detail"]["equity"]) == Decimal("500.00")
 
 
 def test_a_stop_too_close_to_liquidation_is_never_sent(tmp_path):
@@ -1377,14 +1390,15 @@ def test_a_ticker_failure_fails_closed(tmp_path):
 
 
 def test_the_portfolio_ceiling_blocks_a_new_entry_when_open_risk_is_used_up(tmp_path):
-    """Three open full-risk positions (~10 USDT worst case each at equity 1000)
-    fill the 3 % portfolio budget: a fourth signal is not sent - even though
-    max_concurrent_positions is 4."""
+    """Three open positions of ~33.7 USDT worst case each (~101 at equity
+    1000) exceed the 10 % portfolio budget: a fourth signal is not sent -
+    even though max_concurrent_positions is 4."""
     repo = SQLiteRepository(tmp_path / "t.db")
     for i, symbol in enumerate(("AAA-USDT", "BBB-USDT", "CCC-USDT")):
-        _seed_open_live(repo, f"open-{i}", symbol)
+        _seed_open_live(repo, f"open-{i}", symbol, quantity="0.025")
     _open_position(repo, position_id="pos-new")
-    connector = _SpyConnector(balance="1000.00", all_positions=_OPEN_ON_EXCHANGE)
+    connector = _SpyConnector(balance="1000.00", all_positions=[
+        {"symbol": s, "positionAmt": "0.025"} for s in ("AAA-USDT", "BBB-USDT", "CCC-USDT")])
     _run(repo, connector)
     assert connector.calls == []
     assert repo.get_live_execution("pos-new") is None  # budget-type reject: retry while fresh

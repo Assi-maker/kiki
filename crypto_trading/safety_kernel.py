@@ -6,19 +6,21 @@ Sits between every decision layer and the exchange:
 
 Pure functions, no I/O, no AI. Two entry points:
 
-- `size_entry` - before a LIVE entry: the largest quantity, never above the
-  caller's own, whose WORST-CASE loss (stop distance + stop slippage +
-  round-trip fees, at a conservatively high entry estimate) fits the
-  per-trade, per-group, portfolio and notional budgets of CURRENT equity,
-  and a stop far enough from the estimated liquidation price.
-  Result: APPROVE (unchanged), REDUCE (smaller) or REJECT (nothing).
+- `size_entry` - before a LIVE entry: FIXED sizing (user decision
+  2026-09-29). The caller's fixed quantity (100 USDT margin x 10) is
+  APPROVED unchanged, or the entry is REJECTED - never reduced. REJECT when
+  the stop is too close to the estimated liquidation price, or when the
+  WORST-CASE loss (stop distance + stop slippage + round-trip fees, at a
+  conservatively high entry estimate) of all open LIVE positions plus this
+  one would exceed the portfolio cap, or its correlated group's cap, of
+  CURRENT equity.
 - `check_stop_move` - before any stop replacement (Profit Protection,
   Guardian Authority): a LONG stop may only move up, and never to within the
   liquidation buffer.
 
-The kernel can only make a trade smaller or refuse it. It never raises
-leverage, size, a stop distance or a limit, and has no exceptions for
-"high confidence". Limits: config/safety_kernel.yaml (SafetyKernelConfig).
+The kernel can only refuse a trade. It never raises leverage, size, a stop
+distance or a limit, never shrinks the fixed size, and has no exceptions
+for "high confidence". Limits: config/safety_kernel.yaml (SafetyKernelConfig).
 """
 from __future__ import annotations
 
@@ -41,7 +43,7 @@ class Exposure:
 
 @dataclass(frozen=True)
 class EntryDecision:
-    action: str  # "APPROVE" | "REDUCE" | "REJECT"
+    action: str  # "APPROVE" | "REJECT" (fixed sizing: never "REDUCE")
     quantity: Decimal
     risk_usdt: Decimal
     reasons: list[str] = field(default_factory=list)
@@ -50,7 +52,6 @@ class EntryDecision:
     estimated_entry: Decimal | None = None
     liquidation_price: Decimal | None = None
     group: str | None = None
-    per_trade_budget_usdt: Decimal | None = None
     portfolio_risk_before: Decimal = _ZERO
     portfolio_risk_after: Decimal = _ZERO
     group_risk_before: Decimal = _ZERO
@@ -138,35 +139,29 @@ def size_entry(
     if too_close:
         return reject("LIQUIDATION_TOO_CLOSE", estimated_entry=entry, liquidation_price=liquidation)
 
-    unit_risk = worst_case_risk_usdt(Decimal(1), entry, stop_loss, limits)
+    quantity = _floor(base_quantity, quantity_precision)
+    risk = worst_case_risk_usdt(quantity, entry, stop_loss, limits)
     portfolio_before = sum((e.risk_usdt for e in open_exposures), _ZERO)
     group_before = sum((e.risk_usdt for e in open_exposures if e.group == group), _ZERO)
     notional_before = sum((e.notional_usdt for e in open_exposures), _ZERO)
-    per_trade = min(equity * limits.max_risk_per_trade_pct, limits.max_risk_per_trade_usdt)
-    bounds = {
-        "BASE_SIZE": base_quantity,
-        "PER_TRADE_RISK_CAP": per_trade / unit_risk,
-        "PORTFOLIO_RISK_CAP": max(equity * limits.max_portfolio_risk_pct - portfolio_before, _ZERO) / unit_risk,
-        "GROUP_RISK_CAP": max(equity * limits.max_group_risk_pct - group_before, _ZERO) / unit_risk,
-        "TOTAL_NOTIONAL_CAP": max(equity * limits.max_total_notional_multiple - notional_before, _ZERO) / entry,
-    }
-    raw = min(bounds.values())
-    quantity = _floor(raw, quantity_precision)
-    binding = [name for name, bound in bounds.items() if name != "BASE_SIZE" and bound == raw]
     context = dict(
-        estimated_entry=entry, liquidation_price=liquidation, per_trade_budget_usdt=per_trade,
+        estimated_entry=entry, liquidation_price=liquidation,
         portfolio_risk_before=portfolio_before, group_risk_before=group_before,
         notional_before=notional_before,
     )
     if quantity <= 0:
-        return reject(*(binding or ["NO_RISK_BUDGET"]), binding_limits=binding, **context)
+        return reject("NO_BASE_SIZE", **context)
     if quantity * entry < min_notional:
-        return reject("BELOW_EXCHANGE_MINIMUM_AFTER_RISK_SIZING", binding_limits=binding, **context)
-    risk = unit_risk * quantity
+        return reject("BELOW_EXCHANGE_MINIMUM", **context)
+    breached = []
+    if portfolio_before + risk > equity * limits.max_portfolio_risk_pct:
+        breached.append("PORTFOLIO_RISK_CAP")
+    if group_before + risk > equity * limits.max_group_risk_pct:
+        breached.append("GROUP_RISK_CAP")
+    if breached:  # fixed sizing: the full size or nothing - never a smaller one
+        return reject(*breached, binding_limits=breached, **context)
     return EntryDecision(
-        "APPROVE" if quantity >= base_quantity else "REDUCE",
-        quantity, risk, [], binding if quantity < base_quantity else [],
-        equity=equity, group=group,
+        "APPROVE", quantity, risk, [], [], equity=equity, group=group,
         portfolio_risk_after=portfolio_before + risk, notional_after=notional_before + quantity * entry,
         **context,
     )

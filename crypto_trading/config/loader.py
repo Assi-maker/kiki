@@ -395,11 +395,9 @@ class SafetyKernelConfig(BaseModel):
     reasoning behind each value. The defaults ARE the production values, so a
     Settings built without the yaml (tests) is never less safe than LIVE."""
 
-    max_risk_per_trade_pct: Decimal = Decimal("0.01")
-    max_risk_per_trade_usdt: Decimal = Decimal("10")
-    max_portfolio_risk_pct: Decimal = Decimal("0.03")
-    max_group_risk_pct: Decimal = Decimal("0.025")
-    max_total_notional_multiple: Decimal = Decimal("3")
+    # Fixed LIVE sizing (user decision 2026-09-29): APPROVE/REJECT caps only.
+    max_portfolio_risk_pct: Decimal = Decimal("0.10")
+    max_group_risk_pct: Decimal = Decimal("0.05")
     entry_price_buffer_pct: Decimal = Decimal("0.003")
     stop_slippage_buffer_pct: Decimal = Decimal("0.003")
     round_trip_fee_pct: Decimal = Decimal("0.001")
