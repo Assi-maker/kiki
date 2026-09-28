@@ -1,5 +1,6 @@
 """AC7: default pytest-körning kräver noll Claude API-anrop."""
 
+from decimal import Decimal
 from datetime import UTC, datetime
 
 from crypto_trading.agents.runner import MockAgentRunner
@@ -71,6 +72,7 @@ def test_full_discovery_cycle_works_end_to_end_without_anthropic_api_key(tmp_pat
         evidence_record=evidence,
         created_at=_NOW,
         updated_at=_NOW,
+        reference_price=Decimal("55000"),
     )
     repo.create_candidate_with_event(
         candidate,
@@ -87,6 +89,8 @@ def test_full_discovery_cycle_works_end_to_end_without_anthropic_api_key(tmp_pat
     )
 
     runner = MockAgentRunner(fixtures=_happy_fixtures())
-    results = run_discovery_cycle(repo=repo, runner=runner, settings=_settings(), run_id="run-1")
+    results = run_discovery_cycle(
+        repo=repo, runner=runner, settings=_settings(), run_id="run-1", now=_NOW,
+    )
 
     assert results[0].status == "CONFIRMED"

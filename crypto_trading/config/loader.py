@@ -416,6 +416,15 @@ class SafetyKernelConfig(BaseModel):
     default_group: str = "crypto_alt"
 
 
+class GatePolicyConfig(BaseModel):
+    """P1 Gate content requirements (2026-09-28) - see config/gate.yaml.
+    Defaults ARE the production values."""
+
+    min_risk_reward: Decimal = Decimal("1")
+    max_signal_age_minutes: int = 30
+    shadow_min_bullish_probability: float = 0.5
+
+
 class Settings(BaseModel):
     db_path: Path
     pipeline: PipelineConfig
@@ -432,6 +441,7 @@ class Settings(BaseModel):
     )
     godfather: GodfatherConfig = Field(default_factory=GodfatherConfig)
     safety: SafetyKernelConfig = Field(default_factory=SafetyKernelConfig)
+    gate: GatePolicyConfig = Field(default_factory=GatePolicyConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -467,6 +477,7 @@ def get_settings() -> Settings:
         ),
         godfather=_load_yaml_model(_CONFIG_DIR / "godfather.yaml", GodfatherConfig),
         safety=_load_yaml_model(_CONFIG_DIR / "safety_kernel.yaml", SafetyKernelConfig),
+        gate=_load_yaml_model(_CONFIG_DIR / "gate.yaml", GatePolicyConfig),
     )
 
 

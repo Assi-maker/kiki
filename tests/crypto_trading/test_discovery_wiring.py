@@ -52,6 +52,7 @@ def _persisted_candidate_in_status(repo, status: str, candidate_id: str = "cand-
         evidence_record=_evidence(),
         created_at=_NOW,
         updated_at=_NOW,
+        reference_price=Decimal("55000"),
     )
     creation_event = Event(
         event_id=f"CANDIDATE_CREATED:{candidate_id}",
@@ -95,7 +96,8 @@ def test_run_discovery_cycle_sweeps_interrupted_analyses_first_and_resumes_it_sa
     )  # föräldralös, simulerar krasch
 
     results = run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=_settings(), run_id="run-2"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=_settings(), run_id="run-2",
+        now=_NOW,
     )
 
     swept_event = repo._conn.execute(
@@ -116,7 +118,7 @@ def test_run_discovery_cycle_transitions_candidate_status_before_analysis(tmp_pa
     _persisted_candidate_in_status(repo, "CANDIDATE")
     runner = MockAgentRunner(fixtures=_happy_fixtures())
 
-    results = run_discovery_cycle(repo=repo, runner=runner, settings=_settings(), run_id="run-1")
+    results = run_discovery_cycle(repo=repo, runner=runner, settings=_settings(), run_id="run-1", now=_NOW)
 
     assert results[0].status == "CONFIRMED"
 
@@ -127,7 +129,7 @@ def test_run_discovery_cycle_processes_multiple_candidates(tmp_path):
     _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="cand-2")
     runner = MockAgentRunner(fixtures=_happy_fixtures())
 
-    results = run_discovery_cycle(repo=repo, runner=runner, settings=_settings(), run_id="run-1")
+    results = run_discovery_cycle(repo=repo, runner=runner, settings=_settings(), run_id="run-1", now=_NOW)
 
     assert {r.candidate_id for r in results} == {"cand-1", "cand-2"}
     assert all(r.status == "CONFIRMED" for r in results)
@@ -141,7 +143,8 @@ def test_analysis_interrupted_candidate_is_resumed_and_reaches_confirmed(tmp_pat
     _persisted_candidate_in_status(repo, "ANALYSIS_INTERRUPTED", candidate_id="interrupted-1")
 
     results = run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=_settings(), run_id="run-2"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=_settings(), run_id="run-2",
+        now=_NOW,
     )
 
     assert len(results) == 1
@@ -157,7 +160,8 @@ def test_daily_ai_call_cap_sends_candidate_to_budget_limited_not_rejected(tmp_pa
     _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
 
     results = run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1",
+        now=_NOW,
     )
 
     # candidate hann aldrig starta sin analys, men BUDGET_LIMITED-övergången
@@ -190,7 +194,8 @@ def test_daily_ai_call_cap_leaves_interrupted_candidate_untouched_not_budget_lim
     )
 
     results = run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1",
+        now=_NOW,
     )
 
     assert results == []
@@ -206,10 +211,12 @@ def test_daily_ai_call_cap_is_respected_across_two_separate_discovery_cycles(tmp
     _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-2")
 
     run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1",
+        now=_NOW,
     )
     run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-2"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-2",
+        now=_NOW,
     )
 
     statuses = {repo.get_candidate("c-1").status, repo.get_candidate("c-2").status}
@@ -315,7 +322,8 @@ def test_daily_ai_cost_cap_allows_analysis_when_well_under_budget(tmp_path):
     _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
 
     results = run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1",
+        now=_NOW,
     )
 
     assert results[0].status == "CONFIRMED"
@@ -329,7 +337,8 @@ def test_daily_ai_cost_cap_sends_candidate_to_budget_limited_not_rejected(tmp_pa
     _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
 
     results = run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1",
+        now=_NOW,
     )
 
     assert len(results) == 1
@@ -362,7 +371,8 @@ def test_daily_ai_cost_cap_uses_conservative_projected_cost_not_actual_spend(tmp
     _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-1")
 
     results = run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1",
+        now=_NOW,
     )
 
     assert results[0].status == "BUDGET_LIMITED"
@@ -380,7 +390,8 @@ def test_daily_ai_call_cap_still_applies_to_billed_successful_calls(tmp_path):
     _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="c-2")
 
     run_discovery_cycle(
-        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1"
+        repo=repo, runner=MockAgentRunner(_happy_fixtures()), settings=settings, run_id="run-1",
+        now=_NOW,
     )
 
     statuses = {repo.get_candidate("c-1").status, repo.get_candidate("c-2").status}

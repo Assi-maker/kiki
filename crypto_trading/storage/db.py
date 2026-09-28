@@ -1042,6 +1042,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_live_executions_add_exit_fill_source(conn)
     _migrate_live_executions_add_exit_verification(conn)
     _migrate_add_safety_kernel_decisions(conn)
+    _migrate_add_gate_evaluations(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -1226,6 +1227,17 @@ def _migrate_add_safety_kernel_decisions(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS safety_kernel_decisions ("
         "position_id TEXT PRIMARY KEY, decided_at TEXT NOT NULL, action TEXT NOT NULL, "
+        "detail_json TEXT NOT NULL)"
+    )
+
+
+def _migrate_add_gate_evaluations(conn: sqlite3.Connection) -> None:
+    """2026-09-28 P1: the full Gate evaluation per candidate - enforced
+    content conditions, shadow-only forecast conditions, and every metric
+    (probabilities, R:R, uncertainty, signal age, candidate score)."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS gate_evaluations ("
+        "candidate_id TEXT PRIMARY KEY, evaluated_at TEXT NOT NULL, outcome TEXT NOT NULL, "
         "detail_json TEXT NOT NULL)"
     )
 

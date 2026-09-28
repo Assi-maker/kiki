@@ -60,7 +60,12 @@ class Orchestrator:
         self._news_connector = news_connector
         self._external_data_connector = external_data_connector
 
-    def process_candidate(self, candidate: Candidate, run_id: str) -> Candidate:
+    def process_candidate(
+        self, candidate: Candidate, run_id: str, now: datetime | None = None
+    ) -> Candidate:
+        """`now` is the evaluation time of the Gate (P1 signal freshness):
+        run_discovery_cycle passes its own (simulated in replay) clock; the
+        default is the real wall clock."""
         ai_calls = 0
         for role in _ROLE_ORDER:
             if ai_calls >= self._settings.budget_limits.max_ai_calls_per_discovery_run:
@@ -134,11 +139,23 @@ class Orchestrator:
             )
 
         open_positions = self._repo.count_open_positions()
+        now = now or datetime.now(UTC)
         decision = evaluate_risk_signal_gate(
-            candidate, open_positions, self._settings.risk_limits.max_concurrent_positions
+            candidate, open_positions, self._settings.risk_limits.max_concurrent_positions,
+            policy=self._settings.gate, now=now,
         )
-
-        now = datetime.now(UTC)
+        # P1 (2026-09-28) audit trail: every enforced/shadow condition and metric.
+        detail = {
+            "reasons": decision.reasons, "enforced_failed": decision.enforced_failed,
+            "shadow": decision.shadow, "metrics": decision.metrics,
+            "open_positions": open_positions,
+        }
+        self._repo.record_gate_evaluation(candidate.candidate_id, now, decision.outcome, detail)
+        log_event(
+            run_id, event="gate_evaluated", candidate_id=candidate.candidate_id,
+            instrument=candidate.instrument, outcome=decision.outcome, gate_pass=
+            decision.outcome == "CONFIRMED", **detail,
+        )
         allowed, reason = can_transition(candidate.status, decision.outcome)
         if not allowed:
             raise AssertionError(f"illegal transition attempted: {reason}")
@@ -375,7 +392,7 @@ def run_discovery_cycle(
         )
         candidate.status = "UNDER_AI_ANALYSIS"
         analyses_started += 1
-        results.append(orchestrator.process_candidate(candidate, run_id))
+        results.append(orchestrator.process_candidate(candidate, run_id, now=effective_now))
     return results
 
 

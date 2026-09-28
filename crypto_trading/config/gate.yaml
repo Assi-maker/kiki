@@ -1,0 +1,23 @@
+# P1 Gate content requirements (2026-09-28) - gate/risk_signal_gate.py.
+# CONFIRMED used to mean "all 7 AI roles answered ok + QA accepted the format
+# + capacity". It now ALSO requires the ENFORCED conditions below. Nothing here
+# can make a candidate MORE likely to be confirmed than before.
+
+# ENFORCED. Reward:risk from the Risk Agent's own levels and the reference
+# price: (target - reference) / (reference - stop). User requirement: >= 1.
+min_risk_reward: "1"
+
+# ENFORCED. Age of the signal (candidate created_at -> Gate evaluation). Equal
+# to the PRIMARY evidence timeframe (pipeline.yaml screener_timeframes[0] =
+# 30m): the evidence is computed on the last closed 30m candle, so after one
+# more candle it no longer describes the market (a test locks this equality).
+# Historically 11.5 % of signals reached the Gate later than this.
+max_signal_age_minutes: 30
+
+# SHADOW ONLY (user decision 2026-09-28): on 403 analysed candidates the
+# forecast agent had no predictive power (corr. 0.01-0.04), was miscalibrated
+# (mean bullish 0.28 vs 48 % actual up-moves) and "bullish dominant" did
+# worse than the rest. Forecast conditions are computed and logged for every
+# candidate, never enforced, until OOS data shows they add edge. 0.5 is not a
+# tuned value: it is "bullish more likely than not".
+shadow_min_bullish_probability: 0.5

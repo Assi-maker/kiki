@@ -113,6 +113,10 @@ class Repository(Protocol):
         self, position_id: str, decided_at: datetime, action: str, detail: dict
     ) -> None: ...
     def get_safety_kernel_decision(self, position_id: str) -> dict | None: ...
+    def record_gate_evaluation(
+        self, candidate_id: str, evaluated_at: datetime, outcome: str, detail: dict
+    ) -> None: ...
+    def get_gate_evaluation(self, candidate_id: str) -> dict | None: ...
     def record_live_exit_verification(self, position_id: str, result, verified_at: datetime) -> None: ...
     def find_active_live_execution_for_instrument(self, instrument: str) -> dict | None: ...
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]: ...
@@ -1186,6 +1190,25 @@ class SQLiteRepository:
             (position_id, decided_at.isoformat(), action, json.dumps(detail, default=str)),
         )
         self._conn.commit()
+
+    def record_gate_evaluation(
+        self, candidate_id: str, evaluated_at: datetime, outcome: str, detail: dict
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO gate_evaluations (candidate_id, evaluated_at, outcome, "
+            "detail_json) VALUES (?, ?, ?, ?)",
+            (candidate_id, evaluated_at.isoformat(), outcome, json.dumps(detail, default=str)),
+        )
+        self._conn.commit()
+
+    def get_gate_evaluation(self, candidate_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM gate_evaluations WHERE candidate_id = ?", (candidate_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {"outcome": row["outcome"], "evaluated_at": row["evaluated_at"],
+                "detail": json.loads(row["detail_json"])}
 
     def get_safety_kernel_decision(self, position_id: str) -> dict | None:
         row = self._conn.execute(

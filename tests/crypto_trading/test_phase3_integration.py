@@ -4,7 +4,7 @@
 from crypto_trading.agents.runner import MockAgentRunner
 from crypto_trading.orchestrator import run_discovery_cycle
 from crypto_trading.storage.repository import SQLiteRepository
-from tests.crypto_trading.test_discovery_wiring import _persisted_candidate_in_status
+from tests.crypto_trading.test_discovery_wiring import _NOW, _persisted_candidate_in_status
 from tests.crypto_trading.test_orchestrator import _happy_fixtures, _settings
 
 
@@ -15,7 +15,9 @@ def test_end_to_end_confirmed_path(tmp_path):
     _persisted_candidate_in_status(repo, "CANDIDATE")
     runner = MockAgentRunner(fixtures=_happy_fixtures())
 
-    results = run_discovery_cycle(repo=repo, runner=runner, settings=_settings(), run_id="run-1")
+    results = run_discovery_cycle(
+        repo=repo, runner=runner, settings=_settings(), run_id="run-1", now=_NOW,
+    )
 
     assert results[0].status == "CONFIRMED"
     reloaded = repo.get_candidate(results[0].candidate_id)

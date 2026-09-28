@@ -133,6 +133,7 @@ def _persisted_candidate_in_under_ai_analysis(repo) -> Candidate:
         evidence_record=_evidence(),
         created_at=_NOW,
         updated_at=_NOW,
+        reference_price=Decimal("55000"),
     )
     creation_event = Event(
         event_id="CANDIDATE_CREATED:cand-1",
@@ -159,7 +160,10 @@ def _persisted_candidate_in_under_ai_analysis(repo) -> Candidate:
     return candidate.model_copy(update={"status": "UNDER_AI_ANALYSIS"})
 
 
-def _happy_fixtures() -> dict:
+def _happy_fixtures(stop_loss: str = "53000", target: str = "60000") -> dict:
+    """Risk levels consistent with the ~55000 reference price used across the
+    discovery tests (P1 2026-09-28: the Gate now enforces stop < reference <
+    target and reward:risk >= 1)."""
     return {
         "crypto-news-sentiment": NewsSentimentAssessment(
             agent_name="crypto-news-sentiment",
@@ -201,8 +205,8 @@ def _happy_fixtures() -> dict:
             run_id="run-1",
             created_at=_NOW,
             status="ok",
-            suggested_stop_loss="1",
-            suggested_target="2",
+            suggested_stop_loss=stop_loss,
+            suggested_target=target,
             downside="d",
             liquidity_risk="l",
             model_risk="m",
@@ -234,7 +238,7 @@ def test_process_candidate_reaches_confirmed_on_full_happy_path(tmp_path):
     runner = MockAgentRunner(fixtures=_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    result = orch.process_candidate(candidate, run_id="run-1")
+    result = orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     assert result.status == "CONFIRMED"
     reloaded = repo.get_candidate(candidate.candidate_id)
@@ -249,7 +253,7 @@ def test_process_candidate_never_lets_agent_timeout_crash_the_loop(tmp_path):
     runner = MockAgentRunner(fixtures=_happy_fixtures(), timeout_agents={"crypto-risk-agent"})
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    result = orch.process_candidate(candidate, run_id="run-1")  # kastar aldrig
+    result = orch.process_candidate(candidate, run_id="run-1", now=_NOW)  # kastar aldrig
 
     assert result.status == "NO_TRADE"
 
@@ -261,7 +265,7 @@ def test_process_candidate_never_lets_agent_failure_crash_the_loop(tmp_path):
     runner = MockAgentRunner(fixtures=_happy_fixtures(), fail_agents={"crypto-bear-adversarial"})
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    result = orch.process_candidate(candidate, run_id="run-1")
+    result = orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     assert result.status == "NO_TRADE"
 
@@ -319,7 +323,7 @@ def test_build_context_includes_news_and_fear_greed_only_for_news_sentiment_role
         news_connector=_StubNewsConnector(),
         external_data_connector=_StubExternalDataConnector(),
     )
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     news_context = spy.captured_contexts["crypto-news-sentiment"]
     assert news_context["news_headlines"] == [
@@ -350,7 +354,7 @@ def test_build_context_includes_reference_price_only_for_risk_role_when_present(
     spy = _SpyRunner(_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=spy, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     risk_context = spy.captured_contexts["crypto-risk-agent"]
     assert risk_context["reference_price"] == "42150.5"
@@ -367,11 +371,13 @@ def test_build_context_includes_reference_price_only_for_risk_role_when_present(
 
 def test_build_context_omits_reference_price_for_risk_role_when_absent(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
-    candidate = _persisted_candidate_in_under_ai_analysis(repo)  # reference_price=None (default)
+    candidate = _persisted_candidate_in_under_ai_analysis(repo).model_copy(
+        update={"reference_price": None}
+    )
     spy = _SpyRunner(_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=spy, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     assert "reference_price" not in spy.captured_contexts["crypto-risk-agent"]
 
@@ -382,7 +388,7 @@ def test_build_context_omits_news_keys_when_connectors_are_none(tmp_path):
     spy = _SpyRunner(_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=spy, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     news_context = spy.captured_contexts["crypto-news-sentiment"]
     assert "news_headlines" not in news_context
@@ -403,7 +409,7 @@ def test_qa_role_is_routed_through_run_qa_gate_with_six_prior_assessments(tmp_pa
     spy = _SpyRunner(_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=spy, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     qa_context = spy.captured_contexts["crypto-qa-gate"]
     assert "evidence_record" not in qa_context  # bevisar run_qa_gate(), inte generiska pathen
@@ -434,7 +440,7 @@ def test_build_context_degrades_gracefully_when_news_connector_raises(tmp_path):
         news_connector=_RaisingNewsConnector(),
         external_data_connector=_StubExternalDataConnector(),
     )
-    result = orch.process_candidate(candidate, run_id="run-1")  # kastar aldrig
+    result = orch.process_candidate(candidate, run_id="run-1", now=_NOW)  # kastar aldrig
 
     assert result.news_sentiment.status == "ok"
     assert result.status == "CONFIRMED"
@@ -452,7 +458,7 @@ def test_build_context_degrades_gracefully_when_external_data_connector_raises(t
         news_connector=_StubNewsConnector(),
         external_data_connector=_RaisingExternalDataConnector(),
     )
-    result = orch.process_candidate(candidate, run_id="run-1")  # kastar aldrig
+    result = orch.process_candidate(candidate, run_id="run-1", now=_NOW)  # kastar aldrig
 
     assert result.news_sentiment.status == "ok"
     assert result.status == "CONFIRMED"
@@ -464,7 +470,7 @@ def test_process_candidate_records_one_ai_call_event_per_role_invocation(tmp_pat
     runner = MockAgentRunner(fixtures=_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     assert repo.count_ai_calls_since(_NOW) == 7
 
@@ -475,7 +481,7 @@ def test_process_candidate_records_ai_call_event_even_when_role_times_out(tmp_pa
     runner = MockAgentRunner(fixtures=_happy_fixtures(), timeout_agents={"crypto-risk-agent"})
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     # anropet kostade även om utfallet blev timeout - samtliga sju roller körs
     # fortfarande (bara Risk-rollen timeoutar, resten status="ok").
@@ -488,7 +494,7 @@ def test_process_candidate_persists_forecast_record_on_successful_forecast_role(
     runner = MockAgentRunner(_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     record = repo.get_forecast_record(candidate.candidate_id)
     assert record is not None
@@ -508,7 +514,7 @@ def test_process_candidate_does_not_persist_forecast_record_when_forecast_role_f
     runner = MockAgentRunner(_happy_fixtures(), timeout_agents={"crypto-forecast-agent"})
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     assert repo.get_forecast_record(candidate.candidate_id) is None
 
@@ -536,7 +542,7 @@ def test_process_candidate_does_not_record_ai_call_event_when_runner_reports_unb
     runner = _UnbilledRunner(fixtures=_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     assert repo.count_ai_calls_since(_NOW) == 0
 
@@ -556,7 +562,7 @@ def test_process_candidate_persists_zero_cost_ai_call_event_when_billed(tmp_path
     runner = _BilledRunner(fixtures=_happy_fixtures())
 
     orch = Orchestrator(repo=repo, runner=runner, settings=_settings())
-    orch.process_candidate(candidate, run_id="run-1")
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     assert repo.count_ai_calls_since(_NOW) == 7
     assert repo.sum_ai_cost_since(_NOW) == Decimal("0.35")  # 7 roller * $0.05
@@ -570,7 +576,36 @@ def test_process_candidate_stops_role_loop_at_ai_call_budget(tmp_path):
     orch = Orchestrator(
         repo=repo, runner=runner, settings=_settings(max_ai_calls_per_discovery_run=3)
     )
-    result = orch.process_candidate(candidate, run_id="run-1")
+    result = orch.process_candidate(candidate, run_id="run-1", now=_NOW)
 
     assert result.risk is None or result.bear_adversarial is None  # loopen bröts tidigt
     assert result.status == "NO_TRADE"  # ofullständig -> aldrig CONFIRMED
+
+
+def test_the_gate_decision_is_evaluated_with_policy_and_now_and_fully_audited(tmp_path, monkeypatch):
+    """P1 (2026-09-28): the orchestrator passes the configured gate policy and
+    the evaluation time, and persists every enforced/shadow condition and
+    metric, so "why did this trade get through?" is answerable later."""
+    import crypto_trading.orchestrator as orchestrator_module
+
+    seen = {}
+    real_gate = orchestrator_module.evaluate_risk_signal_gate
+
+    def spy_gate(candidate, open_positions, max_concurrent, policy=None, now=None):
+        seen.update(policy=policy, now=now)
+        return real_gate(candidate, open_positions, max_concurrent, policy=policy, now=now)
+
+    monkeypatch.setattr(orchestrator_module, "evaluate_risk_signal_gate", spy_gate)
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    settings = _settings()
+    orch = Orchestrator(repo=repo, runner=MockAgentRunner(fixtures=_happy_fixtures()), settings=settings)
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW)
+
+    assert seen["policy"] == settings.gate
+    assert seen["now"] is not None
+    evaluation = repo.get_gate_evaluation(candidate.candidate_id)
+    assert evaluation["outcome"] in ("CONFIRMED", "NO_TRADE")
+    assert "metrics" in evaluation["detail"] and "shadow" in evaluation["detail"]
+    assert "enforced_failed" in evaluation["detail"]
+    assert evaluation["detail"]["metrics"]["bull_probability"] == 0.6

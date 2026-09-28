@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from crypto_trading.gate.risk_signal_gate import evaluate_risk_signal_gate
 from crypto_trading.schemas.assessments import (
@@ -92,8 +93,8 @@ def _risk(status="ok") -> RiskAssessment:
         run_id="run-1",
         created_at=_NOW,
         status=status,
-        suggested_stop_loss="1",
-        suggested_target="2",
+        suggested_stop_loss="95",
+        suggested_target="110",
         downside="d",
         liquidity_risk="l",
         model_risk="m",
@@ -145,6 +146,7 @@ def _full_candidate(**overrides) -> Candidate:
         evidence_record=_evidence(),
         created_at=_NOW,
         updated_at=_NOW,
+        reference_price=Decimal("100"),
         **defaults,
     )
 
