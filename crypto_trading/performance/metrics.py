@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from crypto_trading.paper_trading.execution import compute_pnl, has_paper_exit_data
+from crypto_trading.paper_trading.execution import (
+    compute_pnl_with_cost_model,
+    configured_cost_model,
+    has_paper_exit_data,
+)
 from crypto_trading.schemas.trade import Position
 
 
@@ -17,7 +21,10 @@ def trade_pnls(positions: list[Position]) -> list[Decimal]:
     PAPER-exitdata - dess PAPER-P/L är okänd och lämnas utanför (samma regel
     som detective/stats.py), aldrig påhittad och aldrig ersatt med LIVE-P/L
     i en annan storlek. Förut kraschade hela notify-dagsrapporten på den."""
-    return [compute_pnl(p) for p in _closed_positions_with_paper_exit(positions)]
+    # P2 (2026-09-28): historical v1-fee closes are recosted with the current
+    # cost model (the stored record itself is never rewritten).
+    costs = configured_cost_model()
+    return [compute_pnl_with_cost_model(p, costs) for p in _closed_positions_with_paper_exit(positions)]
 
 
 def compute_cumulative_pnl(pnls: list[Decimal]) -> Decimal:
@@ -79,8 +86,9 @@ def compute_drawdown(positions: list[Position]) -> Decimal | None:
     running = Decimal("0")
     peak = Decimal("0")
     max_drawdown = Decimal("0")
+    costs = configured_cost_model()
     for position in ordered:
-        running += compute_pnl(position)
+        running += compute_pnl_with_cost_model(position, costs)
         peak = max(peak, running)
         max_drawdown = max(max_drawdown, peak - running)
     return max_drawdown
@@ -92,8 +100,9 @@ def compute_equity_curve(positions: list[Position]) -> list[dict]:
     ordered = _closed_positions_sorted_by_closed_at(positions)
     running = Decimal("0")
     curve = []
+    costs = configured_cost_model()
     for position in ordered:
-        running += compute_pnl(position)
+        running += compute_pnl_with_cost_model(position, costs)
         curve.append({"closed_at": position.closed_at.isoformat(), "cumulative_pnl": str(running)})
     return curve
 

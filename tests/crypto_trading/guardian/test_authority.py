@@ -13,6 +13,7 @@ from crypto_trading.config.loader import (
     PipelineConfig,
     RiskLimitsConfig,
     Settings,
+    get_settings,
 )
 from crypto_trading.guardian.authority import (
     _groups_for_factors,
@@ -27,7 +28,7 @@ from crypto_trading.guardian.authority import (
     resolve_pending_pre_entry_shadows,
     update_heuristics_from_resolved_decisions,
 )
-from crypto_trading.paper_trading.execution import compute_pnl
+from crypto_trading.paper_trading.execution import compute_pnl, compute_pnl_with_cost_model
 from crypto_trading.schemas.assessments import RiskAssessment
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
@@ -1245,7 +1246,9 @@ def test_resolve_pending_decisions_tighten_sl_profitable_close_is_correct(tmp_pa
     _open_position(repo, "pos-2")
     _close_position(repo, "pos-2", fill_exit="51000", exit_reason="target", fees="2", funding="1")
     closed_position = repo.get_position("pos-2")
-    expected_pnl = compute_pnl(closed_position)
+    # P2 (2026-09-28): learning resolves with the CURRENT cost model; this
+    # fixture's stored fees equal the v1 model, so they are recosted.
+    expected_pnl = compute_pnl_with_cost_model(closed_position, get_settings().costs)
     assert expected_pnl > 0  # sanity: this scenario really is profitable
     repo.save_guardian_authority_decision(
         "ga-2", "pos-2", "cand-2", "TIGHTEN_SL", _NOW,
@@ -1277,7 +1280,9 @@ def test_resolve_pending_decisions_tighten_sl_losing_close_is_incorrect(tmp_path
         repo, "pos-3", fill_exit="49000", exit_reason="stop_loss", fees="2", funding="1"
     )
     closed_position = repo.get_position("pos-3")
-    expected_pnl = compute_pnl(closed_position)
+    # P2 (2026-09-28): learning resolves with the CURRENT cost model; this
+    # fixture's stored fees equal the v1 model, so they are recosted.
+    expected_pnl = compute_pnl_with_cost_model(closed_position, get_settings().costs)
     assert expected_pnl < 0  # sanity: this scenario really is a loss
     repo.save_guardian_authority_decision(
         "ga-3", "pos-3", "cand-3", "TIGHTEN_SL", _NOW,
@@ -1337,7 +1342,9 @@ def test_resolve_pending_decisions_close_early_fills_actuals_but_leaves_expectat
         repo, "pos-5", fill_exit="50100", exit_reason="GUARDIAN_EXIT", fees="2", funding="1"
     )
     closed_position = repo.get_position("pos-5")
-    expected_pnl = compute_pnl(closed_position)
+    # P2 (2026-09-28): learning resolves with the CURRENT cost model; this
+    # fixture's stored fees equal the v1 model, so they are recosted.
+    expected_pnl = compute_pnl_with_cost_model(closed_position, get_settings().costs)
     repo.save_guardian_authority_decision(
         "ga-5", "pos-5", "cand-5", "CLOSE_EARLY", _NOW,
         "reasoning", "expect unfavorable if left open", "unfavorable", 0.9, "run-1",

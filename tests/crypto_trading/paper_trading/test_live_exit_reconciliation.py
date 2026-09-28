@@ -444,3 +444,28 @@ def test_overlapping_positions_on_the_same_symbol_are_unverifiable(tmp_path):
     row = repo.get_live_execution(PID)
     assert row["exit_verification"] == "UNVERIFIABLE"
     assert row["exit_verification_reason"] == "OVERLAPPING_SAME_SYMBOL_POSITION"
+
+
+def test_actual_entry_and_exit_fees_and_stop_slippage_are_kept_separate():
+    """P2: actual costs are itemised - entry fee, exit fee, and the stop's
+    fill below its trigger price (execution slippage)."""
+    result = reconcile_exit(PID, Decimal("20433"), _kas_orders(), [])
+    assert result.entry_fee_usdt == Decimal("0.500669")
+    assert result.exit_fee_usdt == Decimal("0.497866")
+    # PP stop at 0.04900 filled at 0.04873: 20433 x 0.00027
+    assert result.exit_slippage_usdt == Decimal("20433") * Decimal("0.00027")
+
+
+def test_market_exits_have_no_trigger_slippage():
+    orders = [_entry(), _order("MARKET", "SELL", "FILLED", "0.0500", "20433", T_EXIT, client=LV + "x")]
+    assert reconcile_exit(PID, Decimal("20433"), orders, []).exit_slippage_usdt is None
+
+
+def test_itemised_actual_costs_are_stored(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _closed_live(repo)
+    verify_closed_live_exits(repo, _ReadOnlyConnector(), "r1", _ms(T_EXIT) + timedelta(minutes=5))
+    row = repo.get_live_execution(PID)
+    assert Decimal(row["actual_entry_fee_usdt"]) == Decimal("0.500669")
+    assert Decimal(row["actual_exit_fee_usdt"]) == Decimal("0.497866")
+    assert Decimal(row["exit_slippage_usdt"]) == Decimal("5.51691")

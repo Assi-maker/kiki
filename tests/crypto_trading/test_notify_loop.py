@@ -397,9 +397,11 @@ def test_run_notify_tick_daily_report_includes_performance_metrics_from_closed_p
 
     assert sent == 2  # 1 CLOSED + 1 daily report
     report = next(msg for msg in notifier.sent if msg.startswith("📊 Daily report"))
-    assert "Cumulative PnL: 192.40" in report
+    # P2 (2026-09-28): the seeded close carries v1 fees (size x 0.04 %); the
+    # report recosts it with the current 0.10 % round trip (-3.00 USDT).
+    assert "Cumulative PnL: 189.40" in report
     assert "Win rate: 100%" in report
-    assert "Expectancy: 192.40" in report
+    assert "Expectancy: 189.40" in report
     assert "Max drawdown: 0.00" in report
 
 

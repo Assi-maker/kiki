@@ -65,6 +65,31 @@ def compute_pnl(position: Position) -> Decimal:
     return gross_pnl - position.fees - position.funding
 
 
+def is_v1_fee_close(position: Position, costs) -> bool:
+    """A paper close charged with the v1 model (size x 0.04 %, exactly)."""
+    return (
+        position.fees is not None
+        and position.fees == position.size * costs.legacy_v1_round_trip_fee_pct
+        and costs.legacy_v1_round_trip_fee_pct != costs.round_trip_fee_pct
+    )
+
+
+def compute_pnl_with_cost_model(position: Position, costs) -> Decimal:
+    """`compute_pnl`, but a historical close charged with the v1 fee model is
+    recosted with the current round trip. The stored record is never
+    rewritten - this is what learning and reporting read (P2, 2026-09-28)."""
+    if not is_v1_fee_close(position, costs):
+        return compute_pnl(position)
+    return compute_pnl(position) + position.fees - position.size * costs.round_trip_fee_pct
+
+
+@lru_cache(maxsize=1)
+def configured_cost_model():
+    from crypto_trading.config.loader import get_settings
+
+    return get_settings().costs
+
+
 def has_paper_exit_data(position: Position) -> bool:
     """False for a position closed only by the LIVE exit mirror
     (`repo.close_position_for_live_exit`), which never writes PAPER's
@@ -162,11 +187,12 @@ def resolve_realized_pnl(
     if position.status != "CLOSED":
         return _unverifiable("NOT_CLOSED")
     if has_paper_exit_data(position):
-        pnl = compute_pnl(position)
+        costs = configured_cost_model()
+        pnl = compute_pnl_with_cost_model(position, costs)
         return RealizedPnl(
             "VERIFIED", "PAPER", pnl,
             pnl / position.size if position.size != 0 else None,
-            fees_source="PAPER_MODEL",
+            fees_source="PAPER_MODEL_V1_RECOSTED" if is_v1_fee_close(position, costs) else "PAPER_MODEL",
         )
     if live_execution is None:
         return _unverifiable("NO_PAPER_EXIT_AND_NO_LIVE_EXECUTION")

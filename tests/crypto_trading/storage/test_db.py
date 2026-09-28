@@ -492,6 +492,8 @@ def test_live_executions_table_exists(tmp_path):
         "exit_verification", "exit_verification_reason", "exit_classification",
         "exit_exchange_order_ids", "entry_filled_at", "exit_filled_at",
         "exchange_realized_pnl_usdt", "exit_verified_at",
+        # 2026-09-28 P2 itemised actual costs
+        "actual_entry_fee_usdt", "actual_exit_fee_usdt", "exit_slippage_usdt",
     }
 
 

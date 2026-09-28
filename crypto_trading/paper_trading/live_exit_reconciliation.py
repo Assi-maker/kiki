@@ -60,6 +60,12 @@ class ExitReconciliation:
     fees_usdt: Decimal | None = None  # cost: positive = paid
     funding_usdt: Decimal | None = None  # cost: positive = paid, negative = received
     exchange_realized_pnl_usdt: Decimal | None = None
+    # P2 (2026-09-28): actual costs itemised. Fees are costs (positive = paid);
+    # slippage = sum over triggered exit orders of qty x (trigger - fill)
+    # (positive = filled worse than the trigger; None for market exits).
+    entry_fee_usdt: Decimal | None = None
+    exit_fee_usdt: Decimal | None = None
+    exit_slippage_usdt: Decimal | None = None
 
 
 def _dec(value) -> Decimal | None:
@@ -164,6 +170,15 @@ def reconcile_exit(
     classification = classes[0] if len(classes) == 1 else "MIXED:" + "+".join(classes)
     commissions = [_dec(o.get("commission")) for o in [entry, *taken]]
     fees = -sum(commissions) if all(c is not None for c in commissions) else None
+    entry_fee = -commissions[0] if commissions[0] is not None else None
+    exit_commissions = commissions[1:]
+    exit_fee = -sum(exit_commissions) if all(c is not None for c in exit_commissions) else None
+    triggered = [o for o in taken if _dec(o.get("stopPrice")) not in (None, Decimal("0"))]
+    slippage = (
+        sum(_dec(o.get("executedQty")) * (_dec(o.get("stopPrice")) - _dec(o.get("avgPrice")))
+            for o in triggered)
+        if triggered else None
+    )
     exit_ms = _ms(taken[-1])
     received = sum(
         (_dec(i.get("income")) or Decimal("0"))
@@ -182,6 +197,9 @@ def reconcile_exit(
         fees_usdt=fees,
         funding_usdt=-received if received else Decimal("0"),
         exchange_realized_pnl_usdt=sum(profits) if all(p is not None for p in profits) else None,
+        entry_fee_usdt=entry_fee,
+        exit_fee_usdt=exit_fee,
+        exit_slippage_usdt=slippage,
     )
 
 

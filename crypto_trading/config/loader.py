@@ -416,6 +416,30 @@ class SafetyKernelConfig(BaseModel):
     default_group: str = "crypto_alt"
 
 
+class CostModelConfig(BaseModel):
+    """P2 economic model (2026-09-28) - see config/cost_model.yaml."""
+
+    model_version: str = "v2-2026-09-28"
+    entry_fee_pct: Decimal = Decimal("0.0005")
+    exit_fee_pct: Decimal = Decimal("0.0005")
+    stop_slippage_pct: Decimal = Decimal("0.0015")
+    legacy_v1_round_trip_fee_pct: Decimal = Decimal("0.0004")
+
+    @property
+    def round_trip_fee_pct(self) -> Decimal:
+        return self.entry_fee_pct + self.exit_fee_pct
+
+
+def validate_cost_model(paper_fee_pct: Decimal, costs: CostModelConfig) -> None:
+    """The paper book charges risk_limits.fee_pct once at close: it must be
+    the cost model's round trip, or paper/learning drift from reality again."""
+    if paper_fee_pct != costs.round_trip_fee_pct:
+        raise ConfigError(
+            f"risk_limits.fee_pct {paper_fee_pct} != cost_model round trip "
+            f"{costs.round_trip_fee_pct} (entry {costs.entry_fee_pct} + exit {costs.exit_fee_pct})"
+        )
+
+
 class GatePolicyConfig(BaseModel):
     """P1 Gate content requirements (2026-09-28) - see config/gate.yaml.
     Defaults ARE the production values."""
@@ -442,6 +466,7 @@ class Settings(BaseModel):
     godfather: GodfatherConfig = Field(default_factory=GodfatherConfig)
     safety: SafetyKernelConfig = Field(default_factory=SafetyKernelConfig)
     gate: GatePolicyConfig = Field(default_factory=GatePolicyConfig)
+    costs: CostModelConfig = Field(default_factory=CostModelConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -461,10 +486,13 @@ def get_settings() -> Settings:
     db_path = (
         Path(db_path_override) if db_path_override else _PROJECT_ROOT / "data" / "crypto_trading.db"
     )
+    risk_limits = _load_yaml_model(_CONFIG_DIR / "risk_limits.yaml", RiskLimitsConfig)
+    costs = _load_yaml_model(_CONFIG_DIR / "cost_model.yaml", CostModelConfig)
+    validate_cost_model(risk_limits.fee_pct, costs)
     return Settings(
         db_path=db_path,
         pipeline=_load_yaml_model(_CONFIG_DIR / "pipeline.yaml", PipelineConfig),
-        risk_limits=_load_yaml_model(_CONFIG_DIR / "risk_limits.yaml", RiskLimitsConfig),
+        risk_limits=risk_limits,
         budget_limits=_load_yaml_model(_CONFIG_DIR / "budget_limits.yaml", BudgetLimitsConfig),
         notify=_load_yaml_model(_CONFIG_DIR / "notify.yaml", NotifyConfig),
         dashboard=_load_yaml_model(_CONFIG_DIR / "dashboard.yaml", DashboardConfig),
@@ -478,6 +506,7 @@ def get_settings() -> Settings:
         godfather=_load_yaml_model(_CONFIG_DIR / "godfather.yaml", GodfatherConfig),
         safety=_load_yaml_model(_CONFIG_DIR / "safety_kernel.yaml", SafetyKernelConfig),
         gate=_load_yaml_model(_CONFIG_DIR / "gate.yaml", GatePolicyConfig),
+        costs=costs,
     )
 
 

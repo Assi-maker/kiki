@@ -1,0 +1,19 @@
+# P2 economic model (2026-09-28). The ONE documented trading-cost model.
+# Measured on every verified BingX LIVE fill 2026-09-26..28 (37 trades):
+# taker commission 0.05 % of notional on the entry AND on the exit.
+model_version: "v2-2026-09-28"
+entry_fee_pct: "0.0005"
+exit_fee_pct: "0.0005"
+# risk_limits.yaml fee_pct (what the paper book charges once at close) MUST
+# equal entry_fee_pct + exit_fee_pct - the loader refuses to start otherwise.
+
+# Measured STOP_MARKET fill below its trigger price (mark-price trigger,
+# market fill): PP stops mean 0.158 %, original SLs 0.109 %, pooled ~0.14 %.
+# Used for modelled stop exits in counterfactuals; the Safety Kernel keeps its
+# own more conservative 0.3 % buffer for worst-case risk.
+stop_slippage_pct: "0.0015"
+
+# The v1 model (0.04 % once, round trip) - only to RECOGNISE historical paper
+# closes charged with it. They are never rewritten; learning and reporting
+# recost them with the current model and label the provenance.
+legacy_v1_round_trip_fee_pct: "0.0004"

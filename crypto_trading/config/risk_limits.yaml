@@ -52,5 +52,9 @@ max_total_exposure_pct: "1.00"
 max_position_notional_usdt: "500"
 spread_pct: "0.0005"
 slippage_pct: "0.0005"
-fee_pct: "0.0004"
+# 2026-09-28 (P2, explicit user decision "rätta fee model"): 0.0004 -> 0.0010.
+# Charged ONCE at close, so it is the ROUND TRIP: 0.05 % taker entry + 0.05 %
+# exit, measured on every verified LIVE fill. Must equal cost_model.yaml's
+# entry_fee_pct + exit_fee_pct (the loader refuses otherwise).
+fee_pct: "0.0010"
 max_position_hold_hours: 24

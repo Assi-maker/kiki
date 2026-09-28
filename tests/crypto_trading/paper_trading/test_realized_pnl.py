@@ -373,8 +373,9 @@ def test_resolve_pending_decisions_uses_a_verified_live_outcome(tmp_path):
     assert resolve_pending_decisions(repo, _T0 + timedelta(hours=1)) == 1
     row = repo.get_guardian_authority_decision("ga-lv")
     assert row["outcome_status"] == "RESOLVED"
-    # paper-size units (same as every other row): -3.04% net x 1000 paper size
-    assert Decimal(row["actual_pnl_usdt"]) == Decimal("-30.4")
+    # paper-size units (same as every other row): -3 % gross - 0.10 % modelled
+    # round-trip fee (P2 cost model) = -3.10 % net x 1000 paper size
+    assert Decimal(row["actual_pnl_usdt"]) == Decimal("-31.0")
     assert row["expectation_correct"] == 0  # predicted favorable, really lost
 
 

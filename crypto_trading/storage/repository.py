@@ -1256,11 +1256,14 @@ class SQLiteRepository:
         if result.verification == "VERIFIED":
             self._conn.execute(
                 "UPDATE live_executions SET exchange_fill_exit = ?, realized_fees_usdt = ?, "
-                "realized_funding_usdt = ?, exit_fill_source = CASE WHEN exit_fill_source = "
+                "realized_funding_usdt = ?, actual_entry_fee_usdt = ?, actual_exit_fee_usdt = ?, "
+                "exit_slippage_usdt = ?, exit_fill_source = CASE WHEN exit_fill_source = "
                 "'MARKET_CLOSE' THEN 'MARKET_CLOSE' ELSE 'EXCHANGE_ORDER' END "
                 "WHERE position_id = ? AND phase = 'CLOSED'",
                 (text(result.exit_price), text(result.fees_usdt), text(result.funding_usdt),
-                 position_id),
+                 text(getattr(result, "entry_fee_usdt", None)),
+                 text(getattr(result, "exit_fee_usdt", None)),
+                 text(getattr(result, "exit_slippage_usdt", None)), position_id),
             )
         self._conn.commit()
 
