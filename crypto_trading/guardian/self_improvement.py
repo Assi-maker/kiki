@@ -415,17 +415,6 @@ def _build_context(repo: Repository, settings: Settings, run_id: str) -> dict:
     }
 
 
-def _release_day_slot(repo: Repository, previous: str | None, now: datetime) -> None:
-    """A strategist AI call that failed/timed out/raised produced no answer,
-    so it must not burn the once-per-UTC-day slot claimed just before it:
-    put back exactly what was there before the claim (2026-09-19: a
-    persistent failure used to lock proposals out for the whole day)."""
-    if previous is not None:
-        repo.set_guardian_authority_strategist_last_proposed_date(previous, now)
-    else:
-        repo.clear_guardian_authority_strategist_last_proposed_date()
-
-
 def propose_candidate_heuristics(
     repo: Repository,
     runner: AgentRunner,
@@ -476,17 +465,22 @@ def propose_candidate_heuristics(
 
         context = _build_context(repo, settings, run_id)
         agent_def = load_agent_definition(_STRATEGIST_AGENT_FILE)
-        try:
-            assessment: GodfatherStrategistAssessment = runner.run(
-                agent_def, context, GodfatherStrategistAssessment
-            )
-        except Exception:
-            _release_day_slot(repo, last_proposed, now)
-            raise
+        # 2026-09-29 cost forensic: the day's slot stays CONSUMED whatever
+        # happens below - failed, timed out or raised. Releasing it made the
+        # strategist retry at every discovery cycle (26 timed-out Sonnet
+        # attempts, ~$4.4, in one night). The next attempt is the next UTC day.
+        assessment: GodfatherStrategistAssessment = runner.run(
+            agent_def, context, GodfatherStrategistAssessment
+        )
 
         billed = getattr(runner, "last_call_billed", True)
-        cost = getattr(runner, "last_call_cost_usd", Decimal("0"))
-        if billed:
+        cost_known = getattr(runner, "last_call_cost_known", True)
+        # A timed-out attempt may have been billed without us seeing its
+        # usage: charge its conservative upper bound to the AI budget.
+        cost = getattr(runner, "last_call_cost_usd", Decimal("0")) + getattr(
+            runner, "last_call_unknown_cost_upper_usd", Decimal("0")
+        )
+        if billed or not cost_known:
             repo.record_ai_call_event(
                 Event(
                     event_id=f"AI_CALL_MADE:godfather_strategist:{run_id}:{day_key}",
@@ -503,6 +497,8 @@ def propose_candidate_heuristics(
                         "role": "godfather_strategist",
                         "status": assessment.status,
                         "cost_usd": str(cost),
+                        "cost_known": cost_known,
+                        "attempts": getattr(runner, "last_call_attempts", 1),
                     },
                 )
             )
@@ -512,8 +508,10 @@ def propose_candidate_heuristics(
                 run_id,
                 event="godfather_strategist_assessment_unusable",
                 status=assessment.status,
+                cost_known=cost_known,
+                cost_usd=str(cost),
+                day_slot_consumed=day_key,
             )
-            _release_day_slot(repo, last_proposed, now)
             return 0
 
         saved = 0
@@ -545,9 +543,9 @@ def propose_candidate_heuristics(
         return saved
     except Exception as exc:
         # Same fail-safe discipline as every other AI call site here: the
-        # caller gets 0 instead of an exception. A failure while BUILDING
-        # the context still leaves the day's slot claimed; a failed AI call
-        # itself already released it above.
+        # caller gets 0 instead of an exception. Every failure after the
+        # claim - building the context, the AI call itself - leaves the day's
+        # slot claimed (module docstring; 2026-09-29 cost forensic).
         log_event(
             run_id,
             event="godfather_strategist_failed",

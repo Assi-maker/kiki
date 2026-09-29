@@ -393,3 +393,100 @@ def test_real_claude_runner_does_not_extract_json_from_surrounding_prose():
         result = runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
 
     assert result.status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-29 cost forensic: every attempt is logged (also timeouts), the cost
+# of an attempt whose usage is unknown gets a conservative upper bound, and a
+# per-agent attempt override caps expensive agents at ONE attempt.
+# ---------------------------------------------------------------------------
+
+def _timeout_error():
+    from anthropic import APITimeoutError
+
+    return APITimeoutError(request=MagicMock())
+
+
+def test_a_timed_out_attempt_is_logged_with_unknown_tokens_and_an_upper_cost_bound():
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic, \
+            patch("crypto_trading.agents.runner.log_event") as mock_log_event:
+        mock_anthropic.return_value.messages.create.side_effect = _timeout_error()
+        runner = RealClaudeRunner(api_key="fake", model="claude-sonnet-5", timeout_seconds=60, max_retries=3)
+        runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    attempts = [c.kwargs for c in mock_log_event.call_args_list if c.kwargs.get("event") == "agent_call_attempt"]
+    assert len(attempts) == 3
+    first = attempts[0]
+    assert first["agent_name"] == "crypto-risk-agent"
+    assert first["model"] == "claude-sonnet-5"
+    assert first["outcome"] == "TIMEOUT"
+    assert first["tokens_known"] is False
+    assert first["cost_upper_bound_usd"] > 0
+    assert first["started_at"] <= first["ended_at"]
+    assert runner.last_call_attempts == 3
+    assert runner.last_call_cost_known is False
+    assert runner.last_call_unknown_cost_upper_usd > 0
+
+
+def test_a_successful_attempt_is_logged_with_known_tokens():
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    fake_message = MagicMock()
+    fake_message.content = [MagicMock(type="text", text=_VALID_JSON_BODY)]
+    fake_message.usage = MagicMock(input_tokens=1000, output_tokens=500, cache_read_input_tokens=0,
+                                   cache_creation_input_tokens=0)
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic, \
+            patch("crypto_trading.agents.runner.log_event") as mock_log_event:
+        mock_anthropic.return_value.messages.create.return_value = fake_message
+        runner = RealClaudeRunner(api_key="fake", model="claude-sonnet-5", timeout_seconds=60, max_retries=3)
+        runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+
+    attempts = [c.kwargs for c in mock_log_event.call_args_list if c.kwargs.get("event") == "agent_call_attempt"]
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "ok"
+    assert attempts[0]["tokens_known"] is True
+    assert attempts[0]["input_tokens"] == 1000
+    assert runner.last_call_cost_known is True
+    assert runner.last_call_unknown_cost_upper_usd == 0
+
+
+def test_an_attempt_override_caps_one_agent_at_a_single_attempt():
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        create = mock_anthropic.return_value.messages.create
+        create.side_effect = _timeout_error()
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=60, max_retries=3,
+            attempt_overrides={"crypto-godfather-strategist": 1},
+        )
+        runner.run(_agent_def("crypto-godfather-strategist"), context={"run_id": "r"},
+                   output_schema=RiskAssessment)
+        assert create.call_count == 1
+        runner.run(_agent_def("crypto-risk-agent"), context={"run_id": "r"}, output_schema=RiskAssessment)
+        assert create.call_count == 1 + 3  # other agents keep their normal retries
+
+
+def test_credit_exhaustion_is_known_to_cost_nothing():
+    from anthropic import APIError
+
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        mock_anthropic.return_value.messages.create.side_effect = APIError(
+            "credit balance too low", request=MagicMock(), body=None)
+        runner = RealClaudeRunner(api_key="fake", model="claude-sonnet-5", timeout_seconds=30, max_retries=2)
+        runner.run(_agent_def(), context={"run_id": "run-1"}, output_schema=RiskAssessment)
+    assert runner.last_call_cost_known is True
+    assert runner.last_call_unknown_cost_upper_usd == 0
+
+
+def test_the_production_discovery_runner_caps_the_godfather_strategists_at_one_attempt(monkeypatch):
+    from crypto_trading import run as run_module
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    runner = run_module.build_runner_from_env()
+    assert runner._attempt_overrides.get("crypto-godfather-strategist") == 1
+    assert runner._attempt_overrides.get("crypto-godfather-priority-strategist") == 1

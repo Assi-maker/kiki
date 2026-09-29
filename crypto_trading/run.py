@@ -68,6 +68,10 @@ def build_runner_from_env() -> AgentRunner:
         model=os.environ.get("CRYPTO_TRADING_CLAUDE_MODEL", "claude-sonnet-5"),
         timeout_seconds=float(os.environ.get("CRYPTO_TRADING_AGENT_TIMEOUT_SECONDS", "60")),
         max_retries=int(os.environ.get("CRYPTO_TRADING_AGENT_MAX_RETRIES", "3")),
+        # 2026-09-29 cost forensic: the once-a-day GODFATHER strategists ride
+        # on this (discovery) runner. Three timed-out attempts per discovery
+        # cycle burned ~$4.4 in one night - they get ONE attempt.
+        attempt_overrides={"crypto-godfather-strategist": 1, "crypto-godfather-priority-strategist": 1},
     )
 
 

@@ -239,8 +239,13 @@ def propose_priority_candidates(
         )
 
         billed = getattr(runner, "last_call_billed", True)
-        cost = getattr(runner, "last_call_cost_usd", Decimal("0"))
-        if billed:
+        cost_known = getattr(runner, "last_call_cost_known", True)
+        # 2026-09-29: a timed-out attempt may be billed unseen - charge its
+        # conservative upper bound to the AI budget (same as the strategist).
+        cost = getattr(runner, "last_call_cost_usd", Decimal("0")) + getattr(
+            runner, "last_call_unknown_cost_upper_usd", Decimal("0")
+        )
+        if billed or not cost_known:
             repo.record_ai_call_event(
                 Event(
                     event_id=f"AI_CALL_MADE:godfather_priority_strategist:{run_id}:{day_key}",
@@ -254,6 +259,7 @@ def propose_priority_candidates(
                         "role": "godfather_priority_strategist",
                         "status": assessment.status,
                         "cost_usd": str(cost),
+                        "cost_known": cost_known,
                     },
                 )
             )

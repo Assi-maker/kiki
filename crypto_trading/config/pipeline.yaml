@@ -2,6 +2,11 @@ discovery_interval_minutes: 15
 monitoring_interval_seconds: 30
 top_n: 80
 cooldown_minutes: 60
+# 2026-09-29 cost forensic: a symbol CONFIRMED and then REJECTED by the Safety
+# Kernel only on PORTFOLIO_RISK_CAP/GROUP_RISK_CAP gets no new candidate (no
+# new 7-role AI analysis) for this long - overnight CRV was analysed 5 times
+# and cap-rejected every time. Risk limits themselves are untouched.
+kernel_reject_cooldown_minutes: 120
 # kline: primary candle's open-time span (30m=1800s) + 300s grace, same
 # calibration formula as the 2026-08-31 1h fix - recalibrated together with
 # screener_timeframes below (primary 1h -> 30m). Never applied to the

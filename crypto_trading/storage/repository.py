@@ -113,6 +113,8 @@ class Repository(Protocol):
         self, position_id: str, decided_at: datetime, action: str, detail: dict
     ) -> None: ...
     def get_safety_kernel_decision(self, position_id: str) -> dict | None: ...
+    def find_latest_kernel_reject_for_instrument(self, instrument: str) -> dict | None: ...
+    def has_candidate_for_instrument_since(self, instrument: str, since: datetime) -> bool: ...
     def record_gate_evaluation(
         self, candidate_id: str, evaluated_at: datetime, outcome: str, detail: dict
     ) -> None: ...
@@ -1208,6 +1210,30 @@ class SQLiteRepository:
             (position_id, decided_at.isoformat(), action, json.dumps(detail, default=str)),
         )
         self._conn.commit()
+
+    def find_latest_kernel_reject_for_instrument(self, instrument: str) -> dict | None:
+        """The most recent Safety Kernel REJECT of a position on `instrument`
+        (2026-09-29 kernel-reject cooldown), with its candidate and the time
+        that candidate became CONFIRMED."""
+        row = self._conn.execute(
+            "SELECT s.position_id, s.decided_at, s.detail_json, p.candidate_id, c.updated_at "
+            "FROM safety_kernel_decisions s JOIN positions p USING(position_id) "
+            "JOIN candidates c ON c.candidate_id = p.candidate_id "
+            "WHERE p.instrument = ? AND s.action = 'REJECT' ORDER BY s.decided_at DESC LIMIT 1",
+            (instrument,),
+        ).fetchone()
+        if row is None:
+            return None
+        detail = json.loads(row["detail_json"])
+        return {"position_id": row["position_id"], "decided_at": datetime.fromisoformat(row["decided_at"]),
+                "reasons": list(detail.get("reasons") or []), "candidate_id": row["candidate_id"],
+                "confirmed_at": row["updated_at"]}
+
+    def has_candidate_for_instrument_since(self, instrument: str, since: datetime) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM candidates WHERE instrument = ? AND created_at > ? LIMIT 1",
+            (instrument, since.isoformat()),
+        ).fetchone() is not None
 
     def record_gate_evaluation(
         self, candidate_id: str, evaluated_at: datetime, outcome: str, detail: dict

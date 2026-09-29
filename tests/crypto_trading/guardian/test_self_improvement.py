@@ -611,12 +611,12 @@ def test_propose_candidate_heuristics_treats_an_empty_proposal_list_as_a_success
 
 
 # --------------------------------------------------------------------------
-# Failure paths: zero candidates, and a failed AI CALL releases the day's slot
-# (2026-09-19: an unusable call - failed/timed out/raised - produced no
-# proposal, so it must not burn the once-per-day slot; only a call that
-# actually returned an answer, even an empty one, consumes it).
+# Failure paths (2026-09-29 cost forensic): a failed, timed-out or exploded
+# AI call CONSUMES the day's slot. Releasing it (the 2026-09-19 behaviour)
+# made the strategist retry at every discovery cycle - 26 timed-out Sonnet
+# attempts (~$4.4, never counted by the budget) in one night.
 # --------------------------------------------------------------------------
-def test_propose_candidate_heuristics_releases_the_slot_on_a_failed_agent_response(tmp_path):
+def test_a_failed_agent_response_consumes_the_day_slot_and_is_not_retried_today(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_history(repo)
     runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
@@ -627,55 +627,74 @@ def test_propose_candidate_heuristics_releases_the_slot_on_a_failed_agent_respon
     assert saved == 0
     assert len(runner.calls) == 1
     assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
-    assert repo.get_guardian_authority_strategist_last_proposed_date() is None
-    # a later tick the same day really does try again
-    propose_candidate_heuristics(repo, runner, _settings(), "run-2", _NOW + timedelta(minutes=10))
-    assert len(runner.calls) == 2
+    assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-15"
+    # every later discovery tick the same UTC day makes NO new call
+    for minutes in (30, 60, 600):
+        propose_candidate_heuristics(repo, runner, _settings(), f"run-{minutes}", _NOW + timedelta(minutes=minutes))
+    assert len(runner.calls) == 1
 
 
-def test_propose_candidate_heuristics_releases_the_slot_on_a_timed_out_agent_response(
-    tmp_path,
-):
+def test_a_timed_out_agent_response_consumes_the_day_slot(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_history(repo)
     runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
     runner._timeout_agents = {_AGENT_NAME}
 
     saved = propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+    propose_candidate_heuristics(repo, runner, _settings(), "run-2", _NOW + timedelta(minutes=30))
 
     assert saved == 0
     assert len(runner.calls) == 1
-    assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
-    assert repo.get_guardian_authority_strategist_last_proposed_date() is None
+    assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-15"
 
 
-def test_propose_candidate_heuristics_never_raises_and_releases_the_slot_when_the_runner_explodes(
-    tmp_path,
-):
+def test_a_timed_out_call_with_unknown_cost_is_charged_to_the_ai_budget(tmp_path):
+    """The budget only knows AI_CALL_MADE events. A timeout whose usage never
+    came back is recorded with its conservative upper cost bound."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
+    runner._timeout_agents = {_AGENT_NAME}
+    runner.last_call_billed = False
+    runner.last_call_cost_usd = Decimal("0")
+    runner.last_call_cost_known = False
+    runner.last_call_unknown_cost_upper_usd = Decimal("0.23")
+    runner.last_call_attempts = 1
+    day_start = _NOW.replace(hour=0, minute=0, second=0, microsecond=0)
+    calls_before = repo.count_ai_calls_since(day_start)
+
+    propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+
+    assert repo.count_ai_calls_since(day_start) == calls_before + 1
+    assert repo.sum_ai_cost_since(day_start) >= Decimal("0.23")
+
+
+def test_the_next_utc_day_gets_a_fresh_attempt_after_a_failure(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
+    runner._timeout_agents = {_AGENT_NAME}
+    propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+    runner._timeout_agents = set()
+
+    saved = propose_candidate_heuristics(repo, runner, _settings(), "run-2", _NOW + timedelta(days=1))
+
+    assert len(runner.calls) == 2
+    assert saved == 1
+
+
+def test_a_runner_explosion_never_raises_and_consumes_the_day_slot(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_history(repo)
     runner = _RaisingRunner()
 
     saved = propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
+    propose_candidate_heuristics(repo, runner, _settings(), "run-2", _NOW + timedelta(minutes=30))
 
     assert saved == 0
     assert runner.call_count == 1
     assert repo.find_proposed_guardian_authority_heuristic_candidates() == []
-    assert repo.get_guardian_authority_strategist_last_proposed_date() is None
-
-
-def test_propose_candidate_heuristics_failed_call_restores_the_previous_days_watermark(tmp_path):
-    """A release must put back what was there before the claim (yesterday's
-    watermark), not blank it."""
-    repo = SQLiteRepository(tmp_path / "t.db")
-    _seed_history(repo)
-    repo.set_guardian_authority_strategist_last_proposed_date("2026-09-14", _NOW - timedelta(days=1))
-    runner = _CountingRunner(fixtures={_AGENT_NAME: _assessment(_heuristic())})
-    runner._fail_agents = {_AGENT_NAME}
-
-    propose_candidate_heuristics(repo, runner, _settings(), "run-1", _NOW)
-
-    assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-14"
+    assert repo.get_guardian_authority_strategist_last_proposed_date() == "2026-09-15"
 
 
 def test_propose_candidate_heuristics_never_raises_when_the_repository_read_explodes(tmp_path):
@@ -904,3 +923,33 @@ def test_strategist_system_prompt_explicitly_allows_proposing_zero_heuristics():
     prompt = load_agent_definition(_STRATEGIST_AGENT_FILE).system_prompt
     assert "NOLL" in prompt
     assert "0-N" in prompt
+
+
+def test_a_permanently_timing_out_strategist_makes_one_api_call_per_day_not_a_loop(tmp_path):
+    """End-to-end reproduction of the 2026-09-28/29 night: the real runner,
+    the real production attempt override, the Anthropic client always times
+    out. 16 discovery ticks (~8 h) must make exactly ONE API call, charged to
+    the AI budget with its upper bound."""
+    from unittest.mock import MagicMock, patch
+
+    from anthropic import APITimeoutError
+
+    from crypto_trading.agents.runner import RealClaudeRunner
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _seed_history(repo)
+    with patch("crypto_trading.agents.runner.Anthropic") as mock_anthropic:
+        create = mock_anthropic.return_value.messages.create
+        create.side_effect = APITimeoutError(request=MagicMock())
+        runner = RealClaudeRunner(
+            api_key="fake", model="claude-sonnet-5", timeout_seconds=60, max_retries=3,
+            attempt_overrides={"crypto-godfather-strategist": 1},
+        )
+        for tick in range(16):
+            propose_candidate_heuristics(repo, runner, _settings(), f"run-{tick}",
+                                         _NOW + timedelta(minutes=30 * tick))
+        assert create.call_count == 1
+
+    day_start = _NOW.replace(hour=0, minute=0, second=0, microsecond=0)
+    assert repo.count_ai_calls_since(day_start) == 1
+    assert repo.sum_ai_cost_since(day_start) > 0

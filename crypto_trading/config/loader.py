@@ -22,6 +22,7 @@ class PipelineConfig(BaseModel):
     monitoring_interval_seconds: int = Field(gt=0)
     top_n: int = Field(gt=0)
     cooldown_minutes: int = Field(gt=0)
+    kernel_reject_cooldown_minutes: int = Field(gt=0, default=120)
     max_data_age_seconds: dict[str, int]
     min_sample_size_for_calibration: int = Field(gt=0)
     calibration_preliminary_sample_size: int = Field(gt=0)

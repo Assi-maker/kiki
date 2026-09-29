@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import Callable
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from crypto_trading.agents.loader import AgentDefinition
@@ -123,6 +124,8 @@ def process_evidence(
     cooldown_minutes: int = 60,
     evidence_change_threshold: float = 0.15,
     reference_price: Decimal | None = None,
+    kernel_reject_cooldown_minutes: int | None = None,
+    on_skip: Callable[[str], None] | None = None,
 ) -> Candidate | None:
     """SPEC §5/§7: skapar en Candidate-rad bara när det finns anledning.
 
@@ -150,9 +153,55 @@ def process_evidence(
     if _is_within_cooldown_and_unchanged(
         repo, evidence, created_at, cooldown_minutes, evidence_change_threshold
     ):
+        if on_skip is not None:
+            on_skip("rejected_cooldown")
+        return None
+
+    if kernel_reject_cooldown_minutes is not None and _is_within_kernel_reject_cooldown(
+        repo, evidence.instrument, created_at, kernel_reject_cooldown_minutes, discovery_run_id
+    ):
+        if on_skip is not None:
+            on_skip("kernel_reject_cooldown")
         return None
 
     return _persist_new_candidate(repo, evidence, discovery_run_id, created_at, reference_price)
+
+
+# Safety Kernel reasons that depend on what ELSE is open (portfolio/group
+# risk budget) rather than on this candidate's own plan. Only these start the
+# kernel-reject cooldown; a structural reject (LIQUIDATION_TOO_CLOSE, ...)
+# depends on the analysis' own stop and a new analysis may propose another.
+_BUDGET_KERNEL_REASONS = frozenset({"PORTFOLIO_RISK_CAP", "GROUP_RISK_CAP"})
+
+
+def _is_within_kernel_reject_cooldown(
+    repo: Repository, instrument: str, now: datetime, cooldown_minutes: int, run_id: str,
+) -> bool:
+    """2026-09-29 cost forensic: a symbol that was CONFIRMED and then
+    rejected by the Safety Kernel only on its portfolio/group risk caps is
+    not re-analysed (7 AI roles) until `cooldown_minutes` after that
+    reject. Logs every skip, and once when the symbol is analysable again."""
+    reject = repo.find_latest_kernel_reject_for_instrument(instrument)
+    if reject is None or not reject["reasons"] or not set(reject["reasons"]) <= _BUDGET_KERNEL_REASONS:
+        return False
+    start = reject["decided_at"]
+    end = start + timedelta(minutes=cooldown_minutes)
+    if now < end:
+        log_event(
+            run_id, event="candidate_skipped_kernel_reject_cooldown", symbol=instrument,
+            previous_candidate_id=reject["candidate_id"], previous_confirmed_at=reject["confirmed_at"],
+            kernel_reasons=reject["reasons"], cooldown_start=start.isoformat(),
+            cooldown_end=end.isoformat(),
+        )
+        return True
+    if not repo.has_candidate_for_instrument_since(instrument, start):
+        log_event(
+            run_id, event="kernel_reject_cooldown_cleared", symbol=instrument,
+            previous_candidate_id=reject["candidate_id"], kernel_reasons=reject["reasons"],
+            cooldown_start=start.isoformat(), cooldown_end=end.isoformat(),
+            reanalysable_at=now.isoformat(),
+        )
+    return False
 
 
 def _priority_boost_adjustment(candidate: Candidate, heuristics: list[dict]) -> float:

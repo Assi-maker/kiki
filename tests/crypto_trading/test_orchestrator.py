@@ -609,3 +609,70 @@ def test_the_gate_decision_is_evaluated_with_policy_and_now_and_fully_audited(tm
     assert "metrics" in evaluation["detail"] and "shadow" in evaluation["detail"]
     assert "enforced_failed" in evaluation["detail"]
     assert evaluation["detail"]["metrics"]["bull_probability"] == 0.6
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-29 P1 signal-age fix: LIVE passes a real clock, so the Gate measures
+# the signal's age at the moment the Gate decides - not at the discovery
+# cycle's start (which made signal_age_minutes 0.0 in 22/22 live cases).
+# ---------------------------------------------------------------------------
+from datetime import timedelta  # noqa: E402
+
+
+def _gate_with_clock(tmp_path, minutes_after_creation):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)  # created_at = _NOW
+    gate_time = _NOW + timedelta(minutes=minutes_after_creation)
+    orch = Orchestrator(repo=repo, runner=MockAgentRunner(fixtures=_happy_fixtures()), settings=_settings(),
+                        clock=lambda: gate_time)
+    # the cycle clock (`now`) is the candidate's creation time, as in LIVE
+    result = orch.process_candidate(candidate, run_id="run-1", now=_NOW)
+    return repo, candidate, result, gate_time
+
+
+def test_signal_age_is_measured_at_the_gate_not_at_the_cycle_start(tmp_path):
+    repo, candidate, result, gate_time = _gate_with_clock(tmp_path, 25)
+    evaluation = repo.get_gate_evaluation(candidate.candidate_id)
+    assert evaluation["detail"]["metrics"]["signal_age_minutes"] == 25.0
+    assert evaluation["evaluated_at"] == gate_time.isoformat()
+    assert result.status == "CONFIRMED"  # 25 < 30: the unchanged P1 limit
+
+
+def test_a_signal_older_than_thirty_minutes_at_the_gate_is_stale(tmp_path):
+    repo, candidate, result, _ = _gate_with_clock(tmp_path, 35)
+    evaluation = repo.get_gate_evaluation(candidate.candidate_id)
+    assert result.status == "NO_TRADE"
+    assert "SIGNAL_STALE" in evaluation["detail"]["enforced_failed"]
+
+
+def test_the_confirmed_transition_time_used_by_the_live_ttl_is_unchanged(tmp_path):
+    """LIVE execution's signal TTL counts from the CONFIRMED transition - the
+    fix must not move it (no LIVE execution change)."""
+    repo, candidate, _, _ = _gate_with_clock(tmp_path, 25)
+    row = repo._conn.execute(
+        "SELECT occurred_at FROM events WHERE event_id = ?",
+        (f"CANDIDATE_TRANSITIONED:{candidate.candidate_id}:CONFIRMED",),
+    ).fetchone()
+    assert row["occurred_at"] == _NOW.isoformat()
+
+
+def test_without_a_clock_replay_keeps_its_simulated_time(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    orch = Orchestrator(repo=repo, runner=MockAgentRunner(fixtures=_happy_fixtures()), settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW + timedelta(minutes=5))
+    evaluation = repo.get_gate_evaluation(candidate.candidate_id)
+    assert evaluation["detail"]["metrics"]["signal_age_minutes"] == 5.0
+
+
+def test_the_live_discovery_tick_passes_a_real_clock():
+    """Structural: discovery_loop wires a wall clock through run_single_cycle."""
+    import inspect
+
+    from crypto_trading import discovery_loop
+    from crypto_trading.orchestrator import run_discovery_cycle
+    from crypto_trading.paper_trading.replay import run_single_cycle
+
+    assert "clock" in inspect.signature(run_single_cycle).parameters
+    assert "clock" in inspect.signature(run_discovery_cycle).parameters
+    assert "clock=_gate_clock" in inspect.getsource(discovery_loop.run_discovery_tick)

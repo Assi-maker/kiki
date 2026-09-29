@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 from typing import Literal
@@ -14,9 +15,10 @@ from crypto_trading.guardian.authority import (
     maybe_record_pre_entry_shadow,
 )
 from crypto_trading.logging import log_event
-from crypto_trading.orchestrator import run_discovery_cycle
+from crypto_trading.orchestrator import _ROLE_ORDER, run_discovery_cycle
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
 from crypto_trading.schemas.candidate import Candidate
+from crypto_trading.schemas.event import Event
 from crypto_trading.schemas.market import FundingRate, InstrumentMetadata, Kline, Ticker
 from crypto_trading.schemas.trade import Position
 from crypto_trading.screening.candidate_engine import (
@@ -83,6 +85,7 @@ def run_single_cycle(
     screener_runner: AgentRunner | None = None,
     live_analysis_cap: int | None = None,
     stale_candidate_after_seconds: int | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> list[Position]:
     """En enda discovery->gate->paper-trading-cykel mot EN snapshot (Fas 5,
     PLAN_CRYPTO_PHASE5.md Task 5/Beslut 1) - faktoriserad ut ur run_replay()
@@ -122,6 +125,9 @@ def run_single_cycle(
     )
 
     new_candidates = []
+    # 2026-09-29 funnel observability: counted here, recorded once per cycle.
+    skips: dict[str, list[str]] = {"rejected_cooldown": [], "kernel_reject_cooldown": []}
+    quant_shortlist = data_invalid = 0
     for symbol in top_n_symbols:
         evidence = evaluate_candidate(
             instrument=symbol,
@@ -140,6 +146,10 @@ def run_single_cycle(
             secondary_klines=snapshot.secondary_klines.get(symbol, []),
             secondary_funding_rates=snapshot.secondary_funding_rates.get(symbol, []),
         )
+        if evidence.data_quality_status == "invalid":
+            data_invalid += 1
+        elif evidence.outcome == "worth_deeper_analysis":
+            quant_shortlist += 1
         candidate = process_evidence(
             repo,
             evidence,
@@ -155,6 +165,8 @@ def run_single_cycle(
             # bara en kvalitativ beskrivning som alltid misslyckades
             # parsningen (0/10 CONFIRMED öppnade någonsin en position).
             reference_price=snapshot.tickers[symbol].last_price,
+            kernel_reject_cooldown_minutes=settings.pipeline.kernel_reject_cooldown_minutes,
+            on_skip=lambda reason, symbol=symbol: skips[reason].append(symbol),
         )
         if candidate is not None:
             new_candidates.append(candidate)
@@ -164,7 +176,7 @@ def run_single_cycle(
     cap_is_binding = live_analysis_cap is not None and live_analysis_cap < candidate_budget
     if cap_is_binding:
         candidate_budget = live_analysis_cap
-    within_budget, _over_budget = prioritize_and_apply_budget(
+    within_budget, over_budget = prioritize_and_apply_budget(
         repo,
         new_candidates,
         liquidity_by_instrument,
@@ -199,9 +211,17 @@ def run_single_cycle(
         now=snapshot.simulated_now,
         max_analyses=live_analysis_cap,
         stale_after_seconds=stale_candidate_after_seconds,
+        clock=clock,
     )
 
     opened = _open_positions_for_confirmed_candidates(processed, snapshot, repo, settings, run_id)
+    _record_funnel(
+        repo, run_id, snapshot.simulated_now,
+        markets_scanned=len(snapshot.instruments), eligible=len(eligible_tickers),
+        top_n=len(top_n_symbols), quant_shortlist=quant_shortlist, data_invalid=data_invalid,
+        skips=skips, created=[c for c in new_candidates if c.status != "DATA_INVALID"],
+        budget_limited=len(over_budget), processed=processed, opened=len(opened),
+    )
 
     price_lookup = _build_price_lookup(snapshot)
     close_triggered_positions(
@@ -209,6 +229,48 @@ def run_single_cycle(
     )
 
     return opened
+
+
+def _record_funnel(repo, run_id, now, *, markets_scanned, eligible, top_n, quant_shortlist,
+                   data_invalid, skips, created, budget_limited, processed, opened) -> None:
+    """One DISCOVERY_FUNNEL row per discovery cycle (2026-09-29): every stage
+    count, so an audit can say exactly where candidates disappeared. The
+    per-candidate path after the Gate (Safety Kernel, execution) lives in
+    its own tables - see performance/funnel_report.py. Never raises."""
+    try:
+        gate: dict[str, dict[str, int]] = {}
+        ai_ok = ai_failed = 0
+        for c in processed:
+            roles = [getattr(c, r, None) for r in _ROLE_ORDER]
+            if all(a is not None and a.status == "ok" for a in roles):
+                ai_ok += 1
+            else:
+                ai_failed += 1
+            evaluation = repo.get_gate_evaluation(c.candidate_id)
+            reasons = (evaluation or {}).get("detail", {}).get("reasons") or ["unknown"]
+            bucket = gate.setdefault(c.status, {})
+            for reason in reasons:
+                bucket[reason] = bucket.get(reason, 0) + 1
+        payload = {
+            "markets_scanned": markets_scanned, "eligible": eligible, "top_n": top_n,
+            "quant_shortlist": quant_shortlist, "data_invalid": data_invalid,
+            "skipped_rejected_cooldown": len(skips["rejected_cooldown"]),
+            "skipped_kernel_reject_cooldown": len(skips["kernel_reject_cooldown"]),
+            "skipped_symbols": skips,
+            "candidates_created": len(created), "budget_limited": budget_limited,
+            "ai_started": len(processed), "ai_all_roles_ok": ai_ok, "ai_failed": ai_failed,
+            "gate": gate, "confirmed": sum(1 for c in processed if c.status == "CONFIRMED"),
+            "paper_positions_opened": opened,
+        }
+        repo.record_event(Event(
+            event_id=f"DISCOVERY_FUNNEL:{run_id}", event_type="DISCOVERY_FUNNEL",
+            aggregate_type="discovery_run", aggregate_id=run_id, occurred_at=now,
+            run_id=run_id, schema_version=1, payload=payload,
+        ))
+        log_event(run_id, event="discovery_funnel",
+                  **{k: v for k, v in payload.items() if k != "skipped_symbols"})
+    except Exception as exc:  # noqa: BLE001 - measurement must never disturb the trading tick
+        log_event(run_id, event="discovery_funnel_failed", error_type=type(exc).__name__, error=str(exc))
 
 
 def _open_positions_for_confirmed_candidates(

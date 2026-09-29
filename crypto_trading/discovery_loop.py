@@ -188,6 +188,9 @@ def run_discovery_tick(
             screener_runner=screener_runner,
             live_analysis_cap=analysis_cap,
             stale_candidate_after_seconds=stale_after_seconds,
+            # 2026-09-29 P1 signal-age fix: the Gate measures signal age at
+            # its real decision time, not at this cycle's start.
+            clock=_gate_clock,
         )
         repo.complete_run(
             run_id, datetime.now(UTC), "ok", [], instruments_scanned=len(snapshot.instruments)
@@ -199,6 +202,10 @@ def run_discovery_tick(
         )
         repo.complete_run(run_id, datetime.now(UTC), "error", [f"{type(exc).__name__}: {exc}"])
         return []
+
+
+def _gate_clock() -> datetime:
+    return datetime.now(UTC)
 
 
 def _record_gate_event(

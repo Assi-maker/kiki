@@ -56,6 +56,29 @@ def _estimate_cost_usd(model: str, input_tokens: int, output_tokens: int) -> flo
     return (input_tokens / 1_000_000) * input_price + (output_tokens / 1_000_000) * output_price
 
 
+_MAX_TOKENS = 16000
+# An attempt that timed out or lost its connection may still have been
+# processed - and billed - by Anthropic; its usage never reaches us.
+_COST_UNKNOWN_KINDS = frozenset({"TIMEOUT", "CONNECTION", "OVERLOADED"})
+
+
+def _log_attempt(run_id: str, agent_name: str, model: str, attempt: int, started_at: datetime,
+                 outcome: str, *, input_tokens: int | None = None, output_tokens: int | None = None,
+                 estimated_cost_usd: float | None = None, cost_upper_bound_usd: float | None = None,
+                 tokens_known: bool | None = None) -> None:
+    """One structured record per API attempt (2026-09-29), successful or
+    not - so a later audit can always count attempts and bound their cost."""
+    ended_at = datetime.now(UTC)
+    log_event(
+        run_id, event="agent_call_attempt", agent_name=agent_name, model=model, attempt=attempt,
+        started_at=started_at.isoformat(), ended_at=ended_at.isoformat(),
+        duration_s=round((ended_at - started_at).total_seconds(), 3), outcome=outcome,
+        tokens_known=tokens_known if tokens_known is not None else input_tokens is not None,
+        input_tokens=input_tokens, output_tokens=output_tokens,
+        estimated_cost_usd=estimated_cost_usd, cost_upper_bound_usd=cost_upper_bound_usd,
+    )
+
+
 class AgentRunner(ABC):
     # Kostnadsbudget (2026-09-03, root cause: ett anrop som aldrig nådde
     # modellen - t.ex. HTTP 400 credit exhaustion - förbrukade ändå dagens
@@ -69,6 +92,13 @@ class AgentRunner(ABC):
     # befintliga Mock-baserade testerna.
     last_call_billed: bool = True
     last_call_cost_usd: Decimal = Decimal("0")
+    # 2026-09-29 cost forensic: attempts made by the last run() and whether
+    # their cost is fully known. A timed-out/dropped attempt may have been
+    # processed (and billed) by Anthropic without us ever seeing its usage -
+    # its cost is unknown and bounded by `last_call_unknown_cost_upper_usd`.
+    last_call_attempts: int = 1
+    last_call_cost_known: bool = True
+    last_call_unknown_cost_upper_usd: Decimal = Decimal("0")
 
     @abstractmethod
     def run(self, agent_def: AgentDefinition, context: dict, output_schema: type[T]) -> T: ...
@@ -101,6 +131,7 @@ class RealClaudeRunner(AgentRunner):
         timeout_seconds: float,
         max_retries: int,
         timeout_overrides: dict[str, float] | None = None,
+        attempt_overrides: dict[str, int] | None = None,
     ):
         # SDK-level retries default to 2 (i.e. 3 attempts) and retry timeouts by
         # design, nesting inside our own retry loop below (self._max_retries) and
@@ -111,6 +142,10 @@ class RealClaudeRunner(AgentRunner):
         self._timeout_seconds = timeout_seconds
         self._max_retries = max_retries
         self._timeout_overrides = timeout_overrides or {}
+        # Per-agent cap on attempts (never above max_retries): expensive,
+        # non-urgent agents (the GODFATHER strategists) get ONE attempt - a
+        # timeout there must never become three billed attempts.
+        self._attempt_overrides = attempt_overrides or {}
 
     def run(self, agent_def: AgentDefinition, context: dict, output_schema: type[T]) -> T:
         schema = output_schema.model_json_schema()
@@ -137,11 +172,21 @@ class RealClaudeRunner(AgentRunner):
         # vad vår klientkod gör med svaret efteråt.
         billed_this_call = False
         cost_this_call = Decimal("0")
-        for attempt in range(self._max_retries):
+        unknown_cost_upper = Decimal("0")
+        max_attempts = min(self._max_retries, self._attempt_overrides.get(agent_def.name, self._max_retries))
+        # Conservative bound for an attempt whose usage never came back: the
+        # whole prompt (~3 chars/token) plus the full max_tokens output.
+        upper_bound = Decimal(str(_estimate_cost_usd(
+            self._model, (len(agent_def.system_prompt) + len(user_message)) // 3 + 1, _MAX_TOKENS,
+        )))
+        attempts = 0
+        for attempt in range(max_attempts):
+            attempts += 1
+            started_at = datetime.now(UTC)
             try:
                 message = self._client.messages.create(
                     model=self._model,
-                    max_tokens=16000,
+                    max_tokens=_MAX_TOKENS,
                     system=agent_def.system_prompt,
                     messages=[{"role": "user", "content": user_message}],
                     timeout=timeout_seconds,
@@ -165,6 +210,9 @@ class RealClaudeRunner(AgentRunner):
                     ),
                     estimated_cost_usd=estimated_cost,
                 )
+                _log_attempt(run_id, agent_def.name, self._model, attempt + 1, started_at, "ok",
+                             input_tokens=input_tokens, output_tokens=output_tokens,
+                             estimated_cost_usd=estimated_cost)
                 text = "".join(b.text for b in message.content if b.type == "text")
                 data = json.loads(_strip_code_fence(text))
                 if not isinstance(data, dict):
@@ -172,8 +220,7 @@ class RealClaudeRunner(AgentRunner):
                 data.setdefault("agent_name", agent_def.name)
                 data.setdefault("status", "ok")
                 data.setdefault("created_at", datetime.now(UTC).isoformat())
-                self.last_call_billed = billed_this_call
-                self.last_call_cost_usd = cost_this_call
+                self._record_call(billed_this_call, cost_this_call, attempts, unknown_cost_upper)
                 AI_HEALTH.record_success(datetime.now(UTC))
                 return output_schema.model_validate(data)
             except APIError as exc:
@@ -183,6 +230,13 @@ class RealClaudeRunner(AgentRunner):
                 # cannot be fixed by retrying - stop at once and fail closed.
                 kind = classify_api_error(exc)
                 AI_HEALTH.record_failure(kind, agent_def.name, datetime.now(UTC))
+                if kind in _COST_UNKNOWN_KINDS:
+                    unknown_cost_upper += upper_bound
+                    _log_attempt(run_id, agent_def.name, self._model, attempt + 1, started_at, kind,
+                                 cost_upper_bound_usd=float(upper_bound))
+                else:  # rejected before the model ran (credit, auth, 4xx): costs nothing
+                    _log_attempt(run_id, agent_def.name, self._model, attempt + 1, started_at, kind,
+                                 estimated_cost_usd=0.0, tokens_known=True)
                 log_event(
                     run_id,
                     event="ai_api_error",
@@ -198,6 +252,8 @@ class RealClaudeRunner(AgentRunner):
                     break
                 continue
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
+                # the attempt itself was billed and logged as "ok" above; the
+                # parse failure is its own diagnostic event below
                 # SPEC §10: every retry failure must leave a diagnostic trace —
                 # never a silent `continue`. Never interpolate the raw exception
                 # or any raw request/response object here, only type name +
@@ -214,9 +270,15 @@ class RealClaudeRunner(AgentRunner):
                 )
                 continue
 
-        self.last_call_billed = billed_this_call
-        self.last_call_cost_usd = cost_this_call
+        self._record_call(billed_this_call, cost_this_call, attempts, unknown_cost_upper)
         return self._failed_assessment(agent_def, output_schema, run_id)
+
+    def _record_call(self, billed: bool, cost: Decimal, attempts: int, unknown_upper: Decimal) -> None:
+        self.last_call_billed = billed
+        self.last_call_cost_usd = cost
+        self.last_call_attempts = attempts
+        self.last_call_cost_known = unknown_upper == 0
+        self.last_call_unknown_cost_upper_usd = unknown_upper
 
     def _failed_assessment(
         self, agent_def: AgentDefinition, output_schema: type[T], run_id: str

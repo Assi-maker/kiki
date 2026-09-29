@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -53,12 +54,17 @@ class Orchestrator:
         settings: Settings,
         news_connector: object | None = None,
         external_data_connector: object | None = None,
+        clock: Callable[[], datetime] | None = None,
     ):
         self._repo = repo
         self._runner = runner
         self._settings = settings
         self._news_connector = news_connector
         self._external_data_connector = external_data_connector
+        # 2026-09-29 P1 signal-age fix: LIVE passes a wall clock so the Gate
+        # measures the signal's age when it actually decides (after the
+        # ~10-25 min AI chain). None = replay/backtest: `now` (simulated).
+        self._clock = clock
 
     def process_candidate(
         self, candidate: Candidate, run_id: str, now: datetime | None = None
@@ -140,9 +146,13 @@ class Orchestrator:
 
         open_positions = self._repo.count_open_positions()
         now = now or datetime.now(UTC)
+        # The Gate (and its audit row) use the real decision time; the
+        # CONFIRMED transition below keeps `now` - LIVE's signal TTL counts
+        # from it and is deliberately unchanged.
+        gate_now = self._clock() if self._clock is not None else now
         decision = evaluate_risk_signal_gate(
             candidate, open_positions, self._settings.risk_limits.max_concurrent_positions,
-            policy=self._settings.gate, now=now,
+            policy=self._settings.gate, now=gate_now,
         )
         # P1 (2026-09-28) audit trail: every enforced/shadow condition and metric.
         detail = {
@@ -150,7 +160,7 @@ class Orchestrator:
             "shadow": decision.shadow, "metrics": decision.metrics,
             "open_positions": open_positions,
         }
-        self._repo.record_gate_evaluation(candidate.candidate_id, now, decision.outcome, detail)
+        self._repo.record_gate_evaluation(candidate.candidate_id, gate_now, decision.outcome, detail)
         log_event(
             run_id, event="gate_evaluated", candidate_id=candidate.candidate_id,
             instrument=candidate.instrument, outcome=decision.outcome, gate_pass=
@@ -234,6 +244,7 @@ def run_discovery_cycle(
     now: datetime | None = None,
     max_analyses: int | None = None,
     stale_after_seconds: int | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> list[Candidate]:
     """Discovery-loop-wiring: (1) sveper föräldralösa UNDER_AI_ANALYSIS-
     candidates till ANALYSIS_INTERRUPTED (Fas 0:s sweep_interrupted_analyses,
@@ -295,6 +306,7 @@ def run_discovery_cycle(
         settings=settings,
         news_connector=news_connector,
         external_data_connector=external_data_connector,
+        clock=clock,
     )
     daily_cap = settings.budget_limits.max_ai_calls_per_day
     daily_cost_cap = settings.budget_limits.max_daily_ai_cost_usd
