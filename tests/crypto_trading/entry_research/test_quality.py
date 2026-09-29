@@ -139,7 +139,10 @@ def test_entry_research_never_touches_trading_code():
 # the Safety Kernel's OWN arithmetic, so "policy A" is provably the LIVE
 # kernel. It may import that module only - and only because the module is
 # pure (locked by the test below).
-_ALLOWED_PURE_IMPORTS = {("risk_policy.py", "crypto_trading.safety_kernel")}
+_ALLOWED_PURE_IMPORTS = {
+    ("risk_policy.py", "crypto_trading.safety_kernel"),
+    ("pre_ai_calibration.py", "crypto_trading.safety_kernel"),  # ground truth = the kernel itself
+}
 
 
 def test_the_safety_kernel_stays_a_pure_module():

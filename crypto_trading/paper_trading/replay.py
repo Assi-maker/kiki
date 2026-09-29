@@ -86,6 +86,7 @@ def run_single_cycle(
     live_analysis_cap: int | None = None,
     stale_candidate_after_seconds: int | None = None,
     clock: Callable[[], datetime] | None = None,
+    pre_ai_shadow: Callable[[tuple, MarketSnapshot, str], None] | None = None,
 ) -> list[Position]:
     """En enda discovery->gate->paper-trading-cykel mot EN snapshot (Fas 5,
     PLAN_CRYPTO_PHASE5.md Task 5/Beslut 1) - faktoriserad ut ur run_replay()
@@ -171,6 +172,15 @@ def run_single_cycle(
         if candidate is not None:
             new_candidates.append(candidate)
 
+    if pre_ai_shadow is not None:
+        # 2026-09-29 SHADOW pre-AI feasibility: measured, never acted on. It
+        # gets an immutable copy and its outcome is ignored - every candidate
+        # continues to the budget, the AI chain, the Gate and the Safety Kernel.
+        try:
+            pre_ai_shadow(tuple(new_candidates), snapshot, run_id)
+        except Exception as exc:  # noqa: BLE001
+            log_event(run_id, event="pre_ai_feasibility_shadow_failed", error_type=type(exc).__name__,
+                      error=str(exc)[:300])
     liquidity_by_instrument = {t.instrument: t.quote_volume for t in eligible_tickers}
     candidate_budget = settings.budget_limits.max_candidates_per_discovery_run
     cap_is_binding = live_analysis_cap is not None and live_analysis_cap < candidate_budget

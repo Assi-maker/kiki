@@ -1,0 +1,12 @@
+{
+ "note": "Pre-AI feasibility calibration - SHADOW ONLY. Frozen on TRAIN (2026-09-01..12); never re-fitted automatically. Produced by crypto_trading.entry_research.pre_ai_calibration.",
+ "calibration": {
+  "timeframe": "30m",
+  "atr_bars": 14,
+  "ratio_lower": 0.4495,
+  "ratio_median": 2.7243,
+  "ratio_upper": 25.182,
+  "stop_floor_pct": 0.4748,
+  "frozen_on": "TRAIN 2026-09-01..12"
+ }
+}

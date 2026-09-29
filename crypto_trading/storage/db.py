@@ -1045,6 +1045,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_add_gate_evaluations(conn)
     _migrate_add_shadow_evaluations(conn)
     _migrate_add_entry_quality_shadow(conn)
+    _migrate_add_pre_ai_feasibility_shadow(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -1276,6 +1277,17 @@ def _migrate_add_entry_quality_shadow(conn: sqlite3.Connection) -> None:
         "snapshot_id TEXT NOT NULL, computed_at TEXT NOT NULL, pattern TEXT NOT NULL, "
         "side TEXT NOT NULL, category TEXT NOT NULL, previous_category TEXT, "
         "n_total INTEGER NOT NULL, stats_json TEXT NOT NULL, PRIMARY KEY (snapshot_id, pattern, side))"
+    )
+
+
+def _migrate_add_pre_ai_feasibility_shadow(conn: sqlite3.Connection) -> None:
+    """2026-09-29 pre-AI risk feasibility, SHADOW ONLY: one verdict
+    (true/false/unknown) per candidate before the AI chain. Never read by
+    any trading decision."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pre_ai_feasibility_shadow ("
+        "candidate_id TEXT PRIMARY KEY, assessed_at TEXT NOT NULL, feasible TEXT NOT NULL, "
+        "record_json TEXT NOT NULL)"
     )
 
 

@@ -129,6 +129,8 @@ class Repository(Protocol):
                                        exclude: str) -> bool: ...
     def save_entry_quality(self, record: dict, classified_at: datetime) -> None: ...
     def list_entry_quality(self) -> list[dict]: ...
+    def save_pre_ai_feasibility(self, record: dict, assessed_at: datetime) -> None: ...
+    def list_pre_ai_feasibility(self) -> list[dict]: ...
     def latest_godfather_entry_patterns(self) -> dict[tuple[str, str], str]: ...
     def save_godfather_entry_patterns(self, snapshot_id: str, computed_at: datetime,
                                       rows: list[dict]) -> None: ...
@@ -1311,6 +1313,22 @@ class SQLiteRepository:
     def list_entry_quality(self) -> list[dict]:
         return [json.loads(r["record_json"]) for r in self._conn.execute(
             "SELECT record_json FROM entry_quality_shadow ORDER BY t0"
+        ).fetchall()]
+
+    # ---- Pre-AI feasibility (shadow-only, 2026-09-29) ---------------------------
+
+    def save_pre_ai_feasibility(self, record: dict, assessed_at: datetime) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO pre_ai_feasibility_shadow (candidate_id, assessed_at, feasible, "
+            "record_json) VALUES (?, ?, ?, ?)",
+            (record["candidate_id"], assessed_at.isoformat(), record["pre_ai_feasible"],
+             json.dumps(record, default=str)),
+        )
+        self._conn.commit()
+
+    def list_pre_ai_feasibility(self) -> list[dict]:
+        return [json.loads(r["record_json"]) | {"assessed_at": r["assessed_at"]} for r in self._conn.execute(
+            "SELECT assessed_at, record_json FROM pre_ai_feasibility_shadow ORDER BY assessed_at"
         ).fetchall()]
 
     def latest_godfather_entry_patterns(self) -> dict[tuple[str, str], str]:

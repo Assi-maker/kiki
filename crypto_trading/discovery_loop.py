@@ -191,6 +191,7 @@ def run_discovery_tick(
             # 2026-09-29 P1 signal-age fix: the Gate measures signal age at
             # its real decision time, not at this cycle's start.
             clock=_gate_clock,
+            pre_ai_shadow=_pre_ai_shadow_hook(repo, live_connector, settings),
         )
         repo.complete_run(
             run_id, datetime.now(UTC), "ok", [], instruments_scanned=len(snapshot.instruments)
@@ -202,6 +203,21 @@ def run_discovery_tick(
         )
         repo.complete_run(run_id, datetime.now(UTC), "error", [f"{type(exc).__name__}: {exc}"])
         return []
+
+
+def _pre_ai_shadow_hook(repo, live_connector, settings):
+    """SHADOW pre-AI feasibility (2026-09-29): only when LIVE is armed (it
+    needs real equity); never blocks anything. None = not measured."""
+    if live_connector is None:
+        return None
+    try:
+        from crypto_trading.shadow.pre_ai_feasibility_hook import build_hook
+
+        return build_hook(repo, live_connector, settings)
+    except Exception as exc:  # noqa: BLE001 - e.g. missing calibration: discovery goes on
+        log_event("discovery", event="pre_ai_feasibility_shadow_unavailable",
+                  error_type=type(exc).__name__, error=str(exc)[:300])
+        return None
 
 
 def _gate_clock() -> datetime:
