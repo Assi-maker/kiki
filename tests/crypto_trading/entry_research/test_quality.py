@@ -130,7 +130,25 @@ def test_entry_research_never_touches_trading_code():
         ROOT / "crypto_trading" / "godfather" / "entry_patterns.py"]
     for f in files:
         for mod in _imports(f):
+            if (f.name, mod) in _ALLOWED_PURE_IMPORTS:
+                continue
             assert not any(part in mod for part in forbidden), f"{f.name} imports {mod}"
+
+
+# The counterfactual risk-policy replay (2026-09-29) evaluates policy A with
+# the Safety Kernel's OWN arithmetic, so "policy A" is provably the LIVE
+# kernel. It may import that module only - and only because the module is
+# pure (locked by the test below).
+_ALLOWED_PURE_IMPORTS = {("risk_policy.py", "crypto_trading.safety_kernel")}
+
+
+def test_the_safety_kernel_stays_a_pure_module():
+    """No connector, storage, execution or network import in the kernel - so
+    importing it from a read-only replay can never reach the exchange."""
+    impure = ("connectors", "storage", "live_execution", "paper_trading", "httpx", "requests",
+              "sqlite3", "orchestrator", "guardian", "godfather")
+    for mod in _imports(ROOT / "crypto_trading" / "safety_kernel.py"):
+        assert not any(part in mod for part in impure), f"safety_kernel imports {mod}"
 
 
 def test_no_trading_path_reads_the_entry_quality_layer():
