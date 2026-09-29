@@ -7,7 +7,7 @@ from typing import Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from crypto_trading.config.exceptions import ConfigError
 
@@ -398,7 +398,7 @@ class SafetyKernelConfig(BaseModel):
 
     # Fixed LIVE sizing (user decision 2026-09-29): APPROVE/REJECT caps only.
     max_portfolio_risk_pct: Decimal = Decimal("0.10")
-    max_group_risk_pct: Decimal = Decimal("0.05")
+    max_group_risk_pct: Decimal = Decimal("0.10")
     entry_price_buffer_pct: Decimal = Decimal("0.003")
     stop_slippage_buffer_pct: Decimal = Decimal("0.003")
     round_trip_fee_pct: Decimal = Decimal("0.001")
@@ -413,6 +413,17 @@ class SafetyKernelConfig(BaseModel):
         }
     )
     default_group: str = "crypto_alt"
+
+    @model_validator(mode="after")
+    def group_cap_never_above_total_cap(self) -> SafetyKernelConfig:
+        """A correlated-group cap above the total cap would be meaningless at
+        best and a misconfiguration at worst - refuse to load it (2026-09-29)."""
+        if self.max_group_risk_pct > self.max_portfolio_risk_pct:
+            raise ValueError(
+                f"max_group_risk_pct {self.max_group_risk_pct} > max_portfolio_risk_pct "
+                f"{self.max_portfolio_risk_pct}"
+            )
+        return self
 
 
 class CostModelConfig(BaseModel):

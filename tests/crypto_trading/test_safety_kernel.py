@@ -48,7 +48,9 @@ def _size(**overrides):
 def test_production_config_loads_the_fixed_sizing_caps():
     safety = get_settings().safety
     assert safety.max_portfolio_risk_pct == D("0.10")
-    assert safety.max_group_risk_pct == D("0.05")
+    # user decision 2026-09-29: correlated-group cap 5 % -> 10 % (== the total cap)
+    assert safety.max_group_risk_pct == D("0.10")
+    assert safety.max_group_risk_pct <= safety.max_portfolio_risk_pct
     assert safety.min_liquidation_buffer_pct >= D("0.01")
     # the per-trade % cap and the notional multiple are gone - they could only REDUCE
     for removed in ("max_risk_per_trade_pct", "max_risk_per_trade_usdt", "max_total_notional_multiple"):
@@ -217,3 +219,66 @@ def test_moving_a_stop_next_to_liquidation_is_forbidden():
 @pytest.mark.parametrize("bad", [None, D("0"), D("-1")])
 def test_an_unparseable_new_stop_is_refused(bad):
     assert check_stop_move(D("10"), D("9.5"), bad, 10, LIMITS) == ["INVALID_STOP"]
+
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-29: correlated-group cap 10 % (== total cap). The group cap can
+# never loosen the TOTAL cap or any other hard rule; the fixed size stays.
+# ---------------------------------------------------------------------------
+
+PROD = SafetyKernelConfig(max_portfolio_risk_pct=D("0.10"), max_group_risk_pct=D("0.10"))
+
+
+def _prod(**overrides):
+    return _full(limits=PROD, **overrides)
+
+
+def test_a_full_size_trade_that_only_broke_the_old_5pct_group_cap_is_now_approved():
+    """420 equity, stop 2 % -> worst case ~26.9 USDT: > 21 (old 5 %) but <= 42."""
+    d = _prod(stop=D("0.98"))
+    assert d.action == "APPROVE"
+    assert d.quantity == D("1000")                       # still exactly 100 x 10
+    assert D("26") < d.risk_usdt < D("28")
+
+
+def test_the_total_cap_still_rejects_a_second_correlated_trade():
+    open_ = [Exposure("A-USDT", "crypto_alt", D("26.9"), D("1000"))]
+    d = _prod(stop=D("0.98"), open_exposures=open_)      # 26.9 + 26.9 > 42 total
+    assert d.action == "REJECT"
+    assert "PORTFOLIO_RISK_CAP" in d.reasons
+    assert d.quantity == 0
+
+
+def test_the_total_cap_binds_across_groups_the_group_cap_cannot_bypass_it():
+    open_ = [Exposure("BTC-USDT", "crypto_major", D("30"), D("1000"))]   # other group
+    d = _prod(stop=D("0.98"), open_exposures=open_)       # group alt 26.9 <= 42, total 56.9 > 42
+    assert d.action == "REJECT"
+    assert d.reasons == ["PORTFOLIO_RISK_CAP"]
+
+
+def test_a_single_trade_above_ten_percent_is_still_rejected_never_reduced():
+    d = _prod(stop=D("0.95"))                              # ~56 USDT worst case
+    assert d.action == "REJECT" and d.quantity == 0
+    assert "PORTFOLIO_RISK_CAP" in d.reasons
+
+
+def test_the_liquidation_guard_still_rejects_regardless_of_the_caps():
+    d = _prod(stop=D("0.90"))  # 10 % stop at 10x: inside the liquidation buffer
+    assert d.action == "REJECT"
+    assert "LIQUIDATION_TOO_CLOSE" in d.reasons
+
+
+def test_the_kernel_never_enlarges_or_shrinks_the_fixed_size_under_the_new_caps():
+    for stop in (D("0.999"), D("0.99"), D("0.98"), D("0.97"), D("0.95")):
+        for equity in (D("100"), D("420"), D("5000")):
+            d = _prod(stop=stop, equity=equity)
+            assert d.quantity in (D("0"), D("1000"))
+
+
+def test_a_group_cap_above_the_total_cap_is_refused_at_config_load():
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    with _pytest.raises(ValidationError):
+        SafetyKernelConfig(max_portfolio_risk_pct=D("0.10"), max_group_risk_pct=D("0.15"))

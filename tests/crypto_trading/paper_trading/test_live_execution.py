@@ -1326,30 +1326,31 @@ def test_fixed_sizing_sends_the_full_100_margin_x_10_order(tmp_path):
     assert decision["action"] == "APPROVE"
 
 
-def test_fixed_sizing_rejects_instead_of_reducing_when_the_group_cap_is_breached(tmp_path):
-    """Equity 400: group cap 5 % = 20 USDT < the ~26.9 USDT worst case of the
-    fixed-size order -> REJECT, no order at all (never a smaller one)."""
+def test_fixed_sizing_rejects_instead_of_reducing_when_the_caps_are_breached(tmp_path):
+    """Equity 250: total and group cap 10 % = 25 USDT < the ~26.9 USDT worst
+    case of the fixed-size order -> REJECT, no order at all (never a smaller
+    one). (Group cap 5 % -> 10 % on 2026-09-29; the total cap still binds.)"""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
-    connector = _SpyConnector(balance="400.00", all_positions=[])
+    connector = _SpyConnector(balance="250.00", all_positions=[])
     _run(repo, connector)
     assert connector.calls == []
     assert repo.get_live_execution("pos-1") is None  # budget-type reject: retried while fresh
     decision = repo.get_safety_kernel_decision("pos-1")
     assert decision["action"] == "REJECT"
-    assert "GROUP_RISK_CAP" in decision["detail"]["reasons"]
+    assert "PORTFOLIO_RISK_CAP" in decision["detail"]["reasons"]
 
 
 def test_the_kernel_uses_current_equity_not_the_balance(tmp_path):
-    """Balance 1000 would allow the fixed order (group cap 50); equity 500
-    gives a group cap of 25 < ~26.9 -> REJECT. Equity, not balance, decides."""
+    """Balance 1000 would allow the fixed order (caps 100); equity 250 gives
+    caps of 25 < ~26.9 -> REJECT. Equity, not balance, decides."""
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
-    connector = _SpyConnector(balance="1000.00", equity="500.00", all_positions=[])
+    connector = _SpyConnector(balance="1000.00", equity="250.00", all_positions=[])
     _run(repo, connector)
     decision = repo.get_safety_kernel_decision("pos-1")
     assert decision["action"] == "REJECT"
-    assert Decimal(decision["detail"]["equity"]) == Decimal("500.00")
+    assert Decimal(decision["detail"]["equity"]) == Decimal("250.00")
 
 
 def test_a_stop_too_close_to_liquidation_is_never_sent(tmp_path):
