@@ -714,30 +714,30 @@ def test_authority_shadow_enabled_defaults_false_in_guardian_yaml():
     assert raw["authority_shadow_enabled"] is False
 
 
-def test_authority_enabled_field_declaration_is_unchanged_pre_existing_code():
-    """The real flag's own declaration/default must be untouched by this
-    plan - not merely 'still False today by coincidence', but genuinely
-    absent from this plan's own diff (i.e. not even re-typed identically).
-    Cross-checked against _added_line_numbers so this fails loudly if a
-    future change ever re-writes that declaration line, even to the exact
-    same text."""
-    added = _added_line_numbers("crypto_trading/config/loader.py")
-    source = _read("crypto_trading/config/loader.py")
-    tree = ast.parse(source, filename="crypto_trading/config/loader.py")
-    declared_lines = [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, ast.Name)
+def test_authority_enabled_is_one_bool_field_default_false_loaded_from_guardian_yaml():
+    """Structural (2026-09-29 rewrite - no git-diff line numbers, which broke
+    whenever an unrelated line was inserted above the declaration before a
+    commit): exactly ONE declaration, inside GuardianConfig, typed bool,
+    default False; the running config loads exactly the yaml's value."""
+    import yaml
+
+    from crypto_trading.config.loader import GuardianConfig, get_settings
+
+    tree = ast.parse(_read("crypto_trading/config/loader.py"))
+    owners = [
+        cls.name for cls in ast.walk(tree) if isinstance(cls, ast.ClassDef)
+        for node in cls.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
         and node.target.id == "authority_enabled"
     ]
-    assert declared_lines, "authority_enabled field declaration not found at all"
-    offenders = [ln for ln in declared_lines if ln in added]
-    assert offenders == [], f"authority_enabled field declaration was touched: lines {offenders}"
-
-    from crypto_trading.config.loader import GuardianConfig
-
-    assert GuardianConfig().authority_enabled is False
+    assert owners == ["GuardianConfig"]
+    field = GuardianConfig.model_fields["authority_enabled"]
+    assert field.annotation is bool
+    assert field.default is False
+    with (REPO_ROOT / "crypto_trading/config/guardian.yaml").open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    assert isinstance(raw["authority_enabled"], bool)
+    assert get_settings().guardian.authority_enabled is raw["authority_enabled"]
 
 
 def test_authority_enabled_yaml_key_is_unchanged_pre_existing_code():
@@ -756,47 +756,206 @@ def test_authority_enabled_yaml_key_is_unchanged_pre_existing_code():
     assert offenders == [], f"authority_enabled yaml key was (re-)added: {offenders}"
 
 
-def _authority_enabled_reference_violations(path: str) -> list[str]:
-    added = _added_line_numbers(path)
-    if not added:
-        return []
-    tree = ast.parse(_read(path), filename=path)
-    violations: list[str] = []
-    for node in ast.walk(tree):
-        lineno = getattr(node, "lineno", None)
-        if lineno is None or lineno not in added:
-            continue
+# Every production module that may reference `authority_enabled` at all
+# (read-only gates of the real Guardian Authority pipeline), recorded
+# 2026-09-29 from a whole-tree AST scan. A NEW module referencing it fails
+# here and needs an explicit review - no git history involved.
+_AUTHORITY_ENABLED_ALLOWED_MODULES = {
+    "crypto_trading/config/loader.py",  # the declaration
+    "crypto_trading/guardian/authority.py",
+    "crypto_trading/guardian/tick.py",
+    "crypto_trading/guardian/self_improvement.py",
+    "crypto_trading/discovery_loop.py",
+    "crypto_trading/backtest/full_chain_replay.py",
+}
+_BACKTEST_PREFIX = "crypto_trading/backtest/"
+_SHADOW_MODE_MODULES = (
+    "crypto_trading/paper_trading/guardian_authority_shadow.py",
+    "crypto_trading/performance/guardian_authority_shadow_report.py",
+)
+
+
+def _rel(path: Path) -> str:
+    return path.relative_to(REPO_ROOT).as_posix()
+
+
+def _authority_enabled_refs(source: str) -> list[tuple[int, str]]:
+    """(line, kind) of every code reference - never prose in docstrings."""
+    hits = []
+    for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Attribute) and node.attr == "authority_enabled":
-            violations.append(f"{path}:{lineno} attribute .authority_enabled")
+            kind = "write" if isinstance(node.ctx, ast.Store) else "read"
+            hits.append((node.lineno, kind))
         elif isinstance(node, ast.Name) and node.id == "authority_enabled":
-            violations.append(f"{path}:{lineno} name authority_enabled")
+            hits.append((node.lineno, "name"))
         elif isinstance(node, ast.keyword) and node.arg == "authority_enabled":
-            violations.append(f"{path}:{lineno} keyword authority_enabled=")
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == "authority_enabled":
-            violations.append(f"{path}:{lineno} field declaration authority_enabled")
-    return violations
+            hits.append((node.lineno, "keyword"))
+        elif isinstance(node, ast.Dict):
+            for key in node.keys:
+                if isinstance(key, ast.Constant) and key.value == "authority_enabled":
+                    hits.append((key.lineno, "dict-key"))
+    return hits
 
 
-def test_authority_enabled_is_never_read_written_or_gated_by_new_code():
-    """Global Constraint (verbatim): 'authority_enabled stays untouched,
-    false, throughout. This plan's new flag (authority_shadow_enabled)
-    never gates anything authority_enabled also gates, and vice versa.'
-    NEW-code-only AST scan (Attribute/Name/keyword-argument/field-
-    declaration references) across every production .py file this plan's
-    diff touches. Deliberately does NOT do a bare substring scan for
-    "authority_enabled" - unlike set_leverage or position_sizing, this
-    identifier legitimately appears in PROSE this plan's own new docstrings
-    and comments add (e.g. guardian_authority_shadow.py's module docstring,
-    explaining that this feature is "completely independent of
-    authority_enabled") to document the very independence this test
-    verifies at the code level - a substring scan would incorrectly flag
-    the documentation of the guarantee as a violation of it (same
-    precedent as test_authority.py's own handling of the bare word
-    "leverage" in a legitimate docstring)."""
-    all_violations: list[str] = []
-    for path in PRODUCTION_FILES:
-        all_violations.extend(_authority_enabled_reference_violations(path))
-    assert all_violations == [], f"new authority_enabled reference(s): {all_violations}"
+def test_authority_enabled_is_referenced_only_by_the_allowed_modules_and_never_written():
+    """Global Constraint: 'authority_enabled stays untouched, false,
+    throughout. This plan's new flag (authority_shadow_enabled) never gates
+    anything authority_enabled also gates, and vice versa.' Structural
+    (2026-09-29 rewrite of the git-diff line-number scan): a whole-tree AST
+    scan of every production module."""
+    referencing, writes = set(), []
+    for path in sorted((REPO_ROOT / "crypto_trading").rglob("*.py")):
+        module = _rel(path)
+        if module.startswith(_BACKTEST_PREFIX):
+            continue  # offline harnesses: see the backtest test below
+        hits = _authority_enabled_refs(path.read_text(encoding="utf-8"))
+        if hits:
+            referencing.add(module)
+        writes += [f"{module}:{ln} {kind}" for ln, kind in hits
+                   if kind in ("write", "keyword", "dict-key")]
+    new = sorted(referencing - _AUTHORITY_ENABLED_ALLOWED_MODULES)
+    assert new == [], f"new module(s) reference authority_enabled: {new}"
+    assert writes == [], f"authority_enabled is written/overridden in code: {writes}"
+    for module in _SHADOW_MODE_MODULES:
+        assert _authority_enabled_refs(_read(module)) == [], module
+
+
+def test_backtests_only_override_authority_enabled_on_their_own_settings_copy():
+    """The offline full-chain backtests switch the flag for a simulated run
+    via `settings.guardian.model_copy(update={...})` - a COPY, never a
+    mutation - and nothing outside crypto_trading/backtest/ imports them, so
+    such an override can never reach the running bot."""
+    for path in sorted((REPO_ROOT / _BACKTEST_PREFIX).glob("*.py")):
+        hits = _authority_enabled_refs(path.read_text(encoding="utf-8"))
+        assert not [h for h in hits if h[1] in ("write", "keyword")], _rel(path)
+    importers = []
+    for path in sorted((REPO_ROOT / "crypto_trading").rglob("*.py")):
+        if _rel(path).startswith(_BACKTEST_PREFIX):
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            module_name = (node.module or "") if isinstance(node, ast.ImportFrom) else ""
+            if isinstance(node, ast.ImportFrom) and module_name.startswith("crypto_trading.backtest"):
+                importers.append(_rel(path))
+            elif isinstance(node, ast.Import) and any(a.name.startswith("crypto_trading.backtest")
+                                                      for a in node.names):
+                importers.append(_rel(path))
+    assert importers == [], f"production code imports a backtest harness: {importers}"
+
+
+def test_authority_enabled_structural_scan_catches_a_write_and_a_new_reference():
+    assert _authority_enabled_refs("settings.guardian.authority_enabled = True\n") == [(1, "write")]
+    assert _authority_enabled_refs(
+        "x = cfg.model_copy(update={'authority_enabled': True})\n") == [(1, "dict-key")]
+    assert _authority_enabled_refs("if s.guardian.authority_enabled:\n    pass\n") == [(1, "read")]
+    assert _authority_enabled_refs('"""prose about authority_enabled"""\n') == []
+
+
+# ---------------------------------------------------------------------------
+# GODFATHER learning <-> Guardian Authority table isolation (2026-09-29).
+# The repository methods that touch each side's tables are DERIVED from the
+# SQL string literals inside SQLiteRepository, so a new method is covered
+# automatically.
+# ---------------------------------------------------------------------------
+
+_GODFATHER_LEARNING_TABLES = (
+    "godfather_priority_heuristics", "godfather_priority_heuristic_candidates",
+    "godfather_entry_patterns", "entry_quality_shadow", "godfather_experience_patterns",
+    "godfather_policies", "godfather_policy_evaluations", "godfather_policy_transitions",
+    "godfather_prediction_errors", "godfather_counterfactuals", "godfather_entry_quality",
+)
+_WRITE_SQL = re.compile(r"\b(INSERT|UPDATE|DELETE|REPLACE)\b", re.IGNORECASE)
+
+
+def _repo_methods_touching(table_test, writes_only=False) -> set[str]:
+    tree = ast.parse(_read("crypto_trading/storage/repository.py"))
+    repo_cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SQLiteRepository"
+    )
+    out = set()
+    for fn in repo_cls.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        sql = " ".join(n.value for n in ast.walk(fn)
+                       if isinstance(n, ast.Constant) and isinstance(n.value, str))
+        if table_test(sql) and (not writes_only or _WRITE_SQL.search(sql)):
+            out.add(fn.name)
+    return out
+
+
+def _calls_and_code_strings(source: str) -> tuple[set[str], list[str]]:
+    """Attribute names called (repo.<method>) and the non-docstring string
+    constants of a module."""
+    tree = ast.parse(source)
+    docstrings = {
+        id(node.body[0].value) for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and node.body and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+        and isinstance(node.body[0].value.value, str)
+    }
+    calls = {n.func.attr for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}
+    strings = [n.value for n in ast.walk(tree)
+               if isinstance(n, ast.Constant) and isinstance(n.value, str)
+               and id(n) not in docstrings]
+    return calls, strings
+
+
+def _guardian_authority_sql(sql: str) -> bool:
+    return "guardian_authority_" in sql
+
+
+def _godfather_learning_sql(sql: str) -> bool:
+    return any(t in sql for t in _GODFATHER_LEARNING_TABLES)
+
+
+def test_the_derived_method_sets_are_real():
+    assert "save_guardian_authority_heuristic_candidate" in _repo_methods_touching(
+        _guardian_authority_sql, writes_only=True)
+    assert _repo_methods_touching(_godfather_learning_sql)
+
+
+def test_godfather_priority_and_entry_learning_never_touch_guardian_authority_data():
+    """priority_boost / entry_patterns / entry research: no Guardian
+    Authority table, read or write, and no repository method that does."""
+    forbidden = _repo_methods_touching(_guardian_authority_sql)
+    modules = [REPO_ROOT / "crypto_trading/godfather/priority_boost.py",
+               REPO_ROOT / "crypto_trading/godfather/entry_patterns.py",
+               *sorted((REPO_ROOT / "crypto_trading/entry_research").glob("*.py"))]
+    for path in modules:
+        calls, strings = _calls_and_code_strings(path.read_text(encoding="utf-8"))
+        assert not calls & forbidden, f"{_rel(path)} calls {sorted(calls & forbidden)}"
+        assert not [x for x in strings if "guardian_authority_" in x], _rel(path)
+
+
+def test_no_godfather_module_writes_guardian_authority_tables():
+    writers = _repo_methods_touching(_guardian_authority_sql, writes_only=True)
+    for path in sorted((REPO_ROOT / "crypto_trading/godfather").glob("*.py")):
+        calls, strings = _calls_and_code_strings(path.read_text(encoding="utf-8"))
+        hit = sorted(calls & writers)
+        assert not hit, f"{_rel(path)} writes Guardian Authority data: {hit}"
+        sql = [x for x in strings if "guardian_authority_" in x and _WRITE_SQL.search(x)]
+        assert not sql, _rel(path)
+
+
+def test_guardian_cannot_reach_godfather_learning_tables():
+    learning_methods = _repo_methods_touching(_godfather_learning_sql)
+    for path in sorted((REPO_ROOT / "crypto_trading/guardian").glob("*.py")):
+        calls, strings = _calls_and_code_strings(path.read_text(encoding="utf-8"))
+        hit = sorted(calls & learning_methods)
+        assert not hit, f"{_rel(path)} calls {hit}"
+        tables = [x for x in strings if any(t in x for t in _GODFATHER_LEARNING_TABLES)]
+        assert not tables, _rel(path)
+
+
+def test_the_table_isolation_scan_genuinely_catches_a_violation():
+    calls, strings = _calls_and_code_strings(
+        '"""docstring mentioning guardian_authority_heuristics is fine"""\n'
+        "def f(repo):\n    repo.save_guardian_authority_heuristic_candidate()\n"
+        "    q = 'INSERT INTO godfather_entry_patterns VALUES (1)'\n"
+    )
+    assert "save_guardian_authority_heuristic_candidate" in calls
+    assert strings == ["INSERT INTO godfather_entry_patterns VALUES (1)"]
 
 
 def test_authority_enabled_scan_genuinely_catches_a_new_reference():
