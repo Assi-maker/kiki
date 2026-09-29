@@ -146,9 +146,11 @@ class Orchestrator:
 
         open_positions = self._repo.count_open_positions()
         now = now or datetime.now(UTC)
-        # The Gate (and its audit row) use the real decision time; the
-        # CONFIRMED transition below keeps `now` - LIVE's signal TTL counts
-        # from it and is deliberately unchanged.
+        # The Gate, its audit row AND the transition below all carry the real
+        # decision time. LIVE's signal TTL counts from the CONFIRMED
+        # transition ("confirmation time", spec 17); stamping it with the
+        # cycle START made every CONFIRMED of a > 30 min cycle stale before
+        # its position was even opened (2026-09-29: 0 of 3 executable).
         gate_now = self._clock() if self._clock is not None else now
         decision = evaluate_risk_signal_gate(
             candidate, open_positions, self._settings.risk_limits.max_concurrent_positions,
@@ -175,16 +177,16 @@ class Orchestrator:
             event_type="CANDIDATE_TRANSITIONED",
             aggregate_type="candidate",
             aggregate_id=candidate.candidate_id,
-            occurred_at=now,
+            occurred_at=gate_now,
             run_id=run_id,
             schema_version=1,
             payload={"from": candidate.status, "to": decision.outcome, "reasons": decision.reasons},
         )
         self._repo.transition_candidate_with_event(
-            candidate.candidate_id, decision.outcome, now, event
+            candidate.candidate_id, decision.outcome, gate_now, event
         )
         self._repo.save_gate_decision(
-            candidate.candidate_id, decision.outcome, decision.reasons, now
+            candidate.candidate_id, decision.outcome, decision.reasons, gate_now
         )
 
         candidate.status = decision.outcome

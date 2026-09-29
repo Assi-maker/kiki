@@ -645,15 +645,40 @@ def test_a_signal_older_than_thirty_minutes_at_the_gate_is_stale(tmp_path):
     assert "SIGNAL_STALE" in evaluation["detail"]["enforced_failed"]
 
 
-def test_the_confirmed_transition_time_used_by_the_live_ttl_is_unchanged(tmp_path):
-    """LIVE execution's signal TTL counts from the CONFIRMED transition - the
-    fix must not move it (no LIVE execution change)."""
-    repo, candidate, _, _ = _gate_with_clock(tmp_path, 25)
+def test_the_confirmed_transition_is_stamped_with_the_real_gate_time(tmp_path):
+    """2026-09-29 stale-skip fix: LIVE's signal TTL counts from the CONFIRMED
+    transition (spec 17: "confirmation time"). It used to carry the discovery
+    CYCLE-START time, so in any cycle longer than 30 min every CONFIRMED was
+    already stale when its position was opened at the cycle's end (first
+    live cycle 2026-09-29: 31 min, 0 of 3 CONFIRMED could be executed)."""
+    repo, candidate, _, gate_time = _gate_with_clock(tmp_path, 25)
     row = repo._conn.execute(
         "SELECT occurred_at FROM events WHERE event_id = ?",
         (f"CANDIDATE_TRANSITIONED:{candidate.candidate_id}:CONFIRMED",),
     ).fetchone()
-    assert row["occurred_at"] == _NOW.isoformat()
+    assert row["occurred_at"] == gate_time.isoformat()
+    assert repo.get_candidate_confirmed_at(candidate.candidate_id) == gate_time
+
+
+def test_a_confirmed_signal_from_a_long_cycle_is_still_fresh_for_live(tmp_path):
+    """The exact 2026-09-29 case: signal at 12:43, confirmed at 12:54, the
+    cycle ends and the LIVE loop first sees it at 13:14 -> 20 min after
+    confirmation, inside the 30 min TTL (it was 31 min 'old' before)."""
+    from crypto_trading.paper_trading.live_execution import _signal_is_fresh
+
+    repo, candidate, _, gate_time = _gate_with_clock(tmp_path, 11)
+    position = type("P", (), {"candidate_id": candidate.candidate_id, "position_id": "p"})()
+    first_live_tick = _NOW + timedelta(minutes=31)
+    assert _signal_is_fresh(repo, position, 1800, "r", first_live_tick) is True
+    assert _signal_is_fresh(repo, position, 1800, "r", gate_time + timedelta(minutes=31)) is False
+
+
+def test_without_a_clock_the_confirmed_time_stays_the_simulated_time(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    candidate = _persisted_candidate_in_under_ai_analysis(repo)
+    orch = Orchestrator(repo=repo, runner=MockAgentRunner(fixtures=_happy_fixtures()), settings=_settings())
+    orch.process_candidate(candidate, run_id="run-1", now=_NOW + timedelta(minutes=5))
+    assert repo.get_candidate_confirmed_at(candidate.candidate_id) == _NOW + timedelta(minutes=5)
 
 
 def test_without_a_clock_replay_keeps_its_simulated_time(tmp_path):
