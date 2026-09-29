@@ -62,20 +62,21 @@ BOOLEAN = ["trig_volume", "trig_momentum", "trig_pricevol", "trig_funding", "tf_
            "gf_eq_trade"]
 
 
-def tertile_cuts(rows: list[dict]) -> dict[str, tuple[float, float]]:
+def tertile_cuts(rows: list[dict], numeric: list[str] | None = None) -> dict[str, tuple[float, float]]:
     cuts = {}
-    for f in NUMERIC:
+    for f in (NUMERIC if numeric is None else numeric):
         xs = sorted(r["feat"][f] for r in rows if r["feat"].get(f) is not None)
         if len(xs) >= 60 and xs[len(xs) // 3] < xs[2 * len(xs) // 3]:
             cuts[f] = (xs[len(xs) // 3], xs[2 * len(xs) // 3])
     return cuts
 
 
-def conditions(cuts: dict) -> list[tuple]:
+def conditions(cuts: dict, boolean: list[str] | None = None) -> list[tuple]:
+    boolean = BOOLEAN if boolean is None else boolean
     out = []
     for f, (lo, hi) in cuts.items():
         out += [(f, "LOW", lo, hi), (f, "MID", lo, hi), (f, "HIGH", lo, hi)]
-    out += [(f, "TRUE", None, None) for f in BOOLEAN] + [(f, "FALSE", None, None) for f in BOOLEAN]
+    out += [(f, "TRUE", None, None) for f in boolean] + [(f, "FALSE", None, None) for f in boolean]
     return out
 
 
@@ -139,8 +140,8 @@ def _stage_stats(rows, pattern) -> dict:
     }
 
 
-def discover(train: list[dict], cuts: dict) -> tuple[list[dict], int]:
-    conds = conditions(cuts)
+def discover(train: list[dict], cuts: dict, boolean: list[str] | None = None) -> tuple[list[dict], int]:
+    conds = conditions(cuts, boolean)
     singles = [(c,) for c in conds]
     pairs = [(a, b) for a, b in itertools.combinations(conds, 2) if a[0] != b[0]]
     tested: dict[tuple, dict] = {}
