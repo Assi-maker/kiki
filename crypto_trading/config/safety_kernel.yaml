@@ -20,12 +20,11 @@ max_portfolio_risk_pct: "0.10"
 # REJECT if the same sum within one correlated group would exceed this share
 # of current equity. Every alt long moved with BTC on 27-28/9 (91 % of the
 # loss in one window), so all alts share one group.
-# User decision 2026-09-29: 5 % -> 10 % (== the total cap) for a higher LIVE
-# trade frequency. The total cap above still binds every trade; the loader
-# refuses a group cap above the total cap. Counterfactual replay of this
-# exact setting (docs/superpowers/reports/2026-09-29-safety-kernel-bottleneck.md,
-# policy B2): ~3x the trades, OOS -82 USDT, max drawdown -25 % - watch it.
-max_group_risk_pct: "0.10"
+# User decision 2026-09-29: back to 5 % after a few hours at 10 % (22ee411).
+# The 10 % replay (policy B2) had ~3x the trades, OOS -82 USDT, drawdown
+# -25 %, and the candidate pool has negative OOS expectancy - more trades
+# from it is more loss. The loader refuses a group cap above the total cap.
+max_group_risk_pct: "0.05"
 
 # Cost assumptions inside "worst-case risk", from the verified LIVE fills:
 # entry: market order may fill above the last price (buffer 0.3 %);

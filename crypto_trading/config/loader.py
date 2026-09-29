@@ -398,7 +398,7 @@ class SafetyKernelConfig(BaseModel):
 
     # Fixed LIVE sizing (user decision 2026-09-29): APPROVE/REJECT caps only.
     max_portfolio_risk_pct: Decimal = Decimal("0.10")
-    max_group_risk_pct: Decimal = Decimal("0.10")
+    max_group_risk_pct: Decimal = Decimal("0.05")
     entry_price_buffer_pct: Decimal = Decimal("0.003")
     stop_slippage_buffer_pct: Decimal = Decimal("0.003")
     round_trip_fee_pct: Decimal = Decimal("0.001")

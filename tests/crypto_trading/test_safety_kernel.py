@@ -48,8 +48,8 @@ def _size(**overrides):
 def test_production_config_loads_the_fixed_sizing_caps():
     safety = get_settings().safety
     assert safety.max_portfolio_risk_pct == D("0.10")
-    # user decision 2026-09-29: correlated-group cap 5 % -> 10 % (== the total cap)
-    assert safety.max_group_risk_pct == D("0.10")
+    # user decision 2026-09-29: correlated-group cap back to 5 % (was 10 % at 22ee411)
+    assert safety.max_group_risk_pct == D("0.05")
     assert safety.max_group_risk_pct <= safety.max_portfolio_risk_pct
     assert safety.min_liquidation_buffer_pct >= D("0.01")
     # the per-trade % cap and the notional multiple are gone - they could only REDUCE
@@ -223,44 +223,59 @@ def test_an_unparseable_new_stop_is_refused(bad):
 
 
 # ---------------------------------------------------------------------------
-# 2026-09-29: correlated-group cap 10 % (== total cap). The group cap can
-# never loosen the TOTAL cap or any other hard rule; the fixed size stays.
+# 2026-09-29: production caps total 10 % / correlated group 5 % (the group cap
+# was 10 % for a few hours at 22ee411). APPROVE the fixed size or REJECT.
 # ---------------------------------------------------------------------------
 
-PROD = SafetyKernelConfig(max_portfolio_risk_pct=D("0.10"), max_group_risk_pct=D("0.10"))
+PROD = SafetyKernelConfig(max_portfolio_risk_pct=D("0.10"), max_group_risk_pct=D("0.05"))
 
 
 def _prod(**overrides):
     return _full(limits=PROD, **overrides)
 
 
-def test_a_full_size_trade_that_only_broke_the_old_5pct_group_cap_is_now_approved():
-    """420 equity, stop 2 % -> worst case ~26.9 USDT: > 21 (old 5 %) but <= 42."""
-    d = _prod(stop=D("0.98"))
+def test_production_caps_match_the_yaml():
+    safety = get_settings().safety
+    assert (safety.max_portfolio_risk_pct, safety.max_group_risk_pct) == (
+        PROD.max_portfolio_risk_pct,
+        PROD.max_group_risk_pct,
+    )
+
+
+def test_a_trade_inside_the_5pct_group_cap_is_approved_at_the_fixed_size():
+    """420 equity, stop 1 % -> worst case ~16.9 USDT <= 21 (5 %)."""
+    d = _prod(stop=D("0.99"))
     assert d.action == "APPROVE"
-    assert d.quantity == D("1000")                       # still exactly 100 x 10
-    assert D("26") < d.risk_usdt < D("28")
+    assert d.quantity == D("1000")                       # exactly 100 x 10
 
 
-def test_the_total_cap_still_rejects_a_second_correlated_trade():
-    open_ = [Exposure("A-USDT", "crypto_alt", D("26.9"), D("1000"))]
-    d = _prod(stop=D("0.98"), open_exposures=open_)      # 26.9 + 26.9 > 42 total
+def test_a_trade_between_5_and_10_pct_is_rejected_by_the_group_cap_never_reduced():
+    """420 equity, stop 2 % -> worst case ~26.9 USDT: > 21 (5 % group) but <= 42 total."""
+    d = _prod(stop=D("0.98"))
     assert d.action == "REJECT"
-    assert "PORTFOLIO_RISK_CAP" in d.reasons
+    assert d.reasons == ["GROUP_RISK_CAP"]
     assert d.quantity == 0
 
 
-def test_the_total_cap_binds_across_groups_the_group_cap_cannot_bypass_it():
+def test_the_total_cap_binds_across_groups():
     open_ = [Exposure("BTC-USDT", "crypto_major", D("30"), D("1000"))]   # other group
-    d = _prod(stop=D("0.98"), open_exposures=open_)       # group alt 26.9 <= 42, total 56.9 > 42
+    d = _prod(stop=D("0.99"), open_exposures=open_)       # group alt ~16.9 <= 21, total ~46.9 > 42
     assert d.action == "REJECT"
     assert d.reasons == ["PORTFOLIO_RISK_CAP"]
 
 
-def test_a_single_trade_above_ten_percent_is_still_rejected_never_reduced():
+def test_a_second_correlated_trade_is_rejected_by_the_group_cap():
+    open_ = [Exposure("A-USDT", "crypto_alt", D("16.9"), D("1000"))]
+    d = _prod(stop=D("0.99"), open_exposures=open_)      # group 33.8 > 21, total 33.8 <= 42
+    assert d.action == "REJECT"
+    assert d.reasons == ["GROUP_RISK_CAP"]
+    assert d.quantity == 0
+
+
+def test_a_single_trade_above_ten_percent_is_rejected_by_both_caps_never_reduced():
     d = _prod(stop=D("0.95"))                              # ~56 USDT worst case
     assert d.action == "REJECT" and d.quantity == 0
-    assert "PORTFOLIO_RISK_CAP" in d.reasons
+    assert {"PORTFOLIO_RISK_CAP", "GROUP_RISK_CAP"} <= set(d.reasons)
 
 
 def test_the_liquidation_guard_still_rejects_regardless_of_the_caps():
@@ -269,7 +284,7 @@ def test_the_liquidation_guard_still_rejects_regardless_of_the_caps():
     assert "LIQUIDATION_TOO_CLOSE" in d.reasons
 
 
-def test_the_kernel_never_enlarges_or_shrinks_the_fixed_size_under_the_new_caps():
+def test_the_kernel_never_enlarges_or_shrinks_the_fixed_size_under_the_caps():
     for stop in (D("0.999"), D("0.99"), D("0.98"), D("0.97"), D("0.95")):
         for equity in (D("100"), D("420"), D("5000")):
             d = _prod(stop=stop, equity=equity)
