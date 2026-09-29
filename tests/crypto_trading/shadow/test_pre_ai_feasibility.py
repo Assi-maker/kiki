@@ -240,3 +240,50 @@ def test_the_forward_report_joins_verdicts_with_what_really_happened(tmp_path):
     assert s["kernel_decisions"] == {"false->APPROVE": 1}
     assert s["false_rejections_kernel_approved"] == 1       # a wrong INFEASIBLE is surfaced, not hidden
     assert s["infeasible_precision_vs_kernel"] == 0.0
+
+
+# ---------------------------------------------------------------- NO_4H_MOMENTUM + OI capture
+
+def test_no_momentum_flag_is_the_exact_edge_lab_definition():
+    from crypto_trading.entry_research import edge_lab as el
+
+    closes = [100 + i * 0.01 for i in range(30)]
+    bars = [(c, c * 1.001, c * 0.999, c, 1.0) for c in closes]
+    f = el.features_from_bars(bars)
+    fh = paf.no_momentum_4h(closes)
+    assert fh["ret_4h"] == round(f["ret_4h"], 4) and fh["accel"] == round(f["accel"], 4)
+    assert fh["flag"] is True                                  # flat drift: no 4 h momentum
+    rising = closes[:-9] + [closes[-10] * (1 + 0.004 * k) for k in range(1, 10)]
+    assert paf.no_momentum_4h(rising)["flag"] is False
+    assert paf.no_momentum_4h(closes[:5])["flag"] is None      # unknown, never a verdict
+
+
+def test_the_failure_hypothesis_is_logged_and_filters_nothing(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    positions = run_single_cycle(_build_snapshots()[1], repo, MockAgentRunner(fixtures=_happy_fixtures()),
+                                 _settings(), run_id="run-1",
+                                 pre_ai_shadow=build_hook(repo, _Live(), get_settings()))
+    rec = repo.list_pre_ai_feasibility()[0]
+    assert rec["failure_hypotheses"][0]["name"] == "NO_4H_MOMENTUM"
+    assert rec["failure_hypotheses"][0]["status"] == "FAILURE_HYPOTHESIS_SHADOW"
+    assert len(positions) == 1                                 # candidate still analysed and traded
+
+
+def test_open_interest_already_fetched_is_stored_without_extra_calls(tmp_path):
+    from crypto_trading.paper_trading.replay import MarketSnapshot
+    from crypto_trading.schemas.market import OpenInterest
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    snap = _build_snapshots()[1]
+    oi = OpenInterest(instrument="BTCUSDT", open_interest=Decimal("12345.6"), observed_at=snap.simulated_now)
+    snap = MarketSnapshot(**{**snap.__dict__, "open_interest": {"BTCUSDT": oi}})
+    run_single_cycle(snap, repo, MockAgentRunner(fixtures=_happy_fixtures()), _settings(), run_id="run-oi")
+    rows = repo._conn.execute("SELECT symbol, open_interest FROM market_observations").fetchall()
+    assert [tuple(r) for r in rows] == [("BTCUSDT", "12345.6")]
+
+
+def test_replays_without_open_interest_store_nothing(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    run_single_cycle(_build_snapshots()[1], repo, MockAgentRunner(fixtures=_happy_fixtures()), _settings(),
+                     run_id="run-1")
+    assert repo._conn.execute("SELECT count(*) FROM market_observations").fetchone()[0] == 0

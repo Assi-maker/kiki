@@ -754,3 +754,18 @@ def test_build_live_snapshot_secondary_fetch_failure_does_not_affect_primary_or_
     assert "BTCUSDT" in snapshot.tickers
     assert len(snapshot.klines["BTCUSDT"]) > 0
     assert snapshot.secondary_klines["BTCUSDT"] == []
+
+
+def test_build_live_snapshot_keeps_the_open_interest_it_already_fetched():
+    """2026-09-29: OI was fetched for every top-N symbol but only
+    quality-checked, then discarded - it is now kept (no extra API call)."""
+    contracts = [_raw_contract("BTCUSDT")]
+    tickers = {"BTCUSDT": _raw_ticker("BTCUSDT", "50000", "10000000", _ms(_NOW))}
+    klines = {"BTCUSDT": [_raw_kline("50000", _ms(_NOW - timedelta(hours=1))), _raw_kline("50200", _ms(_NOW))]}
+    funding_rates = {"BTCUSDT": [_raw_funding("BTCUSDT", "0.0001", _ms(_NOW))]}
+    open_interest = {"BTCUSDT": _raw_open_interest("BTCUSDT", "1000", _ms(_NOW))}
+    connector = _StubConnector(contracts, tickers, klines, funding_rates, open_interest)
+
+    snapshot = build_live_snapshot(connector, _settings(top_n=1), _NOW)
+
+    assert snapshot.open_interest["BTCUSDT"].open_interest == 1000

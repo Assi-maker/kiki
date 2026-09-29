@@ -156,14 +156,18 @@ def atr15_pct(m: Minute, T: int) -> float | None:
     return st.mean(ranges) * 100 if len(ranges) >= 12 else None
 
 
-def outcome(m: Minute, T: int, latency_s: int, atr_pct: float) -> dict | None:
+def outcome(m: Minute, T: int, latency_s: int, atr_pct: float, side: str = "LONG") -> dict | None:
+    """Triple barrier after costs. SHORT mirrors LONG exactly: stop 2 x ATR15
+    ABOVE entry (filled with slippage above), target 3 x ATR15 below; within a
+    bar the stop is still checked first (conservative for both sides)."""
     i = bisect.bisect_left(m.ts, T + latency_s)
     if i >= len(m.ts) or m.ts[i] > T + latency_s + 120:
         return None
     entry, t_entry = m.o[i], m.ts[i]
     risk = STOP_ATR * atr_pct / 100 * entry
-    stop, target = entry - risk, entry + TARGET_ATR * atr_pct / 100 * entry
-    hi = lo = entry
+    sgn = 1 if side == "LONG" else -1
+    stop, target = entry - sgn * risk, entry + sgn * TARGET_ATR * atr_pct / 100 * entry
+    fav = adv = entry            # most favourable / most adverse price so far
     mfe_hit_at = mae_hit_at = None
     one_atr = atr_pct / 100 * entry
     j = i
@@ -171,15 +175,19 @@ def outcome(m: Minute, T: int, latency_s: int, atr_pct: float) -> dict | None:
     while j < len(m.ts) and m.ts[j] < t_entry + HORIZON_S:
         if m.ts[j] - (m.ts[j - 1] if j > i else t_entry) > 600:
             return None                                  # data gap - no fabricated outcome
-        hi, lo = max(hi, m.h[j]), min(lo, m.l[j])
-        if mae_hit_at is None and lo <= entry - one_atr:
+        up, down = m.h[j], m.l[j]
+        if sgn > 0:
+            fav, adv = max(fav, up), min(adv, down)
+        else:
+            fav, adv = min(fav, down), max(adv, up)
+        if mae_hit_at is None and sgn * (adv - entry) <= -one_atr:
             mae_hit_at = j
-        if mfe_hit_at is None and hi >= entry + one_atr:
+        if mfe_hit_at is None and sgn * (fav - entry) >= one_atr:
             mfe_hit_at = j
-        if m.l[j] <= stop:
-            px, reason = stop * (1 - STOP_SLIP), "SL"
+        if (sgn > 0 and down <= stop) or (sgn < 0 and up >= stop):
+            px, reason = stop * (1 - sgn * STOP_SLIP), "SL"
             break
-        if m.h[j] >= target:
+        if (sgn > 0 and up >= target) or (sgn < 0 and down <= target):
             px, reason = target, "TP"
             break
         last_c = m.c[j]
@@ -188,9 +196,10 @@ def outcome(m: Minute, T: int, latency_s: int, atr_pct: float) -> dict | None:
         if j == i or m.ts[j - 1] < t_entry + HORIZON_S - 900:
             return None                                  # window not covered by data
         px, reason = last_c, "TIME"
-    r = (px - entry - FEE_RT * entry) / risk
-    return {"r": r, "reason": reason, "mfe_pct": (hi / entry - 1) * 100, "mae_pct": (lo / entry - 1) * 100,
-            "low_mfe": (hi / entry - 1) * 100 < 0.5,
+    r = (sgn * (px - entry) - FEE_RT * entry) / risk
+    mfe = sgn * (fav / entry - 1) * 100
+    return {"r": r, "reason": reason, "mfe_pct": mfe, "mae_pct": sgn * (adv / entry - 1) * 100,
+            "low_mfe": mfe < 0.5,
             "fast_decay": mae_hit_at is not None and (mfe_hit_at is None or mae_hit_at < mfe_hit_at)}
 
 
@@ -236,11 +245,14 @@ def build_universe(minutes: dict[str, Minute], baseline_every: int = 12) -> list
             slow = outcome(m, T, LATENCY_S, a15)
             if fast is None or slow is None:
                 continue
+            short_fast = outcome(m, T, 0, a15, "SHORT")
+            short_slow = outcome(m, T, LATENCY_S, a15, "SHORT")
             active_ages = [a for a in ages.values() if a is not None]
             rows.append({"symbol": sym, "T": T, "feat": {**f, **s, **events, "atr15_pct": a15,
                          "signal_age_min": min(active_ages) if active_ages else None,
                          **{f"age_{n[2:]}": a for n, a in ages.items()}},
-                         "is_signal": any(s.values()), "out_fast": fast, "out_slow": slow})
+                         "is_signal": any(s.values()), "out_fast": fast, "out_slow": slow,
+                         "short_fast": short_fast, "short_slow": short_slow})
     return rows
 
 

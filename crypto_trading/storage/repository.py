@@ -131,6 +131,7 @@ class Repository(Protocol):
     def list_entry_quality(self) -> list[dict]: ...
     def save_pre_ai_feasibility(self, record: dict, assessed_at: datetime) -> None: ...
     def list_pre_ai_feasibility(self) -> list[dict]: ...
+    def save_market_observations(self, run_id: str, cycle_at: datetime, rows: list[dict]) -> None: ...
     def latest_godfather_entry_patterns(self) -> dict[tuple[str, str], str]: ...
     def save_godfather_entry_patterns(self, snapshot_id: str, computed_at: datetime,
                                       rows: list[dict]) -> None: ...
@@ -1323,6 +1324,15 @@ class SQLiteRepository:
             "record_json) VALUES (?, ?, ?, ?)",
             (record["candidate_id"], assessed_at.isoformat(), record["pre_ai_feasible"],
              json.dumps(record, default=str)),
+        )
+        self._conn.commit()
+
+    def save_market_observations(self, run_id: str, cycle_at: datetime, rows: list[dict]) -> None:
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO market_observations (run_id, symbol, cycle_at, observed_at, "
+            "open_interest, funding_rate, last_price) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(run_id, r["symbol"], cycle_at.isoformat(), r["observed_at"], r["open_interest"],
+              r["funding_rate"], r["last_price"]) for r in rows],
         )
         self._conn.commit()
 

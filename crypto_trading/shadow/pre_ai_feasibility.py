@@ -54,6 +54,30 @@ class Calibration:
         return cls(**json.loads(path.read_text(encoding="utf-8"))["calibration"])
 
 
+# "No 4 h momentum" failure hypothesis (2026-09-29 edge lab,
+# docs/superpowers/reports/2026-09-29-edge-lab.md): 4 h return <= 0.1715 %
+# AND 30m acceleration in (-0.1924, 0.349] - boundaries FROZEN from the
+# universe TRAIN tertiles. -0.72 / -0.92 / -1.25 R in train/valid/test vs
+# -0.07 / -0.14 / -0.35 for the rest (test q 0.061): a HYPOTHESIS, logged in
+# shadow only - it filters nothing until forward data validates it.
+NO_MOMENTUM_RET_4H_MAX = 0.1715
+NO_MOMENTUM_ACCEL = (-0.1924, 0.349)
+
+
+def no_momentum_4h(closes: list[float]) -> dict:
+    """`closes`: 30m closes up to T, the last one the forming bar (the
+    edge-lab definition). Same arithmetic as edge_lab.features_from_bars."""
+    out = {"name": "NO_4H_MOMENTUM", "status": "FAILURE_HYPOTHESIS_SHADOW"}
+    if len(closes) < 9:
+        return {**out, "flag": None, "reason": "INSUFFICIENT_BARS"}
+    c = [float(x) for x in closes]
+    ret_4h = (c[-1] / c[-9] - 1) * 100
+    accel = (c[-1] / c[-2] - 1) * 100 - (c[-2] / c[-3] - 1) * 100
+    lo, hi = NO_MOMENTUM_ACCEL
+    return {**out, "flag": ret_4h <= NO_MOMENTUM_RET_4H_MAX and lo < accel <= hi,
+            "ret_4h": round(ret_4h, 4), "accel": round(accel, 4)}
+
+
 def atr_pct(bars) -> float | None:
     """Mean high-low range in % of close over CLOSED bars (caller passes
     only bars that closed before the signal)."""

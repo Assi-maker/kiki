@@ -285,6 +285,7 @@ def build_live_snapshot(
     funding_rates: dict[str, list[FundingRate]] = {}
     secondary_klines: dict[str, list[Kline]] = {}
     secondary_funding_rates: dict[str, list[FundingRate]] = {}
+    open_interests: dict[str, OpenInterest] = {}
     data_quality_status: dict[str, DataQualityResult] = {}
 
     for symbol in top_n_symbols:
@@ -330,6 +331,7 @@ def build_live_snapshot(
             )
             if oi_completeness == "ok":
                 oi = OpenInterest.from_raw(raw_oi)
+                open_interests[symbol] = oi
                 oi_staleness = check_staleness(
                     oi.observed_at,
                     oi_fetch_time,
@@ -415,6 +417,7 @@ def build_live_snapshot(
         funding_rates=funding_rates,
         secondary_klines=secondary_klines,
         secondary_funding_rates=secondary_funding_rates,
+        open_interest=open_interests,
         data_quality_status=data_quality_status
         | {
             s: "invalid"

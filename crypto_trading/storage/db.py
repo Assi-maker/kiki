@@ -1046,6 +1046,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
     _migrate_add_shadow_evaluations(conn)
     _migrate_add_entry_quality_shadow(conn)
     _migrate_add_pre_ai_feasibility_shadow(conn)
+    _migrate_add_market_observations(conn)
     conn.execute(
         "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -1288,6 +1289,17 @@ def _migrate_add_pre_ai_feasibility_shadow(conn: sqlite3.Connection) -> None:
         "CREATE TABLE IF NOT EXISTS pre_ai_feasibility_shadow ("
         "candidate_id TEXT PRIMARY KEY, assessed_at TEXT NOT NULL, feasible TEXT NOT NULL, "
         "record_json TEXT NOT NULL)"
+    )
+
+
+def _migrate_add_market_observations(conn: sqlite3.Connection) -> None:
+    """2026-09-29: open interest / funding / price per top-N symbol per
+    discovery cycle - data discovery already fetched, kept for research.
+    Never read by any trading decision."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS market_observations ("
+        "run_id TEXT NOT NULL, symbol TEXT NOT NULL, cycle_at TEXT NOT NULL, observed_at TEXT NOT NULL, "
+        "open_interest TEXT NOT NULL, funding_rate TEXT, last_price TEXT, PRIMARY KEY (run_id, symbol))"
     )
 
 

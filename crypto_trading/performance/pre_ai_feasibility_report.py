@@ -39,10 +39,29 @@ def rows(conn: sqlite3.Connection, since: datetime) -> list[dict]:
         analysed = conn.execute(
             "SELECT count(*) FROM events WHERE event_type='AI_CALL_MADE' AND aggregate_id = ?",
             (r["candidate_id"],)).fetchone()[0] > 0
+        eq = conn.execute("SELECT record_json FROM entry_quality_shadow WHERE candidate_id = ?",
+                          (r["candidate_id"],)).fetchone()
+        std_r = ((json.loads(eq["record_json"]).get("outcome") or {}).get("r")) if eq else None
+        fh = (rec.get("failure_hypotheses") or [{}])[0]
         out.append({"candidate_id": r["candidate_id"], "symbol": rec.get("symbol"), "verdict": r["feasible"],
+                    "no_momentum_4h": fh.get("flag"), "std_r": std_r,
                     "reason": rec.get("reason"), "stop_interval": rec.get("estimated_stop_pct_interval"),
                     "estimate_fits": (rec.get("shadow_estimate") or {}).get("fits"),
                     "status": r["status"], "ai_analysed": analysed, "kernel": kernel, "live": live})
+    return out
+
+
+def _flag_split(rs: list[dict]) -> dict:
+    """Forward test of the NO_4H_MOMENTUM failure hypothesis: standardized
+    outcome (Entry Quality Layer, 6 h later) of flagged vs not flagged."""
+    out = {}
+    for name, sel in (("flagged", [r for r in rs if r["no_momentum_4h"] is True]),
+                      ("not_flagged", [r for r in rs if r["no_momentum_4h"] is False])):
+        rr = [r["std_r"] for r in sel if r["std_r"] is not None]
+        out[name] = {"n": len(sel), "n_with_outcome": len(rr),
+                     "mean_std_r": round(sum(rr) / len(rr), 4) if rr else None,
+                     "kernel_approve": sum(r["kernel"] == "APPROVE" for r in sel),
+                     "ai_cost_usd": round(sum(r["ai_analysed"] for r in sel) * COST_PER_ANALYSIS_USD, 2)}
     return out
 
 
@@ -60,6 +79,7 @@ def summarize(conn: sqlite3.Connection, since: datetime) -> dict:
         "false_rejections_kernel_approved": sum(r["kernel"] == "APPROVE" for r in inf),
         "went_live": sum(1 for r in rs if r["live"]),
         "ai_cost_avoidable_usd": round(sum(r["ai_analysed"] for r in inf) * COST_PER_ANALYSIS_USD, 2),
+        "no_momentum_4h": _flag_split(rs),
         "estimate_would_skip": sum(1 for r in rs if r["estimate_fits"] is False),
         "estimate_false_rejections_kernel_approved": sum(
             1 for r in rs if r["estimate_fits"] is False and r["kernel"] == "APPROVE"),

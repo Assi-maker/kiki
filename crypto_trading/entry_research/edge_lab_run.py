@@ -301,6 +301,43 @@ def _spearman(pairs):
     return num / den if den else 0.0
 
 
+def shorts(parts: dict) -> dict:
+    """SHORT side (never tested before 2026-09-29): the mirrored triple
+    barrier on the same universe. Per-period baseline, fade of each bullish
+    state, and the full pre-registered pattern protocol on short outcomes.
+    TEST (26-28/9) was a falling alt market, so a short result counts only if
+    it also holds in TRAIN and VALID and beats the short baseline."""
+    have = {p: [r for r in rows if r.get("short_slow") and r.get("short_fast")] for p, rows in parts.items()}
+    out = {"baseline": {}, "fade_state": {}}
+    for per, rows in have.items():
+        base = [r for r in rows if not r["is_signal"]]
+        out["baseline"][per] = {k: _stats(*_r(base, k)) for k in ("short_fast", "short_slow")}
+        out["fade_state"][per] = {
+            fam: _stats(*_r([r for r in rows if r["feat"][f"S_{fam}"]], "short_slow")) for fam in FAMILIES}
+    thinned = {p: el.as_pattern_rows(el.thin([r for r in rows if r["is_signal"]], 60), key="short_slow")
+               for p, rows in have.items()}
+    cuts = pt.tertile_cuts(thinned["TRAIN"], numeric=NUMERIC)
+    saved = (pt.NUMERIC, pt.BOOLEAN)
+    try:
+        pt.NUMERIC, pt.BOOLEAN = NUMERIC, BOOLEAN
+        selected, n_tested = pt.discover(thinned["TRAIN"], cuts, boolean=BOOLEAN)
+        items = pt.evaluate(selected, thinned["VALID"], thinned["TEST"])
+    finally:
+        pt.NUMERIC, pt.BOOLEAN = saved
+
+    def s_(part, i):
+        rs = [r["outcomes"]["primary"]["r"] for r in i[part]["rows"]]
+        return {"n": len(rs), "mean_r": round(st.mean(rs), 3) if rs else None}
+    out["patterns_tested_train"] = n_tested
+    out["patterns"] = [{"pattern": pt.label(i["pattern"]), "side": i["side"], "class": i["class"],
+                        "train": s_("train", i), "valid": s_("valid", i), "test": s_("test", i),
+                        "rest_mean": [round(i[x]["rest_mean"], 3) if i[x]["rest_mean"] is not None else None
+                                      for x in ("train", "valid", "test")],
+                        "train_family_q": round(i["train_family_q"], 3), "valid_q": round(i["valid_q"], 3),
+                        "test_q": round(i["test_q"], 3) if i["test_q"] is not None else None} for i in items]
+    return out
+
+
 def main() -> None:
     rows = pickle.load(open(OUT / "universe.pkl", "rb"))  # noqa: SIM115 - one-shot read
     parts = el.split(rows, VALID_FROM, TEST_FROM)
@@ -313,6 +350,7 @@ def main() -> None:
         "regimes": regimes(parts),
         "meta_labeling": meta_labeling(),
         "ai_value": ai_value(),
+        "shorts": shorts(parts),
     }
     (OUT / "edge_lab.json").write_text(json.dumps(result, indent=1, default=str), encoding="utf-8")
     print(json.dumps(result["counts"]))

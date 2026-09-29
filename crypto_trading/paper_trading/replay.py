@@ -19,7 +19,13 @@ from crypto_trading.orchestrator import _ROLE_ORDER, run_discovery_cycle
 from crypto_trading.paper_trading.position_closing import close_triggered_positions
 from crypto_trading.schemas.candidate import Candidate
 from crypto_trading.schemas.event import Event
-from crypto_trading.schemas.market import FundingRate, InstrumentMetadata, Kline, Ticker
+from crypto_trading.schemas.market import (
+    FundingRate,
+    InstrumentMetadata,
+    Kline,
+    OpenInterest,
+    Ticker,
+)
 from crypto_trading.schemas.trade import Position
 from crypto_trading.screening.candidate_engine import (
     apply_opportunity_screening,
@@ -50,6 +56,9 @@ class MarketSnapshot(BaseModel):
     data_quality_status: dict[str, Literal["ok", "invalid"]]
     secondary_klines: dict[str, list[Kline]] = {}
     secondary_funding_rates: dict[str, list[FundingRate]] = {}
+    # 2026-09-29: the open interest discovery already fetches per top-N symbol
+    # (previously only quality-checked, then discarded). Empty in replays.
+    open_interest: dict[str, OpenInterest] = {}
 
 
 def run_replay(
@@ -172,6 +181,7 @@ def run_single_cycle(
         if candidate is not None:
             new_candidates.append(candidate)
 
+    _record_market_observations(repo, snapshot, top_n_symbols, run_id)
     if pre_ai_shadow is not None:
         # 2026-09-29 SHADOW pre-AI feasibility: measured, never acted on. It
         # gets an immutable copy and its outcome is ignored - every candidate
@@ -239,6 +249,32 @@ def run_single_cycle(
     )
 
     return opened
+
+
+def _record_market_observations(repo, snapshot, symbols, run_id: str) -> None:
+    """2026-09-29: keep the open interest, latest funding rate and price that
+    this cycle ALREADY fetched (no extra API call), so OI/funding research
+    becomes possible going forward - OI has no public history. Never raises."""
+    if not snapshot.open_interest:
+        return
+    try:
+        rows = []
+        for sym in symbols:
+            oi = snapshot.open_interest.get(sym)
+            if oi is None:
+                continue
+            funding = snapshot.funding_rates.get(sym) or []
+            ticker = snapshot.tickers.get(sym)
+            rows.append({
+                "symbol": sym, "observed_at": oi.observed_at.isoformat(),
+                "open_interest": str(oi.open_interest),
+                "funding_rate": str(funding[-1].funding_rate) if funding else None,
+                "last_price": str(ticker.last_price) if ticker is not None else None,
+            })
+        repo.save_market_observations(run_id, snapshot.simulated_now, rows)
+    except Exception as exc:  # noqa: BLE001 - measurement never disturbs the tick
+        log_event(run_id, event="market_observations_failed", error_type=type(exc).__name__,
+                  error=str(exc)[:300])
 
 
 def _record_funnel(repo, run_id, now, *, markets_scanned, eligible, top_n, quant_shortlist,

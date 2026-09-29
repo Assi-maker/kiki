@@ -46,6 +46,7 @@ def build_hook(repo, live_connector, settings):
             exposures = _open_live_exposures(repo, settings)
             open_symbols = {e.symbol for e in exposures}
             counts = {paf.FEASIBLE: 0, paf.INFEASIBLE: 0, paf.UNKNOWN: 0}
+            flagged = 0
             for c in candidates:
                 if c.status != "CANDIDATE":
                     continue
@@ -59,11 +60,15 @@ def build_hook(repo, live_connector, settings):
                     margin_usdt=settings.live_execution.margin_per_trade_usdt,
                     leverage=settings.live_execution.leverage, limits=settings.safety, calib=calib,
                 )
+                closes = [k.close for k in snapshot.klines.get(c.instrument, []) if k.observed_at <= now]
                 record.update({"candidate_id": c.candidate_id, "signal_at": c.created_at.isoformat(),
-                               "run_id": run_id, "calibration_frozen_on": calib.frozen_on})
+                               "run_id": run_id, "calibration_frozen_on": calib.frozen_on,
+                               "failure_hypotheses": [paf.no_momentum_4h(closes)]})
                 repo.save_pre_ai_feasibility(record, now)
                 counts[record["pre_ai_feasible"]] += 1
-            log_event(run_id, event="pre_ai_feasibility_shadow", **{f"n_{k}": v for k, v in counts.items()})
+                flagged += bool(record["failure_hypotheses"][0]["flag"])
+            log_event(run_id, event="pre_ai_feasibility_shadow", no_momentum_4h_flagged=flagged,
+                      **{f"n_{k}": v for k, v in counts.items()})
         except Exception as exc:  # noqa: BLE001 - shadow measurement never disturbs discovery
             log_event(run_id, event="pre_ai_feasibility_shadow_failed", error_type=type(exc).__name__,
                       error=str(exc)[:300])

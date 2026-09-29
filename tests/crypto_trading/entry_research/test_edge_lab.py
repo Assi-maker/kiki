@@ -136,3 +136,34 @@ def test_per_family_age_is_zero_exactly_on_the_event():
                 assert age == 0
             if not r["feat"][f"S_{fam}"]:
                 assert age is None
+
+
+def test_short_outcome_mirrors_long_exactly():
+    T = T_START
+    up = [T + 60 * i for i in range(500)]
+    # price falls 7 % in minute 3 -> SHORT hits its target (3 ATR = 6 %), LONG its stop
+    o = [100.0] * 500
+    h = [100.0] * 500
+    lo = [100.0] * 500
+    c = [100.0] * 500
+    for k in range(3, 500):
+        o[k] = h[k] = lo[k] = c[k] = 93.0
+    m = el.Minute(up, o, h, lo, c, [1.0] * 500)
+    long_, short = el.outcome(m, T, 0, 2.0, "LONG"), el.outcome(m, T, 0, 2.0, "SHORT")
+    assert long_["reason"] == "SL" and short["reason"] == "TP"
+    assert short["r"] == pytest.approx((6.0 - 0.1) / 4.0)
+    assert long_["r"] == pytest.approx((96 * (1 - el.STOP_SLIP) - 100 - 0.1) / 4.0)
+
+
+def test_short_stop_is_above_entry_and_fills_with_slippage_above():
+    T = T_START
+    ts = [T + 60 * i for i in range(500)]
+    o = [100.0] * 500
+    h = [100.0] * 500
+    lo = [100.0] * 500
+    c = [100.0] * 500
+    h[2] = 105.0                                   # +5 % spike: short stop at 104 (2 ATR)
+    m = el.Minute(ts, o, h, lo, c, [1.0] * 500)
+    out = el.outcome(m, T, 0, 2.0, "SHORT")
+    assert out["reason"] == "SL"
+    assert out["r"] == pytest.approx((-(104 * (1 + el.STOP_SLIP) - 100) - 0.1) / 4.0)
