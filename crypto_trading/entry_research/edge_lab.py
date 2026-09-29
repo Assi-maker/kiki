@@ -185,21 +185,21 @@ def outcome(m: Minute, T: int, latency_s: int, atr_pct: float, side: str = "LONG
         if mfe_hit_at is None and sgn * (fav - entry) >= one_atr:
             mfe_hit_at = j
         if (sgn > 0 and down <= stop) or (sgn < 0 and up >= stop):
-            px, reason = stop * (1 - sgn * STOP_SLIP), "SL"
+            px, reason, exit_ts = stop * (1 - sgn * STOP_SLIP), "SL", m.ts[j] + 60
             break
         if (sgn > 0 and up >= target) or (sgn < 0 and down <= target):
-            px, reason = target, "TP"
+            px, reason, exit_ts = target, "TP", m.ts[j] + 60
             break
         last_c = m.c[j]
         j += 1
     else:
         if j == i or m.ts[j - 1] < t_entry + HORIZON_S - 900:
             return None                                  # window not covered by data
-        px, reason = last_c, "TIME"
+        px, reason, exit_ts = last_c, "TIME", m.ts[j - 1] + 60
     r = (sgn * (px - entry) - FEE_RT * entry) / risk
     mfe = sgn * (fav / entry - 1) * 100
     return {"r": r, "reason": reason, "mfe_pct": mfe, "mae_pct": sgn * (adv / entry - 1) * 100,
-            "low_mfe": mfe < 0.5,
+            "low_mfe": mfe < 0.5, "entry_ts": t_entry, "exit_ts": exit_ts,
             "fast_decay": mae_hit_at is not None and (mfe_hit_at is None or mae_hit_at < mfe_hit_at)}
 
 
