@@ -102,3 +102,16 @@ def test_old_book_files_without_the_02_band_still_give_the_1_pct_imbalance():
         z.writestr("x.csv", "\n".join(lines))
     (row,) = bf.parse("BTCUSDT", buf.getvalue())
     assert row[2] is None and abs(row[3] - 0.5) < 1e-12 and row[4] == 400
+
+
+def test_cross_exchange_imports_nothing_that_trades_and_the_bot_does_not_import_it():
+    tree = ast.parse(
+        (ROOT / "crypto_trading/entry_research/cross_exchange.py").read_text(encoding="utf-8")
+    )
+    for n in ast.walk(tree):
+        if isinstance(n, ast.ImportFrom) and (n.module or "").startswith("crypto_trading"):
+            assert n.module.split(".")[1] == "entry_research", n.module
+    for p in (ROOT / "crypto_trading").rglob("*.py"):
+        rel = p.relative_to(ROOT).as_posix()
+        if not rel.startswith("crypto_trading/entry_research/"):
+            assert "cross_exchange" not in p.read_text(encoding="utf-8"), rel
