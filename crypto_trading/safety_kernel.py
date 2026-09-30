@@ -57,6 +57,7 @@ class EntryDecision:
     group_risk_before: Decimal = _ZERO
     notional_before: Decimal = _ZERO
     notional_after: Decimal = _ZERO
+    caps_breached_observed: list[str] = field(default_factory=list)
 
     def as_log(self) -> dict:
         return {k: (str(v) if isinstance(v, Decimal) else v) for k, v in self.__dict__.items()}
@@ -158,12 +159,14 @@ def size_entry(
         breached.append("PORTFOLIO_RISK_CAP")
     if group_before + risk > equity * limits.max_group_risk_pct:
         breached.append("GROUP_RISK_CAP")
-    if breached:  # fixed sizing: the full size or nothing - never a smaller one
+    if breached and limits.risk_caps_enforced:  # the full size or nothing - never smaller
         return reject(*breached, binding_limits=breached, **context)
+    # risk_caps_enforced=false (user decision 2026-09-29): the % caps are only
+    # OBSERVED - recorded on the decision so their cost/benefit stays measurable.
     return EntryDecision(
         "APPROVE", quantity, risk, [], [], equity=equity, group=group,
         portfolio_risk_after=portfolio_before + risk, notional_after=notional_before + quantity * entry,
-        **context,
+        caps_breached_observed=breached, **context,
     )
 
 

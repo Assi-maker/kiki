@@ -1326,14 +1326,39 @@ def test_fixed_sizing_sends_the_full_100_margin_x_10_order(tmp_path):
     assert decision["action"] == "APPROVE"
 
 
-def test_fixed_sizing_rejects_instead_of_reducing_when_the_caps_are_breached(tmp_path):
-    """Equity 250: total and group cap 10 % = 25 USDT < the ~26.9 USDT worst
-    case of the fixed-size order -> REJECT, no order at all (never a smaller
-    one). (Group cap 5 % -> 10 % on 2026-09-29; the total cap still binds.)"""
+def _caps_enforced():
+    """Production settings with the % caps switched back ON (they are
+    observe-only in LIVE since 2026-09-29) - the enforcing path stays tested."""
+    settings = get_settings()
+    return settings.model_copy(
+        update={"safety": settings.safety.model_copy(update={"risk_caps_enforced": True})}
+    )
+
+
+def test_production_caps_are_observe_only_every_confirmed_signal_goes_live_at_full_size(tmp_path):
+    """User decision 2026-09-29 ("tillbaka till före P0"): equity 250, worst
+    case ~26.9 > both caps -> still APPROVED at the fixed size and sent; the
+    breached caps are recorded on the decision."""
+    assert get_settings().safety.risk_caps_enforced is False
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(balance="250.00", all_positions=[])
     _run(repo, connector)
+    assert len(connector.calls) == 1
+    decision = repo.get_safety_kernel_decision("pos-1")
+    assert decision["action"] == "APPROVE"
+    observed = set(decision["detail"]["caps_breached_observed"])
+    assert observed == {"PORTFOLIO_RISK_CAP", "GROUP_RISK_CAP"}
+
+
+def test_fixed_sizing_rejects_instead_of_reducing_when_the_caps_are_breached(tmp_path):
+    """Caps enforced: equity 250 -> total cap 25 USDT < the ~26.9 USDT worst
+    case of the fixed-size order -> REJECT, no order at all (never a smaller
+    one)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _open_position(repo)
+    connector = _SpyConnector(balance="250.00", all_positions=[])
+    _run(repo, connector, settings=_caps_enforced())
     assert connector.calls == []
     assert repo.get_live_execution("pos-1") is None  # budget-type reject: retried while fresh
     decision = repo.get_safety_kernel_decision("pos-1")
@@ -1347,10 +1372,22 @@ def test_the_kernel_uses_current_equity_not_the_balance(tmp_path):
     repo = SQLiteRepository(tmp_path / "t.db")
     _open_position(repo)
     connector = _SpyConnector(balance="1000.00", equity="250.00", all_positions=[])
-    _run(repo, connector)
+    _run(repo, connector, settings=_caps_enforced())
     decision = repo.get_safety_kernel_decision("pos-1")
     assert decision["action"] == "REJECT"
     assert Decimal(decision["detail"]["equity"]) == Decimal("250.00")
+
+
+def test_with_caps_observe_only_a_fourth_position_is_sent_but_max_4_still_binds(tmp_path):
+    repo = SQLiteRepository(tmp_path / "t.db")
+    for i, symbol in enumerate(("AAA-USDT", "BBB-USDT", "CCC-USDT")):
+        _seed_open_live(repo, f"open-{i}", symbol, quantity="0.025")
+    _open_position(repo, position_id="pos-new")
+    connector = _SpyConnector(balance="1000.00", all_positions=[
+        {"symbol": s, "positionAmt": "0.025"} for s in ("AAA-USDT", "BBB-USDT", "CCC-USDT")])
+    _run(repo, connector)
+    assert len(connector.calls) == 1                     # 4th of max 4: allowed
+    assert repo.get_safety_kernel_decision("pos-new")["detail"]["caps_breached_observed"]
 
 
 def test_a_stop_too_close_to_liquidation_is_never_sent(tmp_path):
@@ -1400,7 +1437,7 @@ def test_the_portfolio_ceiling_blocks_a_new_entry_when_open_risk_is_used_up(tmp_
     _open_position(repo, position_id="pos-new")
     connector = _SpyConnector(balance="1000.00", all_positions=[
         {"symbol": s, "positionAmt": "0.025"} for s in ("AAA-USDT", "BBB-USDT", "CCC-USDT")])
-    _run(repo, connector)
+    _run(repo, connector, settings=_caps_enforced())
     assert connector.calls == []
     assert repo.get_live_execution("pos-new") is None  # budget-type reject: retry while fresh
     decision = repo.get_safety_kernel_decision("pos-new")

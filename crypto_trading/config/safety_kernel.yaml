@@ -26,6 +26,16 @@ max_portfolio_risk_pct: "0.10"
 # from it is more loss. The loader refuses a group cap above the total cap.
 max_group_risk_pct: "0.05"
 
+# User decision 2026-09-29 ("Tillbaka till före P0"), confirmed 2026-09-30 ("Jag
+# vill INTE ha någon procentbaserad riskcap", activate now): the two % caps above no
+# longer REJECT - every CONFIRMED signal may go LIVE at the fixed size, as
+# before P0. They are still computed and logged on every decision
+# (caps_breached_observed) so their effect stays measurable. The liquidation
+# guard, the stop-move guard, fixed size 100 x 10, max 4 and max 1 per symbol
+# are unchanged and still enforced. Advised against: pre-P0 LIVE lost ~-165
+# USDT in ~2 days with today's signal quality (no OOS edge found yet).
+risk_caps_enforced: false
+
 # Cost assumptions inside "worst-case risk", from the verified LIVE fills:
 # entry: market order may fill above the last price (buffer 0.3 %);
 # stop: STOP_MARKET triggers on mark and fills below the stop - measured mean

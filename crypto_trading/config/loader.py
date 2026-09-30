@@ -399,6 +399,10 @@ class SafetyKernelConfig(BaseModel):
     # Fixed LIVE sizing (user decision 2026-09-29): APPROVE/REJECT caps only.
     max_portfolio_risk_pct: Decimal = Decimal("0.10")
     max_group_risk_pct: Decimal = Decimal("0.05")
+    # False = the two % caps above are only observed/logged, never reject
+    # (user decision 2026-09-29, config/safety_kernel.yaml). The default stays
+    # True so a Settings built without the yaml is never less safe.
+    risk_caps_enforced: bool = True
     entry_price_buffer_pct: Decimal = Decimal("0.003")
     stop_slippage_buffer_pct: Decimal = Decimal("0.003")
     round_trip_fee_pct: Decimal = Decimal("0.001")

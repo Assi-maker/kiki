@@ -297,3 +297,38 @@ def test_a_group_cap_above_the_total_cap_is_refused_at_config_load():
 
     with _pytest.raises(ValidationError):
         SafetyKernelConfig(max_portfolio_risk_pct=D("0.10"), max_group_risk_pct=D("0.15"))
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-29 user decision: % caps observe-only in LIVE (risk_caps_enforced
+# false). Every other rule still rejects; the size is still never changed.
+# ---------------------------------------------------------------------------
+
+OBSERVE = SafetyKernelConfig(max_portfolio_risk_pct=D("0.10"), max_group_risk_pct=D("0.05"),
+                             risk_caps_enforced=False)
+
+
+def test_production_yaml_has_the_caps_observe_only_and_the_default_enforces_them():
+    assert get_settings().safety.risk_caps_enforced is False
+    assert SafetyKernelConfig().risk_caps_enforced is True
+
+
+def test_observe_only_approves_a_cap_breaching_trade_at_exactly_the_fixed_size():
+    d = _full(limits=OBSERVE, stop=D("0.95"))              # ~56 USDT worst case, > both caps
+    assert d.action == "APPROVE"
+    assert d.quantity == D("1000")
+    assert set(d.caps_breached_observed) == {"PORTFOLIO_RISK_CAP", "GROUP_RISK_CAP"}
+    assert d.binding_limits == []
+
+
+def test_observe_only_still_rejects_a_stop_too_close_to_liquidation():
+    d = _full(limits=OBSERVE, stop=D("0.90"))
+    assert d.action == "REJECT"
+    assert "LIQUIDATION_TOO_CLOSE" in d.reasons
+
+
+def test_observe_only_never_changes_the_size():
+    for stop in (D("0.999"), D("0.99"), D("0.97"), D("0.95")):
+        for equity in (D("50"), D("420"), D("5000")):
+            d = _full(limits=OBSERVE, stop=stop, equity=equity)
+            assert d.quantity in (D("0"), D("1000"))
