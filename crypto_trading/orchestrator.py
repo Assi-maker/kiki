@@ -247,6 +247,7 @@ def run_discovery_cycle(
     max_analyses: int | None = None,
     stale_after_seconds: int | None = None,
     clock: Callable[[], datetime] | None = None,
+    on_processed: Callable[[Candidate], None] | None = None,
 ) -> list[Candidate]:
     """Discovery-loop-wiring: (1) sveper föräldralösa UNDER_AI_ANALYSIS-
     candidates till ANALYSIS_INTERRUPTED (Fas 0:s sweep_interrupted_analyses,
@@ -298,7 +299,14 @@ def run_discovery_cycle(
     BUDGET_LIMITED (reason "stale_signal"); an ANALYSIS_INTERRUPTED one (no
     legal terminal transition exists for it) is left untouched and skipped,
     like the daily-budget deferral below. Both checks run BEFORE the
-    dollar/call budget gates and never alter an in-flight chain."""
+    dollar/call budget gates and never alter an in-flight chain.
+
+    `on_processed` (2026-09-30, default None = prior behavior): called with
+    each candidate right after its own 7-role chain + Gate decision, before
+    the next candidate's chain starts. The discovery tick uses it to open a
+    CONFIRMED candidate's PAPER position (the one LIVE executes) at once
+    instead of after the whole cycle - LIVE's 30 min TTL counts from
+    CONFIRMED, and a long cycle spent up to 20 min of it waiting (29/9)."""
     effective_now = now if now is not None else datetime.now(UTC)
     sweep_interrupted_analyses(repo, swept_at=effective_now, run_id=run_id)
 
@@ -406,7 +414,10 @@ def run_discovery_cycle(
         )
         candidate.status = "UNDER_AI_ANALYSIS"
         analyses_started += 1
-        results.append(orchestrator.process_candidate(candidate, run_id, now=effective_now))
+        processed = orchestrator.process_candidate(candidate, run_id, now=effective_now)
+        results.append(processed)
+        if on_processed is not None:
+            on_processed(processed)
     return results
 
 

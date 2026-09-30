@@ -434,3 +434,28 @@ def test_run_discovery_cycle_omits_news_keys_when_connectors_not_passed(tmp_path
     news_context = spy.captured_contexts["crypto-news-sentiment"]
     assert "news_headlines" not in news_context
     assert "fear_greed_index" not in news_context
+
+
+def test_on_processed_fires_per_candidate_before_the_next_chain_starts(tmp_path):
+    """2026-09-30 (user: signal TTL counts from CONFIRMED): each processed
+    candidate is handed to `on_processed` right after its own Gate decision,
+    while the next candidate is still untouched - so its PAPER position (the
+    one LIVE executes) is not held back until the whole cycle has ended."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="cand-1")
+    _persisted_candidate_in_status(repo, "CANDIDATE", candidate_id="cand-2")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    seen: list[tuple[str, str, str]] = []
+
+    def on_processed(candidate):
+        other = "cand-2" if candidate.candidate_id == "cand-1" else "cand-1"
+        seen.append((candidate.candidate_id, candidate.status, repo.get_candidate(other).status))
+
+    results = run_discovery_cycle(
+        repo=repo, runner=runner, settings=_settings(), run_id="run-1", now=_NOW,
+        on_processed=on_processed,
+    )
+
+    assert [s[0] for s in seen] == [r.candidate_id for r in results]
+    assert [s[1] for s in seen] == ["CONFIRMED", "CONFIRMED"]
+    assert seen[0][2] == "CANDIDATE"  # the second chain had not started yet

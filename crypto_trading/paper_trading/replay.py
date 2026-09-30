@@ -221,6 +221,7 @@ def run_single_cycle(
             run_id,
         )
 
+    opened: list[Position] = []
     processed = run_discovery_cycle(
         repo,
         runner,
@@ -232,9 +233,15 @@ def run_single_cycle(
         max_analyses=live_analysis_cap,
         stale_after_seconds=stale_candidate_after_seconds,
         clock=clock,
+        # 2026-09-30: each CONFIRMED gets its PAPER position (the one LIVE
+        # executes) right after its own Gate decision, not when the whole
+        # cycle ends - LIVE's 30 min TTL counts from CONFIRMED. Same price
+        # (this cycle's snapshot ticker) and same per-candidate error
+        # isolation as before; only the timing moved.
+        on_processed=lambda c: opened.extend(
+            _open_positions_for_confirmed_candidates([c], snapshot, repo, settings, run_id)
+        ),
     )
-
-    opened = _open_positions_for_confirmed_candidates(processed, snapshot, repo, settings, run_id)
     _record_funnel(
         repo, run_id, snapshot.simulated_now,
         markets_scanned=len(snapshot.instruments), eligible=len(eligible_tickers),

@@ -798,3 +798,34 @@ def test_open_positions_shadow_exception_does_not_block_real_position_open(tmp_p
     assert [p.position_id for p in opened] == ["shadow-2"]
     assert repo.get_position("shadow-2") is not None
     assert _shadow_row_count(repo) == 0  # the shadow save itself never completed
+
+
+def test_run_single_cycle_opens_each_confirmed_position_during_the_cycle_not_after_it(tmp_path):
+    """2026-09-30 (user: the 30 min LIVE TTL counts from CONFIRMED): the PAPER
+    position of a CONFIRMED candidate is opened right after its own Gate
+    decision, before the next candidate is analysed - not in one batch when
+    the whole discovery cycle ends (measured 29/9: up to 20 min of the 30 min
+    TTL was spent waiting for later candidates' AI chains)."""
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+    first, second = object(), object()
+    opened_calls: list[list] = []
+    log: list[str] = []
+
+    def fake_open(processed, snapshot, repo_, settings, run_id):
+        opened_calls.append(list(processed))
+        return []
+
+    def fake_cycle(*args, on_processed, **kwargs):
+        on_processed(first)
+        log.append(f"after first: {len(opened_calls)} open call(s)")
+        on_processed(second)
+        return [first, second]
+
+    with patch("crypto_trading.paper_trading.replay.run_discovery_cycle", side_effect=fake_cycle), \
+         patch("crypto_trading.paper_trading.replay._open_positions_for_confirmed_candidates",
+               side_effect=fake_open):
+        run_single_cycle(_build_snapshots()[0], repo, runner, _settings(), run_id="run-1")
+
+    assert log == ["after first: 1 open call(s)"]
+    assert opened_calls == [[first], [second]]  # per candidate, and no batch at the end
