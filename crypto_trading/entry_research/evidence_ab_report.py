@@ -35,6 +35,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from crypto_trading.config.loader import get_settings
+from crypto_trading.entry_research.stats import cluster_t, t_sf
 
 
 def _ro(path: str | Path) -> sqlite3.Connection:
@@ -62,11 +63,44 @@ def _pnl_after(bot: sqlite3.Connection, position_id: str, observed_at: str) -> d
         - float(pos["funding"] or 0)
     )
     path = [float(r["unrealized_pnl"]) for r in rows] + [final]
+    risk = abs(float(pos["simulated_fill_entry"]) - float(pos["stop_loss"])) * size
     return {
         "at_obs": at_obs,
         "final": final,
         "mfe_after": max(path) - at_obs,
         "mae_after": min(path) - at_obs,
+        "risk_usdt": risk,
+    }
+
+
+# Pre-registered: no conclusion about evidence is drawn below these sizes.
+MIN_AB_WITH_OUTCOME = 100
+MIN_AA = 30
+MIN_CLOSED_TRADES = 100
+
+
+def _mean(xs: list[float]) -> float | None:
+    return round(st.mean(xs), 4) if xs else None
+
+
+def _rate(xs: list[bool]) -> float | None:
+    return round(sum(xs) / len(xs), 3) if xs else None
+
+
+def _cluster_ci(values: list[float], clusters: list) -> dict | None:
+    """Mean with a 95 % CI clustered per position (several decisions on the
+    same position are not independent) and a two-sided p."""
+    if len(values) < 2:
+        return None
+    t, g = cluster_t(values, [str(c) for c in clusters])
+    m = st.mean(values)
+    se = abs(m / t) if t else None
+    p = 2 * t_sf(abs(t), g - 1) if g > 1 and t else 1.0
+    return {
+        "mean": round(m, 4),
+        "ci95": [round(m - 1.96 * se, 4), round(m + 1.96 * se, 4)] if se else None,
+        "p_two_sided": round(p, 4),
+        "clusters": g,
     }
 
 
@@ -89,33 +123,61 @@ def guardian_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
     if out["changed_rate"] is not None and out["aa_noise_rate"] is not None:
         out["changed_above_noise"] = round(out["changed_rate"] - out["aa_noise_rate"], 3)
     arms: dict = {"without": defaultdict(list), "with": defaultdict(list)}
+    paired: dict = defaultdict(list)  # per observation: with - without
     for r in both:
         o = _pnl_after(bot, r["position_id"], r["observed_at"])
         if o is None:
             continue
         hold_gain = o["final"] - o["at_obs"]
+        cf = {}
         for arm, rec in (("without", r["rec_without"]), ("with", r["rec_with"])):
             a = arms[arm]
-            a["counterfactual_pnl"].append(o["at_obs"] if rec == "EXIT" else o["final"])
+            cf[arm] = o["at_obs"] if rec == "EXIT" else o["final"]
+            a["cf_usdt"].append(cf[arm])
+            a["cf_r"].append(cf[arm] / o["risk_usdt"] if o["risk_usdt"] else 0.0)
             a["false_exit"].append(rec == "EXIT" and hold_gain > 0)
             a["missed_exit"].append(rec != "EXIT" and hold_gain < 0)
-            a["mfe_after"].append(o["mfe_after"])
-            a["mae_after"].append(o["mae_after"])
             a["exit_share"].append(rec == "EXIT")
+            if rec == "EXIT":  # upside given away by exiting
+                a["mfe_after_exit"].append(o["mfe_after"])
+            else:  # drawdown sat through by holding
+                a["mae_after_hold"].append(o["mae_after"])
+        paired["pos"].append(r["position_id"])
+        paired["d_usdt"].append(cf["with"] - cf["without"])
+        paired["d_r"].append(
+            (cf["with"] - cf["without"]) / o["risk_usdt"] if o["risk_usdt"] else 0.0
+        )
+        wrong = {arm: (arms[arm]["false_exit"][-1] or arms[arm]["missed_exit"][-1]) for arm in arms}
+        paired["only_without_wrong"].append(wrong["without"] and not wrong["with"])
+        paired["only_with_wrong"].append(wrong["with"] and not wrong["without"])
     for arm, a in arms.items():
-        n = len(a["counterfactual_pnl"])
+        n = len(a["cf_usdt"])
         out[arm] = {
             "n_with_outcome": n,
-            "mean_counterfactual_pnl_usdt": round(st.mean(a["counterfactual_pnl"]), 3)
-            if n
-            else None,
-            "total_counterfactual_pnl_usdt": round(sum(a["counterfactual_pnl"]), 2) if n else None,
-            "false_exit_rate": round(sum(a["false_exit"]) / n, 3) if n else None,
-            "missed_exit_rate": round(sum(a["missed_exit"]) / n, 3) if n else None,
-            "exit_recommendation_share": round(sum(a["exit_share"]) / n, 3) if n else None,
-            "mean_mfe_after_usdt": round(st.mean(a["mfe_after"]), 3) if n else None,
-            "mean_mae_after_usdt": round(st.mean(a["mae_after"]), 3) if n else None,
+            "expectancy_usdt": _mean(a["cf_usdt"]),
+            "expectancy_r": _mean(a["cf_r"]),
+            "total_usdt": round(sum(a["cf_usdt"]), 2) if n else None,
+            "false_exit_rate": _rate(a["false_exit"]),
+            "missed_exit_rate": _rate(a["missed_exit"]),
+            "exit_recommendation_share": _rate(a["exit_share"]),
+            "mean_mfe_after_exit_usdt": _mean(a["mfe_after_exit"]),
+            "mean_mae_after_hold_usdt": _mean(a["mae_after_hold"]),
         }
+    n = len(paired["d_usdt"])
+    out["with_minus_without"] = {
+        "n": n,
+        "positions": len(set(paired["pos"])),
+        "expectancy_usdt": _cluster_ci(paired["d_usdt"], paired["pos"]),
+        "expectancy_r": _cluster_ci(paired["d_r"], paired["pos"]),
+        # discordant errors: the arm that is wrong ALONE more often is worse
+        "only_without_wrong": sum(paired["only_without_wrong"]),
+        "only_with_wrong": sum(paired["only_with_wrong"]),
+    }
+    out["sufficient_data"] = {
+        "required": {"ab_rows_with_outcome": MIN_AB_WITH_OUTCOME, "aa_pairs": MIN_AA},
+        "have": {"ab_rows_with_outcome": n, "aa_pairs": len(aa)},
+        "met": n >= MIN_AB_WITH_OUTCOME and len(aa) >= MIN_AA,
+    }
     return out
 
 
@@ -145,8 +207,13 @@ def candidate_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
                 - float(pos["fees"] or 0)
                 - float(pos["funding"] or 0)
             )
+            risk = abs(float(pos["simulated_fill_entry"]) - float(pos["stop_loss"])) * float(
+                pos["size"]
+            )
             g["pnl"].append(pnl)
-    out = {}
+            g["r"].append(pnl / risk if risk else 0.0)
+            g["day"].append(pos["opened_at"][:10])
+    out: dict = {}
     for status, g in sorted(groups.items()):
         p = g["pnl"]
         out[status] = {
@@ -154,18 +221,39 @@ def candidate_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
             "confirmed": sum(g["confirmed"]),
             "live": sum(g["live"]),
             "closed_paper_trades": len(p),
-            "mean_pnl_usdt": round(st.mean(p), 3) if p else None,
+            "expectancy_usdt": _mean(p),
+            "expectancy_r": _cluster_ci(g["r"], g["day"]) if len(p) >= 2 else None,
             "total_pnl_usdt": round(sum(p), 2) if p else None,
-            "win_rate": round(sum(x > 0 for x in p) / len(p), 3) if p else None,
+            "win_rate": _rate([x > 0 for x in p]),
         }
+    # The evidence status as a (hypothetical) warning label on closed trades:
+    # a NEGATIVE_OOS trade that WON is a false alarm; a non-negative one that
+    # LOST is a missed warning.
+    neg_r = groups.get("NEGATIVE_OOS", {}).get("r", [])
+    rest_r = [x for s_, g in groups.items() if s_ != "NEGATIVE_OOS" for x in g.get("r", [])]
+    all_r = neg_r + rest_r
+    out["_evidence_label_quality"] = {
+        "false_alarm_rate": _rate([x > 0 for x in neg_r]),
+        "missed_warning_rate": _rate([x <= 0 for x in rest_r]),
+        "expectancy_r_negative_oos": _mean(neg_r),
+        "expectancy_r_other": _mean(rest_r),
+    }
+    total_live = sum(v["live"] for v in out.values() if isinstance(v, dict) and "live" in v)
     neg = out.get("NEGATIVE_OOS", {})
-    total_live = sum(v["live"] for v in out.values())
     out["_counterfactual_if_negative_oos_were_skipped_NOT_APPLIED"] = {
         "live_trades_removed": neg.get("live", 0),
         "live_frequency_change_share": round(-neg.get("live", 0) / total_live, 3)
         if total_live
         else None,
+        "paper_trades_removed": len(neg_r),
         "paper_pnl_removed_usdt": neg.get("total_pnl_usdt"),
+        "expectancy_r_all": _mean(all_r),
+        "expectancy_r_if_filtered": _mean(rest_r),
+    }
+    out["_sufficient_data"] = {
+        "required_closed_trades": MIN_CLOSED_TRADES,
+        "have": len(all_r),
+        "met": len(all_r) >= MIN_CLOSED_TRADES,
     }
     return out
 
