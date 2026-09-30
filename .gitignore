@@ -23,6 +23,9 @@ memory/
 # Intelligence-systemet
 data/*.db
 data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.log
 
 # Crypto trading-systemet
 backtest_output/
