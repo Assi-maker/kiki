@@ -449,14 +449,17 @@ def main() -> None:
     settings = get_settings()
     sh = open_shadow_db(settings.evidence.shadow_db)
     bot = _bot_ro(settings.db_path)
-    repo = read_only_repository(settings.db_path)
     ev_path = Path(settings.evidence.evidence_db)
     reader = store.EvidenceReader(ev_path) if ev_path.exists() else None
+    from crypto_trading.evidence_shadow import godfather_shadow as gf
     from crypto_trading.evidence_shadow.local_data import LocalSource
 
     src = LocalSource()  # the research files on disk + an incremental gap store
     clf = Classifier(universe_from_archive(), src)
-    runner = build_runner()
+    # GODFATHER shadow decisions (ENTRY + MANAGEMENT, with / without evidence
+    # as context) replace the earlier Guardian-only A/B (guardian_ab stays
+    # as history).
+    gctx = gf.make_ctx(settings)
     once = "--once" in sys.argv
     print(f"evidence shadow started, universe {len(clf.universe)}", flush=True)
     while True:
@@ -468,8 +471,9 @@ def main() -> None:
             ).fetchone():
                 src.fill_gaps(int(time.time()))  # data up to now covers every pending T
             n1 = classify_new_candidates(bot, sh, clf, reader)
-            n2 = guardian_ab(bot, sh, repo, runner, reader)
-            print(f"{datetime.now(UTC).isoformat()} classified {n1}, guardian A/B {n2}", flush=True)
+            gf.refresh_facts(gctx, settings)
+            g = gf.live_cycle(gctx, datetime.now(UTC))
+            print(f"{datetime.now(UTC).isoformat()} classified {n1}, godfather {g}", flush=True)
         except Exception:  # noqa: BLE001 - the shadow loop never dies on one error
             traceback.print_exc()
         if once:

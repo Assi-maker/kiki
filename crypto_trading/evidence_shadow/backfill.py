@@ -160,7 +160,19 @@ def main() -> None:
     if "--skip-classify" not in sys.argv:
         out["classification"] = classify_all(bot, sh, clf, reader, since)
         print(json.dumps(out["classification"], indent=1), flush=True)
-    if "--skip-guardian" not in sys.argv:
+    if "--godfather" in sys.argv:
+        from crypto_trading.evidence_shadow import godfather_shadow as gf
+
+        gctx = gf.make_ctx(s)
+        out["godfather"] = gf.backfill(gctx, since, workers)
+        gf.refresh_facts(gctx, s)
+        gctx["sh"].commit()
+        sv._set_state(sh, "godfather_watermark", max(
+            (r[0] for r in gctx["sh"].execute("SELECT decided_at FROM godfather_decisions")),
+            default=since,
+        ))
+        print(json.dumps(out["godfather"], indent=1), flush=True)
+    if "--skip-guardian" not in sys.argv and "--godfather" not in sys.argv:
         out["guardian_ab"] = guardian_all(bot, sh, repo, reader, since, workers)
         print(json.dumps(out["guardian_ab"], indent=1), flush=True)
     Path("data/entry_research/evidence_backfill.json").write_text(

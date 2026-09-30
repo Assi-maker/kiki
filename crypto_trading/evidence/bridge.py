@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from crypto_trading.evidence import store
+from crypto_trading.evidence.context import build_evidence_context
 
 
 def _enabled(settings) -> bool:
@@ -47,19 +48,23 @@ def evidence_for_candidate(
         finally:
             sh.close()
         if row is None or datetime.fromisoformat(row[1]) > decision_time:
-            return {"available": False, "reason": "candidate not classified before this decision"}
-        side, types, regimes = row[0], json.loads(row[2]), json.loads(row[3])
+            return {
+                "role": "CONTEXT_NOT_RULE",
+                "available": False,
+                "reason": "candidate not classified before this decision",
+            }
         reader = store.EvidenceReader(settings.evidence.evidence_db)
         try:
-            signals = {}
-            for typ in types:
-                pkg = reader.lookup(
-                    "BASELINE" if typ == "NO_EVENT" else typ, side, decision_time, regimes
-                )
-                signals[typ] = store.evidence_context(pkg)
+            return build_evidence_context(
+                reader,
+                json.loads(row[2]),
+                row[0],
+                json.loads(row[3]),
+                decision_time,
+                classified_for=datetime.fromisoformat(row[1]),
+            )
         finally:
             reader.close()
-        return {"available": True, "classified_at_decision": row[1], "signals": signals}
     except Exception:  # noqa: BLE001 - fail-safe: evidence is optional context
         return None
 

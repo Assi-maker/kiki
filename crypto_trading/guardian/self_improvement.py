@@ -78,7 +78,6 @@ from crypto_trading.detective.stats import (
     compute_breakdown_by_signal_type,
     compute_guardian_exit_effectiveness,
 )
-from crypto_trading.evidence.bridge import evidence_overview
 from crypto_trading.guardian.authority import (
     _ADJUSTMENT_SCALE,
     _MIN_MISCALIBRATION,
@@ -464,13 +463,10 @@ def propose_candidate_heuristics(
         # Claim the day's slot before any work - see module docstring.
         repo.set_guardian_authority_strategist_last_proposed_date(day_key, now)
 
+        # Historical evidence is deliberately NOT given to the strategist
+        # (2026-09-30): its proposals can become PRE_ENTRY_VETO heuristics,
+        # and evidence must never become a trade filter, even indirectly.
         context = _build_context(repo, settings, run_id)
-        # Historical evidence (config/evidence.yaml, default OFF): extra
-        # interpretation material for the proposal only - candidates are
-        # still validated out of sample before anything can go live.
-        overview = evidence_overview(settings, now)
-        if overview is not None:
-            context["historical_evidence_overview"] = overview
         agent_def = load_agent_definition(_STRATEGIST_AGENT_FILE)
         # 2026-09-29 cost forensic: the day's slot stays CONSUMED whatever
         # happens below - failed, timed out or raised. Releasing it made the

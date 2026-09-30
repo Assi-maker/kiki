@@ -184,9 +184,11 @@ def test_flag_on_gives_evidence_only_for_a_classification_made_before_the_decisi
     cls_time = datetime(2026, 9, 20, 12, tzinfo=UTC)
     _classified(tmp_path / "sh.db", cls_time)
     early = bridge.evidence_for_candidate(s, "c1", cls_time - timedelta(minutes=1))
-    assert early == {"available": False, "reason": "candidate not classified before this decision"}
+    assert early["available"] is False and early["role"] == "CONTEXT_NOT_RULE"
     ok = bridge.evidence_for_candidate(s, "c1", cls_time + timedelta(hours=1))
-    assert ok["available"] and ok["signals"]["BRK_4H"]["status"] == "NEGATIVE_OOS"
+    assert ok["available"] and ok["role"] == "CONTEXT_NOT_RULE"
+    assert ok["signals"][0]["signal_type"] == "BRK_4H"
+    assert ok["signals"][0]["status"] == "NEGATIVE_OOS"
     assert (
         bridge.evidence_overview(s, cls_time)["signals"]["BRK_4H LONG"]["status"] == "NEGATIVE_OOS"
     )
@@ -272,8 +274,8 @@ def test_no_bot_module_imports_the_shadow_service():
         assert not any(n.startswith("crypto_trading.evidence_shadow") for n in _imports(p)), rel
 
 
-def test_only_the_ai_context_and_strategist_hosts_read_the_evidence_bridge():
-    allowed = {"crypto_trading/guardian/tick.py", "crypto_trading/guardian/self_improvement.py"}
+def test_only_the_guardian_ai_context_host_reads_the_evidence_bridge():
+    allowed = {"crypto_trading/guardian/tick.py"}
     for p in (ROOT / "crypto_trading").rglob("*.py"):
         rel = p.relative_to(ROOT).as_posix()
         if rel.startswith(
@@ -307,19 +309,14 @@ def test_in_the_guardian_tick_evidence_flows_only_into_build_ai_context():
     assert isinstance(host, ast.Call) and getattr(host.func, "id", None) == "build_ai_context"
 
 
-def test_in_the_strategist_evidence_only_extends_the_proposal_context():
+def test_the_strategist_gets_no_evidence():
+    """2026-09-30: strategist proposals can become PRE_ENTRY_VETO
+    heuristics - evidence must never become a trade filter, even
+    indirectly, so the strategist does not read it at all."""
     src = (ROOT / "crypto_trading/guardian/self_improvement.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    calls = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "evidence_overview"
-    ]
-    assert len(calls) == 1
-    # the only use of its result: one new key on the proposal context
-    uses = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == "overview"]
-    assert len(uses) == 3  # assigned, checked for None, stored as the context value
-    assert 'context["historical_evidence_overview"] = overview' in src
+    assert "evidence_overview" not in src
+    assert not any(n.startswith("crypto_trading.evidence") for n in _imports(
+        ROOT / "crypto_trading/guardian/self_improvement.py"))
 
 
 def test_decision_modules_still_do_not_import_evidence():
