@@ -44,6 +44,28 @@ def _ro(path: str | Path) -> sqlite3.Connection:
     return c
 
 
+def _paper_pnl(pos: sqlite3.Row) -> float:
+    """paper_trading.execution.compute_pnl: `size` is the NOTIONAL in USDT,
+    so P/L = size x price return - fees - funding (the same units as the
+    Guardian's unrealised P/L)."""
+    entry = float(pos["simulated_fill_entry"])
+    return (
+        float(pos["size"]) * (float(pos["simulated_fill_exit"]) - entry) / entry
+        - float(pos["fees"] or 0)
+        - float(pos["funding"] or 0)
+    )
+
+
+def _paper_risk(pos: sqlite3.Row) -> float:
+    """Planned risk in USDT: notional x distance to the stop the position
+    was opened with. positions.stop_loss moves only through a Guardian
+    Authority TIGHTEN_SL, which is always recorded in
+    guardian_authority_decisions (empty as of 2026-09-30), so the stored
+    stop is the planned one."""
+    entry = float(pos["simulated_fill_entry"])
+    return float(pos["size"]) * abs(entry - float(pos["stop_loss"])) / entry
+
+
 def _pnl_after(bot: sqlite3.Connection, position_id: str, observed_at: str) -> dict | None:
     """Unrealised P/L at the observation, final P/L, and MFE/MAE after it,
     from the position's own later Guardian observations and its close."""
@@ -56,14 +78,10 @@ def _pnl_after(bot: sqlite3.Connection, position_id: str, observed_at: str) -> d
     if not rows or pos is None or pos["status"] != "CLOSED" or pos["simulated_fill_exit"] is None:
         return None
     at_obs = float(rows[0]["unrealized_pnl"])
-    size = float(pos["size"])
-    final = (
-        (float(pos["simulated_fill_exit"]) - float(pos["simulated_fill_entry"])) * size
-        - float(pos["fees"] or 0)
-        - float(pos["funding"] or 0)
-    )
+    final, risk = _paper_pnl(pos), _paper_risk(pos)
+    if not risk:
+        return None  # zero-size position: no exposure, no outcome to measure
     path = [float(r["unrealized_pnl"]) for r in rows] + [final]
-    risk = abs(float(pos["simulated_fill_entry"]) - float(pos["stop_loss"])) * size
     return {
         "at_obs": at_obs,
         "final": final,
@@ -71,6 +89,57 @@ def _pnl_after(bot: sqlite3.Connection, position_id: str, observed_at: str) -> d
         "mae_after": min(path) - at_obs,
         "risk_usdt": risk,
     }
+
+
+def verified_outcomes(db_path: str | Path) -> dict[str, dict]:
+    """Per closed position: was the booked paper exit confirmed on exchange
+    candles (godfather.book: MATCH), and the R of the ACTUAL position
+    against the planned risk when that outcome is usable evidence. 39 of
+    the early paper exits were booked after an outage at the wrong price
+    (Fas 2A.1), so every outcome-based number is also reported on verified
+    positions only."""
+    from crypto_trading.godfather.book import load_book
+    from crypto_trading.storage.repository import SQLiteRepository
+
+    # the bot's own read methods on a mode=ro connection (__init__ would
+    # run init_schema, a write, so it is bypassed)
+    repo = SQLiteRepository.__new__(SQLiteRepository)
+    repo._conn = _ro(db_path)
+    try:
+        book = load_book(repo, risk_limits=get_settings().risk_limits)
+    except Exception as e:  # noqa: BLE001 - the report still runs without it
+        print(f"verified outcomes unavailable: {type(e).__name__}: {e}", file=sys.stderr)
+        return {}
+    return {
+        t.position.position_id: {
+            "verdict": t.kline_verdict,
+            "verified": t.kline_verdict == "MATCH",
+            "r": float(t.outcome_r) if t.outcome_r is not None else None,
+        }
+        for t in book
+    }
+
+
+def _wilson(k: int, n: int) -> list[float] | None:
+    if not n:
+        return None
+    z, p = 1.96, k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / d
+    return [round(c - h, 3), round(c + h, 3)]
+
+
+def _binom_two_sided(b: int, c: int) -> float:
+    """Exact McNemar p for b vs c discordant pairs."""
+    from math import comb
+
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    tail = sum(comb(n, i) for i in range(k + 1)) / 2**n
+    return round(min(1.0, 2 * tail), 4)
 
 
 # Pre-registered: no conclusion about evidence is drawn below these sizes.
@@ -104,7 +173,10 @@ def _cluster_ci(values: list[float], clusters: list) -> dict | None:
     }
 
 
-def guardian_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
+def guardian_section(
+    bot: sqlite3.Connection, sh: sqlite3.Connection, verified: dict | None = None
+) -> dict:
+    verified = verified or {}
     rows = sh.execute("SELECT * FROM guardian_ab WHERE error IS NULL").fetchall()
     both = [r for r in rows if r["rec_without"] and r["rec_with"]]
     aa = [r for r in both if r["rec_without_replicate"]]
@@ -122,6 +194,24 @@ def guardian_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
     }
     if out["changed_rate"] is not None and out["aa_noise_rate"] is not None:
         out["changed_above_noise"] = round(out["changed_rate"] - out["aa_noise_rate"], 3)
+    out["changed_rate_ci95"] = _wilson(sum(r["changed"] for r in both), len(both))
+    n_noise = sum(r["rec_without"] != r["rec_without_replicate"] for r in aa)
+    out["aa_noise_rate_ci95"] = _wilson(n_noise, len(aa))
+    # Paired on the A/A rows (same context, same moment): does adding
+    # evidence change the answer more often than simply asking again?
+    b_ = sum(r["rec_with"] != r["rec_without"] and r["rec_without_replicate"] == r["rec_without"]
+             for r in aa)
+    c_ = sum(r["rec_with"] == r["rec_without"] and r["rec_without_replicate"] != r["rec_without"]
+             for r in aa)
+    out["evidence_vs_replicate_mcnemar"] = {
+        "only_evidence_changed": b_,
+        "only_replicate_changed": c_,
+        "p_two_sided": _binom_two_sided(b_, c_),
+    }
+    out["recommendation_mix"] = {
+        arm: {k: sum(r[col] == k for r in both) for k in ("HOLD", "WATCH", "PROTECT", "EXIT")}
+        for arm, col in (("without", "rec_without"), ("with", "rec_with"))
+    }
     arms: dict = {"without": defaultdict(list), "with": defaultdict(list)}
     paired: dict = defaultdict(list)  # per observation: with - without
     for r in both:
@@ -134,7 +224,7 @@ def guardian_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
             a = arms[arm]
             cf[arm] = o["at_obs"] if rec == "EXIT" else o["final"]
             a["cf_usdt"].append(cf[arm])
-            a["cf_r"].append(cf[arm] / o["risk_usdt"] if o["risk_usdt"] else 0.0)
+            a["cf_r"].append(cf[arm] / o["risk_usdt"])
             a["false_exit"].append(rec == "EXIT" and hold_gain > 0)
             a["missed_exit"].append(rec != "EXIT" and hold_gain < 0)
             a["exit_share"].append(rec == "EXIT")
@@ -142,11 +232,10 @@ def guardian_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
                 a["mfe_after_exit"].append(o["mfe_after"])
             else:  # drawdown sat through by holding
                 a["mae_after_hold"].append(o["mae_after"])
+        paired["verified"].append(bool(verified.get(r["position_id"], {}).get("verified")))
         paired["pos"].append(r["position_id"])
         paired["d_usdt"].append(cf["with"] - cf["without"])
-        paired["d_r"].append(
-            (cf["with"] - cf["without"]) / o["risk_usdt"] if o["risk_usdt"] else 0.0
-        )
+        paired["d_r"].append((cf["with"] - cf["without"]) / o["risk_usdt"])
         wrong = {arm: (arms[arm]["false_exit"][-1] or arms[arm]["missed_exit"][-1]) for arm in arms}
         paired["only_without_wrong"].append(wrong["without"] and not wrong["with"])
         paired["only_with_wrong"].append(wrong["with"] and not wrong["without"])
@@ -173,6 +262,15 @@ def guardian_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
         "only_without_wrong": sum(paired["only_without_wrong"]),
         "only_with_wrong": sum(paired["only_with_wrong"]),
     }
+    keep = [i for i, v in enumerate(paired["verified"]) if v]
+    out["with_minus_without_verified_exits_only"] = {
+        "n": len(keep),
+        "positions": len({paired["pos"][i] for i in keep}),
+        "expectancy_usdt": _cluster_ci([paired["d_usdt"][i] for i in keep],
+                                       [paired["pos"][i] for i in keep]),
+        "expectancy_r": _cluster_ci([paired["d_r"][i] for i in keep],
+                                    [paired["pos"][i] for i in keep]),
+    }
     out["sufficient_data"] = {
         "required": {"ab_rows_with_outcome": MIN_AB_WITH_OUTCOME, "aa_pairs": MIN_AA},
         "have": {"ab_rows_with_outcome": n, "aa_pairs": len(aa)},
@@ -181,7 +279,10 @@ def guardian_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
     return out
 
 
-def candidate_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
+def candidate_section(
+    bot: sqlite3.Connection, sh: sqlite3.Connection, verified: dict | None = None
+) -> dict:
+    verified = verified or {}
     ev = {r["candidate_id"]: r for r in sh.execute("SELECT * FROM candidate_evidence")}
     groups: dict = defaultdict(lambda: defaultdict(list))
     live_ids = {
@@ -200,19 +301,20 @@ def candidate_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
         g["confirmed"].append(c["status"] == "CONFIRMED")
         pos = bot.execute("SELECT * FROM positions WHERE candidate_id = ?", (cid,)).fetchone()
         g["live"].append(bool(pos and pos["position_id"] in live_ids))
-        if pos and pos["status"] == "CLOSED" and pos["simulated_fill_exit"] is not None:
-            pnl = (
-                (float(pos["simulated_fill_exit"]) - float(pos["simulated_fill_entry"]))
-                * float(pos["size"])
-                - float(pos["fees"] or 0)
-                - float(pos["funding"] or 0)
-            )
-            risk = abs(float(pos["simulated_fill_entry"]) - float(pos["stop_loss"])) * float(
-                pos["size"]
-            )
+        if (
+            pos
+            and pos["status"] == "CLOSED"
+            and pos["simulated_fill_exit"] is not None
+            and _paper_risk(pos)  # zero-size: no exposure, not a trade outcome
+        ):
+            pnl, risk = _paper_pnl(pos), _paper_risk(pos)
             g["pnl"].append(pnl)
-            g["r"].append(pnl / risk if risk else 0.0)
+            g["r"].append(pnl / risk)
             g["day"].append(pos["opened_at"][:10])
+            v = verified.get(pos["position_id"], {})
+            if v.get("verified") and v.get("r") is not None:
+                g["r_verified"].append(v["r"])
+                g["day_verified"].append(pos["opened_at"][:10])
     out: dict = {}
     for status, g in sorted(groups.items()):
         p = g["pnl"]
@@ -225,6 +327,10 @@ def candidate_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
             "expectancy_r": _cluster_ci(g["r"], g["day"]) if len(p) >= 2 else None,
             "total_pnl_usdt": round(sum(p), 2) if p else None,
             "win_rate": _rate([x > 0 for x in p]),
+            "verified_trades": len(g["r_verified"]),
+            "expectancy_r_verified": _cluster_ci(g["r_verified"], g["day_verified"])
+            if len(g["r_verified"]) >= 2
+            else None,
         }
     # The evidence status as a (hypothetical) warning label on closed trades:
     # a NEGATIVE_OOS trade that WON is a false alarm; a non-negative one that
@@ -250,6 +356,18 @@ def candidate_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
         "expectancy_r_all": _mean(all_r),
         "expectancy_r_if_filtered": _mean(rest_r),
     }
+    neg_v = groups.get("NEGATIVE_OOS", {}).get("r_verified", [])
+    rest_v = [
+        x for s_, g in groups.items() if s_ != "NEGATIVE_OOS" for x in g.get("r_verified", [])
+    ]
+    out["_counterfactual_verified_exits_only_NOT_APPLIED"] = {
+        "trades": len(neg_v) + len(rest_v),
+        "negative_oos_trades": len(neg_v),
+        "expectancy_r_negative_oos": _mean(neg_v),
+        "expectancy_r_other": _mean(rest_v),
+        "expectancy_r_all": _mean(neg_v + rest_v),
+        "expectancy_r_if_filtered": _mean(rest_v),
+    }
     out["_sufficient_data"] = {
         "required_closed_trades": MIN_CLOSED_TRADES,
         "have": len(all_r),
@@ -261,7 +379,12 @@ def candidate_section(bot: sqlite3.Connection, sh: sqlite3.Connection) -> dict:
 def main() -> None:
     s = get_settings()
     bot, sh = _ro(s.db_path), _ro(s.evidence.shadow_db)
-    report = {"guardian_ab": guardian_section(bot, sh), "candidates": candidate_section(bot, sh)}
+    verified = verified_outcomes(s.db_path)
+    report = {
+        "verified_positions": sum(v["verified"] for v in verified.values()),
+        "guardian_ab": guardian_section(bot, sh, verified),
+        "candidates": candidate_section(bot, sh, verified),
+    }
     print(json.dumps(report, indent=1))
     Path("data/entry_research/evidence_ab_report.json").write_text(
         json.dumps(report, indent=1), encoding="utf-8"
