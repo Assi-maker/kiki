@@ -139,6 +139,33 @@ class EvidenceReader:
             }
         return out
 
+    def overview(self, decision_time: datetime) -> dict | None:
+        """Status and headline of every signal type (all regimes) in the
+        newest snapshot with as_of <= decision_time."""
+        snap = self.snapshot_for(decision_time)
+        if snap is None:
+            return None
+        rows = self._conn.execute(
+            "SELECT signal_type, side, oos_status, headline, train_only_positive FROM"
+            " evidence_verdict WHERE snapshot_id=? AND regime_dim='ALL' ORDER BY signal_type, side",
+            (snap["snapshot_id"],),
+        ).fetchall()
+        return {
+            "evidence_as_of": snap["as_of"],
+            "signals": {
+                f"{r['signal_type']} {r['side']}": {
+                    "status": r["oos_status"],
+                    "headline": r["headline"],
+                    "train_only_positive_warning": bool(r["train_only_positive"]),
+                }
+                for r in rows
+            },
+            "caveats": [
+                snap["survivorship_note"],
+                "Evidence is context, not a rule: it never opens, closes, sizes or vetoes.",
+            ],
+        }
+
     def _verdict(self, sid: str, typ: str, side: str, dim: str, val: str) -> dict | None:
         r = self._conn.execute(
             "SELECT oos_status, strength, vs_baseline, train_only_positive, protocol_accepted,"

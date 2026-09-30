@@ -461,6 +461,15 @@ class ShadowConfig(BaseModel):
     evaluation_interval_seconds: int = 1800
 
 
+class EvidenceConfig(BaseModel):
+    """Historical Evidence Layer (2026-09-30) - see config/evidence.yaml.
+    Context only: it never opens, closes, sizes, vetoes or moves a stop."""
+
+    context_enabled: bool = False  # Guardian AI + GODFATHER strategist context
+    evidence_db: str = "data/historical_evidence.db"
+    shadow_db: str = "data/evidence_shadow.db"
+
+
 class GatePolicyConfig(BaseModel):
     """P1 Gate content requirements (2026-09-28) - see config/gate.yaml.
     Defaults ARE the production values."""
@@ -489,6 +498,7 @@ class Settings(BaseModel):
     gate: GatePolicyConfig = Field(default_factory=GatePolicyConfig)
     costs: CostModelConfig = Field(default_factory=CostModelConfig)
     shadow: ShadowConfig = Field(default_factory=ShadowConfig)
+    evidence: EvidenceConfig = Field(default_factory=EvidenceConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -530,6 +540,7 @@ def get_settings() -> Settings:
         gate=_load_yaml_model(_CONFIG_DIR / "gate.yaml", GatePolicyConfig),
         costs=costs,
         shadow=_load_yaml_model(_CONFIG_DIR / "shadow.yaml", ShadowConfig),
+        evidence=_load_yaml_model(_CONFIG_DIR / "evidence.yaml", EvidenceConfig),
     )
 
 

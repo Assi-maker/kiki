@@ -24,7 +24,11 @@ def build_ai_context(
     progress_ratio: Decimal,
     unrealized_pnl: Decimal,
     new_state: str,
+    historical_evidence: dict | None = None,
 ) -> dict:
+    """`historical_evidence` (2026-09-30, config/evidence.yaml, default OFF):
+    interpretation material only. It is added to what the AI reads and to
+    nothing else - the state passed in is already decided deterministically."""
     context: dict = {
         "new_state": new_state,
         "decay_score": str(decay_score),
@@ -37,4 +41,6 @@ def build_ai_context(
             assessment = getattr(candidate, role)
             if assessment is not None:
                 context[f"{role}_assessment"] = assessment.model_dump(mode="json")
+    if historical_evidence is not None:
+        context["historical_evidence"] = historical_evidence
     return context

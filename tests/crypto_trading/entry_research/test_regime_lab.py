@@ -141,7 +141,9 @@ def test_no_bot_module_imports_the_regime_lab_or_the_archive_fill():
     offenders = []
     for p in (ROOT / "crypto_trading").rglob("*.py"):
         rel = p.relative_to(ROOT).as_posix()
-        if rel.startswith("crypto_trading/entry_research/"):
+        # evidence_shadow: separate research-side process reusing the research
+        # feature code on purpose (never imported by the bot - tested).
+        if rel.startswith(("crypto_trading/entry_research/", "crypto_trading/evidence_shadow/")):
             continue
         text = p.read_text(encoding="utf-8")
         if "regime_lab" in text or "archive_fill" in text:

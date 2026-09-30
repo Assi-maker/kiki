@@ -1,0 +1,13 @@
+# Historical Evidence Layer (2026-09-30, design:
+# docs/superpowers/specs/2026-09-30-historical-evidence-layer-design.md).
+# Evidence is CONTEXT only - it never opens, closes, sizes, vetoes, moves a
+# stop or changes a cap. Guardian keeps deterministic authority over
+# HOLD/WATCH/PROTECT/EXIT; the Safety Kernel is not involved.
+#
+# OFF until the shadow classifier is verified (user decision 2026-09-30).
+# When true, Guardian's AI explanation and the GODFATHER strategist receive
+# the historical evidence for the position's / book's signal types.
+context_enabled: false
+# Read-only for the bot (written by the offline builder / shadow service).
+evidence_db: "data/historical_evidence.db"
+shadow_db: "data/evidence_shadow.db"

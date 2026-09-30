@@ -254,7 +254,10 @@ def test_no_bot_module_imports_the_research_engine():
     offenders = []
     for p in (ROOT / "crypto_trading").rglob("*.py"):
         rel = p.relative_to(ROOT).as_posix()
-        if rel.startswith("crypto_trading/entry_research/"):
+        # evidence_shadow is a separate research-side process that reuses the
+        # research feature code on purpose; no bot module may import IT
+        # (tests/crypto_trading/evidence/test_evidence_shadow.py).
+        if rel.startswith(("crypto_trading/entry_research/", "crypto_trading/evidence_shadow/")):
             continue
         text = p.read_text(encoding="utf-8")
         if "event_engine" in text or "derivs_data" in text:

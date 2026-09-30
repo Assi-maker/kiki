@@ -8,6 +8,7 @@ from crypto_trading.agents.loader import load_agent_definition
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.bingx_live_trading import BingXLiveTradingConnector
+from crypto_trading.evidence.bridge import evidence_for_candidate
 from crypto_trading.guardian.ai_context import build_ai_context, should_invoke_ai
 from crypto_trading.guardian.authority import (
     decide_open_position,
@@ -372,7 +373,12 @@ def process_one_position(
     ai_cost_usd: Decimal | None = None
     if should_invoke_ai(previous, new_state):
         if _budget_allows_one_more_call(repo, settings, now):
-            context = build_ai_context(candidate, factors, decay_score, progress_ratio, unrealized_pnl, new_state)
+            # Historical evidence (config/evidence.yaml, default OFF): AI
+            # context ONLY - new_state above is already decided and final.
+            context = build_ai_context(
+                candidate, factors, decay_score, progress_ratio, unrealized_pnl, new_state,
+                historical_evidence=evidence_for_candidate(settings, position.candidate_id, now),
+            )
             agent_def = load_agent_definition(_GUARDIAN_AGENT_FILE)
             assessment: GuardianAssessment = runner.run(agent_def, context, GuardianAssessment)
             billed = getattr(runner, "last_call_billed", True)
