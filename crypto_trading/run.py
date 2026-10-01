@@ -435,6 +435,16 @@ def startup_problems(environ: dict[str, str] | None = None) -> list[str]:
     return problems
 
 
+SAFE_MODE_REASON = "CRYPTO_TRADING_SAFE_MODE=1 active (hard breaker)"
+
+
+def _disabled_reason(default: str) -> str:
+    """Observability only: the startup log names SAFE_MODE when it is what
+    switched a thread off, instead of the arm flag's usual reason. Never
+    decides anything - the gating stays in config.loader."""
+    return SAFE_MODE_REASON if is_safe_mode() else default
+
+
 def main() -> None:
     # First, before anything that can fail: a startup error must be on disk too.
     configure_persistent_logging(log_dir_from_env())
@@ -529,7 +539,7 @@ def main() -> None:
     # no AI analysis) - used for the service smoke test; default unchanged.
     if os.environ.get("CRYPTO_TRADING_DISCOVERY_DISABLED") or is_safe_mode():
         log_event("startup", event="discovery_disabled",
-                  reason="CRYPTO_TRADING_DISCOVERY_DISABLED set")
+                  reason=_disabled_reason("CRYPTO_TRADING_DISCOVERY_DISABLED set"))
     else:
         threads.insert(0, discovery_thread)
     # P1 (2026-10-01): FROZEN / RESEARCH-ONLY layers do not run in the
@@ -565,7 +575,7 @@ def main() -> None:
         log_event(
             "startup",
             event="telegram_notify_disabled",
-            reason="TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing",
+            reason=_disabled_reason("TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing"),
         )
 
     def _dashboard_repo_factory() -> SQLiteRepository:
@@ -605,7 +615,7 @@ def main() -> None:
         log_event(
             "startup",
             event="demo_execution_disabled",
-            reason="CRYPTO_TRADING_DEMO_EXECUTION_ENABLED not set",
+            reason=_disabled_reason("CRYPTO_TRADING_DEMO_EXECUTION_ENABLED not set"),
         )
 
     if is_guardian_enabled():
@@ -620,7 +630,8 @@ def main() -> None:
         )
     else:
         log_event(
-            "startup", event="guardian_disabled", reason="CRYPTO_TRADING_GUARDIAN_ENABLED not set"
+            "startup", event="guardian_disabled",
+            reason=_disabled_reason("CRYPTO_TRADING_GUARDIAN_ENABLED not set"),
         )
 
     if is_live_execution_enabled():
@@ -641,7 +652,7 @@ def main() -> None:
     else:
         log_event(
             "startup", event="live_execution_disabled",
-            reason="CRYPTO_TRADING_LIVE_EXECUTION_ENABLED not set",
+            reason=_disabled_reason("CRYPTO_TRADING_LIVE_EXECUTION_ENABLED not set"),
         )
 
     # Watchdog (2026-09-28): every loop above records one `runs` row per tick
@@ -683,9 +694,10 @@ def main() -> None:
     # exchange is cancelled or closed - SL/TP stay, the next start reconciles.
     while not lifecycle.SHUTDOWN.wait(1.0):
         pass
-    log_event("shutdown", event="shutdown_requested")
+    log_event("shutdown", event="shutdown_requested", safe_mode=is_safe_mode())
     finished = lifecycle.wait_for_live_tick_to_finish(timeout_seconds=120)
-    log_event("shutdown", event="shutdown_complete", live_tick_finished=finished)
+    log_event("shutdown", event="shutdown_complete", live_tick_finished=finished,
+              safe_mode=is_safe_mode())
     instance_lock.release()
     raise SystemExit(lifecycle.EXIT_OK)
 

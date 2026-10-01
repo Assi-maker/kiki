@@ -244,3 +244,20 @@ def test_safe_mode_line_in_dotenv_is_a_hard_breaker_over_live_in_the_same_file(m
     (tmp_path / ".env").write_text(armed, encoding="utf-8")
     loader.get_settings()
     assert loader.is_live_execution_enabled()  # the breaker line is what blocks LIVE
+
+
+def test_startup_log_names_safe_mode_as_the_reason_when_it_blocks(monkeypatch):
+    """Observability only (2026-10-01): with SAFE_MODE on, the startup log
+    must say SAFE_MODE switched LIVE/demo/Guardian off - not "... not set"
+    while .env actually arms them. Without SAFE_MODE the old reasons stay."""
+    from crypto_trading import run
+
+    monkeypatch.setenv("CRYPTO_TRADING_SAFE_MODE", "1")
+    for default in ("CRYPTO_TRADING_LIVE_EXECUTION_ENABLED not set",
+                    "CRYPTO_TRADING_DEMO_EXECUTION_ENABLED not set",
+                    "CRYPTO_TRADING_GUARDIAN_ENABLED not set"):
+        assert run._disabled_reason(default) == "CRYPTO_TRADING_SAFE_MODE=1 active (hard breaker)"
+    monkeypatch.delenv("CRYPTO_TRADING_SAFE_MODE")
+    assert run._disabled_reason("CRYPTO_TRADING_LIVE_EXECUTION_ENABLED not set") == (
+        "CRYPTO_TRADING_LIVE_EXECUTION_ENABLED not set"
+    )
