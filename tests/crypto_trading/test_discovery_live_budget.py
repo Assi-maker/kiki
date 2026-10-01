@@ -205,16 +205,16 @@ def test_1_of_4_with_capital_for_1_sends_exactly_the_usable_slot_count(tmp_path)
     assert _ai_calls(repo) == 1 * _AI_CALLS_PER_FULL_ANALYSIS
 
 
-def test_0_of_4_with_capital_for_all_uses_the_normal_uncapped_budget(tmp_path):
+def test_0_of_4_with_capital_for_all_analyses_at_most_the_4_free_slots(tmp_path):
+    # 2026-10-01 user rule: 4 free LIVE slots = at most 4 full analyses, even
+    # though max_candidates_per_discovery_run=10 would allow all 5.
     repo = _repo_with_open(tmp_path, 0)
     connector = _n_triggering_symbols_connector(5)
 
     _tick(repo, connector, _Live(available="500"))
 
-    assert (
-        _ai_calls(repo) == 5 * _AI_CALLS_PER_FULL_ANALYSIS
-    )  # all 5, under max_candidates_per_discovery_run=10
-    assert _gate_events(repo)[-1]["outcome"] == "normal"
+    assert _ai_calls(repo) == 4 * _AI_CALLS_PER_FULL_ANALYSIS
+    assert _gate_events(repo)[-1]["outcome"] == "capped"
 
 
 def test_live_not_armed_is_completely_unchanged_no_cap_no_gate_event(tmp_path):

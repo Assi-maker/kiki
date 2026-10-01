@@ -142,11 +142,13 @@ def test_a_configured_candidate_buffer_never_lifts_a_zero_budget(tmp_path):
     assert decision.max_candidates == 0
 
 
-def test_0_of_4_with_capital_for_all_4_is_the_normal_uncapped_budget(tmp_path):
+def test_0_of_4_with_capital_for_all_4_is_capped_at_the_4_free_slots(tmp_path):
+    # 2026-10-01 user rule: never analyse more candidates than there are free
+    # LIVE slots - 4 free slots = at most 4 analyses, not the normal 10.
     decision = _evaluate(_repo_with_open(tmp_path, 0), _Live(available="500"))
 
     assert decision.suppressed_reason is None
-    assert decision.max_candidates is None  # None == the normal max_candidates_per_discovery_run
+    assert decision.max_candidates == 4
 
 
 def test_0_of_4_but_capital_for_only_2_is_capped_at_2(tmp_path):

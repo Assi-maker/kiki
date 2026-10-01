@@ -131,10 +131,10 @@ class LiveDiscoveryGate:
             )
             if usable <= 0:
                 return LiveDiscoveryDecision(SUPPRESSED_CAPITAL, 0, **common)
-            if usable >= cfg.max_concurrent_positions:
-                # Every slot is free AND affordable: nothing constrains
-                # LIVE, so the normal discovery budget applies.
-                return LiveDiscoveryDecision(None, None, **common)
+            # 2026-10-01 user rule: never analyse more candidates than there
+            # are usable LIVE slots - also when every slot is free (that used
+            # to fall back to the normal 10-candidate budget and spent AI
+            # credits on signals LIVE had no room for).
             return LiveDiscoveryDecision(
                 None, usable + cfg.discovery_candidate_buffer, **common
             )
