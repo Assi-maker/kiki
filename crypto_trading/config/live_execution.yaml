@@ -28,7 +28,15 @@ signal_ttl_seconds: 1800
 # +1.0% unrealized profit -> real BingX SL moved to break-even. TP/initial
 # SL/entry/sizing/leverage/Gate/Risk/AI/exposure/Guardian all unchanged -
 # this flag ONLY arms the break-even SL replacement mechanism.
-profit_protection_enabled: true
+# DISABLED 2026-10-01 (explicit user decision). The break-even stop sits
+# exactly at avgPrice, so every PP exit lost fees + stop slippage (real LIVE:
+# 33 PP exits, 6 % win rate, -64 USDT). Replay (trade_review_results.json,
+# 1000 notional): 256 bot trades -90 with PP vs +947 without, better without
+# PP in all four periods, p = 0.02; 107 LIVE trades -197 vs +45, not
+# significant. On the broader 1135-signal set no-PP was worse in TEST and
+# HOLDOUT. This is evidence that PP hurt the EXISTING strategy's historical
+# result - NOT evidence of a positive trading edge.
+profit_protection_enabled: false
 profit_protection_threshold_pct: "0.01"
 
 # Discovery-side AI-cost gate (2026-09-19, paper_trading/live_discovery_gate.py).
