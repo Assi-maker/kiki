@@ -208,3 +208,39 @@ def test_safe_mode_forces_every_arm_flag_off_even_when_env_arms_them(monkeypatch
     assert not loader.is_guardian_enabled()
     assert not loader.is_demo_execution_enabled()
     assert build_notifier_from_env() is None
+
+
+_ARM_VARS = ("CRYPTO_TRADING_LIVE_EXECUTION_ENABLED", "CRYPTO_TRADING_GUARDIAN_ENABLED",
+             "CRYPTO_TRADING_DEMO_EXECUTION_ENABLED", "CRYPTO_TRADING_SAFE_MODE")
+
+
+def _isolate_env(monkeypatch):
+    # setenv + delenv: teardown restores the ORIGINAL (absent) state, so the
+    # values load_dotenv() writes into os.environ below never leak to other tests.
+    for name in _ARM_VARS:
+        monkeypatch.setenv(name, "x")
+        monkeypatch.delenv(name)
+
+
+def test_safe_mode_line_in_dotenv_is_a_hard_breaker_over_live_in_the_same_file(monkeypatch, tmp_path):
+    """2026-10-01: SAFE_MODE=1 sits in the real .env as the hard stop while
+    LIVE is stopped, NEXT TO LIVE_EXECUTION_ENABLED=1. Through the bot's own
+    start path (get_settings() loads .env before any arm flag is read) the
+    breaker must win - and without that line the same .env would arm LIVE."""
+    from crypto_trading.config import loader
+
+    monkeypatch.setattr(loader, "_PROJECT_ROOT", tmp_path)
+    armed = "".join(f"{n}=1\n" for n in _ARM_VARS[:3])
+
+    _isolate_env(monkeypatch)
+    (tmp_path / ".env").write_text(armed + "CRYPTO_TRADING_SAFE_MODE=1\n", encoding="utf-8")
+    loader.get_settings()
+    assert loader.is_safe_mode()
+    assert not loader.is_live_execution_enabled()
+    assert not loader.is_guardian_enabled()
+    assert not loader.is_demo_execution_enabled()
+
+    _isolate_env(monkeypatch)
+    (tmp_path / ".env").write_text(armed, encoding="utf-8")
+    loader.get_settings()
+    assert loader.is_live_execution_enabled()  # the breaker line is what blocks LIVE

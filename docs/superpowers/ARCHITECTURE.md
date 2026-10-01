@@ -79,6 +79,11 @@ Task Scheduler "crypto_trading_watchdog" -> logs/heartbeat.json (larmar bara)
 - **Start:** `Start-ScheduledTask crypto_trading_bot`, eller `start_bot.bat`.
 - **Stopp:** `stop_bot.bat`.
 - **Status:** `python -m crypto_trading.supervisor status`.
+- **Hård brytare (sedan 2026-10-01, LIVE stoppad):** `.env` innehåller `CRYPTO_TRADING_SAFE_MODE=1` bredvid `CRYPTO_TRADING_LIVE_EXECUTION_ENABLED=1`.
+  - Effekt: LIVE, demo/VST, Guardian, Telegram och discovery är av även om tasken aktiveras eller `start_bot.bat` körs. Ingen signerad trading-connector byggs.
+  - Verifierat via den riktiga startvägen (supervisor → bot): bara monitoring körde, inga order och inga positioner.
+  - Testad i `tests/crypto_trading/test_supervisor.py`.
+  - LIVE kan bara startas igen om raden tas bort ur `.env`.
 
 ## RESEARCH PATH: PAPER/shadow → mätning → rapport
 
