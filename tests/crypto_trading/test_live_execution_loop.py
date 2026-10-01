@@ -158,7 +158,14 @@ def test_run_live_execution_tick_never_calls_profit_protection_when_disabled(tmp
     repo = SQLiteRepository(tmp_path / "t.db")
     _seed_open_position(repo)
     connector = _SpyConnector()
-    settings = get_settings()
+    # Explicitly OFF (2026-10-01): the running yaml has it ON by user
+    # decision, so the "disabled" case must be constructed, not assumed.
+    base = get_settings()
+    settings = base.model_copy(update={
+        "live_execution": base.live_execution.model_copy(
+            update={"profit_protection_enabled": False}
+        )
+    })
     assert settings.live_execution.profit_protection_enabled is False
 
     with patch(

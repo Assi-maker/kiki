@@ -131,6 +131,13 @@ def test_main_configures_persistent_logging_before_anything_else(monkeypatch, tm
 
     monkeypatch.setattr(run_module, "get_settings", _settings_fail)
     import pytest as _pytest
-    with _pytest.raises(_Stop):
+
+    from crypto_trading.lifecycle import EXIT_CONFIG
+
+    # P1 (2026-10-01): a config failure is a controlled refusal (EXIT_CONFIG,
+    # which the supervisor retries slowly), still logged to the file first.
+    with _pytest.raises(SystemExit) as exit_info:
         run_module.main()
+    assert exit_info.value.code == EXIT_CONFIG
+    assert isinstance(exit_info.value.__cause__, _Stop)
     assert [str(p) for p in calls] == [str(tmp_path / "logs")]

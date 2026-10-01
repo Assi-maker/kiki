@@ -1,0 +1,23 @@
+# AI pipeline on the entry path (P1, 2026-10-01).
+#
+# Which AI roles run for a candidate between the quant shortlist and the
+# deterministic Risk/Signal Gate. The 2026-10-01 audit
+# (docs/superpowers/reports/2026-10-01-p1-simplification.md) found that only
+# the Risk Agent's output reaches a decision (its stop-loss / target are what
+# the Gate checks and what the position is opened with). News, Technical,
+# Bull, Forecast and Bear were read by nothing that decides (Forecast only by
+# a shadow check), and CONFIRMED candidates did worse than every other group.
+#
+# entry_roles: AI roles run per candidate, always in the legacy order. The
+#   code default (loader.py) is the full legacy chain; this file is the
+#   production decision. Valid names: news_sentiment, technical, bull_thesis,
+#   forecast, risk, bear_adversarial. "risk" is required (the Gate needs its
+#   SL/TP).
+# deterministic_qa: true = the QA step is code (gate/qa_checks.py), no LLM
+#   call. false = the legacy QA/Gate LLM agent.
+# opportunity_screening_shadow_enabled: the cheap pre-screen call was SHADOW
+#   only (budget_limits.opportunity_screening_enforce: false) - it cost calls
+#   and changed nothing. false = not called at all unless enforce is true.
+entry_roles: ["risk"]
+deterministic_qa: true
+opportunity_screening_shadow_enabled: false

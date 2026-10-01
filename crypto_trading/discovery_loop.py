@@ -123,7 +123,9 @@ def run_discovery_tick(
     # independent of the others" discipline monitoring_loop.py already
     # established for its own per-feature tick calls.
     try:
-        if settings.guardian.authority_enabled:
+        # P1 (2026-10-01): frozen research layer unless frozen_layers switches it on.
+        if (settings.guardian.authority_enabled
+                and settings.frozen_layers.godfather_self_improvement_enabled):
             run_godfather_self_improvement_tick(repo, runner, settings, run_id, now)
     except Exception as exc:
         log_event(
@@ -208,8 +210,8 @@ def run_discovery_tick(
 def _pre_ai_shadow_hook(repo, live_connector, settings):
     """SHADOW pre-AI feasibility (2026-09-29): only when LIVE is armed (it
     needs real equity); never blocks anything. None = not measured."""
-    if live_connector is None:
-        return None
+    if live_connector is None or not settings.frozen_layers.pre_ai_feasibility_shadow_enabled:
+        return None  # P1 (2026-10-01): frozen research layer unless switched on
     try:
         from crypto_trading.shadow.pre_ai_feasibility_hook import build_hook
 

@@ -829,3 +829,29 @@ def test_run_single_cycle_opens_each_confirmed_position_during_the_cycle_not_aft
 
     assert log == ["after first: 1 open call(s)"]
     assert opened_calls == [[first], [second]]  # per candidate, and no batch at the end
+
+
+def test_run_single_cycle_p1_skips_shadow_only_screening_call(tmp_path):
+    """P1 (2026-10-01): with enforce=False and
+    ai_pipeline.opportunity_screening_shadow_enabled=False the pre-screen
+    is not called at all (it decided nothing), and the outcome is the same
+    as with the shadow call."""
+    from crypto_trading.config.loader import AiPipelineConfig
+
+    repo = SQLiteRepository(tmp_path / "t.db")
+    runner = MockAgentRunner(fixtures=_happy_fixtures())
+
+    class _MustNotRun(MockAgentRunner):
+        def run(self, agent_def, context, output_schema):
+            raise AssertionError("screener must not be called in P1 shadow-off mode")
+
+    settings = _settings().model_copy(update={"ai_pipeline": AiPipelineConfig(
+        opportunity_screening_shadow_enabled=False)})
+    positions = run_single_cycle(
+        _build_snapshots()[1], repo, runner, settings, run_id="run-1",
+        screener_runner=_MustNotRun(fixtures={}),
+    )
+    assert len(positions) == 1
+    assert repo._conn.execute(
+        "SELECT COUNT(*) AS n FROM assessments WHERE field_name = 'opportunity_screen'"
+    ).fetchone()["n"] == 0

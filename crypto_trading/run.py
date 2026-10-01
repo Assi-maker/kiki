@@ -32,6 +32,7 @@ from crypto_trading.config.loader import (
     is_demo_execution_enabled,
     is_guardian_enabled,
     is_live_execution_enabled,
+    is_safe_mode,
 )
 from crypto_trading.connectors.bingx_demo_trading import BingXDemoTradingConnector
 from crypto_trading.connectors.bingx_live_trading import BingXLiveTradingConnector
@@ -39,6 +40,7 @@ from crypto_trading.connectors.bingx_market_data import BingXMarketDataConnector
 from crypto_trading.connectors.external_data import ExternalDataConnector
 from crypto_trading.connectors.news_rss import NewsRSSConnector
 from crypto_trading.dashboard.api import RepositoryFactory, create_app
+from crypto_trading import lifecycle
 from crypto_trading.logging import configure_persistent_logging, log_event, new_run_id
 from crypto_trading.notify.telegram import TelegramNotifier
 from crypto_trading.single_instance import AlreadyRunningError, InstanceLock, lock_path_for
@@ -140,7 +142,7 @@ def build_notifier_from_env() -> TelegramNotifier | None:
     (Fas 5.5) redan hanteras som valfria icke-kritiska källor."""
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not bot_token or not chat_id:
+    if not bot_token or not chat_id or is_safe_mode():
         return None
     return TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
 
@@ -421,11 +423,32 @@ def _run_dashboard_forever(app: FastAPI, settings: Settings) -> None:
         )
 
 
+def startup_problems(environ: dict[str, str] | None = None) -> list[str]:
+    """P1 (2026-10-01): what makes a start pointless or unsafe, checked BEFORE
+    any thread starts. LIVE without its own keys is not a problem (LIVE then
+    simply does not start, as before); the AI key is, because discovery and
+    Guardian cannot run without it."""
+    env = os.environ if environ is None else environ
+    problems = []
+    if not env.get("ANTHROPIC_API_KEY"):
+        problems.append("ANTHROPIC_API_KEY missing")
+    return problems
+
+
 def main() -> None:
     # First, before anything that can fail: a startup error must be on disk too.
     configure_persistent_logging(log_dir_from_env())
     process_started_at = datetime.now(UTC)
-    settings = get_settings()
+    try:
+        settings = get_settings()
+    except Exception as exc:  # noqa: BLE001 - any config error: refuse to start
+        log_event("startup", event="startup_refused", reason="config_invalid",
+                  error_type=type(exc).__name__, error=str(exc)[:500])
+        raise SystemExit(lifecycle.EXIT_CONFIG) from exc
+    problems = startup_problems()
+    if problems:
+        log_event("startup", event="startup_refused", reason="credentials", problems=problems)
+        raise SystemExit(lifecycle.EXIT_CONFIG)
     # One process per database (2026-09-25): two concurrent bots doubled
     # every loop on 2026-09-12. Held for the whole process lifetime and
     # released by the OS on exit, so a crash never leaves a stale lock.
@@ -434,7 +457,13 @@ def main() -> None:
         instance_lock.acquire()
     except AlreadyRunningError as exc:
         print(f"crypto_trading is already running: {exc}")
-        raise SystemExit(1) from exc
+        log_event("startup", event="startup_refused", reason="already_running")
+        raise SystemExit(lifecycle.EXIT_ALREADY_RUNNING) from exc
+    # P1 (2026-10-01): orderly stop on a stop file / Ctrl-C / SIGTERM / SIGBREAK.
+    lifecycle.install_signal_handlers()
+    stop_file = lifecycle.stop_file_path()
+    log_event("startup", event="bot_started", pid=os.getpid(), stop_file=str(stop_file),
+              safe_mode=is_safe_mode())
     runner = build_runner_from_env()
     screener_runner = build_screener_runner_from_env()
     detective_runner = build_detective_runner_from_env()
@@ -494,12 +523,26 @@ def main() -> None:
         args=(settings,),
         daemon=True,
     )
-    threads = [discovery_thread, monitoring_thread, detective_thread]
+    frozen = settings.frozen_layers
+    threads = [monitoring_thread]
+    # P1 (2026-10-01): opt-out for a manage-only process (no new candidates,
+    # no AI analysis) - used for the service smoke test; default unchanged.
+    if os.environ.get("CRYPTO_TRADING_DISCOVERY_DISABLED") or is_safe_mode():
+        log_event("startup", event="discovery_disabled",
+                  reason="CRYPTO_TRADING_DISCOVERY_DISABLED set")
+    else:
+        threads.insert(0, discovery_thread)
+    # P1 (2026-10-01): FROZEN / RESEARCH-ONLY layers do not run in the
+    # trading process unless config/frozen_layers.yaml switches them on.
+    if frozen.detective_enabled:
+        threads.append(detective_thread)
+    else:
+        log_event("startup", event="frozen_layer_not_started", layer="detective")
     # Gated on its own config flag rather than an env var: unlike Guardian
     # or LIVE execution, this thread cannot touch a position or an order,
     # so it needs no arming ritual - but it must still be switchable from
     # the same place its behaviour is documented.
-    if settings.godfather.intelligence_enabled:
+    if settings.godfather.intelligence_enabled and frozen.godfather_intelligence_enabled:
         threads.append(godfather_thread)
         threads.append(threading.Thread(
             target=_run_kline_archive_forever, args=(connector, settings), daemon=True,
@@ -508,7 +551,7 @@ def main() -> None:
         log_event(
             "startup",
             event="godfather_intelligence_disabled",
-            reason="godfather.intelligence_enabled is false",
+            reason="godfather.intelligence_enabled or frozen_layers flag is false",
         )
 
     notifier = build_notifier_from_env()
@@ -605,14 +648,20 @@ def main() -> None:
     # under these run_type names; the watchdog alerts when one stops ticking
     # or its thread dies, and writes logs/heartbeat.json for the external
     # scheduled check (python -m crypto_trading.watchdog).
-    threads.append(threading.Thread(
-        target=_run_shadow_forever, args=(connector, settings), daemon=True,
-        name="shadow_evaluation",
-    ))
-    threads.append(threading.Thread(
-        target=_run_entry_quality_forever, args=(connector, settings), daemon=True,
-        name="entry_quality_shadow",
-    ))
+    if frozen.shadow_evaluation_enabled:
+        threads.append(threading.Thread(
+            target=_run_shadow_forever, args=(connector, settings), daemon=True,
+            name="shadow_evaluation",
+        ))
+    else:
+        log_event("startup", event="frozen_layer_not_started", layer="shadow_evaluation")
+    if frozen.entry_quality_shadow_enabled:
+        threads.append(threading.Thread(
+            target=_run_entry_quality_forever, args=(connector, settings), daemon=True,
+            name="entry_quality_shadow",
+        ))
+    else:
+        log_event("startup", event="frozen_layer_not_started", layer="entry_quality_shadow")
     loop_threads = {
         thread.name: thread for thread in threads if thread.name in watchdog.LOOP_STALE_AFTER_SECONDS
     }
@@ -624,10 +673,21 @@ def main() -> None:
         name="watchdog",
     ))
 
+    threads.append(threading.Thread(
+        target=lifecycle.watch_stop_file, args=(stop_file,), daemon=True, name="stop_watch",
+    ))
     for thread in threads:
         thread.start()
-    for thread in threads:
-        thread.join()
+    # P1 (2026-10-01): wait for a stop request instead of joining daemon
+    # threads forever; then let a running LIVE tick finish. Nothing on the
+    # exchange is cancelled or closed - SL/TP stay, the next start reconciles.
+    while not lifecycle.SHUTDOWN.wait(1.0):
+        pass
+    log_event("shutdown", event="shutdown_requested")
+    finished = lifecycle.wait_for_live_tick_to_finish(timeout_seconds=120)
+    log_event("shutdown", event="shutdown_complete", live_tick_finished=finished)
+    instance_lock.release()
+    raise SystemExit(lifecycle.EXIT_OK)
 
 
 if __name__ == "__main__":

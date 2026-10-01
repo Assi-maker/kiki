@@ -141,6 +141,11 @@ class Repository(Protocol):
     def get_godfather_entry_quality_verdict(self, candidate_id: str) -> str | None: ...
     def verified_live_result(self, position_id: str) -> dict | None: ...
     def record_live_exit_verification(self, position_id: str, result, verified_at: datetime) -> None: ...
+    def record_external_close(self, row: dict) -> None: ...
+    def set_external_close_reason(self, position_id: str, reason: str, noted_at: datetime) -> bool: ...
+    def list_external_closes(self) -> list[dict]: ...
+    def get_external_close(self, position_id: str) -> dict | None: ...
+    def find_verified_closed_live_executions(self) -> list[dict]: ...
     def find_active_live_execution_for_instrument(self, instrument: str) -> dict | None: ...
     def find_positions_pending_live_execution(self, limit: int) -> list[Position]: ...
     def get_candidate_confirmed_at(self, candidate_id: str) -> datetime | None: ...
@@ -1458,6 +1463,44 @@ class SQLiteRepository:
                  text(getattr(result, "exit_slippage_usdt", None)), position_id),
             )
         self._conn.commit()
+
+    def record_external_close(self, row: dict) -> None:
+        """P1 (2026-10-01): idempotent - a row already recorded (and any reason
+        already noted on it) is never overwritten."""
+        columns = ("position_id", "symbol", "direction", "entry_price", "close_price",
+                   "quantity", "pnl_usdt", "fees_usdt", "classification", "source",
+                   "order_ids", "closed_at", "detected_at")
+        self._conn.execute(
+            f"INSERT OR IGNORE INTO external_closes ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)})",
+            tuple(row.get(c) for c in columns),
+        )
+        self._conn.commit()
+
+    def set_external_close_reason(self, position_id: str, reason: str, noted_at: datetime) -> bool:
+        cursor = self._conn.execute(
+            "UPDATE external_closes SET reason = ?, reason_noted_at = ? WHERE position_id = ?",
+            (reason, noted_at.isoformat(), position_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount == 1
+
+    def list_external_closes(self) -> list[dict]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT * FROM external_closes ORDER BY closed_at"
+        ).fetchall()]
+
+    def get_external_close(self, position_id: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM external_closes WHERE position_id = ?", (position_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def find_verified_closed_live_executions(self) -> list[dict]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT * FROM live_executions WHERE phase = 'CLOSED' "
+            "AND exit_verification = 'VERIFIED' ORDER BY closed_at"
+        ).fetchall()]
 
     def mark_live_execution_failed(
         self, position_id: str, last_error: str, updated_at: datetime

@@ -48,3 +48,7 @@ logs/
 # Entry research: DB snapshot, kline cache, generated datasets (reproducible via
 # python -m crypto_trading.entry_research.run --snapshot)
 data/entry_research/
+
+# P1 (2026-10-01): supervisor runtime files
+data/supervisor.lock
+data/STOP_BOT

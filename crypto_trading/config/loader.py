@@ -461,6 +461,46 @@ class ShadowConfig(BaseModel):
     evaluation_interval_seconds: int = 1800
 
 
+class FrozenLayersConfig(BaseModel):
+    """FROZEN / RESEARCH-ONLY layers (P1, 2026-10-01) - see
+    config/frozen_layers.yaml. Defaults = the pre-P1 process (all running)."""
+
+    detective_enabled: bool = True
+    godfather_intelligence_enabled: bool = True
+    shadow_evaluation_enabled: bool = True
+    entry_quality_shadow_enabled: bool = True
+    pre_ai_feasibility_shadow_enabled: bool = True
+    godfather_self_improvement_enabled: bool = True
+
+
+class AiPipelineConfig(BaseModel):
+    """AI roles on the entry path (P1, 2026-10-01) - see config/ai_pipeline.yaml.
+    Code defaults are the LEGACY full chain (same convention as
+    live_execution.profit_protection_enabled: the yaml carries the decision)."""
+
+    entry_roles: list[str] = Field(
+        default_factory=lambda: [
+            "news_sentiment", "technical", "bull_thesis", "forecast", "risk", "bear_adversarial",
+        ]
+    )
+    deterministic_qa: bool = False
+    opportunity_screening_shadow_enabled: bool = True
+
+    @field_validator("entry_roles")
+    @classmethod
+    def _known_roles_and_risk_required(cls, roles: list[str]) -> list[str]:
+        known = {"news_sentiment", "technical", "bull_thesis", "forecast", "risk",
+                 "bear_adversarial"}
+        unknown = [r for r in roles if r not in known]
+        if unknown:
+            raise ValueError(f"unknown entry roles: {unknown}")
+        if "risk" not in roles:
+            raise ValueError("entry_roles must include 'risk' (the Gate needs its SL/TP)")
+        if len(set(roles)) != len(roles):
+            raise ValueError("entry_roles contains duplicates")
+        return roles
+
+
 class EvidenceConfig(BaseModel):
     """Historical Evidence Layer (2026-09-30) - see config/evidence.yaml.
     Context only: it never opens, closes, sizes, vetoes or moves a stop."""
@@ -499,6 +539,8 @@ class Settings(BaseModel):
     costs: CostModelConfig = Field(default_factory=CostModelConfig)
     shadow: ShadowConfig = Field(default_factory=ShadowConfig)
     evidence: EvidenceConfig = Field(default_factory=EvidenceConfig)
+    ai_pipeline: AiPipelineConfig = Field(default_factory=AiPipelineConfig)
+    frozen_layers: FrozenLayersConfig = Field(default_factory=FrozenLayersConfig)
 
 
 def _load_yaml_model(path: Path, model: type[BaseModel]) -> BaseModel:
@@ -541,14 +583,25 @@ def get_settings() -> Settings:
         costs=costs,
         shadow=_load_yaml_model(_CONFIG_DIR / "shadow.yaml", ShadowConfig),
         evidence=_load_yaml_model(_CONFIG_DIR / "evidence.yaml", EvidenceConfig),
+        ai_pipeline=_load_yaml_model(_CONFIG_DIR / "ai_pipeline.yaml", AiPipelineConfig),
+        frozen_layers=_load_yaml_model(_CONFIG_DIR / "frozen_layers.yaml", FrozenLayersConfig),
     )
+
+
+def is_safe_mode() -> bool:
+    """P1 (2026-10-01) hard OFF switch for maintenance and smoke tests:
+    CRYPTO_TRADING_SAFE_MODE=1 forces LIVE execution, demo execution,
+    Guardian, Telegram and discovery off, whatever .env says. Needed because
+    an arm flag cannot be "unset" from a wrapper: removing the variable lets
+    load_dotenv() put the .env value straight back."""
+    return bool(os.environ.get("CRYPTO_TRADING_SAFE_MODE"))
 
 
 def is_guardian_enabled() -> bool:
     """Opt-in arm flag for the Guardian thread - same plain os.environ.get()
     pattern as is_demo_execution_enabled() (no load_dotenv() of its own;
     callers always run after get_settings() has already loaded .env once)."""
-    return bool(os.environ.get("CRYPTO_TRADING_GUARDIAN_ENABLED"))
+    return bool(os.environ.get("CRYPTO_TRADING_GUARDIAN_ENABLED")) and not is_safe_mode()
 
 
 def is_demo_execution_enabled() -> bool:
@@ -560,7 +613,7 @@ def is_demo_execution_enabled() -> bool:
     YAML setting: matches how the other optional threads (dashboard,
     Telegram) are gated in this codebase, and keeps "should this thread run
     at all" a deploy-time decision, not a checked-in default."""
-    return bool(os.environ.get("CRYPTO_TRADING_DEMO_EXECUTION_ENABLED"))
+    return bool(os.environ.get("CRYPTO_TRADING_DEMO_EXECUTION_ENABLED")) and not is_safe_mode()
 
 
 def is_live_execution_enabled() -> bool:
@@ -568,4 +621,4 @@ def is_live_execution_enabled() -> bool:
     is_demo_execution_enabled()/is_guardian_enabled(). Stays unset/False for
     the entire implementation plan; activation is a separate, later,
     explicit decision (see design spec §16)."""
-    return bool(os.environ.get("CRYPTO_TRADING_LIVE_EXECUTION_ENABLED"))
+    return bool(os.environ.get("CRYPTO_TRADING_LIVE_EXECUTION_ENABLED")) and not is_safe_mode()

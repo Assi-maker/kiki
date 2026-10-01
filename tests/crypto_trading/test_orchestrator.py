@@ -591,9 +591,11 @@ def test_the_gate_decision_is_evaluated_with_policy_and_now_and_fully_audited(tm
     seen = {}
     real_gate = orchestrator_module.evaluate_risk_signal_gate
 
-    def spy_gate(candidate, open_positions, max_concurrent, policy=None, now=None):
-        seen.update(policy=policy, now=now)
-        return real_gate(candidate, open_positions, max_concurrent, policy=policy, now=now)
+    def spy_gate(candidate, open_positions, max_concurrent, policy=None, now=None,
+                 required_roles=None):
+        seen.update(policy=policy, now=now, required_roles=required_roles)
+        return real_gate(candidate, open_positions, max_concurrent, policy=policy, now=now,
+                         required_roles=required_roles)
 
     monkeypatch.setattr(orchestrator_module, "evaluate_risk_signal_gate", spy_gate)
     repo = SQLiteRepository(tmp_path / "t.db")

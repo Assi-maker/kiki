@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import time
 from datetime import UTC, datetime
 from decimal import Decimal
 
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.bingx_live_trading import BingXLiveTradingConnector
+from crypto_trading.lifecycle import LIVE_TICK_LOCK, SHUTDOWN
 from crypto_trading.logging import log_event, new_run_id
 from crypto_trading.paper_trading.live_execution import (
     close_guardian_exit_positions,
@@ -100,9 +100,14 @@ def run_forever(
     min_notional_by_symbol: dict[str, Decimal],
     settings: Settings,
 ) -> None:
-    while True:
-        run_live_execution_tick(
-            repo, connector, market_data_connector, quantity_precision_by_symbol,
-            min_notional_by_symbol, settings, datetime.now(UTC),
-        )
-        time.sleep(settings.live_execution.check_interval_seconds)
+    # P1 (2026-10-01): a tick runs under LIVE_TICK_LOCK and no new tick
+    # starts once SHUTDOWN is set, so an orderly stop never lands mid-tick.
+    while not SHUTDOWN.is_set():
+        with LIVE_TICK_LOCK:
+            if SHUTDOWN.is_set():
+                break
+            run_live_execution_tick(
+                repo, connector, market_data_connector, quantity_precision_by_symbol,
+                min_notional_by_symbol, settings, datetime.now(UTC),
+            )
+        SHUTDOWN.wait(settings.live_execution.check_interval_seconds)

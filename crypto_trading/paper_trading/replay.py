@@ -207,7 +207,13 @@ def run_single_cycle(
         limited_reason="live_slot_budget" if cap_is_binding else None,
     )
 
-    if screener_runner is not None:
+    # P1 (2026-10-01): the pre-screen was SHADOW only (enforce false) - a
+    # paid call that changed nothing. It runs only when it decides something
+    # or when shadow measurement is explicitly enabled.
+    screening_active = settings.budget_limits.opportunity_screening_enforce or (
+        settings.ai_pipeline.opportunity_screening_shadow_enabled
+    )
+    if screener_runner is not None and screening_active:
         screener_agent_def = load_agent_definition(_OPPORTUNITY_SCREENER_AGENT_FILE)
         apply_opportunity_screening(
             repo,
@@ -294,8 +300,10 @@ def _record_funnel(repo, run_id, now, *, markets_scanned, eligible, top_n, quant
         gate: dict[str, dict[str, int]] = {}
         ai_ok = ai_failed = 0
         for c in processed:
+            # P1: only the roles that ran (absent ones were not configured).
             roles = [getattr(c, r, None) for r in _ROLE_ORDER]
-            if all(a is not None and a.status == "ok" for a in roles):
+            ran = [a for a in roles if a is not None]
+            if ran and all(a.status == "ok" for a in ran):
                 ai_ok += 1
             else:
                 ai_failed += 1

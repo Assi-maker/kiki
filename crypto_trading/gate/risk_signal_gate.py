@@ -121,6 +121,7 @@ def evaluate_risk_signal_gate(
     max_concurrent_positions: int,
     policy: GatePolicyConfig | None = None,
     now: datetime | None = None,
+    required_roles: tuple[str, ...] | None = None,
 ) -> GateDecision:
     """SPEC §1 kärnprincip 1 / §8.3: helt oberoende av AI-utfallet - kan
     blockera CONFIRMED även när alla sju roller är positiva (AC4).
@@ -132,9 +133,11 @@ def evaluate_risk_signal_gate(
     failed/timeout-assessment, eller gatens egna oberoende regler - ger
     NO_TRADE, aldrig REJECTED.
     """
+    # P1 (2026-10-01): the roles that actually ran (orchestrator.active_roles);
+    # None = the legacy full chain.
     missing_or_failed = [
         role
-        for role in _REQUIRED_ROLES
+        for role in (required_roles or _REQUIRED_ROLES)
         if getattr(candidate, role) is None or getattr(candidate, role).status != "ok"
     ]
     if missing_or_failed:

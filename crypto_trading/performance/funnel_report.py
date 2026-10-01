@@ -37,9 +37,12 @@ def cycle_funnels(conn: sqlite3.Connection, since: datetime, until: datetime) ->
 def _ai_state(statuses: dict[str, str]) -> str:
     if not statuses:
         return "NOT_STARTED"
-    if all(statuses.get(r) == "ok" for r in _AI_ROLES):
+    # P1 (2026-10-01): roles that were not configured never ran; judge only
+    # the ones that did.
+    ran = [r for r in _AI_ROLES if r in statuses]
+    if ran and all(statuses[r] == "ok" for r in ran):
         return "ALL_OK"
-    return "FAILED:" + ",".join(r for r in _AI_ROLES if statuses.get(r) != "ok")
+    return "FAILED:" + ",".join(r for r in ran if statuses[r] != "ok")
 
 
 def candidate_paths(conn: sqlite3.Connection, since: datetime, until: datetime) -> list[dict]:

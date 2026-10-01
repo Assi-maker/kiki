@@ -1,6 +1,8 @@
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from crypto_trading.config.exceptions import ConfigError
@@ -340,9 +342,20 @@ def test_get_settings_loads_guardian_authority_shadow_enabled_default_false():
     observation code paths from this plan, separate and independent from
     authority_enabled. Must default to False - landing this config flag
     changes zero runtime behavior until a later, separate, explicit
-    activation decision."""
-    settings = get_settings()
-    assert settings.guardian.authority_shadow_enabled is False
+    activation decision.
+
+    2026-10-01: the CODE default stays False; the running guardian.yaml now
+    carries the later, explicit activation, and the loaded value must be
+    exactly that yaml value (this test was stale: it asserted the yaml was
+    still False after the deliberate activation)."""
+    from crypto_trading.config.loader import GuardianConfig
+
+    assert GuardianConfig().authority_shadow_enabled is False
+    raw = yaml.safe_load(
+        (Path(__file__).parents[3] / "crypto_trading/config/guardian.yaml")
+        .read_text(encoding="utf-8")
+    )
+    assert get_settings().guardian.authority_shadow_enabled is raw["authority_shadow_enabled"]
 
 
 def test_get_settings_loads_guardian_authority_shadow_yaml_documentation_byte_identical():
@@ -354,16 +367,15 @@ def test_get_settings_loads_guardian_authority_shadow_yaml_documentation_byte_id
     loading the real, running guardian.yaml must produce EXACTLY the same
     GuardianConfig.authority_shadow_enabled value as the bare Pydantic
     default, not just "close enough" or "the right type"."""
-    settings = get_settings()
-    guardian_cfg = settings.guardian
-    assert guardian_cfg.authority_shadow_enabled is False
-    # Cross-check directly against the Pydantic model's own bare defaults
-    # (no YAML involved at all) - the two must be identical, proving the
-    # new YAML entry genuinely changed nothing about the resulting config.
-    from crypto_trading.config.loader import GuardianConfig
-
-    bare_defaults = GuardianConfig()
-    assert guardian_cfg.authority_shadow_enabled == bare_defaults.authority_shadow_enabled
+    # 2026-10-01: the "documentation-only" premise ended when the flag was
+    # deliberately activated. What must still hold: the yaml entry is an
+    # explicit bool and is exactly what the running config loads.
+    raw = yaml.safe_load(
+        (Path(__file__).parents[3] / "crypto_trading/config/guardian.yaml")
+        .read_text(encoding="utf-8")
+    )
+    assert isinstance(raw["authority_shadow_enabled"], bool)
+    assert get_settings().guardian.authority_shadow_enabled is raw["authority_shadow_enabled"]
 
 
 def test_get_settings_loads_detective_config_from_real_yaml():
@@ -392,8 +404,17 @@ def test_detective_config_defaults_when_omitted():
 
 
 def test_get_settings_loads_live_profit_protection_defaults():
+    """Code default stays OFF; live_execution.yaml carries the explicit
+    activation. Stale until 2026-10-01: asserted the running config was OFF."""
+    from crypto_trading.config.loader import LiveExecutionConfig
+
+    assert LiveExecutionConfig.model_fields["profit_protection_enabled"].default is False
+    raw = yaml.safe_load(
+        (Path(__file__).parents[3] / "crypto_trading/config/live_execution.yaml")
+        .read_text(encoding="utf-8")
+    )
     settings = get_settings()
-    assert settings.live_execution.profit_protection_enabled is False
+    assert settings.live_execution.profit_protection_enabled is raw["profit_protection_enabled"]
     assert settings.live_execution.profit_protection_threshold_pct == Decimal("0.01")
 
 

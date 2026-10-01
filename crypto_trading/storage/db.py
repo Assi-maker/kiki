@@ -986,6 +986,27 @@ CREATE TABLE IF NOT EXISTS position_created_at (
     created_at TEXT NOT NULL
 );
 
+-- P1 (2026-10-01): LIVE closes the bot did not make (crypto_trading/
+-- external_closes.py). Attributed from the exchange's own order record;
+-- kept apart so they never mix with the bot's own exit performance.
+CREATE TABLE IF NOT EXISTS external_closes (
+    position_id TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    entry_price TEXT,
+    close_price TEXT,
+    quantity TEXT,
+    pnl_usdt TEXT,
+    fees_usdt TEXT,
+    classification TEXT,
+    source TEXT NOT NULL,
+    order_ids TEXT,
+    closed_at TEXT,
+    detected_at TEXT NOT NULL,
+    reason TEXT,
+    reason_noted_at TEXT
+);
+
 CREATE TRIGGER IF NOT EXISTS record_position_created_at
 AFTER INSERT ON positions
 BEGIN

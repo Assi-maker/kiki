@@ -207,7 +207,10 @@ def test_no_decision_path_reads_the_shadow_verdict():
                "crypto_trading/entry_research/pre_ai_calibration.py",
                "crypto_trading/entry_research/opportunity_v2.py",  # offline research only
                "crypto_trading/entry_research/ai_budget_funnel.py",  # read-only measurement
-               "crypto_trading/performance/pre_ai_feasibility_report.py"}
+               "crypto_trading/performance/pre_ai_feasibility_report.py",
+               # P1 (2026-10-01): only the frozen_layers on/off flag that keeps
+               # the shadow hook from running at all - never its verdict.
+               "crypto_trading/config/loader.py"}
     offenders = []
     for p in (ROOT / "crypto_trading").rglob("*.py"):
         rel = p.relative_to(ROOT).as_posix()

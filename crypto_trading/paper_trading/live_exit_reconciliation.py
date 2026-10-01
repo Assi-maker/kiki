@@ -217,6 +217,24 @@ def _read_exchange(connector, instrument: str, start: datetime, end: datetime):
     return orders, funding
 
 
+def _log_if_external(repo, position_id: str, run_id: str, now: datetime) -> None:
+    """P1 (2026-10-01): a verified close the bot did not make goes to
+    `external_closes` and its own log line. Never fails the verification."""
+    try:
+        from crypto_trading.external_closes import record_if_external
+
+        row = record_if_external(repo, position_id, now)
+    except Exception as exc:  # noqa: BLE001 - logging must never block verification
+        log_event(run_id, event="external_close_record_failed", position_id=position_id,
+                  error_type=type(exc).__name__, error=str(exc))
+        return
+    if row is not None:
+        log_event(run_id, event="live_external_close_recorded", position_id=position_id,
+                  symbol=row["symbol"], direction=row["direction"], source=row["source"],
+                  entry_price=row["entry_price"], close_price=row["close_price"],
+                  pnl_usdt=row["pnl_usdt"], closed_at=row["closed_at"])
+
+
 def verify_closed_live_exits(
     repo, connector, run_id: str, now: datetime, limit: int = 5, grace: timedelta = VERIFY_GRACE
 ) -> int:
@@ -265,6 +283,8 @@ def verify_closed_live_exits(
             continue
         repo.record_live_exit_verification(row["position_id"], result, now)
         recorded += 1
+        if result.verification == "VERIFIED":
+            _log_if_external(repo, row["position_id"], run_id, now)
         log_event(
             run_id,
             event="live_exit_verified"

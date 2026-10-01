@@ -52,15 +52,25 @@ def format_confirmed_message(candidate: Candidate, position: Position) -> str:
     """SPEC §12 CONFIRMED-notis. Tar redan hämtade Candidate/Position-objekt
     som argument - gör ALDRIG en egen DB-fråga (Fas 6 AC4: samma underlag
     som en framtida dashboard-vy skulle läsa, aldrig en andra beräkning).
-    candidate.bull_thesis/forecast/risk kan strukturellt inte vara None för
-    en CONFIRMED candidate (Risk/Signal Gate kräver alla sju assessments
-    status='ok' innan CONFIRMED, se gate/risk_signal_gate.py)."""
+    candidate.risk kan strukturellt inte vara None för en CONFIRMED candidate
+    (Gate kräver den). Bull/Forecast körs inte längre som default (P1,
+    config/ai_pipeline.yaml) och visas bara när de finns."""
     evidence = candidate.evidence_record
-    dominant_scenario = max(
-        candidate.forecast.scenario_probabilities,
-        key=candidate.forecast.scenario_probabilities.get,
-    )
     rr = _risk_reward_ratio(position.simulated_fill_entry, position.stop_loss, position.target)
+    # P1 (2026-10-01): Bull/Forecast no longer run by default
+    # (config/ai_pipeline.yaml) - their lines appear only when present.
+    optional: list[str] = []
+    if candidate.bull_thesis is not None and candidate.bull_thesis.status == "ok":
+        optional.append(f"AI team: {candidate.bull_thesis.hypothesis}")
+    forecast = candidate.forecast
+    if forecast is not None and forecast.status == "ok" and forecast.scenario_probabilities:
+        dominant_scenario = max(
+            forecast.scenario_probabilities, key=forecast.scenario_probabilities.get
+        )
+        optional.append(
+            f"Forecast ({forecast.horizon}): {dominant_scenario} "
+            f"({forecast.scenario_probabilities[dominant_scenario]:.0%})"
+        )
     return "\n".join(
         [
             f"✅ CONFIRMED — {candidate.instrument} {position.direction}",
@@ -70,9 +80,7 @@ def format_confirmed_message(candidate: Candidate, position: Position) -> str:
             f"Risk/reward: {rr}",
             f"Candidate score: {evidence.candidate_score:.2f}",
             f"Evidence: {', '.join(evidence.trigger_reasons)}",
-            f"AI team: {candidate.bull_thesis.hypothesis}",
-            f"Forecast ({candidate.forecast.horizon}): {dominant_scenario} "
-            f"({candidate.forecast.scenario_probabilities[dominant_scenario]:.0%})",
+            *optional,
             f"Time: {candidate.updated_at.isoformat()}",
         ]
     )

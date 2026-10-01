@@ -9,6 +9,7 @@ from crypto_trading.agents.roles import ROLE_MAP
 from crypto_trading.agents.runner import AgentRunner
 from crypto_trading.config.loader import Settings
 from crypto_trading.connectors.exceptions import ConnectorUnavailableError
+from crypto_trading.gate.qa_checks import run_deterministic_qa
 from crypto_trading.gate.qa_gate import run_qa_gate
 from crypto_trading.gate.risk_signal_gate import evaluate_risk_signal_gate
 from crypto_trading.logging import log_event
@@ -19,6 +20,8 @@ from crypto_trading.schemas.forecast import ForecastRecord
 from crypto_trading.state_machine import can_transition, sweep_interrupted_analyses
 from crypto_trading.storage.repository import Repository
 
+# Every role the entry path has ever had, in its fixed order. Which of them
+# actually run is config/ai_pipeline.yaml (P1, 2026-10-01): see active_roles().
 _ROLE_ORDER = (
     "news_sentiment",
     "technical",
@@ -28,6 +31,19 @@ _ROLE_ORDER = (
     "bear_adversarial",
     "qa",
 )
+
+
+def active_roles(settings: Settings) -> tuple[str, ...]:
+    """The roles run for a candidate, in the legacy order; "qa" always last."""
+    configured = set(settings.ai_pipeline.entry_roles)
+    return tuple(role for role in _ROLE_ORDER if role in configured) + ("qa",)
+
+
+def ai_calls_per_candidate(settings: Settings) -> int:
+    """Billed model calls one candidate's chain makes (a deterministic QA step
+    makes none)."""
+    roles = active_roles(settings)
+    return len(roles) - (1 if settings.ai_pipeline.deterministic_qa else 0)
 
 # Kostnadsbudget (2026-09-03): konservativ worst-case-uppskattning av vad EN
 # kandidats fulla 7-rollskedja skulle kunna kosta, använd i
@@ -43,6 +59,8 @@ _ROLE_ORDER = (
 # $0.13-0.14 - denna konstant är medvetet ~10x högre för att vara ett äkta
 # säkerhetsnät, inte en gissning på snittkostnad.
 _WORST_CASE_COST_PER_CALL_USD = Decimal("0.20")
+# Legacy full-chain bound, kept for callers that do not pass settings; the
+# budget gate in run_discovery_cycle uses the configured chain's own count.
 _CONSERVATIVE_COST_PER_CANDIDATE_USD = _WORST_CASE_COST_PER_CALL_USD * len(_ROLE_ORDER)
 
 
@@ -73,7 +91,8 @@ class Orchestrator:
         run_discovery_cycle passes its own (simulated in replay) clock; the
         default is the real wall clock."""
         ai_calls = 0
-        for role in _ROLE_ORDER:
+        roles = active_roles(self._settings)
+        for role in roles:
             if ai_calls >= self._settings.budget_limits.max_ai_calls_per_discovery_run:
                 log_event(
                     run_id,
@@ -84,7 +103,13 @@ class Orchestrator:
                 break
             spec = ROLE_MAP[role]
             agent_def = load_agent_definition(spec.agent_file)
-            if role == "qa":
+            deterministic = role == "qa" and self._settings.ai_pipeline.deterministic_qa
+            if deterministic:
+                # P1 (2026-10-01): code, not a model call - see gate/qa_checks.py.
+                assessment = run_deterministic_qa(
+                    candidate, roles[:-1], run_id, datetime.now(UTC)
+                )
+            elif role == "qa":
                 # QA:s jobb (SPEC §4/§6, .claude/agents/crypto-qa-gate.md) är
                 # intern konsistens MELLAN de sex föregående rollernas
                 # bedömningar - strukturellt omöjligt via den generiska
@@ -109,7 +134,7 @@ class Orchestrator:
             # ofakturerat anrop loggas fortfarande som fel för diagnostik via
             # RealClaudeRunner.run()s egen agent_retry_failed-loggning
             # (oförändrad) - det får bara inte förbruka dagens budget.
-            billed = getattr(self._runner, "last_call_billed", True)
+            billed = (not deterministic) and getattr(self._runner, "last_call_billed", True)
             cost_usd = getattr(self._runner, "last_call_cost_usd", Decimal("0"))
             if billed:
                 ai_calls += 1
@@ -138,7 +163,7 @@ class Orchestrator:
             log_event(
                 run_id,
                 event="assessment_completed",
-                agent_name=agent_def.name,
+                agent_name=assessment.agent_name if deterministic else agent_def.name,
                 role=role,
                 status=assessment.status,
                 candidate_id=candidate.candidate_id,
@@ -154,7 +179,7 @@ class Orchestrator:
         gate_now = self._clock() if self._clock is not None else now
         decision = evaluate_risk_signal_gate(
             candidate, open_positions, self._settings.risk_limits.max_concurrent_positions,
-            policy=self._settings.gate, now=gate_now,
+            policy=self._settings.gate, now=gate_now, required_roles=roles,
         )
         # P1 (2026-09-28) audit trail: every enforced/shadow condition and metric.
         detail = {
@@ -322,8 +347,9 @@ def run_discovery_cycle(
     daily_cost_cap = settings.budget_limits.max_daily_ai_cost_usd
     day_start = _utc_day_start(effective_now)
     planned_calls_for_candidate = min(
-        len(_ROLE_ORDER), settings.budget_limits.max_ai_calls_per_discovery_run
+        ai_calls_per_candidate(settings), settings.budget_limits.max_ai_calls_per_discovery_run
     )
+    cost_per_candidate = _WORST_CASE_COST_PER_CALL_USD * ai_calls_per_candidate(settings)
 
     to_analyze = sorted(
         [
@@ -381,7 +407,7 @@ def run_discovery_cycle(
         # snittkostnad (skulle annars kunna starta en rollskedja som spränger
         # taket mitt i sig själv).
         cost_would_exceed = (
-            repo.sum_ai_cost_since(day_start) + _CONSERVATIVE_COST_PER_CANDIDATE_USD
+            repo.sum_ai_cost_since(day_start) + cost_per_candidate
             > daily_cost_cap
         )
         if calls_would_exceed or cost_would_exceed:

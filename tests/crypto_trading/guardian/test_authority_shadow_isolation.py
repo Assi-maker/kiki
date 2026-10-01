@@ -380,6 +380,10 @@ def test_no_touched_file_imports_position_sizing():
         for lineno, line in enumerate(_read(path).splitlines(), start=1):
             if lineno not in added:
                 continue
+            # Prose is not usage (2026-10-01): a SQL/Python comment that only
+            # names the sizing module cannot import or call it.
+            if line.strip().startswith(("#", "--")):
+                continue
             assert "position_sizing" not in line, f"{path}:{lineno} references position_sizing"
             assert "compute_position_size" not in line, f"{path}:{lineno} references compute_position_size"
 
@@ -706,12 +710,18 @@ def test_authority_shadow_enabled_defaults_false_in_guardian_config():
     assert GuardianConfig().authority_shadow_enabled is False
 
 
-def test_authority_shadow_enabled_defaults_false_in_guardian_yaml():
+def test_authority_shadow_enabled_is_an_explicit_bool_in_guardian_yaml():
+    """Was `..._defaults_false_in_guardian_yaml`, stale since the flag was
+    deliberately activated. The code default (test above) stays False; the
+    yaml must carry an explicit bool that the running config loads."""
     import yaml
+
+    from crypto_trading.config.loader import get_settings
 
     with (REPO_ROOT / "crypto_trading/config/guardian.yaml").open(encoding="utf-8") as f:
         raw = yaml.safe_load(f)
-    assert raw["authority_shadow_enabled"] is False
+    assert isinstance(raw["authority_shadow_enabled"], bool)
+    assert get_settings().guardian.authority_shadow_enabled is raw["authority_shadow_enabled"]
 
 
 def test_authority_enabled_is_one_bool_field_default_false_loaded_from_guardian_yaml():
@@ -740,20 +750,17 @@ def test_authority_enabled_is_one_bool_field_default_false_loaded_from_guardian_
     assert get_settings().guardian.authority_enabled is raw["authority_enabled"]
 
 
-def test_authority_enabled_yaml_key_is_unchanged_pre_existing_code():
-    added_text_lines = subprocess.run(
-        ["git", "diff", "-U0", f"{BASE_SHA}..HEAD", "--", "crypto_trading/config/guardian.yaml"],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    ).stdout.splitlines()
-    added_content = [
-        line[1:] for line in added_text_lines
-        if line.startswith("+") and not line.startswith("+++")
+def test_authority_enabled_yaml_key_is_declared_exactly_once():
+    """Was `..._unchanged_pre_existing_code` (a git diff against BASE_SHA),
+    stale since the key was deliberately set true on 2026-09-17 (4a6e507,
+    GODFATHER live activation). The invariant that still matters: exactly one
+    uncommented `authority_enabled:` declaration, so no second key can
+    silently override the first."""
+    text = (REPO_ROOT / "crypto_trading/config/guardian.yaml").read_text(encoding="utf-8")
+    declarations = [
+        line for line in text.splitlines() if re.match(r"^\s*authority_enabled\s*:", line)
     ]
-    offenders = [
-        line for line in added_content
-        if re.match(r"^\s*authority_enabled\s*:", line)
-    ]
-    assert offenders == [], f"authority_enabled yaml key was (re-)added: {offenders}"
+    assert len(declarations) == 1, declarations
 
 
 # Every production module that may reference `authority_enabled` at all

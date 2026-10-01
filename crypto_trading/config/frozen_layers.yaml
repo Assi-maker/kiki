@@ -1,0 +1,21 @@
+# FROZEN / RESEARCH-ONLY layers (P1, 2026-10-01).
+#
+# These layers never decide a LIVE entry, exit, size or stop. The 2026-10-01
+# reviews (docs/superpowers/reports/2026-10-01-*.md) found no validated effect
+# from any of them, so they are frozen: no functional changes, code kept in
+# git, and their threads/hooks do not run inside the trading process. A layer
+# is switched back on only for a concrete, pre-registered hypothesis.
+#
+# Code defaults (loader.py FrozenLayersConfig) are true = the pre-P1 process;
+# this file is the decision. Not listed here because they are part of the
+# SAFETY path and stay as they are: Guardian, Guardian Authority, Safety
+# Kernel, LIVE Profit Protection, watchdog.
+detective_enabled: false              # post-trade AI analyst (+ GODFATHER strategist calls)
+godfather_intelligence_enabled: false # GODFATHER intelligence loop + its 1m kline archive
+shadow_evaluation_enabled: false      # P3-P6 shadow evaluator thread
+entry_quality_shadow_enabled: false   # Entry Quality Layer shadow thread
+pre_ai_feasibility_shadow_enabled: false  # discovery pre-AI feasibility shadow hook
+# GODFATHER heuristic self-improvement (daily strategist LLM proposal ->
+# validate -> promote). Frozen: Guardian Authority itself keeps running with
+# the heuristics it has (none promoted to date), it just stops learning.
+godfather_self_improvement_enabled: false
