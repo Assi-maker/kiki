@@ -4,20 +4,21 @@
 
 **NO ROBUST EDGE FOUND.**
 
-- 8 fundamentalt olika hypotesfamiljer, 1 484 förregistrerade celler (familj × parametrar × sida × horisont).
+- 1 484 förregistrerade celler (8 mekanismer, 104 händelsemängder; cell = familj × parametrar × sida × horisont). Cellerna är inte oberoende hypoteser: horisonterna är nästlade, FADE/FOLLOW är spegelbilder och trösklar/delmängder är nästlade.
+- **0 celler klarade urvalet ens utan multipeltestskorrigering** (TRAIN p < 0,05 och VALID netto > 0 med p < 0,05). Slutsatsen beror alltså inte på hur testerna grupperas.
 - **0 klarar** multiple-testing-korrektionen på TRAIN som också håller i VALID. 0 når TEST/HOLDOUT-steget. 0 SURVIVING EDGE.
 - Inget har byggts. Ingen tradingkod, LIVE-execution, Safety Kernel, Guardian, max 4, max 1/symbol, %-gränser, leverage eller sizing har ändrats. GODFATHER är orörd.
 - Boten är stoppad hela tiden. Task Scheduler: `crypto_trading_bot` och `crypto_trading_evidence_shadow` står kvar som **Disabled**.
 
 | Steg | Antal |
 |---|---|
-| Hypoteser/celler testade | 1 484 |
+| Celler testade (8 mekanismer, 104 händelsemängder) | 1 484 |
 | TRAIN: netto > 0 (initialt positiva) | 326 |
 | TRAIN: netto p < 0,05 | 8 |
-| TRAIN: brutto p < 0,05 (riktningsinformation före kostnad) | 64 (≈ 74 väntas av ren slump) |
-| Efter Benjamini–Hochberg (q < 0,10) på TRAIN | 3 (alla F6, äkta likvidationer) |
+| TRAIN: brutto p < 0,05 (riktningsinformation före kostnad) | 64 (≈ 74 väntas av ren slump om cellerna vore oberoende, vilket de inte är – jämförelsen är grov) |
+| Efter Benjamini–Hochberg (q < 0,10) på TRAIN | 3 (alla F6, äkta likvidationer, **med timkluster**; se §16) |
 | Efter Bonferroni (p < 0,05) på TRAIN | 2 (samma F6-celler) |
-| + VALID (netto > 0, p < 0,05) | **0** |
+| + VALID (netto > 0, p < 0,05) | **0** (0 även utan någon korrektion) |
 | + TEST och HOLDOUT | 0 |
 | Håller i alla fyra perioderna och är signifikant | 0 |
 | SURVIVING EDGE | **0** |
@@ -131,7 +132,7 @@ Genomsnittligt NETTO (% per trade) över alla celler i familj × sida, i ordning
 - **Positiva LONG-siffror i HOLDOUT** är marknadsdrift, inte signal: en slumpmässig LONG på varje symbol och timme gav brutto +0,94 % per 24h i HOLDOUT, mot −0,22 % i TRAIN (`p4_benchmark.json`).
 - **F2 och F3 LONG i TRAIN** är medelvärden över FADE- och FOLLOW-celler med stor varians och få oberoende kluster. Ingen av dem är signifikant efter korrektion.
 
-**De tre BH-överlevarna i TRAIN** är alla F6 och samma mekanism: *shorts likviderade → FOLLOW LONG, 24h*.
+**De tre BH-överlevarna i TRAIN** (signifikanta bara med F6:s timkluster, se §16) är alla F6 och samma mekanism: *shorts likviderade → FOLLOW LONG, 24h*.
 
 | θ | TRAIN | VALID | TEST | HOLDOUT |
 |---|---|---|---|---|
@@ -240,11 +241,13 @@ Bland 1 484 celler väntas ett tiotal vara positiva i alla fyra perioderna av re
 
 ## 16. Multiple-testing correction
 
-- **BH över 1 484 celler:**
+- **BH över 1 484 celler** (8 mekanismer, 104 händelsemängder; cellerna är beroende):
   - TRAIN: 3 överlevare (F6 θ = 1/3/10 % SHORTS FOLLOW LONG 24h, q = 0,003/0,000/0,043).
+  - **Kvalificering:** F6 klustrades på **timme**, mot 4h i forskningsregistret (`stats.BLOCK_HOURS`) och dag/vecka i resten av P4. Timkluster underskattar standardfelet när likvidationskaskader varar i flera timmar, så de tre TRAIN-överlevarna är sannolikt en klustringseffekt. En grov omräkning med dagkluster (θ = 3 %: 6 dagkluster i TRAIN, t = 3,2) ger p ≈ 0,01, vilket inte klarar BH över 1 484 (minsta tröskel ≈ 0,00007).
   - VALID: 0 överlevare.
-- **Bonferroni:** 2 överlevare på TRAIN, 0 efter VALID.
-- **Naiva p < 0,05 (netto) på TRAIN:** 8 st. Med brutto 64 st, mot ≈ 74 väntade av slump.
+- **Bonferroni:** 2 överlevare på TRAIN (samma timklustrade F6-celler), 0 efter VALID.
+- **Utan multipeltestskorrigering:** 0 celler har TRAIN p < 0,05 och VALID netto > 0 med p < 0,05. BH per familj och BH över 202 grupper (familj × parametrar × sida) ger samma resultat: 0 i VALID.
+- **Naiva p < 0,05 (netto) på TRAIN:** 8 st. Med brutto 64 st, mot ≈ 74 väntade av slump om cellerna vore oberoende (grov jämförelse).
 
 ## 17. Förkastade hypoteser
 
