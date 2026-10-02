@@ -1,0 +1,17 @@
+# P5 trend strategy (2026-10-02). Research: docs/superpowers/reports/2026-10-02-p5-slow-timescale.md
+# Long BTC+ETH while the 20/50-day trend is up, flat otherwise; volatility-targeted size.
+# Replaces the intraday signal engine, which had no edge in 7 studies.
+
+mode: PAPER                # PAPER | LIVE. LIVE also needs: no CRYPTO_TRADING_SAFE_MODE, BINGX_API_KEY/SECRET.
+assets: [BTC-USDT, ETH-USDT]
+lookbacks_days: [20, 50]   # signal = mean of sign(close / close L days ago - 1), clipped at 0 (long/flat)
+vol_target_annual: 0.40    # per-asset size = vol_target / realised 30d vol (annualised), capped at max_scale
+vol_window_days: 30
+max_scale: 2.0             # per asset, before dividing by the number of assets -> gross <= 2x equity
+rebalance_band: 0.05       # skip a trade smaller than 5 % of strategy equity (cost control)
+leverage: 3                # exchange leverage; gross exposure is <= 2x, so margin use <= 67 %
+catastrophe_stop_pct: 0.20 # exchange-side STOP_MARKET this far below the rebalance price, refreshed daily
+capital_cap_usdt: null     # LIVE: trade min(account equity, cap); null = whole futures equity
+paper_start_equity: 1000.0
+fee_rate: 0.0005           # BingX taker
+slippage_rate: 0.0003

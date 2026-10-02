@@ -285,6 +285,27 @@ class BingXLiveTradingConnector:
             )
         )
 
+    def place_market_order(self, symbol: str, side: str, quantity: str, client_order_id: str) -> dict:
+        """P5 trend rebalance (2026-10-02): plain MARKET order on the LONG
+        bucket, no attached SL/TP. BUY opens/increases the LONG, SELL can
+        only reduce/close it (positionSide=LONG pins it to that bucket, same
+        safety property as close_position_market). Raises OrderRejectedError
+        on a structured rejection - zero fill guaranteed."""
+        if side not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": "LONG",
+            "type": "MARKET",
+            "quantity": quantity,
+            "clientOrderID": client_order_id,
+        }
+        try:
+            return _unwrap_order(self._request("POST", _ORDER_PATH, params))
+        except _ApiCodeError as exc:
+            raise OrderRejectedError(str(exc)) from exc
+
     def place_stop_loss_order(
         self, symbol: str, quantity: str, stop_price: str, client_order_id: str
     ) -> dict:

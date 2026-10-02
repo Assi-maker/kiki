@@ -134,8 +134,8 @@ def strategies(close, qv, fund):
         mom = (close / close.shift(L) - 1).where(uni)
         r = mom.rank(axis=1, ascending=False)
         cnt = mom.notna().sum(axis=1)
-        base = (r <= K_XS).astype(float) - (r > cnt.values[:, None] - K_XS).astype(float)
-        base = base.where(cnt.values[:, None] >= 2 * K_XS, 0.0) / (2 * K_XS)
+        base = (r <= K_XS).astype(float) - r.gt(cnt - K_XS, axis=0).astype(float)
+        base = base.mul((cnt >= 2 * K_XS).astype(float), axis=0) / (2 * K_XS)
         for H in (1, 7):
             w = base if H == 1 else base.where(pd.Series(np.arange(len(base)) % H == 0, index=base.index), np.nan).ffill()
             for sign, lab in ((1, "MOM"), (-1, "REV")):
@@ -145,8 +145,8 @@ def strategies(close, qv, fund):
         fm = fund.rolling(K, min_periods=K).mean().where(uni)
         r = fm.rank(axis=1, ascending=False)
         cnt = fm.notna().sum(axis=1)
-        base = -(r <= K_XS).astype(float) + (r > cnt.values[:, None] - K_XS).astype(float)
-        base = base.where(cnt.values[:, None] >= 2 * K_XS, 0.0) / (2 * K_XS)
+        base = -(r <= K_XS).astype(float) + r.gt(cnt - K_XS, axis=0).astype(float)
+        base = base.mul((cnt >= 2 * K_XS).astype(float), axis=0) / (2 * K_XS)
         w = base.where(pd.Series(np.arange(len(base)) % 7 == 0, index=base.index), np.nan).ffill()
         out[f"F4_K{K}"] = simulate(w, ret, fund, liq10)
     # F5: long spot (assumed = perp price) + short perp -> price cancels, earns funding, 2 legs of cost
