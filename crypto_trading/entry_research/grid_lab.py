@@ -70,6 +70,7 @@ THROUGH = 0.0001
 MIN_STEP = 0.002
 MARGIN = 100.0
 COOLDOWN = 60
+LIQ_INTRABAR = False  # robustness: liquidate on the bar's adverse extreme, losing the whole margin + 0.5 % fee
 
 
 @dataclass(frozen=True)
@@ -208,7 +209,14 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
                 if v.mode == "LONG" and pos < 1e-12:
                     pos = 0.0
             eq = cash + pos * c
-            if eq - arm_equity <= -0.9 * MARGIN * notional / 1000.0:
+            worst = cash + pos * (lo if pos > 0 else h)
+            if LIQ_INTRABAR and worst - arm_equity <= -MARGIN * notional / 1000.0:
+                cash = arm_equity - MARGIN * notional / 1000.0 - 0.005 * notional
+                pos = 0.0
+                stats["liquidations"] += 1
+                active = False
+                cooldown_until = i + COOLDOWN * bpd // 1440
+            elif eq - arm_equity <= -0.9 * MARGIN * notional / 1000.0:
                 close_all(c)
                 stats["liquidations"] += 1
                 active = False

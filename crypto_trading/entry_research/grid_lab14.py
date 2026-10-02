@@ -76,11 +76,12 @@ def series(k: int):
             h[j] = lo[j] = c[j]
     t = T0 + STEP * (a + np.arange(len(c)))
     bars = []
-    prev = c[0]
-    for j in range(len(c)):
+    cl, hl, ll, tl = c.tolist(), h.tolist(), lo.tolist(), t.tolist()  # plain floats: ~5x faster loop
+    prev = cl[0]
+    for j in range(len(cl)):
         o = prev
-        bars.append((int(t[j]), o, max(h[j], o, c[j]), min(lo[j], o, c[j]), c[j]))
-        prev = c[j]
+        bars.append((int(tl[j]), o, max(hl[j], o, cl[j]), min(ll[j], o, cl[j]), cl[j]))
+        prev = cl[j]
     cfv = np.nan_to_num(cf, nan=0.0)
     d = np.diff(cfv, prepend=cfv[0])
     fund = [(int(t[j]) + STEP, float(d[j])) for j in np.flatnonzero(d != 0)]
