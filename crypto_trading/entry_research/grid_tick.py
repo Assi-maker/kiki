@@ -146,6 +146,7 @@ class TickGrid:
         self.levels: list[float] = []
         self.live_at: list[int] = []
         self.idx = self.n = 0
+        self.held = 0  # net filled levels, INTEGER: pos == held * q exactly (float pos drifted, fixed 2026-10-02)
         self.q = self.s = 0.0
         self.arm_eq = 0.0
         self.st = {"fills": 0, "stops": 0, "guards": 0, "liquidations": 0, "arms": 0, "fees": 0.0,
@@ -163,6 +164,7 @@ class TickGrid:
             self.cash -= fee
             self.st["fees"] += fee
             self.pos = 0.0
+        self.held = 0
 
     def minute_close(self, mi: int, close: float) -> None:
         """Range stop and -90 % guard on the 1m close (as the candle engine)."""
@@ -205,26 +207,27 @@ class TickGrid:
             def above(x): return p > x
         while self.idx > 0 and live[self.idx - 1] <= t and below(lv[self.idx - 1]):
             px = lv[self.idx - 1]
-            self.pos += self.q
+            self.held += 1
+            self.pos = self.held * self.q
             self.cash -= self.q * px * (1 + G.MAKER)
             self.st["fees"] += self.q * px * G.MAKER
             self.st["fills"] += 1
             self.idx -= 1
             live[self.idx + 1] = t + self.lat
         while (self.idx < 2 * self.n and live[self.idx + 1] <= t and above(lv[self.idx + 1])
-               and self.pos > 1e-12):
+               and self.held > 0):
             px = lv[self.idx + 1]
-            self.pos -= self.q
+            self.held -= 1
+            self.pos = self.held * self.q
             self.cash += self.q * px * (1 - G.MAKER)
             self.st["fees"] += self.q * px * G.MAKER
             self.st["fills"] += 1
             self.idx += 1
             live[self.idx - 1] = t + self.lat
-        if self.pos < 1e-12:
-            self.pos = 0.0
         if self.pos > 0 and self.equity(p) - self.arm_eq <= -G.MARGIN:  # exchange liquidation, tick level
             self.cash = self.arm_eq - G.MARGIN - 0.005 * NOTIONAL
             self.pos = 0.0
+            self.held = 0
             self.st["liquidations"] += 1
             self.active = False
             self.cooldown_until = (t // MIN_MS) + G.COOLDOWN  # in absolute minutes; compared below

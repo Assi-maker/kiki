@@ -88,3 +88,22 @@ def test_funding_charged_on_inventory():
     g.trade(1_000, g.levels[g.n - 1] * 0.999)
     g.pay_funding(0.001)
     assert g.st["funding"] == pytest.approx(-g.pos * g.last_p * 0.001)
+
+
+def test_low_price_coin_inventory_never_exceeds_grid_size():
+    """Regression 2026-10-02: PUMP numbers (q = 17 320.5 coins) produced a float residue
+    (7.3e-12 > 1e-12) that allowed one extra sell; held drifted to 10 levels with n = 9."""
+    import random
+
+    g = TickGrid(V)
+    p0 = 0.006415
+    g.maybe_arm(0, 0, p0, SIG, 0.0)
+    rng = random.Random(1)
+    t = 0
+    for _ in range(20_000):
+        t += 1500
+        k = rng.randrange(0, g.n + 1)
+        g.trade(t, g.levels[k] * (0.999 if rng.random() < 0.5 else 1.001))
+        assert 0 <= g.held <= g.n
+        assert g.held == g.n - g.idx
+        assert g.pos == g.held * g.q

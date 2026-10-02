@@ -98,3 +98,21 @@ def test_funding_charged_on_long_inventory():
     no_f = G.run_grid(bars, [], G.sigma_series(closes), i0, len(bars), V, 1000.0)
     assert with_f["funding"] < 0 and with_f["pnl"] < no_f["pnl"]
     assert math.isclose(no_f["pnl"] - with_f["pnl"], -with_f["funding"], rel_tol=1e-9)
+
+
+def test_long_grid_low_price_inventory_bounded():
+    """Regression 2026-10-02: float residue in pos (PUMP, q ~ 17 320 coins) let a LONG
+    grid sell one level too many and later hold more than n levels (1461 > 1000 USDT)."""
+    p = 0.006415
+    base = [p * (1 + (0.003 if k % 2 else -0.003) / 2) for k in range(1500)]
+    tail = []
+    for k in range(400):
+        tail += [p * (0.985 - 0.001 * (k % 5)), p * 1.004, p * 0.99, p * 1.006]
+    closes = base + tail
+    bars = bars_from(closes)
+    sig = G.sigma_series(closes)
+    v = G.Variant("LONG", 1.0, 0.10, False)
+    st = G.run_grid(bars, [], sig, 1500, len(bars), v, 1000.0)
+    n = max(2, min(40, int(math.log(1 + v.k_range * sig[1500]) / math.log(1 + max(v.k_step * sig[1500], G.MIN_STEP)))))
+    assert st["fills"] > 100
+    assert 0 < st["max_held"] <= n

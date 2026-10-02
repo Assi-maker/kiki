@@ -124,7 +124,8 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
     active = False
     cooldown_until = i0
     stats = {"fills": 0, "stops": 0, "liquidations": 0, "arms": 0, "fees": 0.0, "funding": 0.0,
-             "inv_pnl": 0.0, "exposure_min": 0.0}
+             "inv_pnl": 0.0, "exposure_min": 0.0, "max_held": 0}
+    held = 0  # net filled levels as an INTEGER; pos == held * q exactly (float pos drifted, fixed 2026-10-02)
     levels: list[float] = []
     idx = n = 0
     q = s = 0.0
@@ -133,7 +134,8 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
     day_open_eq = 0.0
 
     def close_all(price: float) -> None:
-        nonlocal cash, pos
+        nonlocal cash, pos, held
+        held = 0
         if pos != 0:
             px = price * (1 - SLIP) if pos > 0 else price * (1 + SLIP)
             cash += pos * px
@@ -185,7 +187,9 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
                 if b < a:  # moving down: buys below idx
                     while idx > 0 and (idx - 1) not in fresh and b <= levels[idx - 1] * (1 - THROUGH):
                         px = levels[idx - 1]
-                        pos += q
+                        held += 1
+                        pos = held * q
+                        stats["max_held"] = max(stats["max_held"], abs(held))
                         cash -= q * px
                         fee = q * px * MAKER
                         cash -= fee
@@ -195,10 +199,12 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
                         fresh.add(idx + 1)
                 elif b > a:  # moving up: sells above idx
                     while idx < 2 * n and (idx + 1) not in fresh and b >= levels[idx + 1] * (1 + THROUGH):
-                        if v.mode == "LONG" and pos <= 1e-12:
+                        if v.mode == "LONG" and held <= 0:
                             break
                         px = levels[idx + 1]
-                        pos -= q
+                        held -= 1
+                        pos = held * q
+                        stats["max_held"] = max(stats["max_held"], abs(held))
                         cash += q * px
                         fee = q * px * MAKER
                         cash -= fee
@@ -206,13 +212,12 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
                         stats["fills"] += 1
                         idx += 1
                         fresh.add(idx - 1)
-                if v.mode == "LONG" and pos < 1e-12:
-                    pos = 0.0
             eq = cash + pos * c
             worst = cash + pos * (lo if pos > 0 else h)
             if LIQ_INTRABAR and worst - arm_equity <= -MARGIN * notional / 1000.0:
                 cash = arm_equity - MARGIN * notional / 1000.0 - 0.005 * notional
                 pos = 0.0
+                held = 0
                 stats["liquidations"] += 1
                 active = False
                 cooldown_until = i + COOLDOWN * bpd // 1440
