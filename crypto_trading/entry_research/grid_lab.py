@@ -95,8 +95,8 @@ def load(sym: str, db: sqlite3.Connection):
     return rows, fund
 
 
-def sigma_series(closes: list[float]) -> list[float | None]:
-    """sig[i] = daily vol from the 1440 log returns ending at close i-1 (known before bar i)."""
+def sigma_series(closes: list[float], bpd: int = 1440) -> list[float | None]:
+    """sig[i] = daily vol from the bpd (bars per day) log returns ending at close i-1 (known before bar i)."""
     s1 = [0.0]
     s2 = [0.0]
     for j in range(1, len(closes)):
@@ -104,14 +104,15 @@ def sigma_series(closes: list[float]) -> list[float | None]:
         s1.append(s1[-1] + r)
         s2.append(s2[-1] + r * r)
     out: list[float | None] = [None] * len(closes)
-    for i in range(1441, len(closes)):
-        a, b = s1[i - 1] - s1[i - 1441], s2[i - 1] - s2[i - 1441]  # returns j = i-1440 .. i-1 only
-        var = (b - a * a / 1440) / 1439
-        out[i] = math.sqrt(max(var, 0.0)) * math.sqrt(1440)
+    for i in range(bpd + 1, len(closes)):
+        a, b = s1[i - 1] - s1[i - 1 - bpd], s2[i - 1] - s2[i - 1 - bpd]  # returns j = i-bpd .. i-1 only
+        var = (b - a * a / bpd) / (bpd - 1)
+        out[i] = math.sqrt(max(var, 0.0)) * math.sqrt(bpd)
     return out
 
 
-def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, daily: dict | None = None) -> dict:
+def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, daily: dict | None = None,
+             bpd: int = 1440, daily_inv: dict | None = None) -> dict:
     """Simulate one grid account on bars[i0:i1] (indices into the full series)."""
     T = [b[0] for b in bars]
     C = [b[4] for b in bars]
@@ -158,8 +159,9 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
         if not active and i >= cooldown_until:
             sig = sig_s[i]
             ok = sig is not None and sig > 0
-            if ok and v.trend and i >= 240:
-                ok = abs(math.log(C[i - 1] / C[i - 241])) < sig * math.sqrt(240 / 1440)
+            w4h = bpd // 6
+            if ok and v.trend and i > w4h:
+                ok = abs(math.log(C[i - 1] / C[i - 1 - w4h])) < sig * math.sqrt(1 / 6)
             if ok:
                 p0 = C[i - 1]
                 s = max(v.k_step * sig, MIN_STEP)
@@ -172,6 +174,8 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
                 stats["arms"] += 1
         if pos != 0:  # analysis only: P/L of simply HOLDING the inventory carried into this bar
             stats["inv_pnl"] += pos * (c - C[i - 1])
+            if daily_inv is not None:
+                daily_inv[t // DAY] = daily_inv.get(t // DAY, 0.0) + pos * (c - C[i - 1])
             stats["exposure_min"] += abs(pos) * c / notional
         if active:
             path = (o, lo, h, c) if c >= o else (o, h, lo, c)
@@ -208,12 +212,12 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
                 close_all(c)
                 stats["liquidations"] += 1
                 active = False
-                cooldown_until = i + COOLDOWN
+                cooldown_until = i + COOLDOWN * bpd // 1440
             elif c > levels[-1] * (1 + s) or c < levels[0] * (1 - s):
                 close_all(c)
                 stats["stops"] += 1
                 active = False
-                cooldown_until = i + COOLDOWN
+                cooldown_until = i + COOLDOWN * bpd // 1440
     close_all(C[i1 - 1])
     if daily is not None and last_day is not None:
         daily[last_day] = daily.get(last_day, 0.0) + cash - day_open_eq
