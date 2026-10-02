@@ -121,7 +121,8 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
     pos = 0.0
     active = False
     cooldown_until = i0
-    stats = {"fills": 0, "stops": 0, "liquidations": 0, "arms": 0, "fees": 0.0, "funding": 0.0}
+    stats = {"fills": 0, "stops": 0, "liquidations": 0, "arms": 0, "fees": 0.0, "funding": 0.0,
+             "inv_pnl": 0.0, "exposure_min": 0.0}
     levels: list[float] = []
     idx = n = 0
     q = s = 0.0
@@ -169,6 +170,9 @@ def run_grid(bars, fund, sig_s, i0: int, i1: int, v: Variant, notional: float, d
                 active = True
                 arm_equity = cash + pos * p0
                 stats["arms"] += 1
+        if pos != 0:  # analysis only: P/L of simply HOLDING the inventory carried into this bar
+            stats["inv_pnl"] += pos * (c - C[i - 1])
+            stats["exposure_min"] += abs(pos) * c / notional
         if active:
             path = (o, lo, h, c) if c >= o else (o, h, lo, c)
             fresh: set[int] = set()
