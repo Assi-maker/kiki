@@ -95,4 +95,53 @@ Smoke runs on 2026-10-02 are only a feasibility check (the collector works, rule
 
 ---
 ## Results
-_(pending)_
+
+**Verdict: INVALID, neither PASS nor FAIL.** The evaluator printed PASS for `d2_all`, but a review on
+2026-10-19 found that the result rests on model defects and on a question paper data cannot answer.
+The decision rule's PASS branch, proposing a real-money test, is **not** triggered. A corrected test
+is pre-registered separately in `2026-10-19-polymarket-rewards-paper-test-v2.md`.
+
+**Run.**
+- The collector ran locally from 2026-10-02, then on Railway (EU) from 2026-10-06 to 2026-10-19.
+- The 7 valid days were 2026-10-07 to 10-13, each with 1440/1440 ticks. Days 10-03 to 10-06 were
+  below 80 % coverage and skipped under the rules.
+- A database snapshot is kept locally as `data/polymarket_paper/railway_v1_2026-10-19.db`
+  (sha256 of the gzip: `7ae43e10…dba85`).
+
+**Evaluator output (as printed, 2026-10-19).**
+
+| Variant | Verdict | Net | Rewards | Inventory | Fills | Positive days |
+|---|---|---|---|---|---|---|
+| d2_all (primary) | PASS | +318.80 | 346.83 | −28.03 | 53 | 7/7 |
+| d1_all | PASS | +128.75 | 193.65 | −64.90 | 37 | 5/7 |
+| d3_all | PASS | +427.66 | 440.13 | −12.47 | 58 | 7/7 |
+| d1_long | PASS | +118.65 | 165.40 | −46.75 | 38 | 5/7 |
+| d2_long | FAIL | +293.57 | 327.55 | −33.98 | 62 | 4/7 |
+| d3_long | PASS | +295.05 | 318.49 | −23.44 | 37 | 7/7 |
+
+Invariants held: max capital 100.00, max net inventory ratio 1.0. 27 markets were unresolved and marked at mid.
+
+**Why the result is invalid.**
+- **Rewards came almost entirely from uncontested minutes.** `d2_all` earned 262.98 USD in the
+  7-day window. Of that:
+  - 245.69 USD (93 %) came from minutes with no competitor in the book within max spread, where our
+    share was 100 %;
+  - 162.70 USD (62 %) came from one-sided quotes that were unwinding inventory.
+  - Counting only minutes with at least one competitor leaves 17.29 USD. That is less than the
+    inventory loss alone.
+- **The mid sat in an empty gap of the book.** Example: the Calder Trophy market.
+  - With dust under `min_size`, the size-cutoff mid was about 0.32 while the market traded at about 0.03.
+  - Our lone ask at about 0.33 then "won" the whole 28 USD/day pool for days.
+  - About 77 USD (29 %) came from quotes clamped by such hollow books.
+- **Stale reward rate (bug).** Held markets that left the reward list kept their last rate, so
+  rewards kept being credited. The Calder Trophy market had `rates: null` by 10-19, yet it was
+  credited at a constant 28 USD/day.
+- **Inventory marked at a false mid (bug).** Unresolved inventory was valued at the last
+  size-cutoff mid, so Calder Yes bought at 0.165 was marked near 0.32 instead of about 0.03. The
+  inventory loss is therefore understated.
+
+**What held.** Yes and No books are exact mirrors, so no competitor was missed on the No side. The
+capital and inventory invariants held.
+
+**Lesson.** The pre-registered "implausibly good is a bug until proven otherwise" was right. The
+evaluator should have reported how much of the reward depended on being alone in a market.
