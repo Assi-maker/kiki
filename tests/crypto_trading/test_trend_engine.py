@@ -256,3 +256,16 @@ def test_live_retry_after_failure_uses_new_client_ids(store):
     assert retry_ids and not (retry_ids & first_ids)
     assert len(r.trades) == 1  # the already-filled leg is not bought twice
     assert all(len(cid) <= 32 for cid in first_ids | retry_ids)
+
+
+def test_status_works_without_the_live_trading_stack(tmp_path, monkeypatch, capsys):
+    # the Railway PAPER image has no uvicorn, so importing the live connector fails there
+    from crypto_trading.trend import __main__ as cli
+
+    def no_stack():
+        raise ModuleNotFoundError("No module named 'uvicorn'")
+
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "trend.db")
+    monkeypatch.setattr(cli, "_trader", no_stack)
+    assert cli.cmd_status() == 0
+    assert "LIVE account: not available (No module named 'uvicorn')" in capsys.readouterr().out

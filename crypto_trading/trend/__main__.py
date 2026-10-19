@@ -100,7 +100,11 @@ def cmd_status() -> int:
             first, last = curve[0][1], curve[-1][1]
             print(f"  {mode} equity {first:.2f} -> {last:.2f} ({last / first - 1:+.2%}) over {len(curve)} days")
     store.close()
-    trader = _trader()
+    try:
+        trader = _trader()
+    except ImportError as e:  # PAPER-only image (Railway) has no live trading stack
+        print(f"  LIVE account: not available ({e})")
+        return 0
     if trader is not None:
         bal = trader.get_balance()
         print(f"  LIVE account equity {bal.get('equity')} available {bal.get('availableMargin')}")
