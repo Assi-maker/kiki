@@ -1,7 +1,8 @@
 """Evaluate the Polymarket rewards PAPER test against its pre-registered criteria.
 
-Usage: python -m crypto_trading.polymarket.evaluate [--db data/polymarket_paper/paper.db]
-Pre-registration: docs/superpowers/reports/2026-10-02-polymarket-rewards-paper-test.md
+Usage: python -m crypto_trading.polymarket.evaluate [--db data/polymarket_paper/paper_v2.db]
+Pre-registration: docs/superpowers/reports/2026-10-19-polymarket-rewards-paper-test-v2.md
+(v1: 2026-10-02-polymarket-rewards-paper-test.md; v1 databases have no ltp column)
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from crypto_trading.polymarket.paper import BUDGET, VARIANTS, Position, _get
 PRIMARY = "d2_all"
 MIN_COVERAGE = 0.80          # a UTC day with fewer ticks than this share of 1440 is invalid
 N_DAYS = 7
+DOMINANT_SHARE = 0.5         # v2 criterion 5: net must hold without minutes where we took > half
 GAMMA = "https://gamma-api.polymarket.com/markets?condition_ids="
 
 
@@ -54,25 +56,29 @@ def evaluate(db, resolve=True):
     if not days:
         return dict(status="NO_DATA", coverage=dict(cov))
     end_day = days[-1]
-    mids = defaultdict(list)                               # cid -> [(ts, mid)]
-    for ts, cid, mid in db.execute("SELECT ts, cid, mid FROM samples ORDER BY ts"):
-        mids[cid].append((ts, mid))
+    marks = defaultdict(list)                              # cid -> [(ts, last trade, else mid)]
+    for ts, cid, mid, ltp in db.execute("SELECT ts, cid, mid, ltp FROM samples ORDER BY ts"):
+        marks[cid].append((ts, ltp if ltp is not None else mid))
     sizes = {c: n for c, n in db.execute("SELECT cid, n FROM markets")}
     out = {}
     res_cache = {}
     for name, *_ in VARIANTS:
         rewards_day, rewards_mkt = defaultdict(float), defaultdict(float)
-        for ts, cid, r in db.execute("SELECT ts, cid, reward FROM samples WHERE variant=?", (name,)):
+        dominant = 0.0                                     # minutes where we held > half the pool
+        rows = db.execute("SELECT ts, cid, reward, share FROM samples WHERE variant=?", (name,))
+        for ts, cid, r, sh in rows:
             if day_of(ts) <= end_day:
                 rewards_day[day_of(ts)] += r
                 rewards_mkt[cid] += r
+                if sh > DOMINANT_SHARE:
+                    dominant += r
         fills = db.execute("SELECT ts, cid, side, price, size, reason FROM fills WHERE variant=? ORDER BY ts",
                            (name,)).fetchall()
         fills = [f for f in fills if day_of(f[0]) <= end_day]
 
         def mark(cid, until_ts):
             last = None
-            for ts, m in mids[cid]:
+            for ts, m in marks[cid]:
                 if ts > until_ts:
                     break
                 last = m
@@ -126,15 +132,17 @@ def evaluate(db, resolve=True):
             days_positive=sum(1 for x in daily if x["net"] > 0),
             without_best_market_positive=total - best[1] > 0,
             avg_reward_per_day_ge_1=total_rewards / max(1, len(rewards_day)) >= 1.0,
+            without_dominant_positive=total - dominant > 0,
         )
         complete = len(days) >= N_DAYS
         passed = (complete and crit["total_positive"] and crit["days_positive"] >= 5
-                  and crit["without_best_market_positive"] and crit["avg_reward_per_day_ge_1"])
+                  and crit["without_best_market_positive"] and crit["avg_reward_per_day_ge_1"]
+                  and crit["without_dominant_positive"])
         out[name] = dict(
             primary=name == PRIMARY, budget=BUDGET, days_evaluated=len(days), complete=complete,
             total_net=round(total, 2), total_rewards=round(total_rewards, 2), inventory_pnl=round(inv_total, 2),
-            fills=len(fills), fill_reasons=dict(reasons),
-            unresolved_marked_at_mid=sum(1 for c in final_vals if res_cache.get(c) is None),
+            dominant_rewards=round(dominant, 2), fills=len(fills), fill_reasons=dict(reasons),
+            unresolved_marked_at_last_trade=sum(1 for c in final_vals if res_cache.get(c) is None),
             best_market=best[0], best_market_net=round(best[1], 2), criteria=crit,
             verdict="PASS" if passed else ("FAIL" if complete else "INCOMPLETE"), daily=daily)
     inv = db.execute("SELECT max(max_capital), max(max_net_inv_ratio), sum(trades_missing), count(*) FROM ticks").fetchone()
@@ -147,7 +155,7 @@ def evaluate(db, resolve=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="data/polymarket_paper/paper.db")
+    ap.add_argument("--db", default="data/polymarket_paper/paper_v2.db")
     ap.add_argument("--no-resolve", action="store_true")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()

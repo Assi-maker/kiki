@@ -6,7 +6,8 @@ scored with Polymarket's own reward formula against the competitors in the
 book, and fills are simulated from the public trade tape. Measures one thing:
 daily rewards minus losses from being filled (adverse selection).
 
-Pre-registration: docs/superpowers/reports/2026-10-02-polymarket-rewards-paper-test.md
+Pre-registration: docs/superpowers/reports/2026-10-02-polymarket-rewards-paper-test.md (v1),
+docs/superpowers/reports/2026-10-19-polymarket-rewards-paper-test-v2.md (v2, this version)
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ TICK_SECONDS = 60
 GAP_SECONDS = 180          # longer gap -> virtual orders count as cancelled
 RESELECT_SECONDS = 3600
 C_SINGLE = 3.0
+SHORTLIST = 40             # per variant, markets whose competitiveness is fetched each hour
 # name, distance from mid in cents, minimum hours to market end
 VARIANTS = [
     ("d2_all", 2.0, 0),    # PRIMARY
@@ -87,6 +89,18 @@ def competitor_q(bids, asks, mid, v):
     q1 = sum(sz * score(v, abs(mid - p) * 100) for p, sz in bids)
     q2 = sum(sz * score(v, abs(p - mid) * 100) for p, sz in asks)
     return (q1 + q2) / 2
+
+
+def honest_mid(mid, bb, ba, ltp, v):
+    """True when the size-cutoff mid agrees with the visible book and the last trade.
+
+    v1 lesson: with dust below min_size, the adjusted mid can sit in an empty gap far
+    from where the market trades; quotes there scored alone and took the whole pool.
+    A visible spread wider than twice the reward band means there is no price to quote around.
+    """
+    if (ba - bb) * 100 > 2 * v or abs(mid - (bb + ba) / 2) * 100 > v / 2:
+        return False
+    return ltp is None or abs(mid - ltp) * 100 <= v
 
 
 def quote_prices(mid, d_cents, tick, best_bid, best_ask):
@@ -188,13 +202,13 @@ def capital(n, pb, pa):
     return n * (pb + 1.0 - pa)
 
 
-def select(cands, d, budget, now, min_hours):
-    """Greedy pick by expected reward per dollar of capital."""
+def rank(cands, d, now, min_hours):
+    """(expected reward per dollar of capital, capital, candidate), best first."""
     ranked = []
     for c in cands:
         if c["end"] is not None and c["end"] - now < min_hours * 3600:
             continue
-        if not 0.10 <= c["mid"] <= 0.90:
+        if not 0.10 <= c["mid"] <= 0.90 or not c.get("honest", True):
             continue
         pb, pa = quote_prices(c["mid"], d, c["tick"], c["bb"], c["ba"])
         ltp = c.get("ltp")
@@ -207,8 +221,18 @@ def select(cands, d, budget, now, min_hours):
         cap = capital(c["n"], pb, pa)
         ranked.append((c["rate"] * q / (q + c["comp"]) / cap, cap, c))
     ranked.sort(key=lambda x: -x[0])
+    return ranked
+
+
+def shortlist(cands, params, now, k):
+    """Union of every variant's top k, the markets worth asking Polymarket about."""
+    return {c["cid"] for d, min_hours in params for _, _, c in rank(cands, d, now, min_hours)[:k]}
+
+
+def select(cands, d, budget, now, min_hours):
+    """Greedy pick by expected reward per dollar of capital."""
     picked, left = [], budget
-    for _, cap, c in ranked:
+    for _, cap, c in rank(cands, d, now, min_hours):
         if cap <= left:
             picked.append(c)
             left -= cap
@@ -286,6 +310,20 @@ def fetch_books(token_ids):
     return books
 
 
+def fetch_competitiveness(cids):
+    """cid -> Polymarket's own market_competitiveness; cids missing from the result failed."""
+    def one(cid):
+        try:
+            d = _retry(_get, f"{CLOB}/rewards/markets/{cid}")["data"]
+            return cid, float(d[0].get("market_competitiveness") or 0.0) if d else None
+        except Exception as e:  # noqa: BLE001
+            log.warning("competitiveness %s failed: %s", cid[:10], e)
+            return cid, None
+
+    with ThreadPoolExecutor(8) as ex:
+        return {cid: mc for cid, mc in ex.map(one, cids) if mc is not None}
+
+
 def fetch_trades(cids, since, until):
     """cid -> trades in (since, until]; cids missing from the result failed."""
     def one(cid):
@@ -310,7 +348,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets(cid TEXT PRIMARY KEY, question TEXT, yes TEXT, end_ts REAL,
     rate REAL, v REAL, n REAL, tick REAL);
 CREATE TABLE IF NOT EXISTS samples(variant TEXT, ts INTEGER, cid TEXT, mid REAL, pb REAL, pa REAL,
-    bid_on INTEGER, ask_on INTEGER, our_q REAL, comp REAL, share REAL, rate REAL, reward REAL);
+    bid_on INTEGER, ask_on INTEGER, our_q REAL, comp REAL, share REAL, rate REAL, reward REAL,
+    ltp REAL);
 CREATE TABLE IF NOT EXISTS fills(variant TEXT, ts INTEGER, cid TEXT, side TEXT, price REAL,
     size REAL, mid REAL, reason TEXT);
 CREATE TABLE IF NOT EXISTS ticks(ts INTEGER, gap INTEGER, n_books INTEGER, trades_missing INTEGER,
@@ -353,8 +392,10 @@ def market_view(m, book):
     mid = adjusted_mid(bids, asks, m["n"])
     if mid is None:
         return None
-    return dict(mid=mid, bb=max(p for p, _ in bids), ba=min(p for p, _ in asks), ltp=ltp,
-                comp=competitor_q(bids, asks, mid, m["v"]))
+    bb, ba = max(p for p, _ in bids), min(p for p, _ in asks)
+    # competitors: our book bound, never below Polymarket's own competitiveness figure
+    return dict(mid=mid, bb=bb, ba=ba, ltp=ltp, honest=honest_mid(mid, bb, ba, ltp, m["v"]),
+                comp=max(competitor_q(bids, asks, mid, m["v"]), m.get("mc", 0.0)))
 
 
 def step_variant(var, uni, views, trades, now, gap, db):
@@ -399,11 +440,21 @@ def step_variant(var, uni, views, trades, now, gap, db):
         var.orders[cid] = (pb, pa, bon, aon)
         ours = our_qmin(pos.size, pb, pa, view["mid"], m["v"], bon, aon)
         sh = share(ours, view["comp"])
-        db.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        reward = m["rate"] * sh / 1440 if view.get("honest", True) else 0.0
+        db.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                    (var.name, now, cid, view["mid"], pb, pa, int(bon), int(aon), ours, view["comp"],
-                    sh, m["rate"], m["rate"] * sh / 1440))
+                    sh, m["rate"], reward, view["ltp"]))
     net_ratio = max((abs(p.yes - p.no) / p.size for p in var.positions.values() if p.size), default=0.0)
     return used, net_ratio
+
+
+def merge_universe(old, fresh, held):
+    """Fresh reward list plus held markets that left it, kept at rate 0 so they can be
+    unwound without earning (v1 credited them at their last, stale rate). The last known
+    competitiveness is carried over until it is fetched again."""
+    kept = {c: dict(m, rate=0.0) for c, m in old.items() if c in held and c not in fresh}
+    fresh = {c: dict(m, mc=old[c]["mc"]) if "mc" in old.get(c, {}) else m for c, m in fresh.items()}
+    return {**kept, **fresh}
 
 
 def run(db_path: Path, stop_at: float | None = None):
@@ -422,8 +473,7 @@ def run(db_path: Path, stop_at: float | None = None):
             reselect = t0 - last_select >= RESELECT_SECONDS or not uni
             if reselect:
                 fresh = fetch_universe()
-                # keep metadata for held markets that dropped out of the reward list
-                uni = {**{c: m for c, m in uni.items() if any(c in v.held() for v in variants)}, **fresh}
+                uni = merge_universe(uni, fresh, {c for v in variants for c in v.held()})
                 db.executemany("INSERT OR REPLACE INTO markets VALUES(?,?,?,?,?,?,?,?)",
                                [(m["cid"], m["question"], m["yes"], m["end"], m["rate"], m["v"], m["n"], m["tick"])
                                 for m in fresh.values()])
@@ -439,6 +489,15 @@ def run(db_path: Path, stop_at: float | None = None):
                         views[c] = vw
             if reselect:
                 cands = [dict(uni[c], **views[c]) for c in views if c in fresh]
+                short = shortlist(cands, [(v.d, v.min_hours) for v in variants], now, SHORTLIST)
+                mcs = fetch_competitiveness(sorted(short))
+                for c, mc in mcs.items():
+                    uni[c] = dict(uni[c], mc=mc)
+                    vw = market_view(uni[c], books.get(uni[c]["yes"]))
+                    if vw:
+                        views[c] = vw
+                # only markets whose competitiveness Polymarket confirmed this hour can be selected
+                cands = [dict(uni[c], **views[c]) for c in mcs if c in views]
                 for v in variants:
                     v.selected = [c["cid"] for c in select(cands, v.d, v.budget - v.inventory_cost(), now, v.min_hours)]
                 last_select = t0
@@ -466,7 +525,7 @@ def run(db_path: Path, stop_at: float | None = None):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="data/polymarket_paper/paper.db")
+    ap.add_argument("--db", default="data/polymarket_paper/paper_v2.db")
     ap.add_argument("--minutes", type=float, default=None)
     a = ap.parse_args()
     Path(a.db).parent.mkdir(parents=True, exist_ok=True)

@@ -127,7 +127,8 @@ def test_evaluator_daily_net_and_verdict_on_synthetic_db(monkeypatch):
         ts = day1 + 60 * i
         db.execute("INSERT INTO ticks VALUES(?,0,1,0,0.1,19.0,1.0)", (ts,))
         mid = 0.50 if i < 720 else 0.40
-        db.execute("INSERT INTO samples VALUES('d2_all',?,'c',?,0.48,0.52,1,1,6,0,1,100,?)", (ts, mid, 100 / 1440))
+        db.execute("INSERT INTO samples VALUES('d2_all',?,'c',?,0.48,0.52,1,1,6,0,1,100,?,?)",
+                   (ts, mid, 100 / 1440, mid))
     # bought 20 Yes at 0.48, market falls to 0.40 -> -1.6 inventory, +100 rewards
     db.execute("INSERT INTO fills VALUES('d2_all',?,'c','bid',0.48,20,0.45,'ltp')", (day1 + 60 * 800,))
     r = E.evaluate(db, resolve=False)
@@ -145,3 +146,100 @@ def test_selection_skips_markets_trading_outside_our_quotes():
     base = dict(rate=100, v=4.5, n=20, mid=0.5, comp=0.0, tick=0.01, bb=0.40, ba=0.60, end=None)
     assert P.select([dict(base, cid="x", ltp=0.30)], d=2.0, budget=100, now=0, min_hours=0) == []
     assert [c["cid"] for c in P.select([dict(base, cid="y", ltp=0.50)], d=2.0, budget=100, now=0, min_hours=0)] == ["y"]
+
+
+# ---- v2 (2026-10-19): fixes found in the v1 review
+
+HOLLOW = ([(0.006, 50.0), (0.005, 5.0)], [(0.03, 10.0), (0.577, 85.0)], 0.044)
+
+
+def test_market_view_flags_mid_detached_from_book_or_last_trade():
+    m = dict(n=20, v=4.5)
+    # dust ask at 0.03 is below min_size, so the adjusted mid sits in the empty gap at ~0.29
+    v = P.market_view(m, HOLLOW)
+    assert v["mid"] == pytest.approx(0.2915) and not v["honest"]
+    assert P.market_view(m, ([(0.48, 100.0)], [(0.52, 100.0)], 0.51))["honest"]
+    assert P.market_view(m, ([(0.48, 100.0)], [(0.52, 100.0)], None))["honest"]
+    # a book that agrees with itself but not with the last trade
+    assert not P.market_view(m, ([(0.48, 100.0)], [(0.52, 100.0)], 0.60))["honest"]
+
+
+def test_selection_skips_markets_whose_mid_is_not_honest():
+    base = dict(rate=100, v=4.5, n=20, mid=0.5, comp=0.0, tick=0.01, bb=0.49, ba=0.51, end=None,
+                ltp=0.5)
+    kw = dict(d=2.0, budget=100, now=0, min_hours=0)
+    assert P.select([dict(base, cid="x", honest=False)], **kw) == []
+    assert len(P.select([dict(base, cid="y", honest=True)], **kw)) == 1
+
+
+def test_no_reward_is_credited_while_the_mid_is_detached():
+    import sqlite3
+    db = sqlite3.connect(":memory:")
+    db.executescript(P.SCHEMA)
+    uni = {"c": dict(cid="c", rate=28.0, v=4.5, n=20.0, tick=0.001)}
+    view = P.market_view(uni["c"], HOLLOW)
+    var = P.Variant("d2_all", 2.0, 0)
+    var.selected = ["c"]
+    P.step_variant(var, uni, {"c": view}, {}, now=100, gap=True, db=db)
+    reward, ltp = db.execute("SELECT reward, ltp FROM samples").fetchone()
+    assert reward == 0.0 and ltp == pytest.approx(0.044)
+
+
+def test_held_market_that_left_the_reward_list_keeps_quoting_at_rate_zero():
+    old = {"a": dict(cid="a", rate=28.0), "b": dict(cid="b", rate=5.0)}
+    fresh = {"c": dict(cid="c", rate=9.0)}
+    uni = P.merge_universe(old, fresh, held={"a"})
+    assert uni["a"]["rate"] == 0.0 and "b" not in uni and uni["c"]["rate"] == 9.0
+    assert old["a"]["rate"] == 28.0          # the old dict is not mutated
+    uni = P.merge_universe({"c": dict(cid="c", rate=1.0, mc=4.0)}, fresh, held=set())
+    assert uni["c"] == dict(cid="c", rate=9.0, mc=4.0)
+
+
+def test_evaluator_marks_at_last_trade_and_requires_net_without_dominant_rewards(monkeypatch):
+    import sqlite3
+    from crypto_trading.polymarket import evaluate as E
+    monkeypatch.setattr(E, "N_DAYS", 1)
+    db = sqlite3.connect(":memory:")
+    db.executescript(P.SCHEMA)
+    day0 = 1_790_899_200
+    day1 = day0 + 86400
+    db.execute("INSERT INTO markets VALUES('c','q','y',NULL,100,4.5,20,0.001)")
+    db.execute("INSERT INTO ticks VALUES(?,0,1,0,0.1,19.0,1.0)", (day0,))
+    for i in range(1440):
+        ts = day1 + 60 * i
+        db.execute("INSERT INTO ticks VALUES(?,0,1,0,0.1,19.0,1.0)", (ts,))
+        share = 0.4 if i < 20 else 1.0         # a minority share only in the first 20 minutes
+        # hollow book: adjusted mid 0.32, but the market trades at 0.03
+        db.execute("INSERT INTO samples VALUES('d2_all',?,'c',0.32,0.30,0.34,1,1,6,0,?,100,?,0.03)",
+                   (ts, share, 100 / 1440))
+    db.execute("INSERT INTO fills VALUES('d2_all',?,'c','bid',0.165,20,0.32,'book')", (day1 + 60,))
+    v = E.evaluate(db, resolve=False)["variants"]["d2_all"]
+    assert v["inventory_pnl"] == pytest.approx(20 * (0.03 - 0.165))
+    assert v["dominant_rewards"] == pytest.approx(100 * 1420 / 1440, abs=0.01)
+    # 1.39 minority-share rewards cannot cover the 2.7 inventory loss
+    assert v["criteria"]["without_dominant_positive"] is False
+    assert v["verdict"] == "FAIL"
+
+
+def test_mid_is_not_honest_when_the_visible_book_is_wider_than_twice_max_spread():
+    # Dota-style book: 0.05 / 0.50 -> mid 0.275 is a guess, not a price
+    m = dict(n=20, v=4.5)
+    assert not P.market_view(m, ([(0.05, 28.0)], [(0.50, 20.0)], None))["honest"]
+    assert P.market_view(m, ([(0.46, 28.0)], [(0.54, 20.0)], None))["honest"]      # 8c <= 9c
+
+
+def test_competition_is_at_least_polymarkets_own_competitiveness():
+    book = ([(0.30, 100.0)], [(0.70, 100.0)], None)            # nothing inside the band
+    assert P.market_view(dict(n=20, v=4.5), book)["comp"] == 0.0
+    assert P.market_view(dict(n=20, v=4.5, mc=6.7), book)["comp"] == pytest.approx(6.7)
+    close = ([(0.49, 100.0)], [(0.51, 100.0)], None)
+    ours = P.market_view(dict(n=20, v=4.5), close)["comp"]
+    assert P.market_view(dict(n=20, v=4.5, mc=1.0), close)["comp"] == pytest.approx(ours)
+
+
+def test_shortlist_keeps_the_best_ranked_candidates_of_every_variant():
+    now = 0
+    base = dict(v=4.5, n=20, mid=0.5, comp=10.0, tick=0.01, bb=0.49, ba=0.51, end=None, honest=True)
+    cands = [dict(base, cid=str(i), rate=float(i)) for i in range(10)]
+    short = P.shortlist(cands, [(2.0, 0), (1.0, 0)], now, k=3)
+    assert set(short) == {"9", "8", "7"}
