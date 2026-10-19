@@ -243,3 +243,94 @@ def test_shortlist_keeps_the_best_ranked_candidates_of_every_variant():
     cands = [dict(base, cid=str(i), rate=float(i)) for i in range(10)]
     short = P.shortlist(cands, [(2.0, 0), (1.0, 0)], now, k=3)
     assert set(short) == {"9", "8", "7"}
+
+
+# ---- v3 final (2026-10-19): every remaining optimistic shortcut closed before data
+
+def test_no_reward_for_a_market_whose_trade_tape_could_not_be_read():
+    import sqlite3
+    db = sqlite3.connect(":memory:")
+    db.executescript(P.SCHEMA)
+    uni = {"c": dict(cid="c", rate=50.0, v=4.5, n=20.0, tick=0.01)}
+    view = P.market_view(uni["c"], ([(0.49, 100.0)], [(0.51, 100.0)], 0.50))
+    var = P.Variant("d2_all", 2.0, 0)
+    var.selected = ["c"]
+    var.orders = {"c": (0.48, 0.52, True, True)}
+    P.step_variant(var, uni, {"c": view}, {}, now=100, gap=False, db=db, missing={"c"})
+    assert db.execute("SELECT reward FROM samples").fetchone()[0] == 0.0
+    P.step_variant(var, uni, {"c": view}, {"c": []}, now=160, gap=False, db=db)
+    assert db.execute("SELECT reward FROM samples WHERE ts=160").fetchone()[0] > 0
+
+
+def test_markets_without_a_positive_rate_are_never_selected():
+    base = dict(v=4.5, n=20, mid=0.5, comp=1.0, tick=0.01, bb=0.49, ba=0.51, end=None, honest=True)
+    assert P.select([dict(base, cid="z", rate=0.0)], d=2.0, budget=100, now=0, min_hours=0) == []
+
+
+def test_rate_is_the_lower_of_both_polymarket_sources():
+    assert P.confirmed(dict(cid="c", rate=50.0), mc=0.4, rate_pm=30.0) == dict(cid="c", rate=30.0, mc=0.4)
+    assert P.confirmed(dict(cid="c", rate=20.0), mc=0.0, rate_pm=30.0)["rate"] == 20.0
+
+
+def _one_day_db(samples, fills=()):
+    import sqlite3
+    db = sqlite3.connect(":memory:")
+    db.executescript(P.SCHEMA)
+    day0 = 1_790_899_200
+    db.execute("INSERT INTO markets VALUES('c','q','y',NULL,100,4.5,20,0.01)")
+    for i in range(10):
+        db.execute("INSERT INTO ticks VALUES(?,0,1,0,0.1,19.0,1.0)", (day0 + 60 * i,))
+    for i in range(1440):
+        db.execute("INSERT INTO ticks VALUES(?,0,1,0,0.1,19.0,1.0)", (day0 + 86400 + 60 * i,))
+    for row in samples(day0):
+        db.execute("INSERT INTO samples VALUES('d2_all',?,'c',?,0.48,0.52,1,1,6,1,?,100,?,?)", row)
+    for f in fills:
+        db.execute("INSERT INTO fills VALUES('d2_all',?,'c',?,?,20,0.5,'tape')", f)
+    return db, day0
+
+
+def test_unresolved_inventory_is_marked_at_the_worse_of_last_trade_and_mid(monkeypatch):
+    from crypto_trading.polymarket import evaluate as E
+    monkeypatch.setattr(E, "N_DAYS", 1)
+    # Yes held: mid 0.50 but last trade 0.45 -> marked at 0.45; No held: marked at the higher one
+    db, day0 = _one_day_db(lambda d0: [(d0 + 86400 + 60, 0.50, 0.1, 0.0, 0.45)],
+                           fills=[(1_790_899_200 + 86400 + 30, "bid", 0.48)])
+    v = E.evaluate(db, resolve=False)["variants"]["d2_all"]
+    assert v["inventory_pnl"] == pytest.approx(20 * (0.45 - 0.48))
+    db, _ = _one_day_db(lambda d0: [(d0 + 86400 + 60, 0.50, 0.1, 0.0, 0.45)],
+                        fills=[(1_790_899_200 + 86400 + 30, "ask", 0.52)])
+    v = E.evaluate(db, resolve=False)["variants"]["d2_all"]
+    assert v["inventory_pnl"] == pytest.approx(20 * (0.52 - 0.50))   # No bought at 0.48, worth 0.50
+
+
+def test_totals_count_only_the_valid_days_not_the_warm_up(monkeypatch):
+    from crypto_trading.polymarket import evaluate as E
+    monkeypatch.setattr(E, "N_DAYS", 1)
+    db, day0 = _one_day_db(lambda d0: [(d0 + 60, 0.5, 0.1, 50.0, 0.5), (d0 + 86400 + 60, 0.5, 0.1, 2.0, 0.5)])
+    r = E.evaluate(db, resolve=False)
+    assert r["variants"]["d2_all"]["total_rewards"] == pytest.approx(2.0)
+
+
+def test_overall_verdict_passes_if_any_variant_passes(monkeypatch):
+    from crypto_trading.polymarket import evaluate as E
+    monkeypatch.setattr(E, "N_DAYS", 1)
+    monkeypatch.setattr(E, "MIN_POSITIVE_DAYS", 1)
+    db, d0 = _one_day_db(lambda d0: [(d0 + 86400 + 60 * i, 0.5, 0.3, 0.01, 0.5) for i in range(200)])
+    for i in range(200):    # a second market, so removing the best one still leaves a profit
+        db.execute("INSERT INTO samples VALUES('d2_all',?,'d',0.5,0.48,0.52,1,1,6,1,0.3,100,0.01,0.5)",
+                   (d0 + 86400 + 60 * i,))
+    r = E.evaluate(db, resolve=False)
+    assert r["variants"]["d2_all"]["verdict"] == "PASS"
+    assert r["verdict"] == "PASS" and r["passing_variants"] == ["d2_all"]
+
+
+def test_collector_freezes_the_verdict_once_the_last_valid_day_is_over(tmp_path, monkeypatch):
+    from crypto_trading.polymarket import evaluate as E
+    monkeypatch.setattr(E, "N_DAYS", 1)
+    db, d0 = _one_day_db(lambda d0: [(d0 + 86400 + 60, 0.5, 0.3, 0.01, 0.5)])
+    out = tmp_path / "result.json"
+    assert P.finish_if_done(db, out, now=d0 + 86400 + 3600, resolve=False) is None   # day 1 still running
+    assert not out.exists()
+    res = P.finish_if_done(db, out, now=d0 + 2 * 86400 + 60, resolve=False)
+    assert res["verdict"] in ("PASS", "FAIL") and out.exists()
+    assert P.finish_if_done(db, out, now=d0 + 3 * 86400, resolve=False) is None      # written once

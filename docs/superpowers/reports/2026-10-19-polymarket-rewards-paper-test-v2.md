@@ -85,4 +85,16 @@ not data.
 
 ---
 ## Results
-_(pending)_
+
+**WITHDRAWN 2026-10-19, before its first evaluation day.** v2 ran on Railway only during its
+warm-up day, from 20:17 UTC. No day that would have counted was collected.
+
+v2 is replaced by `2026-10-19-polymarket-rewards-paper-test-v3-final.md`. v3 closes the remaining
+optimistic shortcuts:
+- the rate is cross-checked against `/rewards/markets`;
+- minutes whose trade tape could not be read earn nothing;
+- inventory is marked pessimistically;
+- totals exclude the warm-up day;
+- the verdict is binding and written automatically.
+
+The v2 database (`paper_v2.db`) is kept in the volume and is not used.

@@ -7,7 +7,8 @@ book, and fills are simulated from the public trade tape. Measures one thing:
 daily rewards minus losses from being filled (adverse selection).
 
 Pre-registration: docs/superpowers/reports/2026-10-02-polymarket-rewards-paper-test.md (v1),
-docs/superpowers/reports/2026-10-19-polymarket-rewards-paper-test-v2.md (v2, this version)
+docs/superpowers/reports/2026-10-19-polymarket-rewards-paper-test-v2.md (v2, withdrawn),
+docs/superpowers/reports/2026-10-19-polymarket-rewards-paper-test-v3-final.md (v3, this version)
 """
 from __future__ import annotations
 
@@ -206,6 +207,8 @@ def rank(cands, d, now, min_hours):
     """(expected reward per dollar of capital, capital, candidate), best first."""
     ranked = []
     for c in cands:
+        if c["rate"] <= 0:
+            continue
         if c["end"] is not None and c["end"] - now < min_hours * 3600:
             continue
         if not 0.10 <= c["mid"] <= 0.90 or not c.get("honest", True):
@@ -310,12 +313,22 @@ def fetch_books(token_ids):
     return books
 
 
+def confirmed(m, mc, rate_pm):
+    """Market metadata after the hourly check against /rewards/markets: competitors floored at
+    Polymarket's competitiveness, rate the lower of both Polymarket sources."""
+    return dict(m, mc=mc, rate=min(m["rate"], rate_pm))
+
+
 def fetch_competitiveness(cids):
-    """cid -> Polymarket's own market_competitiveness; cids missing from the result failed."""
+    """cid -> (market_competitiveness, rate per day) from /rewards/markets; failed cids are missing.
+    A market no longer listed there comes back with rate 0."""
     def one(cid):
         try:
             d = _retry(_get, f"{CLOB}/rewards/markets/{cid}")["data"]
-            return cid, float(d[0].get("market_competitiveness") or 0.0) if d else None
+            if not d:
+                return cid, (0.0, 0.0)
+            rate = sum(float(x.get("rate_per_day") or 0) for x in d[0].get("rewards_config") or [])
+            return cid, (float(d[0].get("market_competitiveness") or 0.0), rate)
         except Exception as e:  # noqa: BLE001
             log.warning("competitiveness %s failed: %s", cid[:10], e)
             return cid, None
@@ -398,7 +411,7 @@ def market_view(m, book):
                 comp=max(competitor_q(bids, asks, mid, m["v"]), m.get("mc", 0.0)))
 
 
-def step_variant(var, uni, views, trades, now, gap, db):
+def step_variant(var, uni, views, trades, now, gap, db, missing=frozenset()):
     # 1) fills of the orders that rested since the previous tick
     if not gap:
         for cid, (pb, pa, bon, aon) in var.orders.items():
@@ -440,7 +453,9 @@ def step_variant(var, uni, views, trades, now, gap, db):
         var.orders[cid] = (pb, pa, bon, aon)
         ours = our_qmin(pos.size, pb, pa, view["mid"], m["v"], bon, aon)
         sh = share(ours, view["comp"])
-        reward = m["rate"] * sh / 1440 if view.get("honest", True) else 0.0
+        # no reward while the mid is not honest, or when this minute's fills could not be checked
+        earns = view.get("honest", True) and cid not in missing
+        reward = m["rate"] * sh / 1440 if earns else 0.0
         db.execute("INSERT INTO samples VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                    (var.name, now, cid, view["mid"], pb, pa, int(bon), int(aon), ours, view["comp"],
                     sh, m["rate"], reward, view["ltp"]))
@@ -457,7 +472,24 @@ def merge_universe(old, fresh, held):
     return {**kept, **fresh}
 
 
+def finish_if_done(db, out_path, now, resolve=True):
+    """After the last valid day has ended, evaluate once and freeze the verdict in out_path."""
+    from crypto_trading.polymarket import evaluate as E
+    if Path(out_path).exists():
+        return None
+    days, _ = E.valid_days(db)
+    if len(days) < E.N_DAYS or E.day_of(now) <= days[-1]:
+        return None
+    res = dict(E.evaluate(db, resolve=resolve), evaluated_at=now)
+    Path(out_path).write_text(json.dumps(res, indent=1, ensure_ascii=False), encoding="utf-8")
+    return res
+
+
 def run(db_path: Path, stop_at: float | None = None):
+    result_path = db_path.with_name(db_path.stem + "_result.json")
+    if result_path.exists():                 # a restart after the end must not extend the test
+        log.info("test already complete: %s", result_path)
+        return
     db = sqlite3.connect(db_path)
     db.executescript(SCHEMA)
     variants = [Variant(*v) for v in VARIANTS]
@@ -488,11 +520,15 @@ def run(db_path: Path, stop_at: float | None = None):
                     if vw:
                         views[c] = vw
             if reselect:
+                result = finish_if_done(db, result_path, now)
+                if result:
+                    log.info("test complete, verdict %s %s", result["verdict"], result["passing_variants"])
+                    return
                 cands = [dict(uni[c], **views[c]) for c in views if c in fresh]
                 short = shortlist(cands, [(v.d, v.min_hours) for v in variants], now, SHORTLIST)
                 mcs = fetch_competitiveness(sorted(short))
-                for c, mc in mcs.items():
-                    uni[c] = dict(uni[c], mc=mc)
+                for c, (mc, rate_pm) in mcs.items():
+                    uni[c] = confirmed(uni[c], mc, rate_pm)
                     vw = market_view(uni[c], books.get(uni[c]["yes"]))
                     if vw:
                         views[c] = vw
@@ -504,10 +540,11 @@ def run(db_path: Path, stop_at: float | None = None):
             gap = prev is None or now - prev > GAP_SECONDS
             resting = list({c for v in variants for c in v.orders})
             trades = fetch_trades(resting, prev, now) if (resting and not gap) else {}
-            missing = 0 if gap else len(set(resting) - set(trades))
+            unread = set() if gap else set(resting) - set(trades)
+            missing = len(unread)
             max_cap, max_ratio = 0.0, 0.0
             for v in variants:
-                cap, ratio = step_variant(v, uni, views, trades, now, gap, db)
+                cap, ratio = step_variant(v, uni, views, trades, now, gap, db, unread)
                 max_cap, max_ratio = max(max_cap, cap), max(max_ratio, ratio)
                 db.execute("INSERT OR REPLACE INTO state VALUES(?,?)", (v.name, v.to_json()))
             db.execute("INSERT INTO ticks VALUES(?,?,?,?,?,?,?)",
@@ -525,7 +562,7 @@ def run(db_path: Path, stop_at: float | None = None):
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", default="data/polymarket_paper/paper_v2.db")
+    ap.add_argument("--db", default="data/polymarket_paper/paper_v3.db")
     ap.add_argument("--minutes", type=float, default=None)
     a = ap.parse_args()
     Path(a.db).parent.mkdir(parents=True, exist_ok=True)
